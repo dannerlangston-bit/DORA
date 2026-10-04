@@ -357,3 +357,27 @@ test('the tour opens from Help and steps through', async ({ page }) => {
   await page.keyboard.press('Escape')
   await expect(page.getByTestId('tour')).toHaveCount(0)
 })
+
+test('the first box you name names the project; double-click the name to rename it', async ({ page }) => {
+  fs.writeFileSync(path.join(WORK, 'map.json'), JSON.stringify({ version: 1, title: '.work', events: [], links: [] }))
+  fs.writeFileSync(path.join(WORK, 'layout.json'), '{}')
+  await page.waitForTimeout(150)
+  await page.goto('/')
+  await expect(page.getByTestId('empty')).toBeVisible()
+  await page.getByTestId('rail').locator('[data-tool=box]').click()
+  await page.mouse.click(300, 160) // clear of the starter buttons in the middle
+  await page.keyboard.type('Acme onboarding')
+  await page.keyboard.press('Enter')
+  await expect(page.getByTestId('map-title')).toHaveText('Acme onboarding')
+  await expect.poll(() => read().title).toBe('Acme onboarding')
+  await page.getByTestId('map-title').dblclick()
+  await page.keyboard.type('Acme platform')
+  await page.keyboard.press('Enter')
+  await expect.poll(() => read().title).toBe('Acme platform')
+  // naming later boxes leaves it alone
+  await page.mouse.click(900, 400)
+  await page.keyboard.type('Second')
+  await page.keyboard.press('Enter')
+  await page.waitForTimeout(300)
+  expect(read().title).toBe('Acme platform')
+})

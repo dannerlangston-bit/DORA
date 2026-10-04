@@ -75,10 +75,10 @@ function Board({ onHint, onTour }: { onHint: (hint: string | null) => void; onTo
   const editor = useRef<{ commit: () => void; owner: object } | null>(null)
   const commitMod = useRef(false)
   const lastCommit = useRef<CommitResult | null>(null)
-  const discardedAt = useRef(0)
-  const lastContextClick = useRef(0)
+  const discardedAt = useRef(-Infinity)
+  const lastContextClick = useRef(-Infinity)
   const marqueeRef = useRef<Marquee | null>(null)
-  const marqueeEndedAt = useRef(0)
+  const marqueeEndedAt = useRef(-Infinity)
   const anim = useRef(0)
   const fitted = useRef(false)
   const wrapRef = useRef<HTMLDivElement>(null)
@@ -327,7 +327,12 @@ function Board({ onHint, onTour }: { onHint: (hint: string | null) => void; onTo
         const value = field === 'files' ? raw.split('\n').map((s) => s.trim()).filter(Boolean)
           : field === 'details' ? raw.replace(/\s+$/, '') : raw.replace(/\s+/g, ' ').trim()
         if (JSON.stringify(e[field]) !== JSON.stringify(value)) {
-          client.apply([{ op: 'updateEvent', id, patch: { [field]: value } }])
+          const m = client.getState().map
+          const ops: Op[] = [{ op: 'updateEvent', id, patch: { [field]: value } }]
+          // the first box you name is the project: it names the map, unless you've named the map already
+          const unnamed = !m.title || m.title === workspace.name || m.title === 'Untitled project'
+          if (field === 'title' && value && m.events.length === 1 && unnamed) ops.push({ op: 'setTitle', title: value as string })
+          client.apply(ops)
           result = 'saved'
         }
       }

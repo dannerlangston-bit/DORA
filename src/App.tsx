@@ -36,9 +36,7 @@ export function App() {
       <Canvas onHint={onHint} onTour={onTour} />
 
       <header className="pointer-events-none absolute left-3 top-3 z-20 flex items-center gap-2">
-        <div className="pointer-events-auto flex h-9 items-center gap-2.5 rounded-3 border border-line-1 bg-raised pl-3 pr-2.5">
-          <span className="text-sm font-medium text-ink-1">Dora</span>
-          <span className="h-4 w-px bg-line-1" aria-hidden />
+        <div className="pointer-events-auto flex h-9 items-center gap-2 rounded-3 border border-line-1 bg-raised pl-1.5 pr-3">
           <MapTitle title={s.map.title} />
           <span
             className={`h-1.5 w-1.5 rounded-full ${s.connected ? 'bg-ink-3' : 'bg-warn'}`}
@@ -107,14 +105,20 @@ function Banner({ tone, children }: { tone: 'err' | 'warn'; children: React.Reac
   )
 }
 
-/** The map's name, double-click to rename. */
+/** The project's name, top-left. Double-click to rename; the first box you name names it if you haven't. */
 function MapTitle({ title }: { title: string }) {
   const [draft, setDraft] = useState<string | null>(null)
   if (draft === null) {
     return (
-      <span className="max-w-[320px] truncate text-sm text-ink-2" onDoubleClick={() => setDraft(title)} title="Double-click to rename the map" data-testid="map-title">
-        {title || 'Untitled map'}
-      </span>
+      <button
+        type="button"
+        className="motion-fast h-7 max-w-[360px] truncate rounded-2 px-1.5 text-base font-medium text-ink-1 transition-colors hover:bg-sel"
+        onDoubleClick={() => setDraft(title)}
+        title="Double-click to rename this project"
+        data-testid="map-title"
+      >
+        {title || 'Untitled project'}
+      </button>
     )
   }
   const save = () => {
@@ -129,8 +133,9 @@ function MapTitle({ title }: { title: string }) {
       onChange={(e) => setDraft(e.target.value)}
       onBlur={save}
       onKeyDown={(e) => { if (e.key === 'Enter') save(); if (e.key === 'Escape') setDraft(null) }}
-      className="w-[240px] rounded-1 bg-transparent text-sm text-ink-1 outline outline-1 outline-offset-2 outline-line-3"
-      aria-label="Map title"
+      onFocus={(e) => e.target.select()}
+      className="h-7 w-[280px] rounded-2 bg-transparent px-1.5 text-base font-medium text-ink-1 outline outline-1 outline-line-3"
+      aria-label="Project name"
     />
   )
 }

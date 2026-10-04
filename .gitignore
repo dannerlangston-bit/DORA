@@ -1,0 +1,9 @@
+node_modules/
+dist/
+playground/
+test-results/
+playwright-report/
+*.tmp
+.scratch/
+e2e/.work/
+*.tsbuildinfo

@@ -1,0 +1,134 @@
+@import "tailwindcss";
+
+/*
+ * Dora design system (DESIGN.md). LD3 Map's tokens, dark only: hierarchy from surface lift and
+ * hairlines, never shadows or gradients. One change from LD3 Map: orange means "in play"
+ * (the selected event and the chain you are linking), not status.
+ */
+@theme {
+  --color-canvas: #08090a;
+  --color-surface: #0f1011;
+  --color-raised: #141516;
+  --color-hover: #18191a;
+
+  --color-line-1: rgba(255, 255, 255, 0.06);
+  --color-line-2: rgba(255, 255, 255, 0.10);
+  --color-line-3: rgba(255, 255, 255, 0.16);
+
+  --color-ink-1: #ededed;
+  --color-ink-2: #9a9fa6;
+  --color-ink-3: #62666d;
+
+  --color-orange: #f28c28;
+  --color-orange-head: rgba(242, 140, 40, 0.20);
+  --color-orange-chain: rgba(242, 140, 40, 0.08);
+  --color-orange-line: rgba(242, 140, 40, 0.60);
+
+  --color-ok: #3fb950;
+  --color-warn: #d29922;
+  --color-err: #f85149;
+
+  --color-sel: rgba(255, 255, 255, 0.06);
+  --color-focus: rgba(255, 255, 255, 0.22);
+
+  --font-sans: "Inter Variable", "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", ui-monospace, monospace;
+
+  --text-xs: 12px;   --text-xs--line-height: 16px;  --text-xs--letter-spacing: 0;
+  --text-sm: 13px;   --text-sm--line-height: 18px;  --text-sm--letter-spacing: -0.005em;
+  --text-base: 14px; --text-base--line-height: 20px; --text-base--letter-spacing: -0.01em;
+  --text-md: 16px;   --text-md--line-height: 22px;  --text-md--letter-spacing: -0.012em;
+  --text-lg: 20px;   --text-lg--line-height: 26px;  --text-lg--letter-spacing: -0.018em;
+
+  --radius-1: 4px; --radius-2: 6px; --radius-3: 8px; --radius-4: 12px;
+  --spacing: 4px;
+}
+
+:root {
+  --bg-canvas: #08090a; --bg-surface: #0f1011; --bg-raised: #141516; --bg-hover: #18191a;
+  --line-1: rgba(255,255,255,0.06); --line-2: rgba(255,255,255,0.10); --line-3: rgba(255,255,255,0.16);
+  --text-1: #ededed; --text-2: #9a9fa6; --text-3: #62666d;
+  --orange: #f28c28; --orange-line: rgba(242,140,40,0.60);
+  --ok: #3fb950; --warn: #d29922; --err: #f85149;
+  --sel-bg: rgba(255,255,255,0.06); --focus: rgba(255,255,255,0.22);
+  --r-1: 4px; --r-2: 6px; --r-3: 8px; --r-4: 12px;
+  --t-fast: 120ms; --t-base: 180ms; --ease: cubic-bezier(.2,.8,.2,1);
+  color-scheme: dark;
+}
+
+@layer base {
+  html, body, #root { height: 100%; }
+  body {
+    margin: 0;
+    overflow: hidden;
+    background: var(--bg-canvas);
+    color: var(--text-1);
+    font-family: var(--font-sans);
+    font-size: 14px;
+    line-height: 20px;
+    letter-spacing: -0.01em;
+    font-weight: 400;
+    font-feature-settings: "tnum" 1, "ss01" 1, "cv11" 1;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  *:focus { outline: none; }
+  *:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; border-radius: var(--r-1); }
+  button { font: inherit; letter-spacing: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: pointer; }
+  input, textarea, select { font: inherit; letter-spacing: inherit; color: inherit; }
+  a { color: inherit; }
+  h1, h2, h3, strong, b { font-weight: 500; }
+  ::selection { background: rgba(242, 140, 40, 0.28); }
+}
+
+.mono { font-family: var(--font-mono); font-feature-settings: "tnum" 1; letter-spacing: 0; }
+.motion-fast { transition-duration: var(--t-fast); transition-timing-function: var(--ease); }
+.motion { transition-duration: var(--t-base); transition-timing-function: var(--ease); }
+.scroll { overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; scrollbar-color: var(--line-2) transparent; }
+
+/* kind chips: 11px/500 uppercase, 1px border, radius 4 */
+.chip {
+  display: inline-flex; align-items: center; height: 18px; padding: 0 6px; border-radius: var(--r-1);
+  font-size: 11px; line-height: 16px; font-weight: 500; letter-spacing: 0.04em; text-transform: uppercase;
+  border: 1px solid var(--line-2); color: var(--text-2); white-space: nowrap; font-family: var(--font-sans);
+}
+
+/* event cards (DESIGN §4). State comes from data-state so styling never rebuilds nodes. */
+.card { transition: border-color var(--t-fast) var(--ease), background-color var(--t-fast) var(--ease); }
+/* head: a 2px orange edge (border + outline, no shadow) so the card never shifts by a pixel */
+.card[data-state="head"] { border-color: var(--orange); outline: 1px solid var(--orange); outline-offset: 0; background: var(--color-orange-head); }
+.card[data-state="chain"] { border-color: var(--orange-line); background: var(--color-orange-chain); }
+.card[data-refuse] { animation: refuse 600ms var(--ease); }
+@keyframes refuse { 0%, 100% { border-color: var(--line-1); } 30%, 70% { border-color: var(--err); } }
+@keyframes card-in { from { opacity: 0; transform: scale(0.97); } to { opacity: 1; transform: none; } }
+.card-in { animation: card-in var(--t-base) var(--ease); }
+
+/* the dropdown's markdown */
+.prose-dora { font-size: 13px; line-height: 19px; color: var(--text-2); }
+.prose-dora > * + * { margin-top: 8px; }
+.prose-dora h1, .prose-dora h2, .prose-dora h3, .prose-dora h4 { font-size: 13px; line-height: 18px; font-weight: 500; color: var(--text-1); }
+.prose-dora strong { color: var(--text-1); }
+.prose-dora ul { list-style: disc; padding-left: 16px; }
+.prose-dora ol { list-style: decimal; padding-left: 18px; }
+.prose-dora li + li { margin-top: 2px; }
+.prose-dora code { font-family: var(--font-mono); font-size: 12px; padding: 0 3px; border-radius: var(--r-1); background: var(--sel-bg); color: var(--text-1); }
+.prose-dora pre { padding: 8px; border-radius: var(--r-2); background: var(--bg-canvas); border: 1px solid var(--line-1); overflow-x: auto; }
+.prose-dora pre code { padding: 0; background: none; }
+.prose-dora a { color: var(--text-1); text-decoration: underline; text-decoration-color: var(--line-3); text-underline-offset: 2px; }
+
+/* map */
+.react-flow__node { transition: opacity var(--t-fast) var(--ease); }
+.react-flow__node.dragging { opacity: 0.9; cursor: grabbing; }
+.react-flow__attribution { display: none; }
+.react-flow__edge-path { transition: stroke var(--t-base) var(--ease), opacity var(--t-base) var(--ease); }
+.linking .react-flow__pane, .linking .react-flow__node { cursor: crosshair; }
+.react-flow__handle { opacity: 0; pointer-events: none; }
+
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes rise-in { from { transform: translateY(6px); opacity: 0; } to { transform: none; opacity: 1; } }
+.fade-in { animation: fade-in var(--t-base) var(--ease); }
+.rise-in { animation: rise-in var(--t-base) var(--ease); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}

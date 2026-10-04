@@ -11,12 +11,9 @@ writes the map file, and you watch the cards arrive and edit them alongside it.
 
 New to it? Read [the guide](docs/GUIDE.md), or click the question mark in the app for the tour.
 
-Dora is a sibling of LD3 Map and uses the same map engine. LD3 Map draws a project from a ledger of
-work that already happened; Dora is for creating the map, to explain the project.
-
 ## Install once
 
-You need Node 20 or newer.
+You need [Node](https://nodejs.org) 20 or newer and git.
 
 ```sh
 git clone https://github.com/dannerlangston-bit/dora.git ~/tools/dora
@@ -93,3 +90,7 @@ npm run typecheck
 ```
 
 `DORA_DIR=/some/project npm run dev` points the dev server at another folder.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

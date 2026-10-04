@@ -1,7 +1,7 @@
 import { useId } from 'react'
 import { useViewport } from '@xyflow/react'
 
-/** Canvas background, as in LD3 Map: a 16px dot grid at rgba(255,255,255,0.04) that pans and zooms with the map. */
+/** Canvas background: a 16px dot grid at rgba(255,255,255,0.04) that pans and zooms with the map. */
 export function Pattern() {
   const { x, y, zoom } = useViewport()
   const id = useId()

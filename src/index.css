@@ -1,8 +1,8 @@
 @import "tailwindcss";
 
 /*
- * Dora design system (DESIGN.md). LD3 Map's tokens, dark only: hierarchy from surface lift and
- * hairlines, never shadows or gradients. One change from LD3 Map: orange means "in play"
+ * Dora design system (DESIGN.md). Dark only: hierarchy from surface lift and
+ * hairlines, never shadows or gradients. Orange means "in play"
  * (the selected event and the chain you are linking), not status.
  */
 @theme {

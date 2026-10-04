@@ -3,7 +3,7 @@ import type { LaneBand } from './blueprint'
 
 /**
  * Blueprint lanes: alternating bands with a hairline between them, drawn under the cards and moving
- * with the map, as LD3 Map draws project lanes. Each lane's name is pinned to the left edge of the
+ * with the map. Each lane's name is pinned to the left edge of the
  * screen (just right of the toolbar) so it stays readable however far the map is scrolled.
  */
 export function Lanes({ lanes, width }: { lanes: LaneBand[]; width: number }) {

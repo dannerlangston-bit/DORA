@@ -8,7 +8,7 @@ const btn = (active: boolean) =>
   `motion-fast flex h-7 items-center gap-1.5 rounded-2 px-2 text-sm transition-colors disabled:opacity-40 ${active ? 'bg-sel text-ink-1' : 'text-ink-2 hover:bg-sel hover:text-ink-1'}`
 
 /**
- * The view toolbar, bottom-right, as in LD3 Map: Flow or Blueprint, Tidy, Fit, and a card listing
+ * The view toolbar, bottom-right: Flow or Blueprint, Tidy, Fit, and a card listing
  * every control (with the tour). Tools that change what a click does live in the left toolbar.
  */
 export function Toolbar({ view, onView, onTidy, onFit, onTour }: { view: 'flow' | 'blueprint'; onView: (v: 'flow' | 'blueprint') => void; onTidy: () => void; onFit: () => void; onTour: () => void }) {

@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Build a map that explains a project, inside VS Code, with your AI filling it alongside you.",
   "type": "module",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "private": true,
   "bin": {
     "dora": "bin/dora.js"

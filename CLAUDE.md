@@ -1,7 +1,6 @@
 # Dora: agent context
 
-Dora is a canvas for building a map that explains a project, run from VS Code. It's a sibling of LD3
-Map (same map engine and look), scoped down to creating maps.
+Dora is a canvas for building a map that explains a project, run from VS Code.
 
 - **The rules live in `DESIGN.md`.** Follow them; they are constraints. Every interaction rule there
   has a browser test in `e2e/dora.spec.ts`. Change the doc, the code and the test together.

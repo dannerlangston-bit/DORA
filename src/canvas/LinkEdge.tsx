@@ -12,7 +12,7 @@ const STROKE: Record<string, string> = {
 }
 
 /**
- * A link (DESIGN §8): LD3 Map's 1.5px curve plus a small arrowhead, because direction matters in an
+ * A link (DESIGN §8): a 1.5px curve with a small arrowhead, because direction matters in an
  * explanation. Orange when selected or part of the chain being linked; hovering an event lights its
  * links and dims the rest. Labels show as an 11px mono chip at the middle.
  */

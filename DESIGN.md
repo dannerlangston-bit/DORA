@@ -10,9 +10,6 @@ It's built for enterprise products, explained the way their teams explain them:
 - how it's secured, where it's kept and how it's tracked;
 - what the customer ends up with.
 
-Dora shares its map engine and look with LD3 Map. The difference: LD3 Map draws a project from a
-ledger that already exists, while Dora is for creating the map.
-
 These are constraints, not suggestions. A value not defined here comes from the closest token in
 `src/index.css`; say so in the PR.
 
@@ -28,7 +25,7 @@ These are constraints, not suggestions. A value not defined here comes from the 
   or links. Tools that create or link say so in the hint and the cursor.
 - **Orange means "in play":** what's selected, and the chain being linked. Card colors are the
   person's own labels and never use orange.
-- LD3 Map's visual rules carry over: hierarchy from surface lift and hairlines, never shadows or
+- Visual rules: hierarchy from surface lift and hairlines, never shadows or
   gradients; weights 400 and 500 only; nothing under 12px except 11px chips; dark only.
 
 ## 1. Where it runs
@@ -136,7 +133,7 @@ Fixed width 240px, `--bg-surface`, 1px `--line-1` border, radius `--r-3`, paddin
 
 ## 5. Tools
 
-A vertical toolbar on the left, below the header, styled as in LD3 Map: 32px buttons, 16px icons, the
+A vertical toolbar on the left, below the header, 32px buttons, 16px icons, the
 active one on `--sel-bg`. One tool is active at a time. Each has a key, and Esc works down through:
 cancel what's happening, then deselect, then back to Select.
 

@@ -283,7 +283,7 @@ function readBody(req) {
 
 const TYPES = /** @type {Record<string, string>} */ ({
   '.html': 'text/html; charset=utf-8', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml',
-  '.woff2': 'font/woff2', '.woff': 'font/woff', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json',
+  '.woff2': 'font/woff2', '.woff': 'font/woff', '.png': 'image/png', '.webp': 'image/webp', '.ico': 'image/x-icon', '.json': 'application/json',
 })
 
 /** Serve the built canvas from dist/, falling back to index.html. */

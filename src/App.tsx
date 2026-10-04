@@ -49,6 +49,8 @@ export function App() {
         </div>
       </header>
 
+      <img src="/ld3-emblem.webp" alt="LD3" title="LD3" draggable={false} className="pointer-events-none absolute right-4 top-3 z-10 h-10 w-auto select-none opacity-90" data-testid="emblem" />
+
       {(s.fileError || s.problems.length > 0) && (
         <div className="absolute left-1/2 top-14 z-30 flex max-w-[560px] -translate-x-1/2 flex-col gap-1.5" data-testid="file-banner">
           {s.fileError && <Banner tone="err">{s.fileError}</Banner>}

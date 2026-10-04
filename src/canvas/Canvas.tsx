@@ -811,6 +811,10 @@ function Board({ onHint, onTour }: { onHint: (hint: string | null) => void; onTo
           proOptions={{ hideAttribution: true }}
           className="bg-canvas"
         >
+          {/* the LD3 mark, very faint, behind everything; fixed to the screen so it never competes with the cards */}
+          <div className="react-flow__background pointer-events-none absolute inset-0 flex items-center justify-center" aria-hidden data-testid="watermark">
+            <img src="/ld3-watermark.webp" alt="" draggable={false} className="select-none" style={{ width: 'min(56vw, 880px)', opacity: 0.08 }} />
+          </div>
           <Pattern />
           {view === 'blueprint' && lanes && <Lanes lanes={lanes.bands} width={lanes.width} />}
           {ghost && (

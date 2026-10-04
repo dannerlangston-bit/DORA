@@ -1,7 +1,15 @@
 import { useSyncExternalStore } from 'react'
 import { applyOps, invertOps, OpError, type DoraMap, type Op } from '../../shared/ops.js'
 
-export type Layout = { positions: Record<string, { x: number; y: number }>; pinned: string[]; expanded: string[] }
+/** Where cards sit (see server/dora-server.js): `placed` by hand, `pinned` locked, and which view is showing. */
+export type Layout = {
+  version: 2
+  view: 'flow' | 'blueprint'
+  positions: Record<string, { x: number; y: number }>
+  placed: string[]
+  pinned: string[]
+  expanded: string[]
+}
 export type DoraState = {
   ready: boolean
   connected: boolean
@@ -20,7 +28,7 @@ export type DoraState = {
 type ServerSnapshot = { rev: number; map: DoraMap; problems: string[]; error: string | null }
 type Batch = { ops: Op[]; inverse: Op[] }
 
-const EMPTY: DoraMap = { version: 1, title: '', events: [], links: [] }
+const EMPTY: DoraMap = { version: 1, title: '', events: [], links: [], workflows: [] }
 
 /**
  * The canvas's side of the sync. Edits apply on screen at once and queue for the server, which
@@ -30,7 +38,7 @@ const EMPTY: DoraMap = { version: 1, title: '', events: [], links: [] }
 class DoraClient {
   state: DoraState = {
     ready: false, connected: false, map: EMPTY, problems: [], fileError: null,
-    layout: { positions: {}, pinned: [], expanded: [] }, workspace: { name: '', dir: '' },
+    layout: { version: 2, view: 'flow', positions: {}, placed: [], pinned: [], expanded: [] }, workspace: { name: '', dir: '' },
     notice: null, canUndo: false, canRedo: false,
   }
   private server: DoraMap = EMPTY

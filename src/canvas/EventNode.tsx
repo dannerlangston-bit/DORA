@@ -2,10 +2,12 @@ import { createContext, useCallback, useContext, useEffect, useLayoutEffect, use
 import { Handle, Position, type Node, type NodeProps } from '@xyflow/react'
 import Markdown from 'react-markdown'
 import { ChevronDown, Pin } from 'lucide-react'
-import { KINDS, type DoraEvent, type Kind } from '../../shared/ops.js'
+import { COLORS, KIND_GROUPS, KIND_LABEL, type Kind } from '../../shared/kinds.js'
+import type { DoraEvent } from '../../shared/ops.js'
+import { KIND_ICON } from './kindIcons'
 import { CARD_W } from './layout'
 
-export type Field = 'title' | 'summary' | 'details' | 'files'
+export type Field = 'title' | 'summary' | 'details' | 'files' | 'actor' | 'system'
 export type EventNodeData = { event: DoraEvent; unplaced?: boolean }
 export type EventNode = Node<EventNodeData, 'event'>
 
@@ -14,8 +16,9 @@ export type EventNode = Node<EventNodeData, 'event'>
  * never rebuilds the nodes.
  */
 export interface CanvasState {
-  head: string | null          // dark orange: selected, and where the next link starts
-  chain: Set<string>           // light orange: earlier events in the chain being linked
+  selected: Set<string>        // dark orange: selected; the last one is where the next link starts
+  chain: Set<string>           // light orange: earlier events in the chain being linked or recorded
+  dimmed: Set<string>          // faded: off the workflow being shown
   hovered: string | null
   refuse: string | null        // flashes red: a link to it was refused
   pinned: Set<string>
@@ -26,6 +29,7 @@ export interface CanvasState {
   commitEdit: (id: string, field: Field, value: string) => void
   cancelEdit: (id: string, field: Field) => void
   toggleExpanded: (id: string) => void
+  togglePinned: (id: string) => void
   setKind: (id: string, kind: Kind) => void
   /** the open field registers how to save itself, so a click elsewhere can save it first */
   registerEditor: (commit: (() => void) | null, owner: object) => void
@@ -36,47 +40,72 @@ const useCanvas = () => useContext(CanvasContext)!
 const stop = (e: { stopPropagation: () => void }) => e.stopPropagation()
 
 /**
- * An event (DESIGN §4). Collapsed it is the snapshot: kind, title, a plain summary, how many files.
- * The Details dropdown opens the in-depth explanation and the files.
+ * An event (DESIGN §4). Collapsed it is the snapshot: kind, title, who and which system, a plain
+ * summary, how many files. The Details dropdown opens the in-depth explanation, who, system and files.
  */
 export function EventNodeView({ id, data }: NodeProps<EventNode>) {
   const c = useCanvas()
   const e = data.event
-  const state = c.head === id ? 'head' : c.chain.has(id) ? 'chain' : undefined
+  const state = c.selected.has(id) ? 'head' : c.chain.has(id) ? 'chain' : undefined
   const open = c.expanded.has(id)
+  const pinned = c.pinned.has(id)
   const hovered = c.hovered === id && !state
   const editingHere = c.editing?.id === id
+  const Icon = KIND_ICON[e.kind] ?? KIND_ICON.action
+  const color = COLORS.find((x) => x.id === e.color)
+  const whoLine = [e.actor, e.system].filter(Boolean).join(' · ')
   return (
     <div
-      className={`card relative rounded-3 border ${hovered ? 'border-line-2 bg-hover' : 'border-line-1 bg-surface'} ${data.unplaced ? 'opacity-0' : 'card-in'}`}
+      className={`card group relative rounded-3 border ${hovered ? 'border-line-2 bg-hover' : 'border-line-1 bg-surface'} ${data.unplaced ? 'opacity-0' : 'card-in'} ${c.dimmed.has(id) ? 'opacity-35' : ''}`}
       style={{ width: CARD_W }}
       data-state={state}
       data-refuse={c.refuse === id ? '1' : undefined}
       data-event-id={id}
+      data-kind={e.kind}
+      data-color={e.color || undefined}
+      data-pinned={pinned ? '1' : undefined}
       data-testid="event"
     >
+      {color && <span aria-hidden className="absolute bottom-[-1px] left-[-1px] top-[-1px] w-[3px] rounded-l-3" style={{ background: color.value }} data-testid="color-stripe" />}
       <Handle type="target" position={Position.Left} isConnectable={false} />
       <div className="px-3.5 pb-2.5 pt-3">
         <div className="flex items-center justify-between gap-2">
-          <select
-            className="chip nodrag cursor-pointer appearance-none bg-transparent hover:border-line-3"
-            style={{ fieldSizing: 'content' } as React.CSSProperties}
-            value={e.kind}
-            onChange={(ev) => c.setKind(id, ev.target.value as Kind)}
-            onClick={stop}
+          <div className="flex min-w-0 items-center gap-1.5">
+            <Icon size={14} strokeWidth={1.5} className="shrink-0 text-ink-2" aria-hidden />
+            <select
+              className="chip nodrag cursor-pointer appearance-none bg-transparent hover:border-line-3"
+              style={{ fieldSizing: 'content' } as React.CSSProperties}
+              value={e.kind}
+              onChange={(ev) => c.setKind(id, ev.target.value as Kind)}
+              onClick={stop}
+              onDoubleClick={stop}
+              aria-label="Kind"
+              data-testid="kind"
+            >
+              {KIND_GROUPS.map((g) => (
+                <optgroup key={g.group} label={g.group} className="bg-raised">
+                  {g.kinds.map((k) => <option key={k.kind} value={k.kind} className="bg-raised text-ink-1">{k.label}</option>)}
+                </optgroup>
+              ))}
+            </select>
+          </div>
+          <button
+            type="button"
+            className={`nodrag motion-fast -mr-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-2 transition-colors hover:bg-sel ${pinned ? 'text-ink-1' : 'text-ink-3 opacity-60 hover:opacity-100'}`}
+            onClick={(ev) => { ev.stopPropagation(); c.togglePinned(id) }}
             onDoubleClick={stop}
-            aria-label="Kind"
-            data-testid="kind"
+            aria-pressed={pinned}
+            aria-label={pinned ? 'Unpin' : 'Pin'}
+            title={pinned ? 'Pinned: this card can’t be moved, and Tidy leaves it alone. Click to unpin.' : 'Pin this card in place'}
+            data-testid="pin"
           >
-            {KINDS.map((k) => <option key={k} value={k} className="bg-raised text-ink-1">{k}</option>)}
-          </select>
-          {c.pinned.has(id) && (
-            <span className="text-ink-3" title="Pinned: auto-spacing leaves this card where you put it. Press T to tidy everything." data-testid="pinned">
-              <Pin size={12} strokeWidth={1.5} />
-            </span>
-          )}
+            <Pin size={13} strokeWidth={1.5} fill={pinned ? 'currentColor' : 'none'} />
+          </button>
         </div>
         <FieldView id={id} field="title" value={e.title} saveOn="enter" className="mt-2 text-base font-medium text-ink-1" placeholder="Untitled" testid="title" />
+        {whoLine && !(editingHere && (c.editing?.field === 'actor' || c.editing?.field === 'system')) && (
+          <div className="mono mt-0.5 truncate text-xs text-ink-3" title={whoLine} data-testid="who">{whoLine}</div>
+        )}
         {/* always there, so selecting a card never changes its height and never moves the map */}
         <FieldView id={id} field="summary" value={e.summary} saveOn="enter" className="mt-1 text-sm text-ink-2" placeholder="Add a summary (double-click)" testid="summary" clamp />
         <div className="mt-2.5 flex items-center justify-between gap-2">
@@ -99,6 +128,10 @@ export function EventNodeView({ id, data }: NodeProps<EventNode>) {
           <FieldView id={id} field="details" value={e.details} saveOn="mod-enter" className="text-sm" placeholder="Double-click to explain this in depth: why it exists, how it works, what it hands off. Markdown works." testid="details-body">
             {e.details ? <div className="prose-dora"><Markdown components={{ a: ({ node: _n, ...p }) => <a {...p} target="_blank" rel="noreferrer" /> }}>{e.details}</Markdown></div> : null}
           </FieldView>
+          <div className="mt-3 space-y-1.5 border-t border-line-1 pt-2.5">
+            <Row label="Who"><FieldView id={id} field="actor" value={e.actor} saveOn="enter" className="text-xs text-ink-1" placeholder="Customer, admin, a nightly job…" testid="actor" /></Row>
+            <Row label="System"><FieldView id={id} field="system" value={e.system} saveOn="enter" className="text-xs text-ink-1" placeholder="Okta, Postgres, Stripe…" testid="system" /></Row>
+          </div>
           <div className="mt-3 border-t border-line-1 pt-2.5">
             <div className="mb-1.5 text-[11px] font-medium uppercase tracking-[0.04em] text-ink-3">Files</div>
             <FieldView id={id} field="files" value={e.files.join('\n')} saveOn="mod-enter" className="mono text-xs" placeholder="Double-click to add paths, one per line" testid="files">
@@ -129,6 +162,17 @@ export function EventNodeView({ id, data }: NodeProps<EventNode>) {
     </div>
   )
 }
+
+function Row({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="flex items-baseline gap-2">
+      <span className="w-12 shrink-0 text-[11px] font-medium uppercase tracking-[0.04em] text-ink-3">{label}</span>
+      <div className="min-w-0 flex-1">{children}</div>
+    </div>
+  )
+}
+
+export const kindLabel = (k: Kind) => KIND_LABEL[k]
 
 /** A field that shows its value, and turns into a text box on double-click. */
 function FieldView({ id, field, value, saveOn, className, placeholder, testid, clamp = false, children }: {

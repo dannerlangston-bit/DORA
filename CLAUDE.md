@@ -10,7 +10,12 @@ Map (same map engine and look), scoped down to creating maps.
 - **The server** is plain Node (`server/dora-server.js`, `bin/dora.js`), JS with JSDoc types and no
   build step, so `npm link` and `npx` installs run it as is.
 - **The canvas** is React with `@xyflow/react` and ELK for spacing (`src/canvas/`).
+- **The vocabulary** (kinds, Blueprint lanes, card colors) lives in `shared/kinds.js`; `dora check`
+  in `shared/check.js`. The AI's instructions describe both, so change them together.
 - **What ships to every project** is `skill/SKILL.md` (the AI's instructions) and
-  `skill/dora-folder.md` (the `.dora/README.md`).
+  `skill/dora-folder.md` (the `.dora/README.md`). Bump `dora-skill-version` in SKILL.md whenever its
+  content changes, so `dora` tells projects to run `dora --update-skill`.
+- **The tour and `docs/GUIDE.md`** stay at or below a 5th-grade reading level;
+  `test/reading-level.test.ts` checks it.
 
 Before pushing, run `npm run typecheck && npm test && npm run build && npm run accept`.

@@ -3,11 +3,16 @@ import fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { jsonErrorLine } from '../shared/jsonpos.js'
 import { applyOps, describeOp, emptyMap, normalizeMap, OpError } from '../shared/ops.js'
 
 /** @typedef {import('../shared/ops.js').DoraMap} DoraMap */
 /** @typedef {import('../shared/ops.js').Op} Op */
-/** @typedef {{ positions: Record<string, { x: number, y: number }>, pinned: string[], expanded: string[] }} Layout */
+/**
+ * Where cards sit. `placed`: cards a person put somewhere by hand; auto-spacing leaves them, Tidy
+ * re-spaces them. `pinned`: cards locked in place; they can't be dragged and Tidy leaves them too.
+ * @typedef {{ version: 2, view: 'flow' | 'blueprint', positions: Record<string, { x: number, y: number }>, placed: string[], pinned: string[], expanded: string[] }} Layout
+ */
 
 const PKG_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const DIST = path.join(PKG_ROOT, 'dist')
@@ -18,7 +23,26 @@ const LOG_MAX = 2000
 const LOG_KEEP = 1000
 
 /** @returns {Layout} */
-export const emptyLayout = () => ({ positions: {}, pinned: [], expanded: [] })
+export const emptyLayout = () => ({ version: 2, view: 'flow', positions: {}, placed: [], pinned: [], expanded: [] })
+
+/**
+ * Read a layout file leniently. Version 1 used `pinned` for cards placed by hand (there was no
+ * lock yet), so those become `placed`.
+ * @param {any} raw @returns {Layout}
+ */
+export function normalizeLayout(raw) {
+  const l = raw && typeof raw === 'object' ? raw : {}
+  const list = (/** @type {unknown} */ v) => (Array.isArray(v) ? v.filter((x) => typeof x === 'string') : [])
+  const v1 = l.version !== 2
+  return {
+    version: 2,
+    view: l.view === 'blueprint' ? 'blueprint' : 'flow',
+    positions: l.positions && typeof l.positions === 'object' ? l.positions : {},
+    placed: v1 ? list(l.pinned) : list(l.placed),
+    pinned: v1 ? [] : list(l.pinned),
+    expanded: list(l.expanded),
+  }
+}
 
 /**
  * Make `.dora/` inside `dir` if it isn't there. Returns what was created, for the CLI to report.
@@ -56,9 +80,8 @@ function writeAtomic(/** @type {string} */ file, /** @type {string} */ text) {
  * @param {string} raw @param {unknown} err
  */
 function syntaxMessage(raw, err) {
-  const msg = err instanceof Error ? err.message : String(err)
-  const pos = /position (\d+)/.exec(msg)
-  const line = pos ? raw.slice(0, Number(pos[1])).split('\n').length : null
+  void err
+  const line = jsonErrorLine(raw)
   return `map.json has a JSON syntax error${line ? ` on line ${line}` : ''}. Showing the last version that worked until it's fixed.`
 }
 
@@ -96,8 +119,7 @@ export function createDora({ dir }) {
 
   function readLayout() {
     try {
-      const l = JSON.parse(fs.readFileSync(layoutFile, 'utf8'))
-      return { ...emptyLayout(), ...l }
+      return normalizeLayout(JSON.parse(fs.readFileSync(layoutFile, 'utf8')))
     } catch {
       return emptyLayout()
     }
@@ -216,7 +238,7 @@ export function createDora({ dir }) {
       }
       if (req.method === 'PUT' && url.pathname === '/api/layout') {
         const body = await readBody(req)
-        writeAtomic(layoutFile, json({ ...emptyLayout(), ...body?.layout }))
+        writeAtomic(layoutFile, json(normalizeLayout({ ...body?.layout, version: 2 })))
         return send(res, 200, { ok: true })
       }
       send(res, 404, { error: 'Not found' })

@@ -122,6 +122,13 @@
 .react-flow__attribution { display: none; }
 .react-flow__edge-path { transition: stroke var(--t-base) var(--ease), opacity var(--t-base) var(--ease); }
 .linking .react-flow__pane, .linking .react-flow__node { cursor: crosshair; }
+/* each tool says what a click will do before you click */
+.tool-box .react-flow__pane { cursor: copy; }
+.tool-area .react-flow__pane { cursor: crosshair; }
+.tool-pan .react-flow__pane, .tool-pan .react-flow__node { cursor: grab; }
+[data-tool="insert"] .react-flow__edge { cursor: copy; }
+[data-tool="insert"] .react-flow__edge:hover .react-flow__edge-path { stroke: rgba(255,255,255,0.45) !important; }
+.react-flow__node:has(.card[data-pinned]) { cursor: default; }
 .react-flow__handle { opacity: 0; pointer-events: none; }
 
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }

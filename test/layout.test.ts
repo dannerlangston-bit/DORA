@@ -45,3 +45,29 @@ describe('placeEvents', () => {
     expect(tall.x.y).toBeGreaterThanOrEqual(400 + GROUP_GAP)
   })
 })
+
+describe('placeBlueprint', () => {
+  it('keeps story columns and puts each kind in its lane, lanes top to bottom in order', async () => {
+    const { placeBlueprint, LANE_HEADER } = await import('../src/canvas/blueprint')
+    const kinds = { s: 'start', d1: 'data', d2: 'data', p: 'process', sec: 'security', out: 'outcome' } as const
+    const bp = await placeBlueprint({
+      ids: Object.keys(kinds),
+      kinds,
+      links: [link('s', 'd1'), link('s', 'd2'), link('d1', 'p'), link('d2', 'p'), link('p', 'sec'), link('sec', 'out')],
+      heights: {},
+    })
+    expect(bp.lanes.map((l) => l.id)).toEqual(['customer', 'data', 'processing', 'security'])
+    const lane = (id: string) => bp.lanes.find((l) => l.id === id)!
+    for (const [id, laneId] of [['s', 'customer'], ['out', 'customer'], ['d1', 'data'], ['d2', 'data'], ['p', 'processing'], ['sec', 'security']]) {
+      const y = bp.positions[id].y
+      expect(y, id).toBeGreaterThanOrEqual(lane(laneId).top)
+      expect(y + 112, id).toBeLessThanOrEqual(lane(laneId).top + lane(laneId).height)
+    }
+    // left to right is still the story: start, the two data cards together, then process, security, outcome
+    expect(bp.positions.s.x).toBe(LANE_HEADER)
+    expect(bp.positions.d1.x).toBe(bp.positions.d2.x)
+    expect(bp.positions.d1.y).not.toBe(bp.positions.d2.y)
+    expect(bp.positions.p.x).toBeGreaterThan(bp.positions.d1.x)
+    expect(bp.positions.out.x).toBeGreaterThan(bp.positions.sec.x)
+  })
+})

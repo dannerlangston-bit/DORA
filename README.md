@@ -1,10 +1,15 @@
 # Dora
 
-A map that explains a project, built inside VS Code with your AI.
+A map that explains a product, built inside VS Code with your AI.
 
-Start on a blank canvas. Click to add an event, hold Ctrl and click to chain events together, and
-open any card's Details for the in-depth explanation. Or ask your AI to map the project: it writes
-the map file, and you watch the cards arrive and edit them alongside it.
+Pick a starter or press B and click to add boxes; hold Ctrl and click to chain them; open any card's
+Details for the depth. Dora speaks the language enterprise products are explained in: where customers
+meet the product, what data comes in and what it passes through, how it's secured, stored and
+tracked, and what the customer ends up with. Group the paths into workflows, light one up, and present
+it step by step. Flip to Blueprint to see the same map in lanes. Or ask your AI to map the project: it
+writes the map file, and you watch the cards arrive and edit them alongside it.
+
+New to it? Read [the guide](docs/GUIDE.md), or click the question mark in the app for the tour.
 
 Dora is a sibling of LD3 Map and uses the same map engine. LD3 Map draws a project from a ledger of
 work that already happened; Dora is for creating the map, to explain the project.
@@ -37,24 +42,34 @@ The first run also adds `.claude/skills/dora/SKILL.md`, which tells Claude Code 
 the map. Ask it things like *"map this project in Dora"* or *"add the retry flow to the map."*
 
 ```
-dora [folder] [--port 4317] [--open] [--no-skill]
+dora [folder] [--port 4317] [--open] [--no-skill] [--update-skill]
+dora check [folder]      # what's wrong with the map; your AI runs this after editing
 ```
+
+After updating Dora, run `dora --update-skill` in a project to give its AI the newest instructions
+(Dora tells you when they're out of date).
 
 ## Controls
 
+The left toolbar sets what a click does. Box, Chain and Insert stay on until you click them off or
+press Esc.
+
 | | |
 |---|---|
-| Click empty space | New event. If an event is selected, the new one links from it |
-| Type, Enter | Name it. Click away unnamed and it's gone |
-| Click an event | Select it (orange) |
-| **Hold Ctrl/Cmd and click** | Chain: each event you click links from the last. Let go to finish |
-| **Tap Ctrl/Cmd**, then click | Link once, then back to normal |
-| Double-click text | Edit the title, summary, details or files |
-| Details | Open the in-depth explanation |
-| Drag a card | Move it (it stays pinned there) |
-| Delete | Remove the selected event or link |
-| Cmd/Ctrl+Z | Undo (add Shift to redo) |
-| T / F / L | Tidy / Fit / Link |
+| **V** Select | Click to select, Shift-click to add, drag to move, double-click open space for a box |
+| **A** Area | Drag a box around cards to select them all |
+| **B** Box | Every click in open space adds a box of the kind picked beside the toolbar |
+| **C** Chain | Each card you click links from the last (same as holding Ctrl/Cmd) |
+| **L** Link | One link (same as tapping Ctrl/Cmd) |
+| **I** Insert | Click a link to put a new step in the middle |
+| **H** Pan | Look around without changing anything |
+| **W** Workflows | The paths customers take: make one, light it up, present it |
+| **P** Present | Walk through a workflow one step at a time |
+| Selection bar | With cards selected: color, kind, pin, details, delete, all at once |
+| Pin (card corner) | Locks a card: it can't be dragged and Tidy leaves it |
+| Double-click text | Edit the title, summary, details, who, system or files |
+| **G** / **T** / **F** | Flow ↔ Blueprint / Tidy / Fit |
+| Delete · Cmd/Ctrl+Z | Remove what's selected · undo (Shift to redo) |
 
 The full rules, including spacing, colors and how the AI and canvas stay in sync, are in
 [DESIGN.md](DESIGN.md).
@@ -62,8 +77,8 @@ The full rules, including spacing, colors and how the AI and canvas stay in sync
 ## How the map is stored
 
 ```
-.dora/map.json      events and links: you and your AI both edit this
-.dora/layout.json   card positions, pins, which cards are open (canvas only)
+.dora/map.json      events, links and workflows: you and your AI both edit this
+.dora/layout.json   card positions, pins, open cards, Flow or Blueprint (canvas only)
 .dora/changes.log   what was changed on the canvas, for the AI to read
 ```
 
@@ -72,7 +87,7 @@ The full rules, including spacing, colors and how the AI and canvas stay in sync
 ```sh
 npm install
 npm run dev          # canvas + API on http://127.0.0.1:5173, mapping ./playground
-npm test             # map rules and spacing
+npm test             # map rules, spacing, dora check, the tour's reading level
 npm run accept       # browser tests of every interaction (Playwright)
 npm run typecheck
 ```

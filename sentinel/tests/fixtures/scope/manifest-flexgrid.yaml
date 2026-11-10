@@ -1,0 +1,22 @@
+# The manifest of the 1.11 worked example (4.3 schema): declares the chart cell only.
+schema_version: 1
+manifest_id: mf-branch-1998.3.0-7be42d0
+candidate: branch-1998.3.0-7be42d0
+base: main-1998.3.0-2c91ae4
+source: manual
+author: jdoe
+entries:
+  - entry_id: tos-48120-1
+    tickets: [TOS-48120]
+    summary: Flexible Grid cells lose 6 px of chrome; hosted content gets the full remaining cell height
+    declared_surfaces: [charts.flexible-grid.chart-cell]
+    touched_primitives: [FlexibleGrid]
+    changed_paths:
+      - "desktop/ui/grid/src/main/java/**/GridCellLayout.java"
+      - "desktop/ui/grid/src/main/java/**/GridCellHeader.java"
+    expected_visual: >
+      Cell header 22 px instead of 28 px. Chart plot area 6 px taller.
+      In a 3x3 grid at 1920x1080 each chart shows one more price label.
+    mock_image: manifests/mocks/tos-48120-grid-3x3.png
+    feature_flags: []
+    must_be_observed: true

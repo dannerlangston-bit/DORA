@@ -1,0 +1,13 @@
+# The candidate build's class dependency index (2.10.2): class -> classes it depends on.
+com.tos.desktop.ui.grid.FlexibleGridCell: [com.tos.desktop.ui.grid.GridCellLayout, com.tos.desktop.ui.grid.GridCellHeader]
+com.tos.desktop.ui.grid.CellContentAdapter: [com.tos.desktop.ui.grid.FlexibleGridCell]
+com.tos.desktop.charts.flexgrid.chartcell.ChartCellView: [com.tos.desktop.ui.grid.CellContentAdapter, com.tos.desktop.charts.engine.ChartCanvas]
+com.tos.desktop.charts.flexgrid.atcell.LadderCellView: [com.tos.desktop.ui.grid.CellContentAdapter, com.tos.desktop.trade.ladder.LadderModel]
+com.tos.desktop.charts.flexgrid.level2cell.Level2CellView: [com.tos.desktop.ui.grid.CellContentAdapter]
+com.tos.desktop.charts.flexgrid.tnscell.TimeSalesCellView: [com.tos.desktop.ui.grid.CellContentAdapter]
+com.tos.desktop.trade.activetrader.LadderPanel: [com.tos.desktop.ui.grid.FlexibleGridCell, com.tos.desktop.trade.ladder.LadderModel]
+com.tos.desktop.sidebar.level2.Level2Gadget: [com.tos.desktop.ui.table.ColumnModel]
+com.tos.desktop.monitor.positions.PositionStatementTable: [com.tos.desktop.ui.table.ColumnModel]
+com.tos.desktop.trade.chain.OptionChainTable: [com.tos.desktop.ui.table.ColumnModel]
+com.tos.desktop.analyze.risk.RiskProfileChart: [com.tos.desktop.charts.engine.ChartCanvas]
+com.tos.desktop.net.QuoteClient: [com.tos.desktop.net.Codec]

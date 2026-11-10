@@ -126,3 +126,27 @@ def test_withheld_report_shows_no_findings(tmp_path):
     assert "report withheld; security contact notified" in page
     for section in ("unexpected", "intended", "coverage", "health"):
         assert f'<section id="{section}">' not in page
+
+
+def test_page_is_well_formed(tmp_path):
+    from html.parser import HTMLParser
+
+    class Balance(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.stack: list[str] = []
+            self.errors: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag not in ("meta", "img"):
+                self.stack.append(tag)
+
+        def handle_endtag(self, tag):
+            if self.stack and self.stack[-1] == tag:
+                self.stack.pop()
+            else:
+                self.errors.append(tag)
+
+    parser = Balance()
+    parser.feed(_write(tmp_path))
+    assert parser.stack == [] and parser.errors == []

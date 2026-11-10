@@ -43,6 +43,11 @@ Choices where 9.2 is silent (reported to the coordinator):
   failing step in ladder order ...; shown at ...", otherwise "Heights ... at ... (k of N
   steps)", as in 9.3. N counts this run's sweep checkpoints of the surface; ladder order is
   descending by width then height (2.5.2); Ladder F for RC runs, Ladder S otherwise (2.5.3).
+- "Why unexpected" on an invariant or assertion cluster of an undeclared surface that carries a
+  primitive and a manifest entry gives the undeclared-surface explanation, as 9.3 item 1 does
+  (the invariant itself is in "What moved"); otherwise it states the invariant (2.7) or assertion.
+- A census cluster of several surfaces in one workspace is described as "one census checkpoint
+  per surface" (9.3 says "per cell" for its Flexible Grid cells; no record carries that noun).
 - Comparable scope for the coverage percent is in-scope cells minus `not_run (entitlement)`
   minus not-compared (blocked) cells (2.12: blocked cells are not in the coverage percent).
 - `aborted_safety` and `aborted_harness` replace Unexpected and Intended with the abort block
@@ -56,7 +61,7 @@ from collections import Counter
 from dataclasses import dataclass, field, replace
 
 from ..records import CheckpointOutcome, Decision, Finding, RunOutcome, StepOutcome
-from ..taxonomy import TaxonomyError, checkpoint_parts, load
+from ..taxonomy import checkpoint_parts, load
 from .cluster import Cluster, Member, cluster_members
 from .inline import C, Image, Line, Link, T, Urls, join_and, number_word, plural, words_and
 
@@ -1332,10 +1337,6 @@ def build_report(run: RunOutcome, outcomes: list[CheckpointOutcome], findings: l
                  manifest: dict | None, context: ReportContext,
                  steps: list[StepOutcome] = ()) -> RunReport:
     """Arrange one run's records into the report of 9.2 (and 9.5 for the static page)."""
-    tax = load()
-    for o in outcomes:
-        if o.outcome not in tax.checkpoint_outcomes:
-            raise TaxonomyError(f"unknown outcome {o.outcome!r}")
     synthetic = {o.checkpoint_id for o in outcomes if o.synthetic}
     b = _Builder(run, outcomes, [f for f in findings if f.checkpoint_id not in synthetic],
                  decisions, coverage, health, manifest, context, steps)

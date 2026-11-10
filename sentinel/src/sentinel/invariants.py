@@ -966,12 +966,12 @@ def _inv10(f: _Frame) -> list[Violation]:
         def inside(rect: Rect, region: Rect | None = ctrl.region) -> bool:
             return region is None or region.contains_point(rect.center)
 
-        a_matches = b_matches = []
-        if ctrl.role and ctrl.name:
-            a_matches = [c for c in f.a_components() if c.role == ctrl.role and c.label == ctrl.name and inside(c.bbox)]
+        jab = bool(ctrl.role and ctrl.name)
+        a_matches = [c for c in f.a_components()
+                     if jab and c.role == ctrl.role and c.label == ctrl.name and inside(c.bbox)]
         templated = [c for c in f.model.components if c.showing and c.control_id == ctrl.id
                      and (c.confidence or 0.0) >= f.config.template_floor and inside(c.bbox)]
-        b_matches = [c for c in templated if f.comp_is_b(c)] if (ctrl.role and ctrl.name) else templated
+        b_matches = [c for c in templated if f.comp_is_b(c)] if jab else templated
         matches = a_matches + [c for c in b_matches if c not in a_matches]
         if len(matches) != 1:
             rects = tuple(c.bbox for c in matches) or (ctrl.region or f.model.client_rect,)

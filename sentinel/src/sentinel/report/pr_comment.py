@@ -4,12 +4,15 @@
 `<!-- sentinel:pr:{pr} -->` (9.1) by which the Reporter finds and edits the one comment of a PR
 in place; `comment_marker` gives it alone. Section labels are bold lines, not headings (9.1).
 
-Escaping (9.1, 5.13). Every `Text` segment is data: `&`, `<` and `>` are HTML-escaped; the
-markdown punctuation that can start a link, image, code span, emphasis, strikethrough or table
-cell is backslash-escaped (`_` only at a word boundary, so `invariant_violation` stays readable);
-`@` mentions, `#` references, bare URLs and `www.` autolinks are broken with a zero-width space;
-newlines collapse to spaces so no text can begin a heading or a list. The only links are the
-`Link` and `Image` segments built from report UI URLs (`inline.Urls`).
+Escaping (9.1, 5.13). Every `Text` segment is data: `&`, `<` and `>` are HTML-escaped (no raw
+HTML, no `<url>` autolink); backslash, backtick, `*` and `~` are backslash-escaped (no code span,
+emphasis or strikethrough), and `_` too at a word boundary (so `invariant_violation` stays
+readable); `]` is escaped where it could close a link, image or reference definition (before
+`(`, `[` or `:`, or at the end of a text run), which leaves `[Tier 1]` as 9.3 prints it; `|` is
+escaped inside table cells; `@` mentions, `#` references, bare URLs and `www.` autolinks are
+broken with a zero-width space; whitespace runs collapse to one space, so no text can begin a
+heading or a list. Adjacent `Text` segments are escaped as one run, so no pattern can straddle
+two of them. The only links are the `Link` and `Image` segments built from report UI URLs.
 
 Size (9.1). GitHub caps a comment at 65,536 characters; the comment is rendered, measured and
 shrunk in this order until it fits: inline Unexpected and Intended items 10, then 5, then 3;
@@ -25,13 +28,14 @@ from .model import (FIELD_EVIDENCE, CommitStatus, Evidence, ReportContext, RunRe
                     commit_status, pending_status)
 
 __all__ = ["render_pr_comment", "render_report_markdown", "comment_marker", "commit_status",
-           "pending_status", "CommitStatus", "ReportContext", "GITHUB_COMMENT_LIMIT", "md_text"]
+           "pending_status", "CommitStatus", "ReportContext", "GITHUB_COMMENT_LIMIT", "md_text", "md_code"]
 
 GITHUB_COMMENT_LIMIT = 65_536
 INLINE_LIMITS = (10, 5, 3)
-_ZWSP = "​"
-_ESCAPE = set("\\`*[]|~")
+ZWSP = chr(0x200B)
+_BACKSLASHED = set("\\`*~")
 _AUTOLINK = re.compile(r"(?i)(://|www\.)")
+_WS = re.compile(r"\s+")
 
 
 def comment_marker(pr: int) -> str:
@@ -39,9 +43,9 @@ def comment_marker(pr: int) -> str:
     return f"<!-- sentinel:pr:{int(pr)} -->"
 
 
-def md_text(s: str) -> str:
-    """Render screen or model text as inert markdown text (9.1)."""
-    s = " ".join(str(s).split())
+def md_text(s: str, table: bool = False) -> str:
+    """Render screen or model text as inert markdown text (9.1); `table` also escapes `|`."""
+    s = _WS.sub(" ", str(s))
     out = []
     n = len(s)
     for i, ch in enumerate(s):
@@ -51,35 +55,47 @@ def md_text(s: str) -> str:
             out.append("&lt;")
         elif ch == ">":
             out.append("&gt;")
-        elif ch in _ESCAPE:
+        elif ch in _BACKSLASHED or (ch == "|" and table):
             out.append("\\" + ch)
+        elif ch == "]":
+            out.append("\\]" if i == n - 1 or s[i + 1] in "([:" else "]")
         elif ch == "_":
             inner = 0 < i < n - 1 and s[i - 1].isalnum() and s[i + 1].isalnum()
             out.append("_" if inner else "\\_")
         elif ch in "@#":
-            out.append(ch + _ZWSP)
+            out.append(ch + ZWSP)
         else:
             out.append(ch)
-    return _AUTOLINK.sub(lambda m: m.group(1)[:-1] + _ZWSP + m.group(1)[-1], "".join(out))
+    return _AUTOLINK.sub(lambda m: m.group(1)[:-1] + ZWSP + m.group(1)[-1], "".join(out))
 
 
-def md_code(s: str) -> str:
-    """A code span whose content cannot close it or break a table row."""
-    body = " ".join(str(s).split()).replace("`", "'").replace("|", "\\|")
-    return f"`{body}`"
+def md_code(s: str, table: bool = False) -> str:
+    """A code span whose content cannot close it (nor, in a table, end the cell)."""
+    body = _WS.sub(" ", str(s)).replace("`", "'")
+    return "`" + (body.replace("|", "\\|") if table else body) + "`"
 
 
-def _md(line: Line) -> str:
-    out = []
+def _md(line: Line, table: bool = False) -> str:
+    out: list[str] = []
+    run: list[str] = []
+
+    def flush() -> None:
+        if run:
+            out.append(md_text("".join(run), table))
+            run.clear()
+
     for seg in line:
         if isinstance(seg, Text):
-            out.append(md_text(seg.text))
-        elif isinstance(seg, Code):
-            out.append(md_code(seg.text))
+            run.append(seg.text)
+            continue
+        flush()
+        if isinstance(seg, Code):
+            out.append(md_code(seg.text, table))
         elif isinstance(seg, Link):
-            out.append(f"[{md_text(seg.label)}]({seg.url})")
+            out.append(f"[{md_text(seg.label, table)}]({seg.url})")
         elif isinstance(seg, Image):
-            out.append(f"![{md_text(seg.alt)}]({seg.url})")
+            out.append(f"![{md_text(seg.alt, table)}]({seg.url})")
+    flush()
     return "".join(out)
 
 
@@ -109,6 +125,7 @@ def _row(cells: list[str]) -> str:
 
 
 def _fence(text: str) -> list[str]:
+    """The 10.3 banner verbatim, in a fence longer than any backtick run inside it."""
     ticks = max([len(m) for m in re.findall(r"`+", text)] + [2]) + 1
     return ["`" * ticks + "text", *text.splitlines(), "`" * ticks]
 
@@ -141,13 +158,18 @@ def _abort(r: RunReport) -> list[str]:
     return [_md(x) for x in r.abort_lines]
 
 
-def _unexpected(r: RunReport, limit: int) -> list[str]:
-    lines = ["", f"**Unexpected ({r.n_unexpected})**"]
-    for i, item in enumerate(r.unexpected[:limit]):
+def _items(items, limit: int) -> list[str]:
+    lines: list[str] = []
+    for i, item in enumerate(items[:limit]):
         if i:
             lines.append("")
         lines.append(f"**{_md(item.header)}**")
         lines += _fields(item.fields)
+    return lines
+
+
+def _unexpected(r: RunReport, limit: int) -> list[str]:
+    lines = ["", f"**Unexpected ({r.n_unexpected})**", *_items(r.unexpected, limit)]
     more = r.n_unexpected - limit
     if more > 0:
         lines.append(f"... and {more} more in the [full report]({r.urls.anchor('unexpected')})")
@@ -158,18 +180,13 @@ def _intended(r: RunReport, limit: int) -> list[str]:
     lines = ["", f"**Intended ({r.n_intended})**"]
     if r.manifest_line:
         lines.append(_md(r.manifest_line))
-    for i, item in enumerate(r.intended[:limit]):
-        if i:
-            lines.append("")
-        lines.append(f"**{_md(item.header)}**")
-        lines += _fields(item.fields)
+    lines += _items(r.intended, limit)
     more = r.n_intended - limit
     if more > 0:
         lines.append(f"... and {more} more in the [full report]({r.urls.anchor('intended')})")
-    if r.reconciliation:
-        lines.append(_md(r.reconciliation))
-    if r.needs_baseline_line:
-        lines.append(_md(r.needs_baseline_line))
+    for line in (r.reconciliation, r.needs_baseline_line):
+        if line:
+            lines.append(_md(line))
     return lines
 
 
@@ -188,9 +205,10 @@ def _suppressed(r: RunReport, collapsed: bool) -> list[str]:
     for row in r.suppressed:
         d: Decision | None = row.decision
         action = f"{d.action} ({d.verdict})" if d else "decision record not loaded"
-        by = f"{md_text(d.decided_by)}, {md_text(d.decided_at[:10])}" if d else ""
-        lines.append(_row([md_code(row.checkpoint_id), md_code(row.region) if row.region else "",
-                           md_text(row.decision_id), action, by, md_text(d.ticket) if d and d.ticket else ""]))
+        by = f"{md_text(d.decided_by, True)}, {md_text(d.decided_at[:10], True)}" if d else ""
+        lines.append(_row([md_code(row.checkpoint_id, True), md_code(row.region, True) if row.region else "",
+                           md_text(row.decision_id, True), action, by,
+                           md_text(d.ticket, True) if d and d.ticket else ""]))
     lines.append("</details>")
     return lines
 
@@ -204,7 +222,7 @@ def _coverage(r: RunReport) -> list[str]:
 
 def _health(r: RunReport) -> list[str]:
     lines = ["", "**Run health**", "| Item | Value |", "|---|---|"]
-    return lines + [_row([label, _md(value)]) for label, value in r.health_rows]
+    return lines + [_row([label, _md(value, table=True)]) for label, value in r.health_rows]
 
 
 def _history(r: RunReport, collapsed: bool) -> list[str]:
@@ -218,8 +236,9 @@ def _history(r: RunReport, collapsed: bool) -> list[str]:
         counts = h.get("counts", "")
         if isinstance(counts, dict):
             counts = ", ".join(f"{v} {k}" for k, v in counts.items())
-        lines.append(_row([md_text(h.get("run_id", "")), md_text(h.get("candidate", "")),
-                           md_text(h.get("result", "")), md_text(counts), md_text(h.get("reported", ""))]))
+        lines.append(_row([md_text(h.get("run_id", ""), True), md_text(h.get("candidate", ""), True),
+                           md_text(h.get("result", ""), True), md_text(counts, True),
+                           md_text(h.get("reported", ""), True)]))
     return lines + ["</details>"]
 
 
@@ -239,13 +258,13 @@ def _render(r: RunReport, limit: int, collapse_suppressed: bool, collapse_histor
 
 def render_report_markdown(report: RunReport, limit_chars: int = GITHUB_COMMENT_LIMIT) -> str:
     """Render a built report, shrinking in the order of 9.1 until it fits `limit_chars`."""
-    steps = [(n, False, False) for n in INLINE_LIMITS] + [(INLINE_LIMITS[-1], True, False),
-                                                          (INLINE_LIMITS[-1], True, True)]
+    last = INLINE_LIMITS[-1]
+    steps = [(n, False, False) for n in INLINE_LIMITS] + [(last, True, False), (last, True, True)]
     text = ""
     for limit, sup, hist in steps:
         text = _render(report, limit, sup, hist)
         if len(text) <= limit_chars:
-            return text
+            break
     return text
 
 
@@ -260,4 +279,3 @@ def render_pr_comment(run: RunOutcome, outcomes: list[CheckpointOutcome], findin
     """
     report = build_report(run, outcomes, findings, decisions, coverage, health, manifest, context, steps)
     return render_report_markdown(report, limit_chars)
-

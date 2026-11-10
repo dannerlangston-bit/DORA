@@ -59,7 +59,7 @@ CONTROL_KINDS = frozenset({"button", "checkbox"})
 WORD_KINDS = frozenset({"label", "text", "cell", "header_cell", "price_cell"})
 OCR_CONFIDENCE = 92.0
 TEMPLATE_SCORE = 0.97
-STUDY_RGB = (255, 200, 0)                        # the SMA line; [0, 200, 255] in the canaries' BGR frames (M24)
+STUDY_RGB = (0, 200, 255)                        # the SMA line, the color M24 erases
 
 
 @dataclass(frozen=True)

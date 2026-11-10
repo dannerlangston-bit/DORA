@@ -30,8 +30,10 @@ Choices where the spec is ambiguous (reported):
 
 - `equals` is exact after normalization by format; money is rounded to the cent first (2.8.2).
 - `matches` uses a regex search (the 4.8 example patterns anchor with `^` themselves).
-- `present` and `absent`: with `pattern`, whether the text matches it; with only `format`, whether
-  the text is a valid value of that format; with neither, whether the region holds any text.
+- `present` and `absent`: with `pattern`, whether the text matches it; with only `format`, row by
+  row: `present` needs every non-empty row of the region to be a valid value of that format (a column
+  region such as the example's `ps_qty` over the Qty rows), `absent` needs no row to be one, and an
+  empty region holds no value; with neither, whether the region holds any text.
 - `changed_since_previous_step` / `unchanged_since_previous_step` compare typed values when both
   sides parse as the format and normalized text otherwise (an empty ticket field has no value).
   The earlier extraction is `previous_values[since_step][region]`; an unreadable earlier
@@ -69,7 +71,7 @@ from .sources import (EXACT_CONFIDENCE, SOURCES, ApiReader, ApiUnavailable, Atte
                       SourceFallback, ValueSource, extract, problem)
 from .tables import (EvalContext, OracleConfigError, RuleConfig, Tolerance, api_comparison, default_tolerance,
                      resolve_ref, tick_size)
-from .values import NUMERIC_FORMATS, FormatError, coerce, normalize_text, number, parse, show, to_cent
+from .values import NUMERIC_FORMATS, FormatError, coerce, normalize_text, number, parse, rows, show, to_cent
 
 KINDS: tuple[str, ...] = ("equals", "matches", "within_tol", "present", "absent", "changed_since_previous_step",
                           "unchanged_since_previous_step", "count", "export_equals", "api_within", "rule",
@@ -275,6 +277,15 @@ class _Fail(Exception):
         self.expected, self.extracted, self.detail = expected, extracted, detail
 
 
+def _valid(fmt: str, text: str) -> bool:
+    """`text` is a valid value of `fmt` (the format-only `present` and `absent`)."""
+    try:
+        parse(fmt, text)
+    except FormatError:
+        return False
+    return True
+
+
 def _palette_class(color: tuple[int, int, int], palette: Mapping[str, tuple[int, int, int]], tol: float) -> str | None:
     best, best_d = None, float("inf")
     for name, ref in palette.items():
@@ -379,30 +390,37 @@ class _Evaluator:
                         f"{ext.field} reads {show(fmt, got)}, outside {show(fmt, want)} +/- {tol}")
         return f"{show(fmt, want)} +/- {tol}", show(fmt, got)
 
-    def _present(self, a: Assertion) -> tuple[bool, str, str]:
+    def _present(self, a: Assertion) -> tuple[list[tuple[str, bool]], str, str]:
+        """Each judged cell with whether `what` is present in it, `what`, and the region's text. A format-only
+        check judges every non-empty row (choice); a pattern or a text check judges the whole text."""
         ext = self.region(a, a.fmt or "text")
         self.readable()
         text = normalize_text(ext.text or "")
         if a.pattern is not None:
-            return bool(re.search(a.pattern, text)), f"/{a.pattern}/", text
+            return [(text, bool(re.search(a.pattern, text)))], f"/{a.pattern}/", text
         if a.fmt is not None and a.fmt != "text":
-            try:
-                parse(a.fmt, text)
-                return True, f"a {a.fmt} value", text
-            except FormatError:
-                return False, f"a {a.fmt} value", text
-        return bool(text), "text", text
+            cells = [normalize_text(r) for r in rows(ext.text)] or [""]
+            return [(c, _valid(a.fmt, c)) for c in cells], f"a {a.fmt} value", text
+        return [(text, bool(text))], "text", text
+
+    @staticmethod
+    def _where(a: Assertion, cells: list[tuple[str, bool]], cell: str, text: str) -> str:
+        return f"{a.region} reads {text!r}" if len(cells) == 1 else f"{a.region} row {cell!r} of {text!r}"
 
     def present(self, a: Assertion) -> tuple[str, str]:
-        hit, what, text = self._present(a)
-        if not hit:
-            raise _Fail(f"{what} present", repr(text), f"{a.region} reads {text!r}: {what} is not present")
+        cells, what, text = self._present(a)
+        miss = next((c for c, hit in cells if not hit), None)
+        if miss is not None:
+            raise _Fail(f"{what} present", repr(text if len(cells) == 1 else miss),
+                        f"{self._where(a, cells, miss, text)}: {what} is not present")
         return f"{what} present", repr(text)
 
     def absent(self, a: Assertion) -> tuple[str, str]:
-        hit, what, text = self._present(a)
-        if hit:
-            raise _Fail(f"{what} absent", repr(text), f"{a.region} reads {text!r}: {what} is present")
+        cells, what, text = self._present(a)
+        hit = next((c for c, h in cells if h), None)
+        if hit is not None:
+            raise _Fail(f"{what} absent", repr(text if len(cells) == 1 else hit),
+                        f"{self._where(a, cells, hit, text)}: {what} is present")
         return f"{what} absent", repr(text)
 
     def _compare_previous(self, a: Assertion) -> tuple[bool, str, str]:

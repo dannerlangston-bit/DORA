@@ -494,8 +494,11 @@ def evaluate_rule(spec: RuleSpec, operands: Mapping[str, Operand], fixture: Mapp
     try:
         expected, extracted = _RULES[spec.rule_id](_Ops(spec, operands, context, config, fixture))
     except _Fail as f:
-        return RuleResult(spec.assertion_id, spec.rule_id, "failed", f.expected, f.extracted,
-                          f"{spec.rule_id}: {f.detail}", fields, label=label)
+        # the rule id leads the detail unless the assertion is named after the rule (`id: R02`), which the
+        # verdict's "<assertion id>: <detail>" already says (no "R02: R02: ...")
+        detail = f.detail if spec.assertion_id == spec.rule_id else f"{spec.rule_id}: {f.detail}"
+        return RuleResult(spec.assertion_id, spec.rule_id, "failed", f.expected, f.extracted, detail, fields,
+                          label=label)
     return RuleResult(spec.assertion_id, spec.rule_id, "passed", expected, extracted, None, fields, label=label)
 
 

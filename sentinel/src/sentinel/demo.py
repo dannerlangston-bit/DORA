@@ -290,6 +290,7 @@ def _run_block(r: RunResult) -> list[str]:
         lines.append("Invariants switched off by the A/A enablement test of 2.7 (they fired on the base build "
                      "against itself, so they would only raise false alarms on these synthetic screens): " +
                      "; ".join(f"{s}: {', '.join(v)}" for s, v in sorted(r.disabled_invariants.items())) + ".")
+    lines += [n[0].upper() + n[1:] + "." for n in r.notes]
     if r.lint_errors:
         lines.append("Config lint errors:")
         lines += [f"  - {e}" for e in r.lint_errors]
@@ -304,7 +305,10 @@ FILES = """Files in this folder:
   artifacts/          content-addressed crops and heatmaps (8.4) with manifest.json
   calibration/        the A/A calibration file of the run's fingerprint (3.9)
   config/<run id>/    the exact config each run linted and used (the example plus the PR's files)
-  reviewer-calls.json every simulated Reviewer request and answer (3.13 shape)"""
+  reviewer-calls.json every simulated Reviewer request and answer (3.13 shape)
+  results.jsonl       the store's append-only ledger of every write batch (8.2)
+  nightly-canary only: canary-results-<run>.json (10.3 result rows), morning-report.txt (the banner),
+                      nightly-report*.html (the Nightly runs' reports)"""
 
 
 def _write_summary(out: Path, title: str, story: list[str], results: list[RunResult], extra: list[str] = ()) -> None:
@@ -338,6 +342,7 @@ LADDER = "trade.active-trader.ladder"
 def demo_flexgrid_ladder(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE) -> list[RunResult]:
     r = run_pipeline(config, flexgrid_scenario(today), out, today)
     inv_at = _count(r, AT, "invariant_violation", "sweep")
+    exhausted = sum(1 for o in r.outcomes if o.stability_cause == "budget")
     sweep_at = _count(r, AT, kind="sweep")
     story = [
         "The worked example of spec 1.11. PR 4812 shrinks the Flexible Grid cell header from 28 to 22 px and gives",
@@ -363,6 +368,9 @@ def demo_flexgrid_ladder(out: Path, today: date = DEFAULT_TODAY, config: Path = 
         "- The smoke census of the example has 4 census checkpoints plus the Active Trader read-back flow (9.3: 60).",
         "- Re-run counts, the Reviewer call count and the wall clock follow from those numbers; the Reviewer costs 0",
         "  because it is simulated.",
+        f"- {_plural(exhausted, 'above-threshold checkpoint')} found the targeted re-run budget of 3.10 (max(30, 10",
+        "  percent of the run's checkpoints) re-captured checkpoints, spent in tier order) used up, so their",
+        "  classification stands with stability unknown (cause: budget) and run health prints rerun_budget_exhausted.",
         "- Item wording and invariant ids follow from the synthetic screens (INV-01 with INV-02 and INV-10 here;",
         "  9.3 has INV-01 and INV-03 from real OCR).",
     ]

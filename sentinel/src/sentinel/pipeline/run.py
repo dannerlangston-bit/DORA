@@ -15,11 +15,13 @@ checkpoint sequence of 5.17 with the rig replaced by `sim`:
    Diff Engine compares them against the calibrated floors, the Invariant Checker runs on both
    builds, targeted re-runs decide stability (3.10, re-run budget max(30, 10 percent)), decisions
    are looked up by signature in the store (9.7), and `classify.classify` gives the outcome.
-5. Reviewer pass (3.12, 3.15). The checkpoints are clustered exactly as the report will show them
+5. The run-level global-shift pre-pass of 3.7 (granularity 0) over every diffed pair; when it
+   is raised its checkpoints become one `needs_human (reason: global_shift)` cluster.
+6. Reviewer pass (3.12, 3.15). The checkpoints are clustered exactly as the report will show them
    (`report.cluster.cluster_members`, 9.7); one simulated Reviewer call per cluster that needs one
    (task A for declared surfaces, task B descriptions for `collateral`; never for invariants or
    assertions, never for a member that inherited a decision), up to the PR cap of 60 calls.
-6. Everything goes through `store.Store` (single writer) and `store.ArtifactStore` (content
+7. Everything goes through `store.Store` (single writer) and `store.ArtifactStore` (content
    addressed, redaction header set: synthetic screens carry no account data). The coverage matrix
    (`coverage.build_matrix`) and the Reporter's PR comment, commit status and static HTML report
    are rendered from what the store returns.
@@ -69,7 +71,8 @@ from ..classify import (REVIEWER_ROWS, Classified, Condition, DecisionMatch, Fac
 from ..coverage import Profile, build_matrix
 from ..diff import load_params
 from ..diff.calibration import CalibrationFile, Capture as CalCapture, calibrate_checkpoint
-from ..diff.engine import DiffContext, DiffResult, compare_fingerprints, diff_pair, fingerprint_id
+from ..diff.engine import (DiffContext, DiffResult, compare_fingerprints, diff_pair, fingerprint_id,
+                           global_shift_prepass)
 from ..diff.phash import phash
 from ..diff.regions import RegionsFile, effective_registry, park_rect
 from ..diff.settle import Recapture, RerunBudget, SettleResult, diff_stability, settle
@@ -218,11 +221,6 @@ def _mmss(seconds: float) -> str:
 def _fingerprint(epoch: str) -> tuple[dict, str]:
     match = dict(FINGERPRINT, data_epoch_id=epoch)
     return match, fingerprint_id(match)
-
-
-def _yaml_dump(obj: Any) -> str:
-    import yaml
-    return yaml.safe_dump(obj, sort_keys=False)
 
 
 def _flow_class(cfg: SentinelConfig, cp: PlannedCheckpoint) -> str | None:
@@ -594,6 +592,8 @@ def _overlay(img: np.ndarray, rects: Iterable[inv.Rect]) -> np.ndarray:
         for b in rs[i + 1:]:
             x0, y0 = max(a.x, b.x), max(a.y, b.y)
             x1, y1 = min(a.right, b.right), min(a.bottom, b.bottom)
+            if x1 <= x0 or y1 <= y0:
+                continue
             for k in range(x0 - (y1 - y0), x1, 6):
                 cv2.line(out, (max(k, x0), y0 + max(0, x0 - k)), (min(k + (y1 - y0), x1 - 1), min(y1 - 1, y0 + x1 - 1 - k)),
                          (255, 64, 64), 1)
@@ -732,8 +732,7 @@ def _case_b_flows(cfg: SentinelConfig, plan: ScopePlan) -> list[PlannedCheckpoin
     return out
 
 
-def coverage_summary(cfg: SentinelConfig, plan: ScopePlan, outcomes: Sequence[CheckpointOutcome], run_id: str,
-                     manifest: Manifest | None) -> dict:
+def coverage_summary(cfg: SentinelConfig, plan: ScopePlan, outcomes: Sequence[CheckpointOutcome], run_id: str) -> dict:
     """The PR run's coverage summary the Reporter reads (`report.model` docstring, 2.12)."""
     matrix = build_matrix(run_id, cfg.registry, [Profile("margin", cfg.entitlements)], {"margin": list(outcomes)},
                           plan.cuts, PERSONAS)
@@ -780,7 +779,7 @@ def coverage_summary(cfg: SentinelConfig, plan: ScopePlan, outcomes: Sequence[Ch
 # The store: identity rows
 
 
-def _register(store: Store, cfg: SentinelConfig, run_ids: Iterable[str], builds: Iterable[str], today: date) -> None:
+def _register(store: Store, cfg: SentinelConfig, builds: Iterable[str]) -> None:
     for i, rig in enumerate(RIGS, 1):
         store.register_rig(rig, login_alias=f"vault://sentinel/rigs/{rig}/tos-login", owner="asmith",
                            snapshot_id=f"snap-{rig}-2026-11-01", allowlist_entry=i)
@@ -880,7 +879,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         # -- T+0:00 to 0:02: the run row, its scope and shards (1.7)
         arts = ArtifactStore(out / "artifacts", f"runs/{scenario.run_id}")
         writer = _Writer(run, arts, today, scenario.clock)
-        _register(store, cfg, [base_id, scenario.candidate.build_id], [base_id, scenario.candidate.build_id], today)
+        _register(store, cfg, [base_id, scenario.candidate.build_id])
         used = sorted({rig_of[cp.checkpoint_id] for cp in planned})
         shard_of = {r: f"{scenario.run_id}/{i}" for i, r in enumerate(used, 1)}
         scope_entries = [ScopeEntry(cp.checkpoint_id, cp.workspace_id, cp.persona, cp.tier, cp.data_mode,
@@ -909,6 +908,16 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                           recapture=lambda cp=cp: run.capture(cp, "candidate", tick=next(ticks)),
                           recapturable=_recapturable(cfg, cp), store=store)
             evals.append(ev)
+        shift = global_shift_prepass([ev.diff.signal for ev in evals if ev.diff is not None and ev.diff.signal is not None],
+                                     params=run.params)
+        if shift.raised:                       # 3.7 granularity 0: one needs_human (global_shift) cluster
+            for ev in evals:
+                if ev.cp.checkpoint_id in shift.collapse:
+                    ev.facts = dataclasses.replace(ev.facts, global_shift=True)
+                    ev.classified = classify(ev.facts)
+            gf = shift.finding(scenario.run_id)
+            if gf is not None:
+                store.write_finding(dataclasses.replace(gf, created_at=started))
         calls = _review_pass(run, evals, rev, scenario.reviewer_cap)
         for f in plan.findings:
             store.write_finding(dataclasses.replace(f, created_at=started))
@@ -941,6 +950,13 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                                           ended_at=_ts(today, scenario.clock, int(wall))))
         result = _report(store, cfg, plan, run, scenario, runrec, manifest, mdoc, out, today, wall, len(used))
         result.reviewer_calls = calls
+        n_pairs = sum(1 for ev in evals if ev.diff is not None and ev.diff.signal is not None)
+        result.notes.append(
+            f"global-shift pre-pass (3.7) over {n_pairs} diffed pairs: "
+            + ("not evaluated (it needs at least 20 pairs)" if not shift.evaluated else
+               f"{'raised' if shift.raised else 'not raised'} ({shift.fraction_above_floor:.1%} of pairs above floor, "
+               f"{shift.text_edge_share:.1%} of their changed pixels on text edges; it is raised above 2 percent "
+               f"and 70 percent)"))
         result.disabled_invariants = run.disabled
         result.extra_flows = sorted({cp.flow_id for cp in extra if cp.flow_id})
         (out / "reviewer-calls.json").write_text(json.dumps(calls, indent=1, sort_keys=True, default=str) + "\n")
@@ -1032,12 +1048,11 @@ def _report(store: Store, cfg: SentinelConfig, plan: ScopePlan, run: _Run, scena
     steps = store.step_outcomes(scenario.run_id)
     ids = sorted({o.decision_ref for o in outcomes if o.decision_ref} | {f.decision_ref for f in findings if f.decision_ref})
     decisions = [d for d in (store.get_decision(i) for i in ids) if d is not None]
-    coverage = coverage_summary(cfg, plan, outcomes, scenario.run_id, manifest)
-    n_calls = 0
+    coverage = coverage_summary(cfg, plan, outcomes, scenario.run_id)
     health = {
         "wall_clock": _mmss(wall), "budget": "45:00", "shards": shards,
         "fingerprint": {"candidate": run.fp_id[7:13], "base": run.fp_id[7:13]},
-        "reviewer": {"cost_usd": 0.0 * n_calls},
+        "reviewer": {"cost_usd": 0.0},
         "safety": {"attestation": "passed (simulated rig)", "paper_mode_asserted": shards, "gateway_drops": 0,
                    "cancel_all": "not needed", "proof": "PROVEN: no orders sent (simulated rig, nothing to send)"},
         "integrations": {"pr_comment": {"state": "posted", "time": "(simulated: written to pr-comment.md)"},
@@ -1261,7 +1276,7 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         report = cn.score(results, history=history or {}, since=f"{today.isoformat()} {scenario.clock[:5]} ET",
                           context=cn.RowContext(scenario.run_id, "ws.tier-a.swing-trader", "swing_trader", "frozen"))
         # -- store: identity, the run, synthetic rows (one per checkpoint at most, run docstring)
-        _register(store, cfg, [], [scenario.build.build_id], today)
+        _register(store, cfg, [scenario.build.build_id])
         store.register_checkpoints([ScopeEntry(cp.checkpoint_id, cp.workspace_id, cp.persona, cp.tier, cp.data_mode,
                                                flow_class=_flow_class(cfg, cp)) for cp in cps.values()],
                                    config_commit=tree_sha256(cfg.root)[:12])

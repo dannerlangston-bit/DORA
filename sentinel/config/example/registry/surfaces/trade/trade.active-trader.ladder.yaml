@@ -1,0 +1,35 @@
+schema_version: 1
+id: trade.active-trader.ladder
+title: Active Trader
+kind: active_trader_panel
+tier: 1
+owner: tos-trade-ui
+smoke: true
+path:
+  - {id: p1, type: wait_for, anchor: {landmark: lm.ladder-header}, timeout_ms: 8000}
+primitives: [FlexibleGrid, OrderTicketCore, LadderModel, Theme]
+roots: ["com.tos.desktop.trade.activetrader"]
+personas: [active_trader, futures_trader]
+entitlements: [margin]
+enumerable_by: P2
+resizable: true
+hosts: [tab, flexgrid, detached]
+splitters:
+  - {id: side-panel, template: registry/templates/active-trader/side-splitter.png, host: tab}
+target_window: {kind: main}
+data_mode: frozen                     # DR-02 branch A
+account_state: true
+landmarks:
+  - {id: lm.ladder-header, template: registry/templates/active-trader/ladder-header.png, confidence_min: 0.92, must_see: true}
+  - {id: lm.ladder-buy-column, template: registry/templates/active-trader/buy-col-header.png, must_see: true}
+anti_anchors: [Loading, Reconnecting, "No data"]
+labels: ["Bid Size", "Ask Size"]
+controls:
+  - {id: auto-send-checkbox, template: registry/templates/active-trader/auto-send.png, ocr_text: "Auto send", required: true}
+  - {id: symbol-box, template: registry/templates/common/symbol-box.png, ocr_text: Symbol}
+  - {id: buy-mkt-button, template: registry/templates/active-trader/buy-mkt.png, ocr_text: "BUY MKT", required: true, deny: true}
+  - {id: flatten-button, template: registry/templates/active-trader/flatten.png, ocr_text: Flatten, deny: true}
+settle: {max_wait_ms: 10000}
+census:
+  enabled: true
+  workspaces: [ws.tier-a.active-trader, ws.tier-a.futures-trader]

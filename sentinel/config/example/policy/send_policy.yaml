@@ -1,0 +1,4 @@
+# The OPEN paper_send_ok switch (brief 1.7, 6.7). No sends until the risk owner signs.
+schema_version: 1
+decision: OPEN
+enabled: false

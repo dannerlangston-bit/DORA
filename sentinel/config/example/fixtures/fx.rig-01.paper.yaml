@@ -1,0 +1,55 @@
+# The account and data fixture of rig-01 (4.9). Positions are seeded by asmith during market hours,
+# never by the Executor. The margin account is golden, the IRA account empty.
+schema_version: 1
+fixture_id: fx.rig-01.paper
+rig: rig-01
+login_ref: vault://sentinel/rigs/rig-01/tos-login
+owner: asmith
+accounts:
+  - {account_id: D-20481133, kind: margin, role: golden, cash: 50000.00, cash_tolerance: 5000.00}
+  - {account_id: D-20481134, kind: ira, role: empty, cash: 2500.00, cash_tolerance: 250.00, cash_floor: 2500}
+settings_profile: profile.app-settings.sentinel-pinned
+order_defaults_profile: profile.order-defaults.fresh-install
+data_mode:
+  frozen: {provider: backend_fixture, timestamp: 2026-11-09T15:30:00-05:00, symbol_set: core}   # DR-02 branch A
+  masked_live: {delay_minutes: 20, realtime: false}
+symbols:
+  - {id: mes_front, symbol: /MESZ26, asset: future, purpose: [ticket, ladder], roll_date: 2026-12-11}
+  - {id: es_continuous, symbol: /ES, asset: future, purpose: [chart]}
+  - {id: aapl, symbol: AAPL, asset: equity, purpose: [ticket, chart, chain, watchlist]}
+  - {id: spx, symbol: SPX, asset: index, purpose: [chain, chart]}
+  - {id: sub_dollar, symbol: CEI, asset: equity, purpose: [watchlist]}
+  - {id: bkng, symbol: BKNG, asset: equity, purpose: [watchlist]}
+  - {id: aapl_c200, symbol: .AAPL261218C200, asset: option, purpose: [chain]}
+  - {id: aapl_c210, symbol: .AAPL261218C210, asset: option, purpose: [chain]}
+  - {id: aapl_leaps, symbol: .AAPL281215C250, asset: option, purpose: [chain]}
+  - {id: eurusd, symbol: EUR/USD, asset: forex, purpose: [watchlist]}
+prices:
+  - {id: mes_far_below, symbol_ref: mes_front, rule: "last_delayed - 1000, rounded to 0.25", value: 5325.00, computed_at: 2026-11-09T08:30:00-05:00}
+  - {id: aapl_far_below, symbol_ref: aapl, rule: "last_delayed x 0.65, rounded to 0.01", value: 150.25, computed_at: 2026-11-09T08:30:00-05:00}
+positions:                            # the golden list of 7.6
+  - {account_ref: D-20481133, symbol_ref: aapl, qty: 100, avg_price: 180.25, seeded_by: asmith, seeded_at: 2026-10-06T10:15:00-04:00}
+  - {account_ref: D-20481133, symbol_ref: mes_front, qty: 1, avg_price: 6210.50, seeded_by: asmith, seeded_at: 2026-10-06T10:20:00-04:00}
+  - {account_ref: D-20481133, symbol_ref: sub_dollar, qty: 1000, avg_price: 0.62, seeded_by: asmith, seeded_at: 2026-10-06T10:25:00-04:00}
+  - {account_ref: D-20481133, symbol_ref: bkng, qty: 1, avg_price: 4100.00, seeded_by: asmith, seeded_at: 2026-10-06T10:30:00-04:00}
+  - {account_ref: D-20481133, symbol_ref: aapl_c200, qty: 1, avg_price: 12.40, seeded_by: asmith, seeded_at: 2026-10-06T10:35:00-04:00}
+  - {account_ref: D-20481133, symbol_ref: aapl_c210, qty: -1, avg_price: 8.10, seeded_by: asmith, seeded_at: 2026-10-06T10:35:00-04:00}
+  - {account_ref: D-20481133, symbol_ref: aapl_leaps, qty: 1, avg_price: 31.00, seeded_by: asmith, seeded_at: 2026-10-06T10:40:00-04:00}
+  - {account_ref: D-20481133, symbol_ref: eurusd, qty: 10000, avg_price: 1.0825, seeded_by: asmith, seeded_at: 2026-10-06T10:45:00-04:00}
+watchlists:
+  - {name: SENTINEL-CORE, symbols: [aapl, spx, es_continuous]}
+working_orders_expected: 0
+alerts_expected: 0
+epoch:
+  epoch_id: "sha256:b2f5490356cae8e20612bc1ec7c3eaac8b8cc60276f7ccd53f5f4b1a48056673"
+  window_date: 2026-11-09
+  dataset_id: fx-dataset-2026-11-09-core
+  front_month: {mes: Z26, es: Z26}
+  nearest_monthly_expiration: 2026-11-20
+  option_expirations: {aapl_c200: [2026-12-18], aapl_c210: [2026-12-18], aapl_leaps: [2028-12-15]}
+  data_delay: delayed_20
+churn_calendar:
+  - {date: 2026-11-20, event: expiration, symbol_ref: spx, action: reapprove}
+  - {date: 2026-12-11, event: roll, symbol_ref: mes_front, action: reapprove}
+  - {date: 2026-11-26, event: holiday, action: skip_checkpoints}
+  - {date: 2026-12-18, event: reseed_due, action: reseed}

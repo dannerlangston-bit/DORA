@@ -1,0 +1,27 @@
+schema_version: 1
+id: charts.flexible-grid.level2-cell
+title: "Level II"
+kind: gadget
+tier: 2
+owner: tos-data-ui
+smoke: false
+path:
+  - {id: p1, type: wait_for, anchor: {landmark: lm.level2-cell-header}, timeout_ms: 8000}
+primitives: [FlexibleGrid, Theme]
+roots: ["com.tos.desktop.charts.grid.level2cell"]
+personas: [active_trader]
+entitlements: []
+enumerable_by: P8
+resizable: true
+hosts: [flexgrid]
+target_window: {kind: main}
+data_mode: frozen                     # DR-02 branch A replays the quote fixture
+landmarks:
+  - {id: lm.level2-cell-header, template: registry/templates/charts/level2-cell-header.png, must_see: true}
+anti_anchors: [Loading]
+labels: []
+controls: []
+settle: {max_wait_ms: 8000}
+census:
+  enabled: true
+  workspaces: [ws.tier-a.active-trader]

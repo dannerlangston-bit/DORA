@@ -1,0 +1,41 @@
+# Flow headers and checkpoint steps (4.7); non-checkpoint steps are omitted.
+- flow_id: flow.trade.active-trader.ticket
+  class: standard
+  tier: 1
+  persona: active_trader
+  workspace: ws.tier-a.active-trader
+  surfaces: [trade.active-trader.ladder, dialog.order-confirmation]
+  requires: [margin]
+  fixture: fx.rig-01.paper
+  data_mode: frozen
+  steps:
+    - {id: cp1, type: checkpoint, checkpoint_id: flow/trade.active-trader.ladder/flow.trade.active-trader.ticket/cp1,
+       surface_id: trade.active-trader.ladder}
+    - {id: cp2, type: checkpoint, checkpoint_id: flow/dialog.order-confirmation/flow.trade.active-trader.ticket/cp2,
+       surface_id: dialog.order-confirmation}
+- flow_id: flow.trade.order-ticket.futures.single-leg
+  class: standard
+  tier: 1
+  persona: futures_trader
+  workspace: ws.tier-a.futures-trader
+  surfaces: [trade.order-entry.futures, dialog.order-confirmation]
+  requires: [futures]
+  fixture: fx.rig-01.paper
+  data_mode: masked_live
+  steps:
+    - {id: cp1, type: checkpoint, checkpoint_id: flow/trade.order-entry.futures/flow.trade.order-ticket.futures.single-leg/cp1,
+       surface_id: trade.order-entry.futures}
+    - {id: cp2, type: checkpoint, checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.futures.single-leg/cp2,
+       surface_id: dialog.order-confirmation}
+- flow_id: flow.charts.flexible-grid.studies
+  class: standard
+  tier: 2
+  persona: swing_trader
+  workspace: ws.tier-a.swing-trader
+  surfaces: [charts.flexible-grid.chart-cell]
+  requires: []
+  fixture: fx.rig-02.paper
+  data_mode: frozen
+  steps:
+    - {id: cp1, type: checkpoint, checkpoint_id: flow/charts.flexible-grid.chart-cell/flow.charts.flexible-grid.studies/cp1,
+       surface_id: charts.flexible-grid.chart-cell}

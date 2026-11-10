@@ -1,0 +1,146 @@
+# Surface Registry entries (4.5), only the fields scope and coverage read. Roots are illustrative.
+- id: charts.flexible-grid.chart-cell
+  kind: chart
+  tier: 2
+  primitives: [FlexibleGrid, ChartEngine, Theme, FontMetrics]
+  roots: ["com.tos.desktop.charts.flexgrid.chartcell"]
+  personas: [active_trader, swing_trader]
+  entitlements: []
+  resizable: true
+  hosts: [flexgrid]
+  data_mode: frozen
+  census: {enabled: true, workspaces: [ws.tier-a.active-trader, ws.tier-a.swing-trader]}
+- id: charts.flexible-grid.active-trader-cell
+  kind: active_trader_panel
+  tier: 1
+  smoke: true
+  primitives: [LadderModel, FlexibleGrid, Docking, ColumnModel, OrderTicketCore, Theme, FontMetrics]
+  roots: ["com.tos.desktop.charts.flexgrid.atcell"]
+  personas: [active_trader]
+  entitlements: [margin]
+  resizable: true
+  hosts: [flexgrid]
+  data_mode: frozen
+  census: {enabled: true, workspaces: [ws.tier-a.active-trader, ws.tier-c.sweep-harness]}
+- id: charts.flexible-grid.level2-cell
+  kind: gadget
+  tier: 2
+  primitives: [FlexibleGrid, ColumnModel, Theme, FontMetrics]
+  roots: ["com.tos.desktop.charts.flexgrid.level2cell"]
+  personas: [active_trader]
+  resizable: true
+  hosts: [flexgrid]
+  data_mode: frozen
+  census: {enabled: true, workspaces: [ws.tier-a.active-trader]}
+- id: charts.flexible-grid.time-sales-cell
+  kind: gadget
+  tier: 2
+  primitives: [FlexibleGrid, ColumnModel, Theme, FontMetrics]
+  roots: ["com.tos.desktop.charts.flexgrid.tnscell"]
+  personas: [active_trader]
+  resizable: true
+  hosts: [flexgrid]
+  data_mode: frozen
+  census: {enabled: true, workspaces: [ws.tier-a.active-trader]}
+- id: trade.active-trader.ladder
+  kind: active_trader_panel
+  tier: 1
+  smoke: true
+  primitives: [FlexibleGrid, Docking, ColumnModel, Theme, FontMetrics, OrderTicketCore, LadderModel]
+  roots: ["com.tos.desktop.trade.activetrader"]
+  personas: [active_trader, futures_trader]
+  entitlements: [margin]
+  resizable: true
+  hosts: [tab, flexgrid, detached]
+  splitters: [{id: side-panel, host: tab}]
+  data_mode: frozen
+  census: {enabled: true, workspaces: [ws.tier-a.active-trader, ws.tier-a.futures-trader, ws.tier-c.sweep-harness]}
+- id: trade.order-entry.futures
+  kind: ticket_variant
+  tier: 1
+  smoke: true
+  primitives: [OrderTicketCore, Theme, FontMetrics]
+  roots: ["com.tos.desktop.trade.orderentry.futures"]
+  personas: [futures_trader]
+  entitlements: [futures]
+  resizable: false
+  data_mode: masked_live
+  census: {enabled: true, workspaces: [ws.tier-a.futures-trader]}
+- id: dialog.order-confirmation
+  kind: dialog
+  tier: 1
+  smoke: true
+  primitives: [OrderTicketCore, Theme, FontMetrics]
+  roots: ["com.tos.desktop.trade.confirm"]
+  personas: [active_trader, options_trader, futures_trader, swing_trader, beginner]
+  entitlements: [margin]
+  resizable: false
+  data_mode: masked_live
+  census: {enabled: true, workspaces: [ws.tier-a.active-trader]}
+- id: monitor.activity.position-statement
+  kind: section
+  tier: 1
+  smoke: true
+  primitives: [ColumnModel, Docking, Theme, FontMetrics]
+  roots: ["com.tos.desktop.monitor.positions"]
+  personas: [active_trader, options_trader, futures_trader, swing_trader, beginner]
+  entitlements: [margin]
+  resizable: true
+  hosts: [tab]
+  data_mode: masked_live
+  census: {enabled: true, workspaces: [ws.tier-a.active-trader, ws.tier-a.swing-trader, ws.tier-a.futures-trader]}
+- id: trade.all-products.option-chain
+  kind: section
+  tier: 1
+  smoke: true
+  primitives: [ColumnModel, Theme, FontMetrics]
+  roots: ["com.tos.desktop.trade.chain"]
+  personas: [options_trader]
+  entitlements: [options_L1]
+  resizable: false
+  data_mode: masked_live
+  census:
+    enabled: true
+    workspaces: [ws.tier-a.options-trader, ws.tier-b.power-1]
+    dimensions: {layout: [delta, theo], strikes: ["8", "16"]}
+- id: settings.order-defaults
+  kind: settings_page
+  tier: 1
+  smoke: true
+  primitives: [Theme, FontMetrics]
+  roots: ["com.tos.desktop.settings.orderdefaults"]
+  personas: [active_trader, options_trader, futures_trader, swing_trader, beginner]
+  resizable: false
+  data_mode: frozen
+  census: {enabled: true, workspaces: [ws.tier-a.active-trader]}
+- id: analyze.risk-profile
+  kind: section
+  tier: 2
+  primitives: [ChartEngine, Theme, FontMetrics]
+  roots: ["com.tos.desktop.analyze.risk"]
+  personas: [options_trader]
+  resizable: true
+  hosts: [tab]
+  splitters: [{id: graph-split, host: tab, collapsible: true}]
+  data_mode: frozen
+  census: {enabled: true, workspaces: [ws.tier-a.options-trader]}
+- id: sidebar.level2
+  kind: gadget
+  tier: 2
+  primitives: [ColumnModel, Docking, Theme, FontMetrics]
+  roots: ["com.tos.desktop.sidebar.level2"]
+  personas: [active_trader]
+  resizable: true
+  hosts: [sidebar]
+  data_mode: masked_live
+  census: {enabled: true, workspaces: [ws.tier-a.active-trader]}
+- id: tools.thinklog
+  kind: subtab
+  tier: 3
+  primitives: [Theme, FontMetrics]
+  roots: ["com.tos.desktop.tools.thinklog"]
+  personas: [beginner]
+  resizable: true
+  hosts: [tab]
+  data_mode: frozen
+  census: {enabled: true, workspaces: [ws.tier-a.beginner]}

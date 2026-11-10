@@ -1,0 +1,21 @@
+schema_version: 1
+id: ws.tier-a.active-trader
+tier: A
+persona: active_trader
+file: corpus/workspaces/ws.tier-a.active-trader/workspace.sentinel-active
+file_sha256: "sha256:493d9c2e702f354598df2da659bbfaaf17b738bc5230accba022e2ca93a56890"
+display_config: {width: 1920, height: 1080, scale_percent: 100, theme: dark, font_size: medium}
+link_groups:
+  - {color: red, symbol_ref: aapl}
+  - {color: green, symbol_ref: mes_front}
+gadgets_present:
+  - trade.active-trader.ladder
+  - charts.flexible-grid.active-trader-cell
+  - charts.flexible-grid.level2-cell
+  - charts.flexible-grid.time-sales-cell
+  - monitor.activity.position-statement
+active_trader_panels:
+  - {panel_id: at-main, surface: trade.active-trader.ladder}
+  - {panel_id: at-grid, surface: charts.flexible-grid.active-trader-cell}
+owner: tos-trade-ui
+notes: Active Trader docked on the Trade tab; a 2x2 Flexible Grid on the Charts tab with a ladder, Level II and Time & Sales cell; Position Statement on Monitor.

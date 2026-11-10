@@ -1,0 +1,27 @@
+schema_version: 1
+id: charts.flexible-grid.chart-cell
+title: Chart
+kind: chart
+tier: 2
+owner: tos-charts-ui
+smoke: false
+path:
+  - {id: p1, type: wait_for, anchor: {landmark: lm.chart-cell-header}, timeout_ms: 15000}
+primitives: [FlexibleGrid, Theme]
+roots: ["com.tos.desktop.charts.grid.chartcell"]
+personas: [options_trader, futures_trader, swing_trader, beginner]
+entitlements: []
+enumerable_by: P8
+resizable: true
+hosts: [flexgrid]
+target_window: {kind: main}
+data_mode: frozen                     # chart surfaces sweep frozen only (2.5.3)
+landmarks:
+  - {id: lm.chart-cell-header, template: registry/templates/charts/chart-cell-header.png, must_see: true}
+anti_anchors: [Loading]
+labels: []
+controls: []
+settle: {max_wait_ms: 15000}
+census:
+  enabled: true
+  workspaces: [ws.tier-a.swing-trader, ws.tier-a.options-trader, ws.tier-a.futures-trader, ws.tier-a.beginner]

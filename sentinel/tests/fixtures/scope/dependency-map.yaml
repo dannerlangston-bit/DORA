@@ -1,0 +1,39 @@
+# Dependency map (4.4); source_packages stand in for the TBD placeholders of 12.9.
+schema_version: 1
+primitives:
+  - {id: FlexibleGrid,    source_packages: ["com.tos.desktop.ui.grid.**"],      owner: tos-shell-ui}
+  - {id: Docking,         source_packages: ["com.tos.desktop.ui.docking.**"],   owner: tos-shell-ui}
+  - {id: ColumnModel,     source_packages: ["com.tos.desktop.ui.table.**"],     owner: tos-data-ui}
+  - {id: Theme,           source_packages: ["com.tos.desktop.laf.**"],          owner: tos-shell-ui, global: true}
+  - {id: FontMetrics,     source_packages: ["com.tos.desktop.ui.text.**"],      owner: tos-shell-ui, global: true}
+  - {id: ChartEngine,     source_packages: ["com.tos.desktop.charts.engine.**"], owner: charts}
+  - {id: OrderTicketCore, source_packages: ["com.tos.desktop.trade.ticket.**"], owner: trade-ui}
+  - {id: LadderModel,     source_packages: ["com.tos.desktop.trade.ladder.**"], owner: trade-ui}
+edges:
+  - {primitive: FlexibleGrid, surface: charts.flexible-grid.chart-cell, source: declared, confidence: 1.0}
+  - {primitive: FlexibleGrid, surface: charts.flexible-grid.active-trader-cell, source: declared, confidence: 1.0}
+  - {primitive: FlexibleGrid, surface: charts.flexible-grid.level2-cell, source: declared, confidence: 1.0}
+  - {primitive: FlexibleGrid, surface: charts.flexible-grid.time-sales-cell, source: declared, confidence: 1.0}
+  - {primitive: FlexibleGrid, surface: trade.active-trader.ladder, source: declared, confidence: 1.0}
+  - {primitive: Docking, surface: trade.active-trader.ladder, source: declared, confidence: 1.0}
+  - {primitive: Docking, surface: charts.flexible-grid.active-trader-cell, source: declared, confidence: 1.0}
+  - {primitive: Docking, surface: monitor.activity.position-statement, source: declared, confidence: 1.0}
+  - {primitive: Docking, surface: sidebar.level2, source: declared, confidence: 1.0}
+  - {primitive: ColumnModel, surface: monitor.activity.position-statement, source: static_analysis, confidence: 0.82,
+     evidence: com.tos.desktop.monitor.positions.PositionStatementTable imports com.tos.desktop.ui.table.ColumnModel}
+  - {primitive: ColumnModel, surface: trade.all-products.option-chain, source: declared, confidence: 1.0}
+  - {primitive: ColumnModel, surface: trade.active-trader.ladder, source: declared, confidence: 1.0}
+  - {primitive: ColumnModel, surface: charts.flexible-grid.active-trader-cell, source: declared, confidence: 1.0}
+  - {primitive: ColumnModel, surface: charts.flexible-grid.level2-cell, source: declared, confidence: 1.0}
+  - {primitive: ColumnModel, surface: charts.flexible-grid.time-sales-cell, source: declared, confidence: 1.0}
+  - {primitive: ColumnModel, surface: sidebar.level2, source: declared, confidence: 1.0}
+  - {primitive: Theme, surface: "*", source: declared, confidence: 1.0}
+  - {primitive: FontMetrics, surface: "*", source: declared, confidence: 1.0}
+  - {primitive: ChartEngine, surface: "charts.*", source: declared, confidence: 1.0}
+  - {primitive: ChartEngine, surface: analyze.risk-profile, source: declared, confidence: 1.0}
+  - {primitive: OrderTicketCore, surface: "trade.order-entry.*", source: declared, confidence: 1.0}
+  - {primitive: OrderTicketCore, surface: dialog.order-confirmation, source: declared, confidence: 1.0}
+  - {primitive: OrderTicketCore, surface: trade.active-trader.ladder, source: declared, confidence: 1.0}
+  - {primitive: OrderTicketCore, surface: charts.flexible-grid.active-trader-cell, source: declared, confidence: 1.0}
+  - {primitive: LadderModel, surface: trade.active-trader.ladder, source: declared, confidence: 1.0}
+  - {primitive: LadderModel, surface: charts.flexible-grid.active-trader-cell, source: declared, confidence: 1.0}

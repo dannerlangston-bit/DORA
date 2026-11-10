@@ -1,0 +1,32 @@
+schema_version: 1
+id: dialog.order-confirmation
+title: Order Confirmation
+parent: trade.order-entry.stock
+kind: dialog
+tier: 1
+owner: tos-trade-ui
+smoke: true
+path:
+  - {id: p1, type: click_named, target: trade.order-entry.stock.confirm-and-send, order_stage: true}
+  - {id: p2, type: wait_for, anchor: {window_title_regex: "^Order Confirmation", landmark: lm.order-confirmation-title}, timeout_ms: 6000}
+primitives: [OrderTicketCore, Theme]
+roots: ["com.tos.desktop.trade.confirm"]
+personas: [active_trader, options_trader, futures_trader, swing_trader, beginner]
+entitlements: [margin]
+enumerable_by: none
+resizable: false
+target_window: {kind: dialog, title_regex: "^Order Confirmation"}
+data_mode: frozen
+account_state: true
+landmarks:
+  - {id: lm.order-confirmation-title, template: registry/templates/dialog/order-confirmation-title.png, confidence_min: 0.93, must_see: true}
+anti_anchors: [Loading]
+labels: [Send, Delete]
+controls:
+  - {id: title-close, jab: {name: Close, role: push button}, template: registry/templates/dialog/title-close.png}
+  - {id: send-button, template: registry/templates/dialog/send-button.png, ocr_text: Send, required: true, deny: true}
+  - {id: delete-button, template: registry/templates/dialog/delete-button.png, ocr_text: Delete, required: true}
+settle: {max_wait_ms: 6000}
+census:
+  enabled: false        # reached only by flows: the dialog needs a staged ticket
+  workspaces: []

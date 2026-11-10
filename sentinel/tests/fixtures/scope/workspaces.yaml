@@ -1,0 +1,15 @@
+# Workspace Corpus entries (4.6): tier, persona tag and gadgets_present (the hosted_by relation of 2.3).
+- {id: ws.tier-a.active-trader, tier: A, persona: active_trader,
+   gadgets_present: [charts.flexible-grid.chart-cell, charts.flexible-grid.active-trader-cell,
+                     charts.flexible-grid.level2-cell, charts.flexible-grid.time-sales-cell,
+                     trade.active-trader.ladder, monitor.activity.position-statement, sidebar.level2]}
+- {id: ws.tier-a.swing-trader, tier: A, persona: swing_trader,
+   gadgets_present: [charts.flexible-grid.chart-cell, monitor.activity.position-statement]}
+- {id: ws.tier-a.futures-trader, tier: A, persona: futures_trader,
+   gadgets_present: [trade.active-trader.ladder, trade.order-entry.futures, monitor.activity.position-statement]}
+- {id: ws.tier-a.options-trader, tier: A, persona: options_trader,
+   gadgets_present: [trade.all-products.option-chain, analyze.risk-profile]}
+- {id: ws.tier-a.beginner, tier: A, persona: beginner, gadgets_present: [tools.thinklog]}
+- {id: ws.tier-b.power-1, tier: B, persona: active_trader,
+   gadgets_present: [charts.flexible-grid.chart-cell, trade.all-products.option-chain, trade.active-trader.ladder]}
+- {id: ws.tier-c.sweep-harness, tier: C, gadgets_present: [charts.flexible-grid.active-trader-cell]}

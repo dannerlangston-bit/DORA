@@ -1,0 +1,7 @@
+schema_version: 1
+checkpoint_id: census/charts.flexible-grid.chart-cell/ws.tier-a.swing-trader
+landmarks:
+  - {id: lm.chart-cell-header, template: regions/landmarks/lm.chart-cell-header.png, confidence_min: 0.92}
+regions:
+  - {id: rgn.chart.header, type: diff, landmark: lm.chart-cell-header, rect: {dx: 0, dy: 0, w: 320, h: 20}}
+  - {id: rgn.chart.plot, type: diff, landmark: lm.chart-cell-header, rect: {dx: 0, dy: 24, w: 460, h: 300}}

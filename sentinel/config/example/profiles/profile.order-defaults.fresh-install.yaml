@@ -1,0 +1,9 @@
+# The fresh-install Order Defaults profile: stages a BUY LMT DAY ticket (4.7, 2.6.3).
+schema_version: 1
+id: profile.order-defaults.fresh-install
+kind: order_defaults
+owner: tos-trade-ui
+defaults:
+  equity: {side: BUY, quantity: 100, order_type: LMT, tif: DAY}
+  future: {side: BUY, quantity: 1, order_type: LMT, tif: DAY}
+  active_trader_quantity: 1

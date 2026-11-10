@@ -1,0 +1,8 @@
+# The 480x360 step of ladder S, where the reference ladder overlap reproduces (2.5.2, 10.10).
+schema_version: 1
+checkpoint_id: sweep/charts.flexible-grid.active-trader-cell/flexgrid/480x360
+landmarks:
+  - {id: lm.atcell-header, template: regions/landmarks/lm.atcell-header.png, confidence_min: 0.92}
+regions:
+  - {id: rgn.ladder.viewport, type: diff, landmark: lm.atcell-header, rect: {dx: 0, dy: 22, w: 300, h: 250}}
+  - {id: rgn.ladder.order-strip, type: diff, landmark: lm.atcell-header, rect: {dx: 0, dy: 276, w: 300, h: 40}}

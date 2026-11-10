@@ -1,0 +1,18 @@
+schema_version: 1
+id: ws.tier-a.futures-trader
+tier: A
+persona: futures_trader
+file: corpus/workspaces/ws.tier-a.futures-trader/workspace.sentinel-futures
+file_sha256: "sha256:94e925f156844d687f0b8b282cb4abc71ad9201cdd3b477738c198093c285e1e"
+display_config: {width: 1920, height: 1080, scale_percent: 100, theme: dark, font_size: medium}
+link_groups:
+  - {color: red, symbol_ref: mes_front}
+  - {color: green, symbol_ref: es_continuous}
+gadgets_present:
+  - trade.active-trader.ladder
+  - charts.flexible-grid.chart-cell
+  - monitor.activity.position-statement
+active_trader_panels:
+  - {panel_id: at-left, surface: trade.active-trader.ladder}
+owner: tos-trade-ui
+notes: Two-column layout; Active Trader docked left of a Flexible Grid of charts.

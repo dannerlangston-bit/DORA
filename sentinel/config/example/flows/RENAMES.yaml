@@ -1,0 +1,5 @@
+# Checkpoint rename map (4.1, L-FLW-03): old id, new id or retired, and the build of the change.
+schema_version: 1
+renames:
+  - {old: flow/trade.order-entry.stock/flow.trade.order-ticket.stock.limit/cp1,
+     new: flow/trade.order-entry.stock/flow.trade.order-ticket.stock.limit/s03, build: main-1998.2.0-4f1c9a2}

@@ -1,0 +1,12 @@
+schema_version: 1
+mask_id: msk.ps.last-update-01
+checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
+region_id: rgn.ps.last-update
+owner: tos-monitor-ui
+reason: The section header shows the last quote update time to the second; it moves on every capture.
+created_by: human
+created_run: run-2026-11-05-merge-0418
+created_at: 2026-11-05T15:20:00-05:00
+expires_at: 2026-12-05T15:20:00-05:00
+ticket: TOS-48133
+decision_ref: dec-000812

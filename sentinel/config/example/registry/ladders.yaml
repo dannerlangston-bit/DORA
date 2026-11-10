@@ -1,0 +1,76 @@
+# Size-sweep ladders S and F and the splitter sets of 2.5.2. Sizes are client-area pixels on the
+# 1920x1080 rig at 100 percent; MAXW and MAXH are measured at calibration. Descending order is
+# mandatory; 480x360 is the cell size where the reference ladder overlap reproduces.
+schema_version: 1
+ladders:
+  - id: ladder-s
+    name: S
+    run_types: [pr, merge]
+    corpus_sizes: false
+    steps:
+      - {w: 960, h: 720}
+      - {w: 960, h: 480}
+      - {w: 960, h: 360}
+      - {w: 640, h: 720}
+      - {w: 640, h: 480}
+      - {w: 640, h: 360}
+      - {w: 480, h: 720}
+      - {w: 480, h: 480}
+      - {w: 480, h: 360}
+      - {w: 320, h: 720}
+      - {w: 320, h: 480}
+      - {w: 320, h: 360}
+  - id: ladder-f
+    name: F
+    run_types: [rc]
+    corpus_sizes: true                # the corpus sizes run after the corners
+    steps:
+      - {w: 960, h: 720, part: grid}
+      - {w: 960, h: 600, part: grid}
+      - {w: 960, h: 480, part: grid}
+      - {w: 960, h: 420, part: grid}
+      - {w: 960, h: 360, part: grid}
+      - {w: 960, h: 300, part: grid}
+      - {w: 800, h: 720, part: grid}
+      - {w: 800, h: 600, part: grid}
+      - {w: 800, h: 480, part: grid}
+      - {w: 800, h: 420, part: grid}
+      - {w: 800, h: 360, part: grid}
+      - {w: 800, h: 300, part: grid}
+      - {w: 640, h: 720, part: grid}
+      - {w: 640, h: 600, part: grid}
+      - {w: 640, h: 480, part: grid}
+      - {w: 640, h: 420, part: grid}
+      - {w: 640, h: 360, part: grid}
+      - {w: 640, h: 300, part: grid}
+      - {w: 480, h: 720, part: grid}
+      - {w: 480, h: 600, part: grid}
+      - {w: 480, h: 480, part: grid}
+      - {w: 480, h: 420, part: grid}
+      - {w: 480, h: 360, part: grid}
+      - {w: 480, h: 300, part: grid}
+      - {w: 400, h: 720, part: grid}
+      - {w: 400, h: 600, part: grid}
+      - {w: 400, h: 480, part: grid}
+      - {w: 400, h: 420, part: grid}
+      - {w: 400, h: 360, part: grid}
+      - {w: 400, h: 300, part: grid}
+      - {w: 320, h: 720, part: grid}
+      - {w: 320, h: 600, part: grid}
+      - {w: 320, h: 480, part: grid}
+      - {w: 320, h: 420, part: grid}
+      - {w: 320, h: 360, part: grid}
+      - {w: 320, h: 300, part: grid}
+      - {w: 240, h: 160, part: corner}
+      - {w: 240, h: MAXH, part: corner}
+      - {w: MAXW, h: 160, part: corner}
+      - {w: MAXW, h: MAXH, part: corner}
+      - {w: 320, h: 480, part: ascending}
+      - {w: 400, h: 480, part: ascending}
+      - {w: 480, h: 480, part: ascending}
+      - {w: 640, h: 480, part: ascending}
+      - {w: 800, h: 480, part: ascending}
+      - {w: 960, h: 480, part: ascending}
+splitter_sets:
+  full: [0.00, 0.15, 0.30, 0.50, 0.70, 0.85, 1.00]   # RC; 0.00 and 1.00 only when collapsible
+  short: [0.15, 0.50, 0.85]                         # PR and merge

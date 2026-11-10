@@ -1,0 +1,24 @@
+# Copied from .sentinel/manifest.yaml on the PR 4812 branch at run creation (4.3).
+schema_version: 1
+manifest_id: mf-branch-1998.3.0-5d3e812
+candidate: branch-1998.3.0-5d3e812
+base: main-1998.2.0-4f1c9a2
+source: manual
+author: jdoe
+entries:
+  - entry_id: tos-48120-1
+    tickets: [TOS-48120]
+    summary: Flexible Grid chart cells get 4 px inner padding so the chart header does not touch the cell border
+    declared_surfaces: [charts.flexible-grid.chart-cell]
+    new_surface: false
+    touched_primitives: [FlexibleGrid]
+    changed_paths:
+      - "desktop/ui/grid/src/main/java/**/FlexibleGridCell*.java"
+      - "desktop/ui/grid/src/main/java/**/GridCellInsets.java"
+    expected_visual: >
+      Every Flexible Grid chart cell shows a 4 px gap between the cell border and the chart header on all
+      four sides. Header text, fonts and colors are unchanged. Gadgets outside a chart cell are unchanged.
+    mock_image: manifests/mocks/tos-48120-chart-cell-padding.png
+    feature_flags:
+      - {name: flexgrid.cell_padding_v2, state: on, scope: build}
+    must_be_observed: true

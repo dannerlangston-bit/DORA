@@ -1,0 +1,9 @@
+# The chosen branch of each Phase 0 unknown (brief 1.11, decision records DR-01 to DR-07 of 11.8).
+schema_version: 1
+jab: A              # DR-01 Java Access Bridge exposes names, roles and bounds
+data_fixture: A     # DR-02 the test backend replays a frozen market-data fixture
+login_mfa: A        # DR-03 test-backend credential without MFA
+pinned_install: A   # DR-04 pipeline artifact with auto-update disabled
+aa_floor: A         # DR-05 A/A floor near zero on frozen checkpoints
+session_rule: A     # DR-06 a second login kicks the first; one session per login
+computer_use: A     # DR-07 computer use allowed on the approved endpoint

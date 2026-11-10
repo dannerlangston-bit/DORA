@@ -1,0 +1,7 @@
+schema_version: 1
+checkpoint_id: flow/charts.flexible-grid.active-trader-cell/flow.trade.active-trader.read-back/cp-atcell
+landmarks:
+  - {id: lm.atcell-header, template: regions/landmarks/lm.atcell-header.png, confidence_min: 0.92}
+regions:
+  - {id: rgn.atcell.viewport, type: diff, landmark: lm.atcell-header, rect: {dx: 0, dy: 22, w: 300, h: 250}}
+  - {id: rgn.atcell.qty, type: diff, landmark: lm.atcell-header, rect: {dx: 0, dy: 276, w: 60, h: 20}, money_cell: true}

@@ -1,0 +1,51 @@
+# Which surfaces consume which hosting primitive (4.4). Source packages are filled from the Phase 0
+# jar listing (11.8); the 12.9 starter wrote them as TBD.<area>.** placeholders.
+schema_version: 1
+primitives:
+  - id: FlexibleGrid
+    description: Grid container that hosts gadgets in resizable cells with splitters
+    source_packages: ["com.tos.desktop.ui.grid.**"]
+    owner: ui-platform
+  - id: OrderTicketCore
+    description: Order model, ticket fields, validation and the confirmation dialog
+    source_packages: ["com.tos.desktop.trade.order.**"]
+    owner: trade-ui
+  - id: LadderModel
+    description: Price ladder rows, centering and order bubbles of Active Trader
+    source_packages: ["com.tos.desktop.trade.ladder.**"]
+    owner: trade-ui
+  - id: Theme
+    description: Colors, borders and icon sets of the custom look and feel
+    source_packages: ["com.tos.desktop.ui.laf.**"]
+    owner: ui-platform
+    global: true
+edges:
+  - {primitive: FlexibleGrid, surface: trade.active-trader.ladder, source: declared, confidence: 1.0,
+     confirmed_from_source: true, confirmed_build: main-1998.2.0-4f1c9a2,
+     first_seen: 2026-10-01T09:00:00-04:00, last_verified: 2026-11-02T03:10:00-05:00}
+  - {primitive: FlexibleGrid, surface: charts.flexible-grid.active-trader-cell, source: declared, confidence: 1.0,
+     first_seen: 2026-10-01T09:00:00-04:00, last_verified: 2026-11-02T03:10:00-05:00}
+  - {primitive: FlexibleGrid, surface: charts.flexible-grid.chart-cell, source: declared, confidence: 1.0,
+     first_seen: 2026-10-01T09:00:00-04:00, last_verified: 2026-11-02T03:10:00-05:00}
+  - {primitive: FlexibleGrid, surface: charts.flexible-grid.level2-cell, source: declared, confidence: 1.0,
+     first_seen: 2026-10-01T09:00:00-04:00, last_verified: 2026-11-02T03:10:00-05:00}
+  - {primitive: FlexibleGrid, surface: charts.flexible-grid.time-sales-cell, source: declared, confidence: 1.0,
+     first_seen: 2026-10-01T09:00:00-04:00, last_verified: 2026-11-02T03:10:00-05:00}
+  - {primitive: OrderTicketCore, surface: trade.order-entry.stock, source: declared, confidence: 1.0,
+     first_seen: 2026-10-01T09:00:00-04:00, last_verified: 2026-11-02T03:10:00-05:00}
+  - {primitive: OrderTicketCore, surface: dialog.order-confirmation, source: static_analysis, confidence: 1.0,
+     confirmed_from_source: true, confirmed_build: main-1998.2.0-4f1c9a2,
+     evidence: com.tos.desktop.trade.confirm.OrderConfirmationDialog imports com.tos.desktop.trade.order.OrderModel,
+     first_seen: 2026-11-02T03:10:00-05:00, last_verified: 2026-11-02T03:10:00-05:00}
+  - {primitive: OrderTicketCore, surface: trade.active-trader.ladder, source: declared, confidence: 1.0,
+     first_seen: 2026-10-01T09:00:00-04:00, last_verified: 2026-11-02T03:10:00-05:00}
+  - {primitive: OrderTicketCore, surface: charts.flexible-grid.active-trader-cell, source: declared, confidence: 1.0,
+     first_seen: 2026-10-01T09:00:00-04:00, last_verified: 2026-11-02T03:10:00-05:00}
+  - {primitive: LadderModel, surface: trade.active-trader.ladder, source: declared, confidence: 1.0,
+     first_seen: 2026-10-01T09:00:00-04:00, last_verified: 2026-11-02T03:10:00-05:00}
+  - {primitive: LadderModel, surface: charts.flexible-grid.active-trader-cell, source: declared, confidence: 1.0,
+     reason: the cell hosts the ladder through a factory the bytecode scan cannot follow,
+     first_seen: 2026-10-01T09:00:00-04:00, last_verified: 2026-11-02T03:10:00-05:00}
+  - {primitive: Theme, surface: "*", source: declared, confidence: 1.0,
+     reason: properties-driven theming is invisible to the scan,
+     first_seen: 2026-10-01T09:00:00-04:00, last_verified: 2026-11-02T03:10:00-05:00}

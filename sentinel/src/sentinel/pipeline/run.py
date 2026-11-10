@@ -71,22 +71,21 @@ from ..diff import load_params
 from ..diff.calibration import CalibrationFile, Capture as CalCapture, calibrate_checkpoint
 from ..diff.engine import DiffContext, DiffResult, compare_fingerprints, diff_pair, fingerprint_id
 from ..diff.phash import phash
-from ..diff.regions import RegionsFile, Rect, effective_registry, park_rect
+from ..diff.regions import RegionsFile, effective_registry, park_rect
 from ..diff.settle import Recapture, RerunBudget, SettleResult, diff_stability, settle
 from ..lint import lint
-from ..records import (PERSONAS, Classification, CheckpointOutcome, Decision, DiffSummary, Finding, RunOutcome,
-                       Signature, StepOutcome)
+from ..records import PERSONAS, CheckpointOutcome, Decision, Finding, RunOutcome, Signature, StepOutcome
 from ..report import ReportContext, build_report, render_pr_comment, render_run_report
 from ..report.cluster import Member, cluster_members
-from ..scope import (Cut, DependencyIndex, Manifest, PlannedCheckpoint, Rig, ScopeConfigError, ScopePlan,
-                     classes_in, compute_scope)
+from ..scope import (DependencyIndex, Manifest, PlannedCheckpoint, Rig, ScopeConfigError, ScopePlan, classes_in,
+                     compute_scope)
 from ..store import ArtifactStore, Store
 from ..store.artifacts import ManifestHeader, Redaction, StoredArtifact
 from ..store.store import RunPlan, ScopeEntry, ShardPlan
 from ..taxonomy import checkpoint_parts, load
 from .config import SentinelConfig, as_dict, materialize, parse_time, tree_sha256
 from .reviewer import ReviewerAdapter, ReviewRequest, SimulatedReviewer, change_types, to_review, validate
-from .sim import Capture, Observation, SimApp, SimBuild, observe, screen_model
+from .sim import Capture, SimApp, SimBuild, observe
 
 DEFAULT_TODAY = date(2026, 11, 10)
 RIGS = ("rig-01", "rig-02", "rig-03", "rig-04")
@@ -312,7 +311,8 @@ class _Run:
                 if key not in _CALIBRATIONS:
                     _CALIBRATIONS[key] = calibrate_checkpoint(
                         [CalCapture(c.screen.image, time_to_settle_ms=3 * 250) for c in caps], reg,
-                        data_mode=cp.data_mode, now=self.now, params=self.params)
+                        data_mode=cp.data_mode, system_masks=[park_rect(_park(caps[0]))], now=self.now,
+                        params=self.params)
                 cal.checkpoints[cp.checkpoint_id] = _CALIBRATIONS[key]
             pairs.setdefault(f"{cp.surface_id}|{cp.data_mode}", []).append(
                 inv.AAPair(cp.data_mode, caps[0].models, caps[5].models))
@@ -330,6 +330,11 @@ class _Run:
 
 # ------------------------------------------------------------------------------------------------
 # One checkpoint (5.17): settle, diff, invariants, re-runs, decisions, classification
+
+
+def _park(cap: Capture) -> tuple[int, int]:
+    """The declared parking coordinate (3.5): a dead area 8 px inside the capture's bottom-right corner."""
+    return cap.screen.image.shape[1] - 8, cap.screen.image.shape[0] - 8
 
 
 def _region_choice(ev_reg: RegionsFile, res: DiffResult | None, comparison: inv.Comparison | None,
@@ -377,7 +382,7 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
     loop, a capture-time gate, does not run on it."""
     reg = run.registry(cp, base if base is not None else cand)
     rules = run.surface_rules(cp)
-    park = (cand.screen.image.shape[1] - 8, cand.screen.image.shape[0] - 8)
+    park = _park(cand)
     spec = SimApp.settle_spec(reg, park)
     fkw: dict[str, Any] = dict(manifest=x, primitive=primitive, manifest_entry_ref=entry_ref,
                                manifest_entries=run.entries, manifest_tickets=run.tickets)
@@ -392,7 +397,8 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
         comparison = inv.compare(None, cand.models, rules)
     else:
         res = diff_pair(s_b.capture, s_c.capture, reg, calibration=run.calibration, system_masks=[park_rect(park)],
-                        context=DiffContext(run.run_id, cp.checkpoint_id, cp.tier), params=run.params)
+                        context=DiffContext(run.run_id, cp.checkpoint_id, cp.tier, synthetic=synthetic),
+                        params=run.params)
         comparison = inv.compare(base.models, cand.models, rules)
         if res.terminal is not None:
             t = res.terminal
@@ -421,6 +427,7 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
                 else:
                     def above(a: np.ndarray, b: np.ndarray) -> bool:
                         return diff_pair(a, b, reg, calibration=run.calibration, system_masks=[park_rect(park)],
+                                         context=DiffContext(run.run_id, cp.checkpoint_id, cp.tier, synthetic=synthetic),
                                          params=run.params).level == "above"
                     if recapturable and budget_ok:
                         again = [recapture(), recapture()]
@@ -458,11 +465,12 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
         ev.crop = (0, 0, w, h)
     if store is not None and not synthetic and ev.phash and ev.region:
         look = store.lookup_decisions(Signature(cp.checkpoint_id, ev.region, ev.phash, ev.category),
-                                      at=run.now.isoformat())
+                                      at=run.now.isoformat(), run_id=run.run_id, manifest_entries=run.entries,
+                                      manifest_tickets=run.tickets)
         ev.related = [{"decision_id": m.decision.decision_id, "hamming": m.distance} for m in look.related]
-        if look.matches:
+        if look.applicable and not look.frozen:      # a frozen signature inherits nothing (9.7)
             facts = dataclasses.replace(facts, decisions=tuple(DecisionMatch(m.decision, m.distance)
-                                                               for m in look.matches))
+                                                               for m in look.applicable))
             ev.facts, ev.classified = facts, classify(facts)
             if look.conflict:
                 ev.conflicts = [{"decision_id": m.decision.decision_id, "verdict": m.decision.verdict}
@@ -485,6 +493,8 @@ def _with_review(ev: Evaluated, review: Review) -> None:
         c = dataclasses.replace(c, classification=dataclasses.replace(cls, model_id=review.model_id,
                                                                        prompt_hash=review.prompt_hash))
     ev.classified = c
+    if not (c.reason or "").startswith("decision:"):
+        ev.facts_category = c.outcome     # the verdict decided the category; a decision would not have
 
 
 # ------------------------------------------------------------------------------------------------
@@ -810,6 +820,7 @@ def _abort_config(store: Store, scenario: Scenario, cfg_root: Path, errors: list
     """1.7 T+0:00: a lint failure ends the run aborted_harness (reason: config_invalid)."""
     store.begin_run(_run_plan(scenario.run_id, scenario.run_type, cfg_root, (), (), started, None, scenario.pr,
                               scenario.author))
+    store.fill_unreached(scenario.run_id, "harness_error", "config_invalid")   # 1.10: none was scoped yet
     run = store.end_run(RunOutcome(scenario.run_id, scenario.run_type, "aborted_harness", "provisioned",
                                    reason="config_invalid", started_at=started, ended_at=_ts(today, scenario.clock, 60)))
     ctx = ReportContext(pr=scenario.pr or 0, candidate_build=scenario.candidate.build_id,
@@ -866,22 +877,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         mismatch = compare_fingerprints({"match": dict(run.fp_match, build_id=base_id)},
                                         {"match": dict(run.fp_match, build_id=scenario.candidate.build_id)})
         assert mismatch is None
-        rev = reviewer or SimulatedReviewer()
-        # -- 5.17 per checkpoint
-        evals: list[Evaluated] = []
-        for k, cp in enumerate(planned):
-            live = cp.data_mode == "masked_live"
-            base_cap = run.capture(cp, "base", tick=1 if live else 0)
-            cand_cap = run.capture(cp, "candidate", tick=2 if live else 0)
-            att = plan.attribution.get(cp.surface_id)
-            ticks = iter(range(3, 9))
-            ev = evaluate(run, cp, base_cap, cand_cap, x=plan.x_input(cp.surface_id),
-                          primitive=att.primitive if att else None, entry_ref=att.entry_id if att else None,
-                          recapture=lambda cp=cp: run.capture(cp, "candidate", tick=next(ticks)),
-                          recapturable=_recapturable(cfg, cp), store=store)
-            evals.append(ev)
-        calls = _review_pass(run, evals, rev, scenario.reviewer_cap)
-        # -- records, store
+        # -- T+0:00 to 0:02: the run row, its scope and shards (1.7)
         arts = ArtifactStore(out / "artifacts", f"runs/{scenario.run_id}")
         writer = _Writer(run, arts, today, scenario.clock)
         _register(store, cfg, [base_id, scenario.candidate.build_id], [base_id, scenario.candidate.build_id], today)
@@ -899,6 +895,21 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         mtext = (cfg.root / "manifests" / f"{scenario.candidate.build_id}.yaml")
         store.begin_run(_run_plan(scenario.run_id, "pr", cfg.root, scope_entries, shards, started,
                                   mtext.read_text() if mtext.exists() else None, scenario.pr, scenario.author))
+        rev = reviewer or SimulatedReviewer()
+        # -- 5.17 per checkpoint
+        evals: list[Evaluated] = []
+        for k, cp in enumerate(planned):
+            live = cp.data_mode == "masked_live"
+            base_cap = run.capture(cp, "base", tick=1 if live else 0)
+            cand_cap = run.capture(cp, "candidate", tick=2 if live else 0)
+            att = plan.attribution.get(cp.surface_id)
+            ticks = iter(range(3, 9))
+            ev = evaluate(run, cp, base_cap, cand_cap, x=plan.x_input(cp.surface_id),
+                          primitive=att.primitive if att else None, entry_ref=att.entry_id if att else None,
+                          recapture=lambda cp=cp: run.capture(cp, "candidate", tick=next(ticks)),
+                          recapturable=_recapturable(cfg, cp), store=store)
+            evals.append(ev)
+        calls = _review_pass(run, evals, rev, scenario.reviewer_cap)
         for f in plan.findings:
             store.write_finding(dataclasses.replace(f, created_at=started))
         for n in run.expiry_notices:

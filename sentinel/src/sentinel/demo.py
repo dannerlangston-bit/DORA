@@ -34,7 +34,7 @@ from . import synth
 from .pipeline.reviewer import SIMULATED_MODEL_ID
 from .pipeline.run import (DEFAULT_TODAY, NOT_SIMULATED, NightlyScenario, RunResult, Scenario, record_decisions,
                            run_nightly, run_pipeline)
-from .pipeline.sim import VISUAL_CHANGES, SimBuild
+from .pipeline.sim import SimBuild
 from .store import Store
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "example"

@@ -19,7 +19,7 @@ from .. import invariants as inv
 from ..canary import Catalog, parse_catalog
 from ..diff.regions import MaskRecord
 from ..lint.repo import Repo
-from ..scope import DependencyMap, Flow, Manifest, Registry, Workspace
+from ..scope import DependencyMap, Flow, Registry, Workspace
 
 
 def materialize(config_dir: str | Path, overlay: Mapping[str, str | bytes], dest: str | Path) -> Path:

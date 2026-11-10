@@ -337,6 +337,10 @@ def _in_scope(m: DecisionMatch, facts: Facts) -> bool:
     d = m.decision
     if d.verdict != "intended":
         return True
+    # 9.7: a waiver (mark_intended on an invariant_violation or assertion_failed signature) applies to
+    # every run while it is active; its expiry is enforced by the store (L-DEC-07).
+    if d.signature.category in ("invariant_violation", "assertion_failed"):
+        return True
     # L-02, 4.3 Missing manifest: the `intended` category is disabled for a no-manifest run, so an
     # intended decision is not in scope there and the item falls through to rows 15 to 18.
     if facts.manifest in ("no_manifest_ui", "no_manifest_nonui"):

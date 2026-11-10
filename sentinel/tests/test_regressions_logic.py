@@ -260,3 +260,17 @@ def test_l11_rescued_clean_capture_does_not_count_as_an_observed_intended_change
     shown = DiffSummary(regions=[RegionDiff("rgn.ladder.viewport", 0.03, 0.8, True)])
     rows, findings = manifest_coverage("run-pr-1", manifest, [replace(rec, diff=shown)])
     assert rows[0].status == "verified_visible" and findings == []
+
+
+def test_waiver_applies_to_every_run_while_active():
+    """9.7: a waiver (mark_intended on an invariant_violation signature) is not limited by the ticket
+    scope that limits ordinary intended decisions; the outcome stays invariant_violation and the
+    decision is linked as the waiver."""
+    wsig = Signature(SIG.checkpoint_id, SIG.region_id, SIG.phash, "invariant_violation")
+    w = Decision("dec-9", "mark_intended", "intended", wsig, decided_by="alice",
+                 decided_at="2026-11-01T00:00:00+00:00", ticket="TOS-9", build_pair_id="pair-1")
+    facts = Facts(invariant_ids=("INV-01",), invariant_stability="stable", manifest="undeclared",
+                  decisions=(DecisionMatch(w, hamming=0),), build_pair_id="pair-2")
+    c = classify(facts)
+    assert c.outcome == "invariant_violation"
+    assert c.decision_ref == "dec-9"

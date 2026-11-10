@@ -31,9 +31,11 @@ Choices where the spec is ambiguous (each is reported to the coordinator):
    on (surface, splitter) so a ladder runs in its mandatory order in one session (2.5.1, 2.5.2).
    `masked_live` items take a pair of identically fingerprinted rigs; with no such pair they are
    `not_run (reason: budget)` (3.1). A flow with any `masked_live` checkpoint is a lockstep item.
+   The soak rig and the Explorer rig are outside the pool (1.9, 11.3).
 7. Cost on a rig: per-side duration from the run database (defaults 11.2: census visit 12 s, sweep
    or split step 8 s, flow 90 s, soak cycle 15 min) times 2 for a frozen item without a reusable
-   base (base then candidate on one rig) and times 1 with one; a `masked_live` item costs its
+   base (base then candidate on one rig) and times 1 with one, reuse being decided against the
+   fingerprint of the rig the item is placed on; a `masked_live` item costs its
    per-side duration on each rig of its pair. Session startups are not modelled. The budget is the
    pseudocode's B (PR 45 min, merge 3 h, RC 8 h - 10 min - 90 min) unless overridden.
 8. Ladder F's ascending pass revisits six grid sizes whose checkpoint ids the grammar of 4.1 cannot
@@ -56,7 +58,7 @@ from __future__ import annotations
 import fnmatch
 import hashlib
 import itertools
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Iterable, Iterator, Mapping, Sequence
 
 from .records import DATA_MODES, PERSONAS, CheckpointOutcome, Finding
@@ -538,12 +540,14 @@ class BaseReuse:
     redaction_version: str = ""
     region_versions: Mapping[str, str] = field(default_factory=dict)
 
-    def source_for(self, checkpoint_id: str) -> str | None:
-        """The run whose base capture this checkpoint reuses, or None when it must be re-captured."""
+    def source_for(self, checkpoint_id: str, fingerprint_id: str | None = None) -> str | None:
+        """The run whose base capture this checkpoint reuses, or None when it must be re-captured.
+        `fingerprint_id` is the live fingerprint of the rig the item runs on, when known."""
         b = self.stored.get(checkpoint_id)
         if b is None:
             return None
-        same = (b.fingerprint_id == self.fingerprint_id and b.data_epoch_id == self.data_epoch_id
+        live_fp = self.fingerprint_id if fingerprint_id is None else fingerprint_id
+        same = (b.fingerprint_id == live_fp and b.data_epoch_id == self.data_epoch_id
                 and b.redaction_version == self.redaction_version
                 and b.region_version == self.region_versions.get(checkpoint_id, ""))
         return b.source_run_id if same else None
@@ -876,25 +880,37 @@ def _rig_pairs(rigs: Sequence[Rig]) -> list[tuple[str, str]]:
     return [(g[i], g[i + 1]) for g in groups.values() for i in range(0, len(g) - 1, 2)]
 
 
-def _order_and_cut(items: list[PlanItem], rigs: Sequence[Rig], soak_rig: Rig | None, budget_s: float
+def _order_and_cut(items: list[PlanItem], rigs: Sequence[Rig], soak_rig: Rig | None, budget_s: float,
+                   explorer_rig: str | None = None, base_reuse: BaseReuse | None = None
                    ) -> tuple[list[PlanItem], dict[str, list[PlanItem]], list[Cut], dict[str, float]]:
     """`order_and_cut` of 2.11: sort, shard, then cut the last item of the highest tier on an over-budget rig."""
     if not rigs:
         raise ScopeConfigError("a run needs at least one rig")
+    # L-07, L-08 (1.9, 11.2, 11.3): the soak rig carries only the soak and the Explorer rig no
+    # scripted work, so neither is in the sharding pool.
+    pool = [r for r in rigs if r.id != explorer_rig and (soak_rig is None or r.id != soak_rig.id)]
+    if not pool and any(it.kind != "soak" for it in items):
+        raise ScopeConfigError("a run needs at least one rig for scripted work besides the soak and Explorer rigs")
+    fingerprint = {r.id: r.fingerprint_id for r in pool}
     items = sorted(items, key=lambda it: (it.tier, KIND_ORDER[it.kind], -it.estimated_s, it.order))
-    pairs = _rig_pairs(rigs)
+    pairs = _rig_pairs(pool)
     cuts: list[Cut] = []
     placed: list[PlanItem] = []
     for it in items:
         if it.kind == "soak":
-            it.rigs = (soak_rig.id,) if soak_rig else (rigs[0].id,)
+            it.rigs = (soak_rig.id,) if soak_rig else (pool[0].id,)
         elif it.data_mode == "masked_live":
             if not pairs:
                 cuts.extend(Cut("budget", cp.surface_id, cp.tier, cp) for cp in it.checkpoints)
                 continue
             it.rigs = pairs[_stable_hash(it.shard_key) % len(pairs)]
         else:
-            it.rigs = (rigs[_stable_hash(it.shard_key) % len(rigs)].id,)
+            it.rigs = (pool[_stable_hash(it.shard_key) % len(pool)].id,)
+        if base_reuse is not None and it.kind != "soak":
+            # L-09, 3.1: a frozen base is reused only under the fingerprint of the rig the item runs on.
+            fp = fingerprint[it.rigs[0]]
+            it.checkpoints = [replace(cp, base_source_run_id=base_reuse.source_for(cp.checkpoint_id, fp))
+                              if cp.data_mode == "frozen" else cp for cp in it.checkpoints]
         placed.append(it)
 
     rig_ids = [r.id for r in rigs] + ([soak_rig.id] if soak_rig and soak_rig.id not in {r.id for r in rigs} else [])
@@ -994,7 +1010,7 @@ def compute_scope(run_type: str, manifest: Manifest | None, dep_map: DependencyM
     of `quarantine.yaml` (Q), `durations` per-side seconds by checkpoint id (flows by flow id).
     A PR manifest naming another candidate is treated as missing (L-MAN-09); merge and RC runs
     take the union manifest, `Manifest.union`, which is never absent (4.3). `soak` and `explorer_rig` apply to RC runs, and
-    `map_scan_failed` to merge runs (2.10.1).
+    `map_scan_failed` to merge runs (2.10.1). The soak and Explorer rigs never take scripted work (11.3).
     """
     if run_type in ("nightly", "calibration"):
         raise ValueError(f"{run_type} runs compute no scope; they take the canary and calibration lists (2.11)")
@@ -1080,7 +1096,8 @@ def compute_scope(run_type: str, manifest: Manifest | None, dep_map: DependencyM
 
     items, filtered = _common_filters(items, ctx, flow_map, E, Q)
     budget = float(budget_s if budget_s is not None else BUDGET_S[run_type])
-    kept, by_rig, budget_cuts, overrun = _order_and_cut(items, rigs, soak.rig if soak and run_type == "rc" else None, budget)
+    kept, by_rig, budget_cuts, overrun = _order_and_cut(items, rigs, soak.rig if soak and run_type == "rc" else None, budget,
+                                                        explorer_rig, base_reuse)
 
     proposed = []
     if impact is not None:
@@ -1128,7 +1145,7 @@ def merge_run_findings(run_id: str, findings: Iterable[Finding], prs: Iterable[P
                 if any(class_matches(cls, r) for paths in reach[pr.run_id].values() for cls in paths for r in s.roots):
                     out.add("missed_in_pr_run", f"missed by static impact: {pr.run_id} had {sid} not_run (scope) and "
                             "the dependency index reaches it from a class the PR changed",
-                            checkpoint_id=f.checkpoint_id, tier=f.tier,
+                            checkpoint_id=f.checkpoint_id, tier=f.tier, detail="static_impact",
                             evidence={"raw_values": {**raw, "detail": "static_impact"}})
             consumed = sorted(set(s.primitives) & pr.touched_primitives)
             if sid not in pr.change_scope and consumed:

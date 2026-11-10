@@ -334,12 +334,21 @@ def _in_scope(m: DecisionMatch, facts: Facts) -> bool:
     d = m.decision
     if d.verdict != "intended":
         return True
-    return ((m.build_pair_id is not None and m.build_pair_id == facts.build_pair_id)
+    # L-02, 4.3 Missing manifest: the `intended` category is disabled for a no-manifest run, so an
+    # intended decision is not in scope there and the item falls through to rows 15 to 18.
+    if facts.manifest in ("no_manifest_ui", "no_manifest_nonui"):
+        return False
+    # L-01, F38: the pair the decision was made on is on the Decision record; a DecisionMatch may
+    # repeat it. Whichever is set must equal this run's pair.
+    pairs = {p for p in (m.build_pair_id, d.build_pair_id) if p is not None}
+    return ((bool(pairs) and pairs == {facts.build_pair_id})
             or (d.manifest_entry_ref is not None and d.manifest_entry_ref in facts.manifest_entries)
             or (d.ticket is not None and d.ticket in facts.manifest_tickets))
 
 
 def _memory(facts: Facts) -> _Memory:
+    if facts.rescued:       # L-03, 3.11 notes rows 13 and 14: a rescued checkpoint ignores decision memory
+        return _Memory("none")
     live = [m for m in facts.decisions if m.decision.status == "active" and _in_scope(m, facts)]
     if not live:
         return _Memory("none")

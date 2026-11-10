@@ -113,7 +113,7 @@ Classes. The table maps the starter catalog to class names; the class enum in 4.
 | `font_height` | M16 | Downscale one row to a 5 px cap height | `invariant_violation` INV-07 |
 | `scrollbar` | M17 | Draw a scrollbar thumb on an empty grid | `invariant_violation` INV-06 |
 | `redaction` | M19 | Leave a synthetic account id unredacted in the input frame | Redaction stage masks it and the egress log shows the hit; else `harness_error` (6.10 Redaction pipeline and egress log) |
-| `sub_floor` (control) | M20 | Shift one divider by 1 px | `noise`; any finding is the miss (over-firing) |
+| `sub_floor` (control) | M20 | Shift one divider by 1 px | `noise` or `identical` (absorbed); any finding is the miss (over-firing) |
 | `global_shift` | M21, M23 | Translate the whole window 1 px, or add 6 to the red channel everywhere | One whole-window `needs_human (reason: global_shift)` cluster from the pre-pass of 3.7 under the run-level `global_rendering_shift` finding, zero region findings |
 | `landmark_loss` | M22 | Erase the dialog title | `landmark_missing`, never a blind diff |
 | `study_removed` | M24 | Erase the SMA line on the standard chart | `collateral` on the chart region |

@@ -5968,7 +5968,7 @@ Classes. The table maps the starter catalog to class names; the class enum in 4.
 | `font_height` | M16 | Downscale one row to a 5 px cap height | `invariant_violation` INV-07 |
 | `scrollbar` | M17 | Draw a scrollbar thumb on an empty grid | `invariant_violation` INV-06 |
 | `redaction` | M19 | Leave a synthetic account id unredacted in the input frame | Redaction stage masks it and the egress log shows the hit; else `harness_error` (6.10 Redaction pipeline and egress log) |
-| `sub_floor` (control) | M20 | Shift one divider by 1 px | `noise`; any finding is the miss (over-firing) |
+| `sub_floor` (control) | M20 | Shift one divider by 1 px | `noise` or `identical` (absorbed); any finding is the miss (over-firing) |
 | `global_shift` | M21, M23 | Translate the whole window 1 px, or add 6 to the red channel everywhere | One whole-window `needs_human (reason: global_shift)` cluster from the pre-pass of 3.7 under the run-level `global_rendering_shift` finding, zero region findings |
 | `landmark_loss` | M22 | Erase the dialog title | `landmark_missing`, never a blind diff |
 | `study_removed` | M24 | Erase the SMA line on the standard chart | `collateral` on the chart region |
@@ -6862,7 +6862,7 @@ One catalog file, `sentinel-config/canaries/mutants.yaml`, with the entry schema
 | M17 | `scrollbar` | `census/monitor.activity.working-orders/ws.tier-a.active-trader` | Scrollbar drawn on the empty grid | `invariant_violation (reason: INV-06)` | no |
 | M18 | `erased_control` | `census/sidebar.account-info/ws.tier-a.active-trader` | "Net Liq" label erased | `invariant_violation (reason: INV-05)` || no |
 | M19 | `redaction` | `census/sidebar.account-info/ws.tier-a.active-trader` | Synthetic account id left unredacted in the input frame | The redaction stage masks it and the egress log shows the hit; the account id is an identity field, not a money cell, so a miss is `harness_error (reason: safety_canary_blind:redaction)` as for the redaction canary (6.10) | no |
-| M20 | `sub_floor` (control) | `flow/trade.order-entry.stock/flow.trade.order-ticket.stock.limit/s06` | One divider shifted 1 px | `noise (reason: below_floor)`; any finding is the miss (over-firing) | no |
+| M20 | `sub_floor` (control) | `flow/trade.order-entry.stock/flow.trade.order-ticket.stock.limit/s06` | One divider shifted 1 px | `noise (reason: below_floor)` or `identical` (a 1 px shift is often below the pixel threshold everywhere, so the engine reports no change; both mean the detector absorbed it); any finding is the miss (over-firing) | no |
 | M21 | `global_shift` | `census/charts.charts/ws.tier-a.swing-trader` | Whole window translated 1 px | One `needs_human (reason: global_shift)` cluster from the whole-window pre-pass of 3.7 under the run-level `global_rendering_shift` finding, with one `layout_shift` finding and zero region findings | no |
 | M22 | `landmark_loss` | `flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07` | Dialog title erased | `landmark_missing (reason: landmark:<title landmark id>)`, never a blind diff || no |
 | M23 | `global_shift` | `census/monitor.activity.position-statement/ws.tier-a.active-trader` | Red channel +6 everywhere | One `needs_human (reason: global_shift)` cluster under the run-level `global_rendering_shift` finding with `color_shift` findings; zero component findings | no |

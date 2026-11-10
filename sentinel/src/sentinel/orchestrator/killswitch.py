@@ -258,7 +258,9 @@ class KillSwitchReport:
     steps: list[tuple[str, float]] = field(default_factory=list)
 
 
-def _login_ok(rig: Rig, allowlist: Allowlist, clock: Clock, fixture_account: str | None) -> bool:
+def recovery_login(rig: Rig, allowlist: Allowlist, clock: Clock, fixture_account: str | None) -> bool:
+    """A fresh scripted login with A1 and A2 (6.6 step 5): relaunch, LOGIN, an allowlisted selector, the fixture
+    account selected. True when the session is usable for the proof."""
     rig.launch()
     o = rig.login()
     if o.auth_error or o.challenge or o.session_kicked or o.live_selected or not o.vault_lease \
@@ -292,7 +294,7 @@ def execute_kill_switch(rig: Rig, decision: ControlResult, *, clock: Clock, allo
     steps.append(("kill_tree", clock.monotonic()))
     cancel = "not_needed"
     end: OrderBook | None = None
-    login_ok = _login_ok(rig, allowlist, clock, fixture_account)
+    login_ok = recovery_login(rig, allowlist, clock, fixture_account)
     steps.append(("recovery_login", clock.monotonic()))
     if login_ok:
         end = rig.read_orders()

@@ -6,12 +6,16 @@ hash) and the few-shot, mask, redaction and registry versions. `Verdict.to_revie
 classifier's input R (`classify.Review`), so every way a call can fail lands on the row 23 outcome
 3.11 names for it:
 
-| What happened | Verdict | 3.11 outcome |
-|---|---|---|
-| refusal, max_tokens, a second schema violation, a non-rate-limit 4xx, a response model other than the pin, a batch entry expired or errored twice, still pending 24 h after the deadline | `unavailable` | `needs_human (reason: reviewer_unavailable)`, `review_state: done` |
-| timeout, 5xx, 429 or connection failure after the SDK's retries (deferred to the Batch path, or left for the drainer) | `pending` | `needs_human (reason: reviewer_unavailable)`, `review_state: pending` |
-| beyond the run's call cap | `capped` (`call_cap`) | `needs_human (reason: reviewer_cap)`, `review_state: none` |
-| per-run ceiling or weekly cap reached while the item awaited a verdict | `capped` (`dollar_cap`, queued) | `needs_human (reason: reviewer_cap)`, `cause: dollar_cap`, `review_state: done` |
+- `unavailable` -> `needs_human (reason: reviewer_unavailable)`, `review_state: done`: refusal,
+  max_tokens, a second schema violation, a non-rate-limit 4xx, a response model other than the pin,
+  a batch entry expired or errored twice, an item still pending 24 hours after the deadline.
+- `pending` -> `needs_human (reason: reviewer_unavailable)`, `review_state: pending`: a timeout, 5xx,
+  429 or connection failure after the SDK's retries (deferred to the Batch path, or left for the
+  drainer), and every item queued on the Batch path.
+- `capped`, not queued -> `needs_human (reason: reviewer_cap)`, `review_state: none`: beyond the run's
+  call cap (`call_cap`), or a dollar ceiling already reached when the item was admitted (`dollar_cap`).
+- `capped` with `dollar_cap`, queued -> `needs_human (reason: reviewer_cap)`, `cause: dollar_cap`,
+  `review_state: done`: the per-run ceiling or the weekly cap stopped calls while it awaited a verdict.
 
 Paths (3.15, 10.7): a PR run, and any run while the Batch path is off (`ReviewerConfig.batch_enabled`),
 sends every item synchronously with concurrency 4; after 3 consecutive transient failures or a 429
@@ -54,7 +58,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
-from ..classify import Review
+from ..classify import ROUTING_THRESHOLD, Review
 from ..pipeline.reviewer import CLOSEST_ORDER
 from .budget import SpendLedger, cost_usd, rank_for_cap
 from .config import RUN_KINDS, ReviewerConfig
@@ -100,6 +104,7 @@ class Verdict:
     images_sent: int = 0
     bytes_sent: int = 0
     refusal_category: str | None = None
+    violations: tuple[str, ...] = ()     # each logged reviewer_schema_violation (3.13)
     mask_version: str = ""
     redaction_version: str = ""
     registry_version: str = ""
@@ -123,7 +128,7 @@ class Verdict:
         """The task C answer, when this is an answered task C item."""
         return self.answer["visibility"] if self.answer is not None and self.task == TASK_C else None
 
-    def to_review(self, threshold: float, region_pointer: str | None = None) -> Review:
+    def to_review(self, threshold: float = ROUTING_THRESHOLD, region_pointer: str | None = None) -> Review:
         """The classifier's input R (3.11) for a task A or B item."""
         if self.task == TASK_C:
             raise ValueError("task C feeds the manifest coverage table, not the classifier (2.12)")
@@ -199,6 +204,17 @@ def visibility_by_entry(verdicts: Iterable[Verdict]) -> dict[str, str]:
     return {e: next(x for x in ("visible", "unsure", "not_visible") if x in s) for e, s in sorted(seen.items())}
 
 
+def run_health(verdicts: Iterable[Verdict], alert_share: float = 0.02) -> dict:
+    """The Reviewer's run-health line (3.15): items by state and cause, schema violations, spend, and
+    whether unavailable items exceed 2 percent of the run's items (the on-call alert)."""
+    vs = list(verdicts)
+    unavailable = sum(v.state == "unavailable" for v in vs)
+    return {"items": len(vs), "by_state": dict(sorted(Counter(v.state for v in vs).items())),
+            "by_cause": dict(sorted(Counter(v.cause for v in vs if v.cause).items())),
+            "schema_violations": sum(len(v.violations) for v in vs), "cost_usd": sum(v.cost_usd for v in vs),
+            "alert_on_call": bool(vs) and unavailable / len(vs) > alert_share}
+
+
 def custom_id(queue_key: str, copy: int, attempt: int) -> str:
     """The Message Batches `custom_id` of one copy of one item (module docstring)."""
     return f"rv-{hashlib.sha256(queue_key.encode()).hexdigest()[:40]}-{copy}-{attempt}"
@@ -217,6 +233,7 @@ class _Acc:
     latency_ms: int = 0
     calls: int = 0
     refusal_category: str | None = None
+    violations: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -277,6 +294,8 @@ class ReviewerJob:
         keys = [i.queue_key for i in items]
         if len(set(keys)) != len(keys):
             raise ValueError("queue keys must be unique within one review call (10.7)")
+        if self.config.batch_enabled and self.deadline is None:
+            raise ValueError("the Batch path needs the run's report deadline (3.15)")
         verdicts: dict[str, Verdict] = {}
         todo = self._admit(items, verdicts)
         if self.run_kind in SYNC_RUN_KINDS or not self.config.batch_enabled:
@@ -322,11 +341,12 @@ class ReviewerJob:
         if self.deadline is not None and now >= self.deadline - timedelta(seconds=self.config.deadline_margin_s) \
                 and not st.fallback_done:
             st.fallback_done = True
-            for key in self._open_keys():
-                if st.items[key].tier == 1:
-                    v = self._sync_item(st.items[key], acc=st.acc[key])
-                    if v.state != "pending":
-                        newly[key] = self._final(key, v)
+            tier1 = [k for k in self._open_keys() if st.items[k].tier == 1]
+            with ThreadPoolExecutor(max_workers=self.config.sync_concurrency) as pool:
+                late = list(pool.map(lambda k: self._sync_item(st.items[k], acc=st.acc[k]), tier1))
+            for key, v in zip(tier1, late):
+                if v.state != "pending":
+                    newly[key] = self._final(key, v)
         if self.deadline is not None and now >= self.deadline + timedelta(seconds=self.config.give_up_after_s):
             for key in self._open_keys():
                 newly[key] = self._final(key, self._verdict(st.items[key], "unavailable", st.acc[key], path="batch",
@@ -401,7 +421,7 @@ class ReviewerJob:
     def _attempt(self, item: ReviewItem, params: Mapping[str, Any], acc: _Acc) -> tuple[str, Any]:
         """One answer, re-sent once on a schema violation (3.13): ('answer', dict), ('failed', cause),
         ('transient', kind) or ('stopped', 'run' | 'week')."""
-        for tries in (1, 2):
+        for _ in (1, 2):
             stop = self.ledger.stop_reason()
             if stop is not None:
                 return "stopped", stop
@@ -417,6 +437,7 @@ class ReviewerJob:
             kind, value = self._evaluate(resp, item)
             if kind != "violation":
                 return kind, value
+            acc.violations.append("; ".join(value))
         return "failed", "schema_violation"
 
     def _borderline(self, confidence: float) -> bool:
@@ -434,12 +455,12 @@ class ReviewerJob:
             cause=cause, detail=detail, queued=queued, path=path, votes=votes, response_models=tuple(acc.models),
             request_ids=tuple(acc.request_ids), usage=acc.usage, cost_usd=acc.cost, latency_ms=acc.latency_ms,
             calls=acc.calls, images_sent=acc.images * acc.calls, bytes_sent=acc.bytes * acc.calls,
-            refusal_category=acc.refusal_category, mask_version=item.mask_version,
+            refusal_category=acc.refusal_category, violations=tuple(acc.violations), mask_version=item.mask_version,
             redaction_version=item.redaction_version, registry_version=item.registry_version)
 
     def _capped(self, item: ReviewItem, stop: str, *, queued: bool, acc: _Acc | None) -> Verdict:
-        detail = (f"per-run ceiling of {self.config.run_ceiling_usd:g} USD" if stop == "run"
-                  else f"weekly cap of {self.config.weekly_cap_usd:g} USD")
+        detail = (f"per-run ceiling of {self.ledger.run_ceiling_usd:g} USD" if stop == "run"
+                  else f"weekly cap of {self.ledger.weekly_cap_usd:g} USD")
         return self._verdict(item, "capped", acc, path="none", cause="dollar_cap", detail=detail, queued=queued)
 
     def _answered(self, item: ReviewItem, answer: dict, acc: _Acc, *, path: str,
@@ -513,8 +534,6 @@ class ReviewerJob:
     def _submit(self, items: Sequence[ReviewItem], verdicts: dict[str, Verdict]) -> None:
         if not items:
             return
-        if self.deadline is None:
-            raise ValueError("the Batch path needs the run's report deadline (3.15)")
         st = self._batch = self._batch or _BatchState()
         stop = self.ledger.stop_reason()
         requests, fresh = [], []
@@ -566,6 +585,7 @@ class ReviewerJob:
             if kind == "failed":
                 c.status, c.cause = "failed", value
                 return
+            acc.violations.append("; ".join(value))
             bucket, cause = "violation", "schema_violation"
         else:
             bucket, cause = e.kind, f"batch_{e.kind}"

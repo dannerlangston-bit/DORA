@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable
 
-from ..classify import Review
+from ..classify import ROUTING_THRESHOLD, Review
 from .job import ReviewerJob, Verdict
 from .prompt import ReviewItem
 
@@ -28,7 +28,7 @@ class ReviewerUnavailable(RuntimeError):
         super().__init__(f"{verdict.state}: {verdict.cause}")
         self.verdict = verdict
 
-    def review(self, threshold: float) -> Review:
+    def review(self, threshold: float = ROUTING_THRESHOLD) -> Review:
         return self.verdict.to_review(threshold)
 
 

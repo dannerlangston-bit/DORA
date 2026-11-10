@@ -168,7 +168,8 @@ class AnthropicTransport:
         return self._call(self._client.messages.batches.retrieve, batch_id).processing_status == "ended"
 
     def batch_results(self, batch_id: str) -> Iterator[BatchEntry]:
-        for r in self._call(self._client.messages.batches.results, batch_id):
+        lines = self._call(lambda: list(self._client.messages.batches.results(batch_id)))   # read errors map too
+        for r in lines:
             kind = r.result.type
             if kind == "succeeded":
                 yield BatchEntry(r.custom_id, kind, _response(r.result.message))

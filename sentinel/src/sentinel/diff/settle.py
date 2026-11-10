@@ -13,10 +13,16 @@ third, which is the same pixels outside masks). An unexpected modal up at `max_w
 Choice (3.5 is ambiguous about `timeout`): when `max_wait` elapses, the reason is the condition
 that held at the end ("whichever held at timeout", 4.7 `wait_for`): `unexpected_window:<title>`,
 `anchor_missing` (conditions 2 and 3, the control or anchor named in `detail`),
-`anti_anchor_present`, or `frames_unstable`. `timeout` is the remaining case: the last failing
-condition was the parking condition (1), which has no code of its own, or nothing failed but too
-few frames arrived to form the triple; `detail` names the last failing condition either way.
-Frames closer than 250 ms to the previous frame of the run are skipped, never compared.
+`anti_anchor_present`, or `frames_unstable`. A condition that failed earlier and holds again by
+the end is not the reason: conditions 1 to 4 recover on a frame that passes them, and condition 5
+on a frame identical to the one before it. `timeout` is the remaining case: the condition failing
+at the end was the parking condition (1), which has no code of its own, or nothing was failing
+any more but too few frames arrived to form the triple; `detail` names the last failing condition
+either way (marked recovered when it no longer held). Frames closer than 250 ms to the previous
+frame of the run are skipped, never compared.
+
+Frames are RGB like every capture (an `mss` grab, BGRA, is converted by the platform side);
+template matching drops a fourth (alpha) channel and repeats a grayscale frame to 3 channels.
 
 Re-run (3.10). An above-threshold diff is re-captured up to twice, an `invariant_violation` once
 to confirm persistence (F49), an `assertion_failed` never. Every settled candidate capture is
@@ -159,7 +165,8 @@ def settle(frames: Iterable[Frame], spec: SettleSpec, params: Mapping[str, Any] 
     max_wait = spec.max_wait_ms or int(sp["max_wait_long_ms"] if spec.long_wait else sp["max_wait_ms"])
     run: list[Frame] = []
     last: Frame | None = None
-    last_fail: tuple[str, str] | None = None
+    last_fail: tuple[str, str] | None = None     # the condition failing at the latest frame
+    prior_fail: tuple[str, str] | None = None    # the last condition that failed at all (a timeout's detail)
     ignore: np.ndarray | None = None
     seen: dict[str, bool] = {}          # template results, valid while frames stay pixel-identical
     for f in frames:
@@ -171,23 +178,33 @@ def settle(frames: Iterable[Frame], spec: SettleSpec, params: Mapping[str, Any] 
         last = f
         fail = _failing(f, spec, confidence, int(sp["tooltip_delay_ms"]), seen)
         if fail is not None:
-            run, last_fail = [], fail
+            run, last_fail, prior_fail = [], fail, fail
             continue
+        if last_fail is not None and last_fail[0] != "frames_unstable":
+            last_fail = None                      # conditions 1 to 4 hold again on this frame
         if run and f.t_ms - run[-1].t_ms < interval:
             continue
         if ignore is None or ignore.shape != f.image.shape[:2]:
             ignore = _ignore_mask(f.image.shape[:2], spec, int(sp["park_mask_px"]))
         if run and not (run[-1].image.shape == f.image.shape
                         and np.array_equal(run[-1].image[~ignore], f.image[~ignore])):
-            run, last_fail = [f], ("frames_unstable", "condition 5: consecutive frames differ outside masks")
+            run = [f]
+            last_fail = prior_fail = ("frames_unstable", "condition 5: consecutive frames differ outside masks")
             continue
         run.append(f)
+        if len(run) > 1:
+            last_fail = None                      # condition 5 holds again: this frame equals the one before
         if len(run) == need:
             first = run[0]
             return SettleResult(True, first.image, first.t_ms, run[-1].t_ms, None, None, None, run[-1].t_ms)
     elapsed = last.t_ms if last is not None else 0
     if last_fail is None or last_fail[0] == "park":
-        detail = last_fail[1] if last_fail else f"fewer than {need} frames {interval} ms apart within {max_wait} ms"
+        if last_fail is not None:
+            detail = last_fail[1]
+        elif prior_fail is not None:
+            detail = f"{prior_fail[1]} (recovered; fewer than {need} frames {interval} ms apart within {max_wait} ms)"
+        else:
+            detail = f"fewer than {need} frames {interval} ms apart within {max_wait} ms"
         reason = "timeout"
     else:
         reason, detail = last_fail

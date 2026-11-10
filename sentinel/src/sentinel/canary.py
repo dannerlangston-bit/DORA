@@ -9,8 +9,9 @@ produced for each mutant and returns the `canary_results` rows of 8.3, the run's
 synthetic `harness_error` rows of 4.13 and the morning banner of 10.3.
 
 One recipe per class of the 10.3 class table, each a pure function
-``recipe(image, box, rng, **params) -> image`` over an 8-bit BGR frame and an ``(x, y, w, h)`` box from
-the Region Registry located by landmark. The money-cell flag comes from the catalog only: money cells
+``recipe(image, box, rng, **params) -> image`` over an 8-bit RGB frame (the channel order of the Diff
+Engine, `synth` and the landmark-template loader) and an ``(x, y, w, h)`` box from the Region Registry
+located by landmark. The money-cell flag comes from the catalog only: money cells
 are a closed list (Qty, Price, Buying Power Effect, Max Loss, Send, Cancel, Delete; F58, 3.8), so the
 ladder, P/L, balances, BUY and SELL labels and dialog titles are non-money and count toward
 `detector_degraded`, M12 among them.
@@ -18,16 +19,22 @@ ladder, P/L, balances, BUY and SELL labels and dialog titles are non-money and c
 Choices where the spec is ambiguous (reported to the coordinator):
 
 1. Glyph transplant (`swapped_digit`, `header_change`, 10.3): glyphs are columns of ink (pixels more
-   than 48 levels from the background sampled on the box's 4 px border); the donor is a different glyph
-   of the same row band across the whole frame, chosen by the seeded rng. There is no OCR here, so the
-   catalog's `from`/`to` params (M03) are descriptive only, and `header_change` cannot guarantee that
-   the new date is exactly one day later; it transplants a different glyph into the header.
+   than 48 levels from the box's interior background); a run of touching glyphs, as wide as
+   `round(width / (0.75 x ink height))` glyphs (a digit's advance is about three quarters of its
+   height), is split at the column of least ink nearest each even division, and a run with no clear
+   valley there (more than 60 percent of its peak column) cannot be isolated: never a target
+   (`GenerationError`) and never a donor, so one glyph is replaced, never several. The donor is a
+   different glyph of the same row band across the whole frame, chosen by the seeded rng. There is
+   no OCR here, so the catalog's `from`/`to` params (M03) are descriptive only, and `header_change`
+   cannot guarantee that the new date is exactly one day later; it transplants a different glyph
+   into the header. Touching glyphs narrower together than 1.125 x their height (a "1" against a
+   "0" in some fonts) still read as one glyph.
 2. Parameter ranges the table does not give: `shifted_panel` without `dx`/`dy` moves 8 to 12 px (the
    M08 and M09 values) in an rng-chosen direction; `scrollbar` draws a 12 px track with a thumb of 20 to
    50 percent of the box height; `error_dialog` synthesizes the Java exception dialog with OpenCV
    (no template asset ships with the core); `redaction` plants 9 rng digits unless `text` is given;
    `window_offscreen` moves the frame to `x` (default -200, M30) and fills the uncovered strip with
-   black desktop; `study_removed` needs the study's BGR `color` and inpaints it (Telea, radius 3).
+   black desktop; `study_removed` needs the study's RGB `color` and inpaints it (Telea, radius 3).
    Erase and translate fills use the 4 px border background of 10.3; the value-region recipes (glyphs,
    clipping, rows, placeholder, font height, scrollbar, typed value, cell shift) use the region's most
    common interior color, so a white field stays white around the new text.
@@ -51,6 +58,11 @@ Choices where the spec is ambiguous (reported to the coordinator):
    footprint, a region above threshold that is the `region_ref`, or the classification's region
    pointer. `gateway` is detected on step status `blocked_by_gateway`; `redaction` on the redaction
    hit (12.5 M19). Borderline Reviewer verdicts must already be re-sampled (3.15) before `score`.
+   The below-threshold control `sub_floor` (M20) is detected whenever the path absorbed it, that is
+   on any outcome without a finding (`identical` or `noise`, 10.3 class table and 12.5 M20), whatever
+   its `expected` list says: under the zero floor of a frozen region a 1 px divider shift is either
+   under the YIQ threshold everywhere (`identical`) or above it, never `below` (`noise`). The
+   identical control `aa_control` (M25) still needs its expected `identical`.
 8. Rolling floor: the lower of the median of the class's last 14 nightly rates minus 5 points and
    90 percent; 90 percent with no history; never below 95 percent once Phase 2 exits (read literally,
    the floor is then 95 percent). Tonight's rate is detected over scored non-money mutants of the class,
@@ -99,6 +111,7 @@ CLASSES = (                                           # the 26 names of the 10.3
 )
 BEHAVIORAL_CLASSES = frozenset({"wrong_quantity", "blank_field", "gateway", "window_offscreen"})
 CONTROL_CLASSES = frozenset({"sub_floor", "aa_control"})   # M20, M25: collateral never counts (10.3)
+ABSORBED_OUTCOMES = ("identical", "noise")                  # no finding: what detects the sub_floor control (choice 7)
 WHOLE_WINDOW_CLASSES = frozenset({"global_shift", "window_offscreen", "focus_order", "aa_control"})
 OPS = ("erase", "translate", "replace_glyph", "channel_swap", "crop_right", "overlay", "remove_row", "type_value")
 ENTRY_KEYS = frozenset({"mutant_id", "name", "checkpoint_id", "class", "mode", "money_cell", "generator",
@@ -110,6 +123,8 @@ MUTANT_ID = re.compile(r"^M[0-9]{2,}$")
 BORDER_PX = 4          # 10.3 erased_control: background sampled from the 4 px border
 INK_DELTA = 48         # a channel this far from the background is ink
 CHROMA = 40            # max minus min channel above this is a colored pixel (color_swap)
+GLYPH_PITCH = 0.75     # a glyph's advance as a share of its ink height: splits touching glyphs (choice 1)
+GLYPH_VALLEY = 0.6     # a split column holds at most this share of the run's peak column ink (choice 1)
 FLOOR_CAP = 0.90       # 10.3 rolling floor
 FLOOR_MARGIN = 0.05
 FLOOR_TARGET = 0.95    # 9.11 rolling target once Phase 2 exits
@@ -257,7 +272,7 @@ def image_sha256(image: Image) -> str:
 
 def _check_image(image: Any) -> Image:
     if not isinstance(image, np.ndarray) or image.dtype != np.uint8 or image.ndim != 3 or image.shape[2] != 3:
-        raise GenerationError("approved capture must be an 8-bit BGR frame")
+        raise GenerationError("approved capture must be an 8-bit RGB frame (H x W x 3)")
     return image
 
 
@@ -300,6 +315,39 @@ def _runs(flags: NDArray[np.bool_]) -> list[tuple[int, int]]:
     """Start and end (exclusive) of each run of True."""
     d = np.diff(np.concatenate(([0], flags.astype(np.int8), [0])))
     return list(zip(np.flatnonzero(d == 1).tolist(), np.flatnonzero(d == -1).tolist()))
+
+
+def _glyphs(ink: NDArray[np.bool_]) -> tuple[dict[tuple[int, int], tuple[int, int]], set[tuple[int, int]]]:
+    """The glyphs of a row band (choice 1) as {(start, end) column: (top, bottom) row}, left to right, and
+    the ones that could not be isolated. Ink cut by the band's top or bottom is not a glyph of this row."""
+    h = ink.shape[0]
+    counts = ink.sum(axis=0)
+    glyphs: dict[tuple[int, int], tuple[int, int]] = {}
+    unsure: set[tuple[int, int]] = set()
+    for s, e in _runs(counts > 0):
+        rows = np.flatnonzero(ink[:, s:e].any(axis=1))
+        if rows[0] == 0 or rows[-1] == h - 1:
+            continue
+        n = max(1, round((e - s) / (GLYPH_PITCH * (rows[-1] + 1 - rows[0]))))
+        cuts, clear = [s], True
+        for k in range(1, n):                         # touching glyphs: cut at the ink valley nearest k/n
+            want = s + k * (e - s) / n
+            half = max(1, int((e - s) / n / 3))
+            cols = range(max(cuts[-1] + 1, int(want) - half), min(e - 1, int(want) + half + 1))
+            if not cols:
+                clear = False
+                continue
+            c = min(cols, key=lambda c: (counts[c], abs(c + 0.5 - want)))
+            clear = clear and counts[c] <= GLYPH_VALLEY * counts[s:e].max()
+            cuts.append(c + 1)                        # the valley column ends the left glyph
+        cuts.append(e)
+        for a, b in zip(cuts, cuts[1:]):
+            r = np.flatnonzero(ink[:, a:b].any(axis=1))
+            if r.size:
+                glyphs[(a, b)] = (int(r[0]), int(r[-1]) + 1)
+                if not clear:
+                    unsure.add((a, b))
+    return glyphs, unsure
 
 
 def _ink_color(crop: Image, bg: NDArray[np.uint8]) -> tuple[int, int, int]:
@@ -381,12 +429,7 @@ def replace_glyph(image: Image, box: Box, rng: np.random.Generator, *, position:
     x, y, w, h = _check_box(image, box)
     bg = interior_background(image[y:y + h, x:x + w])
     band = image[y:y + h]
-    ink = _ink(band, bg)
-    extent: dict[tuple[int, int], tuple[int, int]] = {}
-    for g in _runs(ink.any(axis=0)):
-        rows = np.flatnonzero(ink[:, g[0]:g[1]].any(axis=1))
-        if rows[0] > 0 and rows[-1] < h - 1:          # ink cut by the band is not a glyph of this row
-            extent[g] = (int(rows[0]), int(rows[-1]) + 1)
+    extent, unsure = _glyphs(_ink(band, bg))
     inside = [g for g in extent if g[0] >= x and g[1] <= x + w]
     if not inside:
         raise GenerationError("no glyph inside the target box")
@@ -400,8 +443,10 @@ def replace_glyph(image: Image, box: Box, rng: np.random.Generator, *, position:
         t = targets[int(rng.integers(len(targets)))]
     else:
         t = targets[int(position)]
+    if t in unsure:
+        raise GenerationError("cannot isolate one glyph of the target's run of touching glyphs")
     tbit, th = band[:, t[0]:t[1]], extent[t][1] - extent[t][0]
-    donors = [g for g, (r0, r1) in extent.items() if g != t and 0.6 * th <= r1 - r0 <= 1.4 * th
+    donors = [g for g, (r0, r1) in extent.items() if g != t and g not in unsure and 0.6 * th <= r1 - r0 <= 1.4 * th
               and not (g[1] - g[0] == t[1] - t[0] and np.array_equal(band[:, g[0]:g[1]], tbit))]
     if not donors:
         raise GenerationError("no different glyph in the row to transplant")
@@ -432,7 +477,7 @@ def channel_swap(image: Image, box: Box, rng: np.random.Generator) -> Image:
     colored = (c.max(axis=2) - c.min(axis=2)) > CHROMA
     if not colored.any():
         raise GenerationError("no colored pixels in the target box")
-    crop[colored] = crop[colored][:, [0, 2, 1]]
+    crop[colored] = crop[colored][:, [1, 0, 2]]          # RGB: red and green trade places
     return _paste(image, b, crop)
 
 
@@ -594,7 +639,7 @@ def global_shift(image: Image, box: Box, rng: np.random.Generator, *, dx: int | 
     """global_shift (M21, M23): translate the whole window 1 px, or add `delta` (6) to one channel everywhere."""
     _check_image(image)
     if delta is not None:
-        idx = {"blue": 0, "green": 1, "red": 2}[channel]
+        idx = {"red": 0, "green": 1, "blue": 2}[channel]          # RGB
         out = image.copy()
         out[..., idx] = np.clip(image[..., idx].astype(np.int16) + int(delta), 0, 255)
         return out
@@ -607,7 +652,7 @@ def global_shift(image: Image, box: Box, rng: np.random.Generator, *, dx: int | 
 
 
 def remove_study(image: Image, box: Box, rng: np.random.Generator, *, color: Sequence[int], tolerance: int = 40) -> Image:
-    """study_removed (M24): erase the study line of BGR `color` from the chart region by inpainting."""
+    """study_removed (M24): erase the study line of RGB `color` from the chart region by inpainting."""
     b = _check_box(image, box)
     crop, _ = _box_view(image, b)
     near = np.abs(crop.astype(np.int16) - np.array(color, np.int16)).max(axis=2) <= tolerance
@@ -709,10 +754,10 @@ def composite_error_dialog(image: Image, box: Box, rng: np.random.Generator, *, 
     ox, oy = int(rng.integers(0, w - dw + 1)), int(rng.integers(0, h - dh + 1))
     dlg = np.full((dh, dw, 3), 240, np.uint8)
     bar = max(10, dh // 6)
-    dlg[:bar] = (160, 90, 30)
+    dlg[:bar] = (30, 90, 160)                         # RGB: a blue title bar
     dlg[1:bar - 1, 3:dw // 2] = _with_text(dlg[1:bar - 1, 3:dw // 2], title, (255, 255, 255))
     r = max(3, min(10, (dh - bar) // 5))
-    cv2.circle(dlg, (6 + r, bar + 6 + r), r, (0, 0, 210), -1)
+    cv2.circle(dlg, (6 + r, bar + 6 + r), r, (210, 0, 0), -1)   # RGB: the red error icon
     left = 12 + 2 * r
     dlg[bar + 6:bar + 6 + 2 * r, left:dw - 4] = _with_text(dlg[bar + 6:bar + 6 + 2 * r, left:dw - 4], message, (0, 0, 0))
     cv2.rectangle(dlg, (dw // 2 - 15, dh - 16), (dw // 2 + 15, dh - 5), (200, 200, 200), -1)
@@ -832,7 +877,7 @@ def generate(catalog_entries: Iterable[MutantEntry], approved_images: Mapping[st
              catalog_hash_ok: bool = True) -> Generation:
     """Generate every mutant of the catalog from the approved captures (10.3 Determinism, 12.5).
 
-    `approved_images` maps checkpoint id to the approved BGR capture of the main build; `region_boxes`
+    `approved_images` maps checkpoint id to the approved RGB capture of the main build; `region_boxes`
     maps checkpoint id to {region id: (x, y, w, h)} located by landmark. An entry's own generator seed
     wins over `seed`. A missing capture, region or donor, a degenerate box, a generator exception, a
     mutant equal to its base, a sha256 that differs from `previous_manifest` for the same base and
@@ -992,6 +1037,8 @@ def _detected(m: Mutant, r: MutantResult) -> bool:
         return False
     if outcome in m.entry.expected.outcomes:
         return True
+    if m.defect_class == "sub_floor":
+        return outcome in ABSORBED_OUTCOMES            # absorbed below threshold; any finding is the miss
     return m.defect_class not in CONTROL_CLASSES and outcome in ("collateral", "needs_human") and _on_region(m, r)
 
 

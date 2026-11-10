@@ -10,8 +10,8 @@ hash, then rename into place. A failed write or a failed read-back is retried on
 
 Redaction (8.4, 6.10, 8.9): an image (or video) is refused unless it arrives with a redaction header saying the
 redaction stage passed and naming the redaction version; the refusal is `RedactionRefused`, which the caller
-turns into `harness_error (reason: redaction_version_missing)`. Images are recognised by media type, by kind and
-by their leading bytes, so a PNG declared as text is still caught.
+turns into `harness_error (reason: redaction_version_missing)`. Images are recognised by media type, by kind, by
+their leading bytes and by Pillow being able to read them, so a PNG, WebP or TIFF declared as text is still caught.
 
 Choices where 8.4 is silent:
 - The "redaction header" is the `Redaction` value passed with the bytes, the in-process form of the
@@ -44,7 +44,7 @@ EXTENSIONS = {
     "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/bmp": "bmp", "video/mp4": "mp4",
     "application/json": "json", "application/x-ndjson": "jsonl", "text/csv": "csv", "text/plain": "txt",
 }
-_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"BM")
+_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"BM", b"II*\x00", b"MM\x00*")
 MANIFEST = "manifest.json"
 
 
@@ -138,7 +138,8 @@ def _read_back(path: Path) -> bytes:
 def is_visual(data: bytes, kind: str, media_type: str) -> bool:
     """True for anything that may show the screen: image or video media type, a visual kind, or image bytes."""
     return (media_type.startswith(("image/", "video/")) or kind in VISUAL_KINDS
-            or data.startswith(_IMAGE_MAGIC))
+            or data.startswith(_IMAGE_MAGIC) or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+            or _dimensions(data) != (None, None))      # any other format Pillow reads is a picture too
 
 
 def _dimensions(data: bytes) -> tuple[int | None, int | None]:

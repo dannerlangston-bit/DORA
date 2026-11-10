@@ -202,8 +202,8 @@ def _watch_rows(rng: np.random.Generator, n: int) -> list[list]:
 
 
 def _ladder_split(fraction: float) -> tuple[dict, ScreenInfo]:
-    w, h = 960, 540
-    side = int(round(w * fraction))
+    side = int(round(960 * fraction))
+    w, h = max(960, side + 334), 540             # the ladder keeps room for its order strip
     rows = _watch_rows(np.random.default_rng(11), 10)
     layout = {"type": "window", "name": "main", "title": "Trade", "children": [
         {"type": "panel", "name": "side", "title": "Watchlist", "rect": [0, 0, side, h - 24], "children": [
@@ -462,17 +462,17 @@ def screen_model(screen: synth.Screen, controls: Mapping[str, str] | None = None
             p = by_name[p].parent if p in by_name else None
         return "frame"
 
+    is_control = [d.kind in CONTROL_KINDS or (d.kind == "titlebar" and (d.text or "") in controls) for d in comps]
+    names |= {d.name for d, c in zip(comps, is_control) if c or (d.kind in PANEL_KINDS and d.parent is not None)}
     for i, d in enumerate(comps):
-        if d.kind in CONTROL_KINDS or (d.kind == "titlebar" and (d.text or "") in controls):
+        if is_control[i]:
             share, _ = _visible(d.bbox, covers_after(i, d))
             cid = controls.get(d.text or "")
             score = TEMPLATE_SCORE * share
             ui.append(inv.UIComponent(d.name, inv.Rect(*d.bbox), "control", parent=parent_of(d), text=d.text,
                                       control_id=cid, confidence=round(score, 3)))
-            names.add(d.name)
         elif d.kind in PANEL_KINDS and d.parent is not None:
             ui.append(inv.UIComponent(d.name, inv.Rect(*d.bbox), "panel", parent=parent_of(d), text=d.text))
-            names.add(d.name)
         if d.kind in WORD_KINDS and d.text:
             ink = _ink_box(d)
             if ink is None:
@@ -530,6 +530,12 @@ def observe(base: synth.Screen, cand: synth.Screen, tickets: frozenset[str] = fr
             obs.append(Observation("resized", f"plot area {abs(dh)} px {'taller' if dh > 0 else 'shorter'}", d.bbox, tickets))
         elif d.kind in ("label", "text", "cell") and d.text != o.text and d.text and o.text:
             obs.append(Observation("text_change", f"{o.text!r} now reads {d.text!r}", d.bbox, tickets))
+    texts = [o for o in obs if o.change_type == "text_change"]
+    if len(texts) > 3:                            # one sentence for a reformatted column, not one per cell
+        first = texts[0]
+        obs = [o for o in obs if o.change_type != "text_change"]
+        obs.append(Observation("text_change", f"{len(texts)} values changed text, for example {first.text}",
+                               first.box, tickets))
     for kind, noun in (("price_cell", "price row"), ("row", "grid row")):
         nb = sum(1 for d in base.components if d.kind == kind)
         nc = sum(1 for d in cand.components if d.kind == kind)
@@ -569,6 +575,7 @@ class SimApp:
 
     def __init__(self, build: SimBuild):
         self.build = build
+        self._cache: dict[tuple, Capture] = {}
 
     # -- screens ---------------------------------------------------------------------------
     def layout(self, cp: PlannedCheckpoint, *, tick: int = 0) -> tuple[dict, tuple[int, int], ScreenInfo]:
@@ -589,7 +596,8 @@ class SimApp:
                 return layout, size, info
             if kind == "split":
                 layout, info = _ladder_split(float(step["fraction"]))
-                return layout, (960, 540), info
+                side = int(round(960 * float(step["fraction"])))
+                return layout, (max(960, side + 334), 540), info
             layout, info = _ladder_window((480, 420))
             return layout, (480, 420), info
         if s == "charts.flexible-grid.chart-cell":
@@ -624,7 +632,14 @@ class SimApp:
                 tick: int = 0) -> Capture:
         """Frames of the settle loop and the settled screen. A frozen checkpoint renders the same pixels
         every time; a `masked_live` one moves its live values with `tick`."""
-        screen, info = self.render(cp, tick=tick if cp.data_mode == "masked_live" else 0)
+        tick = tick if cp.data_mode == "masked_live" else 0
+        key = (cp.checkpoint_id, side, tick, tuple(sorted((controls or {}).items())))
+        if key not in self._cache:            # the same build renders the same pixels: render once
+            self._cache[key] = self._capture(cp, side, controls, tick)
+        return self._cache[key]
+
+    def _capture(self, cp: PlannedCheckpoint, side: str, controls: Mapping[str, str] | None, tick: int) -> Capture:
+        screen, info = self.render(cp, tick=tick)
         img = screen.image
         flash = img.copy()
         h, w = img.shape[:2]
@@ -670,7 +685,12 @@ class SimApp:
     @staticmethod
     def settle_spec(regfile: RegionsFile, park: tuple[int, int]) -> SettleSpec:
         """Settle parameters (3.5): the landmark as must-see anchor, masks ignored, the parking point."""
-        anchors = [Anchor(lm.id, template=lm.template) for lm in regfile.landmarks]
+        anchors = []
+        for lm in regfile.landmarks:          # searched near where the landmark was cut, as 3.7 searches
+            th, tw = lm.template.shape[:2]
+            ex, ey = lm.expected or (0, 0)
+            anchors.append(Anchor(lm.id, template=lm.template, search=Rect(max(0, ex - 40), max(0, ey - 40),
+                                                                           tw + 80, th + 80)))
         masks = [r.rect.offset(*regfile.landmark(r.landmark).expected) for r in regfile.regions
                  if r.type == "mask" and regfile.landmark(r.landmark).expected is not None]
         return SettleSpec(anchors=anchors, ignore=masks, park=park)

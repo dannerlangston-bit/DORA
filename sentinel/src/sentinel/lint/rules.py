@@ -37,10 +37,13 @@ Choices where the spec is ambiguous (reported):
    `connection-indicator`, `caret` or `parking`.
 9. L-MSK-03 measures a panel class as the bounding box of the checkpoint's regions of that class on
    one landmark; redaction anchors (`redaction/anchors.yaml`) on a landmark the checkpoint declares
-   count toward it unless `identity_field: true`.
+   count toward it unless `identity_field: true`. Every mask and every redaction box, identity or not,
+   is checked against the money cells (budget 0 percent). A rect with a non-positive w or h is an
+   L-RGN-00 (regions) or L-MSK-03 (redaction anchors) error and takes part in no geometry check.
 10. L-XREF-06 reports a manifest that still names a surface or primitive absent from the registry
     or the map, and a disagreement between map and registry, once per file.
-11. L-XREF-07's credential pattern: `password`, `passwd`, `pwd` or `secret` followed by `:` or `=`
+11. L-XREF-07's credential pattern: `password`, `passwd`, `pwd` or `secret`, alone or inside a key such
+    as `db_password` or `client_secret`, quoted or not, followed by `:` or `=`
     and a value that is not a vault reference, or a value after `:` of 20 or more characters with
     upper case, lower case and digits whose character class changes at least every 2.5 characters
     (random keys do, branch names and class names do not); `//` URIs and vault references are exempt.
@@ -297,7 +300,10 @@ FUTURE_MONTH = re.compile(r"^/(?P<root>[A-Z0-9]+?)(?P<month>[FGHJKMNQUVXZ])(?P<y
 ENTER_KEYS = frozenset({"enter", "return", "space", "spacebar", "ctrl+enter"})
 TARGET_FIELDS = ("target", "from", "to", "at")
 
-_CRED_KEY = re.compile(r"(?i)\b(?:password|passwd|pwd|secret)\b\s*[:=]\s*['\"]?(?P<v>[^\s'\",}\]#]+)")
+# The keyword may sit inside a snake_case key (`db_password`, `client_secret`, S-19) and a quoted key's closing quote
+# may sit before the separator (`"password": ...` in JSON, S-20); 4.15 L-XREF-07, 4.9 L-FIX-04.
+_CRED_KEY = re.compile(r"(?i)(?<![A-Za-z0-9])(?:password|passwd|pwd|secret)[A-Za-z0-9_]*['\"]?\s*[:=]\s*['\"]?"
+                       r"(?P<v>[^\s'\",}\]#]+)")
 _CRED_VALUE = re.compile(r":\s*['\"]?(?P<v>[^\s'\",{}\[\]#]{20,})")
 
 
@@ -417,9 +423,11 @@ def _num(v: Any) -> float | None:
 
 
 def _rect(r: Any) -> tuple[int, int, int, int] | None:
+    """(dx, dy, w, h) of a 4.8 rect; None unless all four are integers and the size is positive (S-23)."""
     r = _d(r)
     vals = [r.get(k) for k in ("dx", "dy", "w", "h")]
-    return tuple(vals) if all(isinstance(v, int) and not isinstance(v, bool) for v in vals) else None  # type: ignore[return-value]
+    ok = all(isinstance(v, int) and not isinstance(v, bool) for v in vals) and vals[2] > 0 and vals[3] > 0
+    return tuple(vals) if ok else None  # type: ignore[return-value]
 
 
 def _overlap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> int:
@@ -737,6 +745,11 @@ class _Linter:
                 continue
             for loc, msg in schemas.validate(name, doc.data):
                 self.add(rule, doc.rel, msg, loc)
+            if doc.kind in ("regions", "redaction"):        # 4.8 rect {dx, dy, w, h}: an offset and a size
+                for i, x in enumerate(_l(_d(doc.data).get("regions"))):
+                    rect = _d(_d(x).get("rect"))
+                    if any(isinstance(rect.get(k), int) and not isinstance(rect.get(k), bool) and rect[k] <= 0 for k in ("w", "h")):
+                        self.add(rule, doc.rel, "rect w and h are positive sizes", f"regions[{i}].rect")
 
     # -- 4.2 builds ------------------------------------------------------------------------------
 
@@ -1343,13 +1356,16 @@ class _Linter:
                 if isinstance(v, str) and v not in allowed:
                     self.add("L-FLW-11", f, f"operand {name} region {v} is not declared on the checkpoint", f"{loc}.inputs.{name}")
 
+    def _confirm_and_send(self, target: Any) -> bool:
+        """A target that resolves to Confirm and Send: control id `confirm-and-send` or OCR text "Confirm and Send"."""
+        ctl = self.controls.get(_s(target))
+        return ctl is not None and (ctl[1].get("id") == "confirm-and-send" or _s(ctl[1].get("ocr_text")).strip().casefold() == "confirm and send")
+
     def _flow_safety(self, fl: dict, f: str) -> None:
         seq = self._seq(fl)
         start = None
         for k, st in enumerate(seq):
-            ctl = self.controls.get(_s(st.get("target")))
-            is_cs = ctl is not None and (ctl[1].get("id") == "confirm-and-send" or _s(ctl[1].get("ocr_text")).strip().casefold() == "confirm and send")
-            if is_cs:
+            if self._confirm_and_send(st.get("target")):
                 if st.get("order_stage") is not True:
                     self.add("L-FLW-07", f, f"step {st.get('id')} targets Confirm and Send without order_stage: true", f"steps[{st.get('id')}]")
                 start = k if start is None else start
@@ -1483,13 +1499,16 @@ class _Linter:
         doc = self.regions.get(cid)
         landmarks = {_d(x).get("id") for x in _l(_d(doc.data).get("landmarks") if doc else [])}
         masks = [x for x in regions if x.get("type") == "mask"]
-        masks += [x for x in self.redaction if x.get("landmark") in landmarks and x.get("identity_field") is not True]
-        for m in masks:
+        boxes = [x for x in self.redaction if x.get("landmark") in landmarks]
+        # identity_field exempts a redaction box from the panel share only; no mask or box ever covers a money cell
+        # (4.8 mask budget, S-21)
+        for m in masks + boxes:
             rm = _rect(m.get("rect"))
             for x in regions:
                 rx = _rect(x.get("rect"))
                 if x.get("money_cell") is True and rm and rx and x.get("landmark") == m.get("landmark") and _overlap(rm, rx):
                     self.add("L-MSK-03", f, f"mask or redaction box {m.get('id')} covers money cell {x.get('id')} (budget 0 percent)")
+        masks += [x for x in boxes if x.get("identity_field") is not True]
         for panel, budget in MASK_BUDGET.items():
             for lm in landmarks:
                 members = [x for x in regions + masks if x.get("panel", "other") == panel and x.get("landmark") == lm and _rect(x.get("rect"))]
@@ -1758,7 +1777,10 @@ class _Linter:
                 fdoc = self.flows.get(_s(flow))
                 if fdoc is None or _d(fdoc.data).get("class") != "canary":
                     self.add("L-MUT-04", f, f"behavioral mutant {mid} needs a canary_flow of class canary (got {flow})", f"{at}.canary_flow")
-                elif any(_s(_d(st).get(k)).endswith(".confirm-and-send") for _sec, st in self._all_steps(fdoc.data) for k in TARGET_FIELDS):
+                elif any(_d(st).get("order_stage") is True or any(
+                        _s(_d(st).get(k)).endswith(".confirm-and-send") or self._confirm_and_send(_d(st).get(k)) for k in TARGET_FIELDS)
+                        for _sec, st in self._all_steps(fdoc.data)):
+                    # same predicate as L-FLW-07 (id or OCR text), and any order-stage step (S-22)
                     self.add("L-MUT-04", f, f"canary flow {flow} targets confirm-and-send", f"{at}.canary_flow")
             elif mode == "image" and "canary_flow" in m:
                 self.add("L-MUT-04", f, f"image mutant {mid} carries no canary_flow", f"{at}.canary_flow")

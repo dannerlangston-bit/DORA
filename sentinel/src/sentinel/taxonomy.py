@@ -20,6 +20,16 @@ class TaxonomyError(ValueError):
     """A value is outside the closed vocabulary."""
 
 
+# 12.7 outcomes by group: only H items abort the run (`aborted_harness (reason: preflight.<item>)`, unreached
+# checkpoints `harness_error` with the same reason); R, B, G2-G4, N1, N3, N4 and N6 give `env_error (gate:
+# preflight.<item>)`; N2 and N5 are a degraded mode, N7 lets the run proceed, G1 is `config_invalid` and G5 is
+# `not_comparable`, so these five are never a preflight gate.
+PREFLIGHT_NEVER_ENV = frozenset({"N2", "N5", "N7", "G1", "G5"})
+# 4.13 assertion_failed: the parameter of `assertion:<id>` is one assertion id (the id grammar of the flow schema);
+# the app_alive cause goes in detail, never in the reason.
+ASSERTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
 @dataclass(frozen=True)
 class Taxonomy:
     data: dict
@@ -66,9 +76,10 @@ class Taxonomy:
         for pat in self._patterns(outcome):
             pcode, _, pparam = pat.partition(":")
             if pcode == "preflight.<item>" and code.startswith("preflight."):
-                return code[len("preflight."):] in self._preflight_items()
+                item = code[len("preflight."):]
+                return item in self._preflight_items() and item.startswith("H")
             if pcode == "assertion" and code == "assertion":
-                return bool(param)
+                return bool(ASSERTION_ID.match(param)) and not param.startswith("app_alive.")
             if pcode == code:
                 if pparam:
                     return bool(param)
@@ -86,6 +97,9 @@ class Taxonomy:
                 raise TaxonomyError("env_error requires a gate (F65)")
             if gate not in self.gates:
                 raise TaxonomyError(f"unknown gate {gate!r}")
+            item = gate[len("preflight."):] if gate.startswith("preflight.") else None
+            if item is not None and (item.startswith("H") or item in PREFLIGHT_NEVER_ENV):
+                raise TaxonomyError(f"preflight item {item} never gives env_error (12.7)")
         if not self.reason_allowed(outcome, reason):
             raise TaxonomyError(f"reason {reason!r} is not allowed with {outcome!r}")
 

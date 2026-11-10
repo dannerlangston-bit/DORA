@@ -131,6 +131,12 @@ class CheckpointOutcome:
             for i in self.invariant_ids:
                 if i not in t.data["reasons"]["invariant_violation"]:
                     raise TaxonomyError(f"unknown invariant {i!r}")
+        if (self.classification is not None and self.classification.by == "reviewer"
+                and self.outcome in ("invariant_violation", "assertion_failed")):
+            raise TaxonomyError(f"classification.by reviewer never appears with {self.outcome} (L-OUT-03)")
+        if self.rescued and self.outcome in ("identical", "noise", "intended"):
+            # 1.10 identical, F32: an agent-rescued capture is needs_human (rescued_capture) unless a higher outcome
+            raise TaxonomyError(f"a rescued capture is never {self.outcome} (1.10, F32)")
 
     def to_dict(self) -> dict:
         return _asdict(self)

@@ -22,8 +22,8 @@ from ..lint.repo import Repo
 from ..scope import DependencyMap, Flow, Manifest, Registry, Workspace
 
 
-def materialize(config_dir: str | Path, overlay: Mapping[str, str], dest: str | Path) -> Path:
-    """Copy `config_dir` to `dest` and write each overlay file (repository-relative path -> text)."""
+def materialize(config_dir: str | Path, overlay: Mapping[str, str | bytes], dest: str | Path) -> Path:
+    """Copy `config_dir` to `dest` and write each overlay file (repository-relative path -> text or bytes)."""
     src, out = Path(config_dir), Path(dest)
     if out.exists():
         shutil.rmtree(out)
@@ -31,7 +31,10 @@ def materialize(config_dir: str | Path, overlay: Mapping[str, str], dest: str | 
     for rel, text in sorted(overlay.items()):
         p = out / rel
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(text, encoding="utf-8")
+        if isinstance(text, bytes):
+            p.write_bytes(text)
+        else:
+            p.write_text(text, encoding="utf-8")
     return out
 
 

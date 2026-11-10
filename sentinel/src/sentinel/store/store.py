@@ -18,10 +18,22 @@ Enforced here and, where SQL can say it, again by the schema:
   (run, checkpoint) is an `ImportConflict`. The only later changes are the three of 4.13: `set_decision_ref`,
   `apply_review` (pending -> done with the verdict's outcome, or as an annotation only when a human decision
   already exists on the item, F28) and `end_review` (reviewer_cap or reviewer_unavailable, no review id).
-- decisions are human-only (4.14, L-DEC-01) and never edited in place: supersede and revoke only (8.3).
-- a run is `complete` only with an outcome for every scoped checkpoint, no env_error, no store-failure
-  harness_error, no unimported shard and every outcome-named artifact stored (8.1, 8.3, 8.9). An outcome that
-  names an artifact the store has no row for is refused at write (8.2).
+- decisions are human-only (4.14, L-DEC-01) and never edited in place: supersede and revoke only (8.3). Also
+  refused at write: approve_baseline from a PR run, a run not complete, a synthetic outcome or by the change's
+  author on tier 1 (L-DEC-05); a waiver without an expiry at most 30 days out (L-DEC-07); a fixed_in_build build
+  not newer, by first_seen_at, than build_id or the superseded row's build_id (L-DEC-08).
+- the lookup reads only actions that act through the signature (request_mask once its mask_ref is set); a
+  signature with two supersessions within 30 days is frozen; a mark_intended decision applies (counts toward the
+  verdict set and inheritance) only within its 9.7 scope: made on this run or its build pair, or the run's loaded
+  manifests carry its entry or ticket; a waiver applies to every run. Inheritance replaces only a computed
+  collateral or needs_human (1.10).
+- a run is `complete` only with an outcome for every scoped checkpoint, no env_error, no not_comparable
+  (fingerprint_mismatch), no store-failure harness_error, no UNPROVEN post-run proof, no unimported shard, no
+  shard that ended worse than complete and every outcome-named artifact stored (1.10, 8.1, 8.2, 8.3, 8.9); no run
+  ends with a scoped checkpoint silent (L-OUT-07), or less severe than its worst shard (8.2). An outcome that
+  names an artifact the store has no row for is refused at write (8.2); an artifact row needs bytes on disk that
+  hash to its name, and an image its redaction version (8.3, 8.4); a `decision:<id>` reason needs an active
+  decision with the outcome's verdict (4.13).
 - every write batch is one `BEGIN IMMEDIATE` transaction, appended to `results.jsonl` before it commits (8.2).
 
 Choices where the spec is ambiguous or silent (reported to the coordinator):
@@ -30,7 +42,8 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   `outcome_records` (the 4.13 record as written, so the store returns persona, classification and diff regions,
   which 8.3 has no column for), and triggers for F65 (an env_error names a gate from taxonomy.yaml), for "nothing
   else is ever rewritten" (every outcome column the 8.3 triggers leave open, and deletion), for decision_ref
-  set once, review_id only with the review transition, and complete-needs-every-scoped-id.
+  set once, review_id only with the review transition, complete-needs-every-scoped-id, and complete-needs-no
+  fingerprint mismatch, UNPROVEN proof or worse shard (trg_run_complete_env).
 - outcome_reasons seed: taxonomy.yaml has no owner_section or detail_means, so rows carry owner_section '4.13'
   (the reason vocabulary table the file is generated from; '1.10' for rows inherited through
   `reason_inheritance`, as 8.3's INSERT ... SELECT writes) and detail_means is the parameter placeholder
@@ -74,7 +87,7 @@ from ..records import (ACTION_VERDICT, DATA_MODES, PERSONAS, RUN_TYPES, Checkpoi
                        Decision, DiffSummary, Finding, RegionDiff, RunOutcome, Signature, StepOutcome, now,
                        to_jsonable)
 from ..taxonomy import Taxonomy, TaxonomyError, checkpoint_parts, load
-from .artifacts import ArtifactStore, StoredArtifact
+from .artifacts import ArtifactStore, StoredArtifact, is_visual
 
 SCHEMA_VERSION = 1
 DEFAULT_TOLERANCE = 8          # 4.14, 9.7: bits of 64
@@ -93,6 +106,10 @@ TRIAGE_FOR_ACTION = {
 SERVICE_IDENTITIES = frozenset({"", "ai", "reviewer", "system", "orchestrator", "reporter"})
 STORE_FAILURE_REASONS = ("store_write_failed", "artifact_persist_failed", "redaction_version_missing")
 PENDING_REASONS = ("reviewer_unavailable", "global_shift")      # 4.13: pending only while queued with these
+# 8.2: the run outcome is the worst of the shards' outcomes, least severe first.
+RUN_SEVERITY = ("complete", "complete_with_env_errors", "aborted_budget", "aborted_harness", "aborted_safety")
+# 4.13 required fields: the verdict a `decision:<id>` reason names, by outcome.
+DECISION_REASON_VERDICT = {"noise": "noise", "intended": "intended", "collateral": "confirmed_bug"}
 LOCATOR_LEVELS = ("jab", "image", "ocr", "agent")
 NETWORK_FS = frozenset({"nfs", "nfs4", "cifs", "smb3", "smbfs", "afs", "ncpfs", "fuse.sshfs"})
 _PHASH_RE = re.compile(r"^[0-9a-f]{16}$")
@@ -209,10 +226,18 @@ class DecisionLookup:
     """The answer of the 8.3 signature lookup: the full verdict set (F25, 9.7)."""
     matches: tuple[DecisionMatch, ...] = ()       # every active decision within tolerance, nearest then newest
     related: tuple[DecisionMatch, ...] = ()       # above tolerance, up to 12 bits: shown, never inherited (4.14)
+    frozen: bool = False                          # two supersessions within 30 days: nothing inherited (9.7)
+    out_of_scope: tuple[DecisionMatch, ...] = ()  # the mark_intended matches outside their 9.7 scope for this run
+
+    @property
+    def applicable(self) -> tuple[DecisionMatch, ...]:
+        """The matches that apply to this run: all but the out-of-scope mark_intended ones (9.7)."""
+        outside = {m.decision.decision_id for m in self.out_of_scope}
+        return tuple(m for m in self.matches if m.decision.decision_id not in outside)
 
     @property
     def verdicts(self) -> frozenset[str]:
-        return frozenset(m.decision.verdict for m in self.matches)
+        return frozenset(m.decision.verdict for m in self.applicable)
 
     @property
     def conflict(self) -> bool:
@@ -221,10 +246,12 @@ class DecisionLookup:
 
     @property
     def inherited(self) -> Decision | None:
-        """The nearest, then newest, match when every match carries one verdict; else None (F25)."""
-        if not self.matches or self.conflict:
+        """The nearest, then newest, applicable match when every applicable match carries one verdict and the
+        signature is not frozen; else None (F25, 9.7)."""
+        ok = self.applicable
+        if not ok or self.conflict or self.frozen:
             return None
-        return self.matches[0].decision
+        return ok[0].decision
 
 
 @dataclass(frozen=True)
@@ -489,54 +516,116 @@ def connect_reader(path: str | os.PathLike, *, busy_timeout_ms: int = 5000) -> s
 # ---------------------------------------------------------------------------------------------------------------
 # the decision lookup (8.3) and inheritance (4.14), usable on any connection with the decisions table
 
+# Only actions that act on a later checkpoint outcome through the signature are looked up (S-02; 8.3 and 4.14
+# action tables): request_mask is inert until its mask merges (mask_ref set); agent_mistake and expected_behavior
+# close an Explorer finding's signature; approve_baseline and reject_baseline move a baselines row.
 _LOOKUP_WHERE = """
-WHERE checkpoint_id = :cp AND region_id = :region AND category = :cat
-  AND verdict IS NOT NULL AND status IN ('active','reopened')
-  AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > :now)"""
-LOOKUP_SQL = ("SELECT *, hamming(phash, :phash) AS distance FROM decisions" + _LOOKUP_WHERE + """
-  AND hamming(phash, :phash) <= hamming_tolerance
-ORDER BY hamming(phash, :phash), decided_at DESC""")   # 8.3: no LIMIT, the verdict set is the answer (9.7)
-RELATED_SQL = ("SELECT *, hamming(phash, :phash) AS distance FROM decisions" + _LOOKUP_WHERE + """
-  AND hamming(phash, :phash) > hamming_tolerance AND hamming(phash, :phash) <= :related
-ORDER BY hamming(phash, :phash), decided_at DESC""")
+WHERE d.checkpoint_id = :cp AND d.region_id = :region AND d.category = :cat
+  AND d.verdict IS NOT NULL AND d.status IN ('active','reopened')
+  AND d.revoked_at IS NULL AND (d.expires_at IS NULL OR d.expires_at > :now)
+  AND (d.action IN ('confirm_bug','mark_intended','noise_signature','fixed_in_build')
+       OR (d.action = 'request_mask' AND d.mask_ref IS NOT NULL))"""
+_LOOKUP_FROM = """SELECT d.*, r.pair_id AS run_pair_id, f.manifest_entry AS finding_manifest_entry,
+  hamming(d.phash, :phash) AS distance
+FROM decisions d LEFT JOIN runs r ON r.run_id = d.run_id LEFT JOIN findings f ON f.finding_id = d.source_finding_id"""
+LOOKUP_SQL = (_LOOKUP_FROM + _LOOKUP_WHERE + """
+  AND hamming(d.phash, :phash) <= d.hamming_tolerance
+ORDER BY hamming(d.phash, :phash), d.decided_at DESC""")   # 8.3: no LIMIT, the verdict set is the answer (9.7)
+RELATED_SQL = (_LOOKUP_FROM + _LOOKUP_WHERE + """
+  AND hamming(d.phash, :phash) > d.hamming_tolerance AND hamming(d.phash, :phash) <= :related
+ORDER BY hamming(d.phash, :phash), d.decided_at DESC""")
+FREEZE_DAYS = 30               # 9.7: two supersessions within 30 days on one signature freeze it
+WAIVER_CATEGORIES = ("invariant_violation", "assertion_failed")   # mark_intended on these is a waiver (9.7)
+# 1.10 precedence: the computed diff outcomes a noise or intended verdict may replace (S-06). Everything ranked
+# above them (env_error to needs_baseline) is not a diff the decision speaks for, and stays as computed.
+INHERITABLE_OUTCOMES = ("collateral", "needs_human")
 
 
 def _decision_from_row(r: sqlite3.Row) -> Decision:
+    keys = r.keys()
+    pair = r["run_pair_id"] if "run_pair_id" in keys else None
     return Decision(
         decision_id=decision_ref(r["decision_id"]), action=r["action"], verdict=r["verdict"],
         signature=Signature(r["checkpoint_id"], r["region_id"], bytes(r["phash"]).hex(), r["category"]),
         decided_by=r["decided_by"], hamming_tolerance=r["hamming_tolerance"], ticket=r["ticket_ref"],
-        status=r["status"], source=r["source"], reason=r["reason"], decided_at=r["decided_at"])
+        status=r["status"], source=r["source"], reason=r["reason"], decided_at=r["decided_at"],
+        run_id=r["run_id"], build_pair_id=None if pair is None else str(pair),
+        manifest_entry_ref=r["finding_manifest_entry"] if "finding_manifest_entry" in keys else None,
+        supersedes=decision_ref(r["supersedes_decision_id"]))
+
+
+def _frozen(conn: sqlite3.Connection, rows: Iterable[sqlite3.Row]) -> bool:
+    """9.7: two supersessions within 30 days on one signature freeze it (S-05). Walks each row's chain."""
+    for row in rows:
+        times, seen = [], set()
+        while row is not None and row["supersedes_decision_id"] is not None and row["decision_id"] not in seen:
+            seen.add(row["decision_id"])
+            times.append(datetime.fromisoformat(row["decided_at"]))
+            row = conn.execute("SELECT decision_id, decided_at, supersedes_decision_id FROM decisions "
+                               "WHERE decision_id = ?", (row["supersedes_decision_id"],)).fetchone()
+        times.sort()
+        if any(b - a <= timedelta(days=FREEZE_DAYS) for a, b in zip(times, times[1:])):
+            return True
+    return False
+
+
+def _in_ticket_scope(d: Decision, run_id: str | None, run_pair: str | None, entries: frozenset[str],
+                     tickets: frozenset[str]) -> bool:
+    """9.7 mark_intended scope: the build pair it was made on, or a run whose loaded manifest carries its entry or
+    its ticket. A waiver (mark_intended on an invariant or assertion) applies to every run while active."""
+    if d.action != "mark_intended" or d.signature.category in WAIVER_CATEGORIES:
+        return True
+    return ((run_id is not None and d.run_id == run_id)
+            or (run_pair is not None and d.build_pair_id == run_pair)
+            or (d.manifest_entry_ref is not None and d.manifest_entry_ref in entries)
+            or (d.ticket is not None and d.ticket in tickets))
 
 
 def lookup_decisions(conn: sqlite3.Connection, signature: Signature, *, at: str | None = None,
-                     rescued: bool = False, synthetic: bool = False) -> DecisionLookup:
+                     rescued: bool = False, synthetic: bool = False, run_id: str | None = None,
+                     manifest_entries: Iterable[str] = (), manifest_tickets: Iterable[str] = ()
+                     ) -> DecisionLookup:
     """Every active decision within tolerance of `signature`, plus the related ones up to 12 bits (8.3, 4.14).
 
     A rescued checkpoint (5.5) and a synthetic outcome (10.3) never run the query: the answer is empty.
+    `run_id` (the run being classified; its build pair is read from `runs`), `manifest_entries` and
+    `manifest_tickets` (the entry ids and tickets of the run's loaded manifests) give the 9.7 scope of a
+    `mark_intended` decision: one outside it stays in `matches` (the full 8.3 answer) but is listed in
+    `out_of_scope`, so it neither conflicts nor is inherited. Without them no `mark_intended` decision made on
+    another run is in scope.
     """
     if rescued or synthetic:
         return DecisionLookup()
     args = {"cp": signature.checkpoint_id, "region": signature.region_id, "cat": signature.category,
             "phash": phash_bytes(signature.phash), "now": utc(at) or now(), "related": RELATED_LIMIT}
-    found = [DecisionMatch(_decision_from_row(r), r["distance"]) for r in conn.execute(LOOKUP_SQL, args)]
+    rows = conn.execute(LOOKUP_SQL, args).fetchall()
+    pair = None
+    if run_id is not None:
+        r = conn.execute("SELECT pair_id FROM runs WHERE run_id = ?", (run_id,)).fetchone()
+        pair = None if r is None or r["pair_id"] is None else str(r["pair_id"])
+    entries, tickets = frozenset(manifest_entries), frozenset(manifest_tickets)
+    found = [DecisionMatch(_decision_from_row(r), r["distance"]) for r in rows]
+    outside = [m for m in found if not _in_ticket_scope(m.decision, run_id, pair, entries, tickets)]
     related = [DecisionMatch(_decision_from_row(r), r["distance"]) for r in conn.execute(RELATED_SQL, args)]
-    return DecisionLookup(tuple(found), tuple(related))
+    return DecisionLookup(tuple(found), tuple(related), frozen=_frozen(conn, rows), out_of_scope=tuple(outside))
 
 
 def apply_inheritance(outcome: CheckpointOutcome, lookup: DecisionLookup) -> CheckpointOutcome:
     """The 4.14 inheritance rule for one computed outcome; returns a new record, never edits `outcome`.
 
-    No match, a conflict (F25), a rescued or a synthetic row: unchanged. `invariant_violation` and
-    `assertion_failed` keep their outcome and only carry the decision (it suppresses the finding). A `noise` or
-    `intended` verdict sets that outcome with `decision:<id>`; a `confirmed_bug` verdict keeps the computed
-    outcome and links the decision (a computed `collateral` carries reason `decision:<id>`, 8.3 seed).
+    No match, a conflict (F25), a frozen signature (9.7), a rescued or a synthetic row: unchanged.
+    `invariant_violation` and `assertion_failed` keep their outcome and only carry the decision (it suppresses the
+    finding). A `noise` or `intended` verdict sets that outcome with `decision:<id>` on a computed `collateral` or
+    `needs_human` diff; a `confirmed_bug` verdict keeps the computed outcome and links the decision (a computed
+    `collateral` carries reason `decision:<id>`, 8.3 seed). Every other outcome is returned unchanged (1.10).
     """
     d = lookup.inherited
     if d is None or outcome.rescued or outcome.synthetic:
         return outcome
-    if outcome.outcome in ("invariant_violation", "assertion_failed"):
+    if outcome.outcome in WAIVER_CATEGORIES:
         return dataclasses.replace(outcome, decision_ref=d.decision_id)
+    if outcome.outcome not in INHERITABLE_OUTCOMES:
+        return outcome
     if d.verdict in ("noise", "intended"):
         return dataclasses.replace(outcome, outcome=d.verdict, reason=f"decision:{d.decision_id}",
                                    decision_ref=d.decision_id, review_state="none")
@@ -906,8 +995,16 @@ class Store:
         if n := q("SELECT count(*) FROM outcomes WHERE run_id = ? AND outcome = 'harness_error' AND reason IN ("
                   + _sql_list(STORE_FAILURE_REASONS) + ")"):
             out.append(f"{n} store-failure harness_error outcome(s)")
+        if n := q("SELECT count(*) FROM outcomes WHERE run_id = ? AND synthetic = 0 AND outcome = 'not_comparable' "
+                  "AND reason = 'fingerprint_mismatch'"):
+            out.append(f"{n} not_comparable (fingerprint_mismatch) outcome(s)")      # 1.10 per run
+        if n := q("SELECT count(*) FROM post_run_proofs WHERE run_id = ? AND verdict = 'unproven' "
+                  "AND verified_by IS NULL"):
+            out.append(f"{n} UNPROVEN post-run proof(s)")                            # 1.10 per run, 6.6
         if n := q("SELECT count(*) FROM shards WHERE run_id = ? AND state <> 'imported'"):
             out.append(f"{n} shard(s) not imported")
+        if n := q("SELECT count(*) FROM shards WHERE run_id = ? AND shard_outcome <> 'complete'"):
+            out.append(f"{n} shard(s) ended worse than complete")                    # 8.2: worst of the shards
         if n := q("SELECT count(*) FROM outcomes o WHERE o.run_id = ? AND ("
                   + " OR ".join(f"(o.{c} IS NOT NULL AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.sha256 = o.{c}))"
                                 for c in ("cand_capture_sha256", "base_capture_sha256", "heatmap_sha256")) + ")"):
@@ -917,7 +1014,9 @@ class Store:
     def end_run(self, outcome: RunOutcome) -> RunOutcome:
         """Write the run outcome (8.2: the worst of the shards, decided by the caller); counts are computed here.
 
-        `complete` is refused with `RunNotComplete` while `complete_blockers` lists anything.
+        `complete` is refused with `RunNotComplete` while `complete_blockers` lists anything; any other outcome is
+        refused while a scoped checkpoint is silent (write it with `fill_unreached` first, L-OUT-07) or when it is
+        less severe than a shard's own outcome (8.2).
         """
         r = _revalidate(outcome)
         run = self._one("SELECT * FROM runs WHERE run_id = ?", (r.run_id,))
@@ -930,6 +1029,16 @@ class Store:
             raise ImportConflict(f"run {r.run_id} already ended {run['outcome']}")
         if code is not None and self._forms.get((r.status, code), (0, ":"))[0] and not param:
             raise StoreRefused(f"reason {code} needs its parameter (8.3)")
+        if r.status != "complete" and (missing := self.missing_outcomes(r.run_id)):
+            # L-OUT-07, 8.2: no checkpoint is left silent; a finished run is final, so fill them first (S-10)
+            raise StoreRefused(f"run {r.run_id} cannot end {r.status} with {len(missing)} scoped checkpoint(s) "
+                               f"without an outcome, first {missing[0]}; write them (fill_unreached) first (L-OUT-07)")
+        worst = max((RUN_SEVERITY.index(s[0]) for s in self._conn.execute(
+            "SELECT shard_outcome FROM shards WHERE run_id = ? AND shard_outcome IS NOT NULL", (r.run_id,))),
+            default=0)
+        if r.status != "complete" and RUN_SEVERITY.index(r.status) < worst:
+            raise StoreRefused(f"run {r.run_id} cannot end {r.status}: a shard ended {RUN_SEVERITY[worst]} (8.2: the "
+                               "run outcome is the worst of the shards')")
         if r.status == "complete" and (blockers := self.complete_blockers(r.run_id)):
             raise RunNotComplete(f"run {r.run_id} cannot be complete: " + "; ".join(blockers))
         counts = self.run_counts(r.run_id)
@@ -1009,6 +1118,35 @@ class Store:
         if any(old[k] != v for k, v in row.items() if k not in later):
             raise ImportConflict(f"finding {f.finding_id} is already recorded with other content (8.2)")
 
+    def _check_decision_reason(self, o: CheckpointOutcome, code: str | None) -> None:
+        """4.13 required fields: `decision:<id>` names an active (or reopened) decision whose verdict is the one the
+        outcome claims (noise, intended, or confirmed_bug for a known-bug collateral); a decision_ref exists."""
+        did = None
+        if code == "decision":
+            did = self._split_reason(o.outcome, o.reason)[1]
+            want = DECISION_REASON_VERDICT.get(o.outcome)
+            row = self._one("SELECT status, verdict FROM decisions WHERE decision_id = ?", (decision_int(did),))
+            if row is None or row["status"] not in ("active", "reopened") or row["verdict"] != want:
+                raise StoreRefused(f"{o.outcome} (reason: decision:{did}) needs an active decision {did} with verdict "
+                                   f"{want} (4.13)")
+        if o.decision_ref and o.decision_ref != did and self._one(
+                "SELECT 1 FROM decisions WHERE decision_id = ?", (decision_int(o.decision_ref),)) is None:
+            raise StoreRefused(f"{o.checkpoint_id} names unknown decision {o.decision_ref} (4.13 decision_ref)")
+
+    def _verify_artifact(self, a: StoredArtifact) -> None:
+        """8.2, 8.3 artifacts: a row exists only for verified bytes on disk, and an image only with the redaction
+        version of its passing redaction header (8.4, 8.9). A hash already indexed was verified when it was."""
+        if self._one("SELECT 1 FROM artifacts WHERE sha256 = ?", (a.sha256,)) is not None:
+            return
+        try:
+            data = Path(a.path).read_bytes()
+        except OSError as e:
+            raise StoreRefused(f"artifact {a.sha256} is not on disk at {a.path} (8.2)") from e
+        if hashlib.sha256(data).hexdigest() != a.sha256:
+            raise StoreRefused(f"{a.path} does not hash to {a.sha256} (8.2)")
+        if is_visual(data, a.kind, a.media_type) and not a.redaction_version:
+            raise StoreRefused(f"image {a.sha256} has no redaction version (8.4, 8.9 redaction_version_missing)")
+
     def _put_artifact(self, rows: list[dict], a: StoredArtifact, run_id: str) -> None:
         if self._one("SELECT 1 FROM artifacts WHERE sha256 = ?", (a.sha256,)) is not None:
             return                                   # 8.4: a hash already indexed; the first set keeps the row
@@ -1051,6 +1189,9 @@ class Store:
         code = self._split_reason(o.outcome, o.reason)[0]
         if o.review_state == "pending" and code not in PENDING_REASONS:
             raise StoreRefused("review_state pending only with reason reviewer_unavailable or global_shift (4.13)")
+        self._check_decision_reason(o, code)
+        for a in artifacts:
+            self._verify_artifact(a)
         named = [h for h in (o.artifacts or {}).get("crops", [])] + [
             (o.artifacts or {}).get(k) for k in ("candidate", "base", "heatmap")]
         batch_hashes = {a.sha256 for a in artifacts}
@@ -1254,6 +1395,34 @@ class Store:
         if identity is not None and identity.strip().lower() in SERVICE_IDENTITIES:
             raise StoreRefused(f"{role} {identity!r} is not a person: decisions are human-only (4.14, L-DEC-01)")
 
+    def _approvable(self, run_id: str, d: Decision, tier: int) -> None:
+        """L-DEC-05: approve_baseline never from a PR run, a run not `complete`, a run with a synthetic outcome on
+        the checkpoint (the 8.3 trg_baseline_approve form), or by the change's author on a tier-1 checkpoint."""
+        run = self._one("SELECT run_type, outcome, pr_author FROM runs WHERE run_id = ?", (run_id,))
+        if run is None:
+            raise StoreRefused(f"unknown run {run_id}")
+        if run["run_type"] == "pr":
+            raise StoreRefused("approve_baseline is refused from a PR run; promotion happens at merge-run triage "
+                               "(L-DEC-05, 9.8)")
+        if run["outcome"] != "complete":
+            raise StoreRefused(f"approve_baseline needs a complete run; {run_id} is "
+                               f"{run['outcome'] or 'not finished'} (L-DEC-05)")
+        if self._one("SELECT 1 FROM outcomes WHERE run_id = ? AND checkpoint_id = ? AND synthetic = 1",
+                     (run_id, d.signature.checkpoint_id)) is not None:
+            raise StoreRefused("approve_baseline is refused from a synthetic outcome (L-DEC-05)")
+        if tier == 1 and run["pr_author"] is not None and d.decided_by == run["pr_author"]:
+            raise StoreRefused("the author of the change never approves a tier-1 baseline (L-DEC-05, 9.6)")
+
+    def _newer_build(self, fixed: str, base: str | None) -> None:
+        """L-DEC-08: fixed_in_build names a build newer (by builds.first_seen_at) than the decision's build_id,
+        or the build_id of the confirm_bug row it supersedes."""
+        if base is None:
+            raise StoreRefused("fixed_in_build needs the build_id it is newer than (L-DEC-08)")
+        seen = {r["build_id"]: r["first_seen_at"] for r in self._conn.execute(
+            "SELECT build_id, first_seen_at FROM builds WHERE build_id IN (?, ?)", (fixed, base))}
+        if fixed == base or fixed not in seen or base not in seen or seen[fixed] <= seen[base]:
+            raise StoreRefused(f"fixed_in_build {fixed} is not a build newer than {base} (L-DEC-08)")
+
     def record_decision(self, decision: Decision, *, run_id: str, finding_id: str | None = None,
                         build_id: str | None = None, expires_at: str | None = None,
                         confirmed_by: str | None = None, proposed_by: str | None = None,
@@ -1287,6 +1456,12 @@ class Store:
         decided_at = utc(d.decided_at)
         if expires_at is None and d.action in ("noise_signature", "request_mask"):
             expires_at = (datetime.fromisoformat(decided_at) + timedelta(days=EXPIRY_DAYS)).isoformat()
+        if d.action == "mark_intended" and d.signature.category in WAIVER_CATEGORIES:
+            # L-DEC-07, 9.7 waiver row: an expiry at most 30 days out, no silent renewal (S-03)
+            if expires_at is None or (datetime.fromisoformat(utc(expires_at))
+                                      > datetime.fromisoformat(decided_at) + timedelta(days=EXPIRY_DAYS)):
+                raise StoreRefused("a waiver (mark_intended on an invariant or assertion) carries expires_at at most "
+                                   "30 days after decided_at (L-DEC-07)")
         source_finding = None
         if finding_id is not None:
             f = self._one("SELECT finding_id, synthetic FROM findings WHERE natural_key = ?", (finding_id,))
@@ -1295,9 +1470,13 @@ class Store:
             source_finding = f["finding_id"]
         old = None
         if supersedes is not None:
-            old = self._one("SELECT status FROM decisions WHERE decision_id = ?", (decision_int(supersedes),))
+            old = self._one("SELECT status, build_id FROM decisions WHERE decision_id = ?", (decision_int(supersedes),))
             if old is None or old["status"] not in ("active", "reopened"):
                 raise StoreRefused(f"{supersedes} is not an active decision to supersede (8.3)")
+        if d.action == "approve_baseline":
+            self._approvable(run_id, d, cp["tier"])
+        if d.action == "fixed_in_build" and fixed_in_build_id is not None:
+            self._newer_build(fixed_in_build_id, build_id or (old["build_id"] if old is not None else None))
         triage = (TRIAGE_FOR_ACTION.get(d.action)
                   or ("confirmed_bug" if d.verdict == "confirmed_bug" else "open"))   # reject_baseline (4.14)
         self.taxonomy.check_member("triage_states", triage)
@@ -1343,9 +1522,11 @@ class Store:
         return None if r is None else _decision_from_row(r)
 
     def lookup_decisions(self, signature: Signature, *, at: str | None = None, rescued: bool = False,
-                         synthetic: bool = False) -> DecisionLookup:
+                         synthetic: bool = False, run_id: str | None = None, manifest_entries: Iterable[str] = (),
+                         manifest_tickets: Iterable[str] = ()) -> DecisionLookup:
         """The 8.3 signature lookup on this database (see the module-level `lookup_decisions`)."""
-        return lookup_decisions(self._conn, signature, at=at, rescued=rescued, synthetic=synthetic)
+        return lookup_decisions(self._conn, signature, at=at, rescued=rescued, synthetic=synthetic, run_id=run_id,
+                                manifest_entries=manifest_entries, manifest_tickets=manifest_tickets)
 
     # -- retention (8.6) -------------------------------------------------------------------------------------
     def deletable(self, sha256: str) -> bool:

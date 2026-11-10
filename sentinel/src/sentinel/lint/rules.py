@@ -45,6 +45,14 @@ Choices where the spec is ambiguous (reported):
     upper case, lower case and digits whose character class changes at least every 2.5 characters
     (random keys do, branch names and class names do not); `//` URIs and vault references are exempt.
 12. `today` (default: the current date) decides expiries, roll dates and the 90-day verification age.
+
+Rules checked only in part from files (the rest needs live state, history or a store; reported):
+L-DEP-07 (the 90 days after the first Phase 1 scan), L-FLW-03 (that a removed id was renamed needs
+the previous commit; the rename map itself is checked), L-FLW-13 (the 6.8 Explorer deny list has no
+file), L-RGN-02 (bounds from the last calibration), L-RGN-04 (the zero floor lives in calibration;
+on census checkpoints the 2.8 Oracle checks are code, not files), L-MSK-01 (the decision record is in
+the Central Store), L-POP-06 (counts the released builds present in builds/), L-XREF-04 and L-XREF-11
+(calibration files), L-XREF-15 (JAB fields are reported by L-SRF-09).
 """
 from __future__ import annotations
 
@@ -421,6 +429,11 @@ def _short_sha(build_id: str) -> str:
     return build_id.rsplit("-", 1)[-1] if isinstance(build_id, str) else ""
 
 
+def _id_diff(got: set, want: Iterable[str]) -> str:
+    want = set(want)
+    return f"missing {sorted(want - got)}, extra {sorted(map(str, got - want))}"
+
+
 def _canonical(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -470,11 +483,29 @@ _SCHEMA_OF: dict[str, tuple[str, str]] = {      # doc kind -> (schema name, rule
 _CATALOGS = {"popups": ("popup", "L-POP-00", "popups"), "mutants": ("mutant", "L-MUT-00", "mutants")}
 
 
+def _rule_view(repo: Repo) -> Repo:
+    """The repository as the rules see it: every document passed through `schemas.coerce_shapes`."""
+    view = Repo(repo.root)
+    for rel, doc in repo.docs.items():
+        data = doc.data
+        if doc.kind in _CATALOGS:
+            name, _rule, key = _CATALOGS[doc.kind]
+            if isinstance(data, list):
+                data = [schemas.coerce_shapes(name, x) for x in data]
+            elif isinstance(data, dict) and isinstance(data.get(key), list):
+                data = {**data, key: [schemas.coerce_shapes(name, x) for x in data[key]]}
+        elif doc.kind in _SCHEMA_OF:
+            data = schemas.coerce_shapes(_SCHEMA_OF[doc.kind][0], data)
+        view.docs[rel] = Doc(rel, doc.kind, data, doc.error)
+    return view
+
+
 class _Linter:
     """One lint pass over a loaded repository; `run()` returns the violations."""
 
     def __init__(self, repo: Repo, phase: int, today: date, flow_p50_s: dict[str, float] | None):
-        self.r = repo
+        self.raw = repo
+        self.r = _rule_view(repo)
         self.phase = phase
         self.today = today
         self.now = datetime.combine(today, time(0), tzinfo=timezone.utc)
@@ -672,7 +703,7 @@ class _Linter:
     # -- schemas (4.1) ---------------------------------------------------------------------------
 
     def check_schemas(self) -> None:
-        for doc in self.r.docs.values():
+        for doc in self.raw.docs.values():
             if doc.kind in _CATALOGS:
                 name, rule, key = _CATALOGS[doc.kind]
                 if doc.error:
@@ -1065,9 +1096,8 @@ class _Linter:
             dc = _d(w.get("display_config"))
             if {k: dc.get(k) for k in ("width", "height", "scale_percent", "theme", "font_size")} not in allowed:
                 self.add("L-WSP-05", f, "display_config is not listed in configs/allowed.yaml", "display_config")
-            gadgets = [g for g in _l(w.get("gadgets_present"))]
             panels = {_d(p).get("surface") for p in _l(w.get("active_trader_panels"))}
-            for g in gadgets:
+            for g in _l(w.get("gadgets_present")):
                 if g not in self.surfaces:
                     self.add("L-WSP-06", f, f"gadget {g} is not in the registry", "gadgets_present")
                 elif self.surfaces[g].get("kind") == "active_trader_panel" and g not in panels:
@@ -1117,9 +1147,8 @@ class _Linter:
             self.add("L-FLW-01", f, "the first step is reset_input_state", "steps[0]")
         if not teardown or teardown[-1].get("type") != "reset_input_state":
             self.add("L-FLW-01", f, "the last teardown step is reset_input_state", "teardown")
-        for key in ("surface",):
-            if fl.get(key) not in self.surfaces:
-                self.add("L-FLW-02", f, f"flow surface {fl.get(key)} is not in the registry", key)
+        if fl.get("surface") not in self.surfaces:
+            self.add("L-FLW-02", f, f"flow surface {fl.get('surface')} is not in the registry", "surface")
         if fl.get("surface") not in _l(fl.get("surfaces")):
             self.add("L-FLW-02", f, "the primary surface is listed in surfaces", "surfaces")
         for s in _l(fl.get("surfaces")):
@@ -1728,6 +1757,8 @@ class _Linter:
                 tier1_classes.setdefault(_s(cls), set()).add(cid)
             if "invariant_id" in exp and exp.get("invariant_id") not in invs:
                 self.add("L-MUT-06", f, f"invariant_id {exp.get('invariant_id')} is not in INV-01 to INV-15", f"{at}.expected.invariant_id")
+        if set(ids) != set(MUTANTS_12_5):
+            self.add("L-MUT-01", f, "the catalog's id set is exactly M01 to M33 of 12.5")
         for cls in BRIEF_CLASSES:
             if cls not in tier1_classes:
                 self.add("L-MUT-05", f, f"brief class {cls} is bound to no tier-1 checkpoint")
@@ -1839,14 +1870,14 @@ class _Linter:
         else:
             got = {p.get("popup_id") for p in pops}
             if got != set(POP_IDS_12_8):
-                self.add("L-XREF-12", _f, f"popup ids differ from 12.8: missing {sorted(set(POP_IDS_12_8) - got)}, extra {sorted(map(str, got - set(POP_IDS_12_8)))}")
+                self.add("L-XREF-12", _f, "popup ids differ from POP-01 to POP-22 of 12.8: " + _id_diff(got, POP_IDS_12_8))
         f_mut, mutants = self._catalog("mutants", "mutants")
         if not f_mut:
             self.add("L-XREF-12", "canaries/mutants.yaml", "canaries/mutants.yaml is missing")
         else:
             got = {m.get("mutant_id") for m in mutants}
             if got != set(MUTANTS_12_5):
-                self.add("L-XREF-12", f_mut, f"mutant ids differ from M01 to M33 of 12.5: missing {sorted(set(MUTANTS_12_5) - got)}, extra {sorted(map(str, got - set(MUTANTS_12_5)))}")
+                self.add("L-XREF-12", f_mut, "mutant ids differ from M01 to M33 of 12.5: " + _id_diff(got, MUTANTS_12_5))
             for i, m in enumerate(mutants):
                 want = MUTANTS_12_5.get(_s(m.get("mutant_id")))
                 if want and (m.get("class"), m.get("money_cell")) != want:

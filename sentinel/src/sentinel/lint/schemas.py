@@ -1038,3 +1038,38 @@ def check_schemas(directory: str | Path) -> list[tuple[str, str]]:
         if p.name not in known:
             problems.append((p.name, "no record type generates this schema"))
     return problems
+
+
+def _resolve(s: dict, root: dict) -> dict:
+    while isinstance(s, dict) and "$ref" in s:
+        s = root.get("$defs", {}).get(s["$ref"].rsplit("/", 1)[-1], {})
+    return s if isinstance(s, dict) else {}
+
+
+def _is_scalar(s: dict, root: dict) -> bool:
+    if "anyOf" in s:
+        return all(_is_scalar(_resolve(x, root), root) for x in s["anyOf"])
+    return any(k in s for k in ("enum", "const", "pattern")) or s.get("type") in ("string", "integer", "number", "boolean")
+
+
+def _coerce(data: Any, s: dict, root: dict) -> Any:
+    s = _resolve(s, root)
+    if isinstance(data, (list, dict)) and s and _is_scalar(s, root):
+        return f"<{type(data).__name__}>"
+    if isinstance(data, dict):
+        props = dict(s.get("properties", {}))
+        for branch in s.get("allOf", []):
+            props.update(branch.get("then", {}).get("properties", {}))
+        extra = s.get("additionalProperties")
+        return {k: _coerce(v, props.get(k, extra if isinstance(extra, dict) else {}), root) for k, v in data.items()}
+    if isinstance(data, list):
+        return [_coerce(v, s.get("items", {}), root) for v in data]
+    return data
+
+
+def coerce_shapes(name: str, data: Any) -> Any:
+    """A copy of `data` in which a list or map standing where the schema wants a scalar becomes the
+    string `<list>` or `<dict>`, so rules can index a document that fails its schema; the schema
+    violation itself is reported by `validate`."""
+    root = _schema(name)
+    return _coerce(data, root, root)

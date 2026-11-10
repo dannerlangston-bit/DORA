@@ -76,7 +76,6 @@ SHORT_FRACTIONS = (0.15, 0.50, 0.85)
 GLOBAL_KINDS = frozenset({"tab", "subtab", "menu", "settings_page", "dialog"})
 KIND_ORDER = {"soak": 0, "flow": 0, "sweep": 1, "split": 2, "census": 3}
 MISSABLE_KINDS = frozenset({"collateral", "invariant_violation", "assertion_failed", "needs_human", "landmark_missing"})
-MANIFEST_STATES = ("loaded", "no_manifest_ui", "no_manifest_nonui")
 
 
 class ScopeConfigError(ValueError):
@@ -647,7 +646,7 @@ class ScopePlan:
     run_id: str
     run_type: str
     budget_s: float
-    manifest_state: str
+    manifest_state: str                  # loaded | no_manifest_ui (case a) | no_manifest_nonui (case b), 4.3
     declared: frozenset[str]
     scope_surfaces: frozenset[str]
     census_surfaces: frozenset[str]
@@ -712,7 +711,6 @@ class ScopePlan:
 
 @dataclass
 class _Ctx:
-    run_id: str
     run_type: str
     registry: Registry
     workspaces: dict[str, Workspace]
@@ -776,11 +774,11 @@ def _census_items(ctx: _Ctx, s: Surface, workspace_ids: Iterable[str]) -> list[P
     return out
 
 
-def _ladder(s: Surface, run_type: str, ctx: _Ctx) -> tuple[tuple[tuple[int, int], ...], bool | None]:
+def _ladder(s: Surface, ctx: _Ctx) -> tuple[tuple[tuple[int, int], ...], bool | None]:
     """2.5.3: (sizes, full splitter set?) for a resizable surface in this run type; no sweep -> ((), None)."""
-    if run_type == "pr":
+    if ctx.run_type == "pr":
         return (LADDER_S, False) if s.tier == 1 else ((), None)
-    if run_type == "merge":
+    if ctx.run_type == "merge":
         return (LADDER_S, False) if s.tier <= 2 else ((), None)
     if s.tier <= 2:
         maxw, maxh = ctx.max_client
@@ -794,7 +792,7 @@ def _ladder(s: Surface, run_type: str, ctx: _Ctx) -> tuple[tuple[tuple[int, int]
 def _sweep_items(ctx: _Ctx, s: Surface) -> list[PlanItem]:
     if not s.resizable:
         return []
-    sizes, full = _ladder(s, ctx.run_type, ctx)
+    sizes, full = _ladder(s, ctx)
     if not sizes:
         return []
     w = ctx.harness()
@@ -823,7 +821,7 @@ def _flow_item(ctx: _Ctx, f: Flow) -> PlanItem:
         s = ctx.registry[fc.surface_id] if fc.surface_id in ctx.registry else Surface(fc.surface_id, f.tier)
         cps.append(ctx.checkpoint(fc.checkpoint_id, s, "flow", w, fc.data_mode, persona=f.persona,
                                   flow_id=f.flow_id, step_id=fc.step_id))
-    mode = "masked_live" if any(c.data_mode == "masked_live" for c in f.checkpoints) or f.data_mode == "masked_live" else "frozen"
+    mode = "masked_live" if any(c.data_mode == "masked_live" for c in f.checkpoints) else "frozen"
     protected = bool(set(f.surfaces) & ctx.protected_surfaces)
     return ctx.item(f.flow_id, "flow", f.tier, cps, mode, f"fixture:{f.fixture or f.flow_id}", protected,
                     ctx.duration(f.flow_id, "flow"))
@@ -995,7 +993,7 @@ def compute_scope(run_type: str, manifest: Manifest | None, dep_map: DependencyM
     `entitlements` is the profile E of the run's logins, `quarantine` the checkpoint and flow ids
     of `quarantine.yaml` (Q), `durations` per-side seconds by checkpoint id (flows by flow id).
     A PR manifest naming another candidate is treated as missing (L-MAN-09); merge and RC runs
-    without one get the empty union (4.3). `soak` and `explorer_rig` apply to RC runs, and
+    take the union manifest, `Manifest.union`, which is never absent (4.3). `soak` and `explorer_rig` apply to RC runs, and
     `map_scan_failed` to merge runs (2.10.1).
     """
     if run_type in ("nightly", "calibration"):
@@ -1012,7 +1010,8 @@ def compute_scope(run_type: str, manifest: Manifest | None, dep_map: DependencyM
         if manifest is not None and candidate_build_id and manifest.candidate != candidate_build_id:
             manifest = None
     elif manifest is None:
-        manifest = Manifest.union((), candidate_build_id or "unknown", "unknown", "orchestrator")
+        raise ScopeConfigError("merge and RC runs never lack a manifest: pass the union, empty when no PR "
+                               "manifests are in range (4.3)")
 
     impact = None
     if run_type == "pr":
@@ -1043,7 +1042,7 @@ def compute_scope(run_type: str, manifest: Manifest | None, dep_map: DependencyM
             fs.add("dependency_map_gap", "The dependency scan failed; the previous committed map stays in force (2.10.1)",
                    evidence={"raw_values": {"reason": "scan_failed"}})
 
-    ctx = _Ctx(run_id, run_type, registry, wmap, declared | smoke, durations or {}, base_reuse, max_client,
+    ctx = _Ctx(run_type, registry, wmap, declared | smoke, durations or {}, base_reuse, max_client,
                corpus_sizes or {})
     items: list[PlanItem] = []
     cuts: list[Cut] = []

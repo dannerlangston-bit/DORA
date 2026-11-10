@@ -153,7 +153,8 @@ class ExplorerSession:
         self.week_usd += usd
         spent = self.budget_exhausted()
         if spent:
-            return self._end(f"budget {spent}", detail=f"Explorer budget hit: {spent}; the run continues")
+            return self._end(f"budget {spent}", detail=f"Explorer budget hit: {spent}; the run continues",
+                             evidence={"budget": spent})
         return None
 
     def record_drop(self, drop: GatewayDrop) -> ControlResult:

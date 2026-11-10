@@ -512,3 +512,46 @@ def test_decision_constraints_from_8_3(tmp_path):
             s.record_decision(bad, run_id=RUN)
         with pytest.raises(StoreRefused, match="dec-"):
             s.record_decision(dataclasses.replace(bad, decision_id="D7"), run_id=RUN)
+
+
+# -- canary results (8.3 canary_results, 10.3) ---------------------------------------------------------------------
+
+def test_canary_results_hold_one_row_per_mutant(tmp_path):
+    from sentinel.canary import CanaryResult
+
+    night = "run-n1"
+    rows = [
+        CanaryResult("M01", "cat-v3", CENSUS, "erased_control", False, 11, ["collateral"], "detected",
+                     base_sha256="a" * 64, mutant_sha256="b" * 64, produced_outcome="collateral"),
+        CanaryResult("M04", "cat-v3", CENSUS, "swapped_digit", True, 12, ["collateral", "assertion_failed"],
+                     "detector_blind", produced_outcome="identical", absorbed_by="msk-7"),   # same checkpoint as M01
+        CanaryResult("M25", "cat-v3", SWEEP, "aa_control", False, 13, ["identical"], "detected",
+                     produced_outcome="identical"),
+        CanaryResult("M25", "cat-v3", FLOW, "aa_control", False, 13, ["identical"], "detector_degraded",
+                     produced_outcome="noise", class_rate=0.5, class_floor=0.9, model_id="claude-x",
+                     prompt_hash="c" * 64),                                                   # one id, two checkpoints
+    ]
+    with Store(tmp_path / "run.db") as s:
+        s.begin_run(dataclasses.replace(plan(night), run_type="nightly"))
+        s.write_canary_results(night, rows, created_at="2026-11-10T03:12:00-05:00")
+        assert s.canary_results(night) == rows
+        assert [r[0] for r in s.conn.execute("SELECT DISTINCT created_at FROM canary_results")] == [
+            "2026-11-10T08:12:00+00:00"]
+        s.write_canary_results(night, rows[:2])                       # replay: a no-op (8.2)
+        assert len(s.canary_results(night)) == 4
+        with pytest.raises(ImportConflict):
+            s.write_canary_results(night, [dataclasses.replace(rows[0], state="missed", produced_outcome="identical")])
+        bad = dataclasses.replace(rows[2])
+        bad.state = "detector_blind"                                  # mutable; a non-money row is never blind (8.3)
+        with pytest.raises(TaxonomyError):
+            s.write_canary_results(night, [bad])
+        with pytest.raises(StoreRefused, match="unknown run"):
+            s.write_canary_results("run-x", rows)
+        # the money-cell miss still writes its synthetic harness_error row to outcomes, beside its canary row
+        s.write_checkpoint(out(CENSUS, "harness_error", run_id=night, reason="detector_blind", synthetic=True))
+        assert s.get_outcome(night, CENSUS).reason == "detector_blind"
+        assert s.run_counts(night)["harness_error"] == 0               # synthetic rows are not the run's counts
+        assert len(s.canary_results(night)) == 4
+    lines = [json.loads(x) for x in (tmp_path / "results.jsonl").read_text().splitlines()]
+    assert [x["batch"] for x in lines] == ["run_begin", "canary_results", "checkpoint"]
+    assert {r["table"] for r in lines[1]["rows"]} == {"canary_results"} and len(lines[1]["rows"]) == 4

@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from sentinel import canary as C
+from sentinel.diff.engine import RegionComponent
 from sentinel.records import CheckpointOutcome, Classification, Component, DiffSummary
 from sentinel.taxonomy import TaxonomyError
 
@@ -153,6 +154,16 @@ def test_recipe_changes_only_its_target_and_is_deterministic(cls, box, params, a
         assert got is not None, "the mutant must differ from the approved capture"
         assert allowed[0] <= got[0] and allowed[1] <= got[1] and got[2] <= allowed[2] and got[3] <= allowed[3], (got, allowed)
     assert np.array_equal(out, C.RECIPES[cls](BASE, box, rng(), **params))
+
+
+@pytest.mark.parametrize("cls,params", [("color_swap", {}), ("study_removed", {"color": list(YELLOW)}),
+                                        ("gateway", {}), ("error_dialog", {})])
+def test_recipes_that_need_no_background_take_a_whole_frame_box(cls, params):
+    """No border exists around a whole-frame box; a recipe that never uses the background needs none."""
+    out = C.RECIPES[cls](BASE, FRAME, rng(), **params)
+    assert out.shape == BASE.shape and not np.array_equal(out, BASE)
+    with pytest.raises(C.GenerationError, match="no border"):
+        C.erase(BASE, FRAME, rng())                       # the border fill still needs its border (10.3)
 
 
 def test_focus_order_takes_the_next_steps_after_frame():
@@ -461,6 +472,16 @@ def test_collateral_counts_only_on_the_mutated_region():
     assert C.score([result(m31, "collateral", diff=near)]).results[0].state == "detected"
     assert C.score([result(m31, "needs_human", "reviewer_no_match", diff=named)]).results[0].state == "detected"
     assert C.score([result(m31, "collateral", diff=far)]).results[0].state == "detector_degraded"
+
+
+def test_footprint_test_uses_window_coordinates_not_region_relative_boxes():
+    """The mutant footprint is measured in the frame, so it meets `bbox`, never `bbox_region` (engine choice 16)."""
+    m31 = mutant("M31", "misaligned_column", cid=POSITIONS, region="rgn.positions.cell", footprint=(100, 100, 20, 20))
+    in_window = DiffSummary(components=[RegionComponent(90, (105, 105, 10, 10), "rgn.positions.panel", (5, 5, 10, 10))])
+    in_region_only = DiffSummary(components=[RegionComponent(90, (5, 5, 10, 10), "rgn.positions.panel",
+                                                             (105, 105, 10, 10))])
+    assert C.score([result(m31, "collateral", diff=in_window)]).results[0].state == "detected"
+    assert C.score([result(m31, "collateral", diff=in_region_only)]).results[0].state == "detector_degraded"
 
 
 def test_min_confidence_gates_detection():

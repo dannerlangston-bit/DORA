@@ -52,7 +52,11 @@ Choices where the spec is ambiguous (each cites the section it reads):
   `needs_human (reason: global_shift)`, `row` keeps the table row and `exception` is
   `global_shift`.
 - `classification` is set on every comparison outcome: by `rule` except the rows that read a
-  verdict (20, 21, 22, 24 and 25a with a verdict), which are by `reviewer`. On rows 7 and 8 the
+  verdict (20, 21, 22, 24 and 25a with a verdict), which are by `reviewer`. A rule classification
+  of an item the Reviewer answered for (a task B description of a `collateral`, 3.12) carries the
+  answer's description and region pointer with its `model_id` and `prompt_hash`: the description's
+  provenance, which is how the report tells a described item from an undescribed one (9.2, 9.3);
+  the outcome stays the rule's. On rows 7 and 8 the
   lower result the table would give without the invariant or assertion is kept as evidence and,
   when it is a rule classification, as `classification` (4.13 worked example); a reviewer
   classification never appears there (L-OUT-03).
@@ -535,10 +539,13 @@ def _join(*parts: str | None) -> str | None:
 
 
 def _rule(category: str, c: _Ctx) -> Classification:
+    """A rule classification; an answered Reviewer call that described the item stays on it with
+    the call's provenance (`model_id`, `prompt_hash`), so a described item reads as reviewed (9.2, 9.3)."""
     r = c.facts.review
-    described = r is not None and r.state == "answered"
-    return Classification(category, "rule", description=r.description if described else None,
-                          region_pointer=r.region_pointer if described else None)
+    if r is None or r.state != "answered":
+        return Classification(category, "rule")
+    return Classification(category, "rule", model_id=r.model_id, prompt_hash=r.prompt_hash,
+                          description=r.description, region_pointer=r.region_pointer)
 
 
 def _by_reviewer(category: str, c: _Ctx) -> Classification:

@@ -63,6 +63,13 @@ Choices where the spec is ambiguous (each reported to the coordinator):
     `GlobalShiftSignal` carry `synthetic=True`, and the run-level passes (`global_shift_prepass`,
     `calibration.aa_drift`) ignore it, so an injected global shift (M21, M23) never trips
     `aa_drift_global` (10.3 Injection).
+16. Component boxes are recorded twice: `bbox` in window coordinates of the base capture (what
+    the heatmap, crops and the canary footprint test use, 10.3) and `bbox_region` relative to the
+    top-left of the owning region's anchored bounds in the base (the region as located from its
+    landmark, before any accepted in-region shift), which is what 9.7 compares across checkpoints,
+    so a defect in a panel that sits elsewhere in another workspace still clusters. A `_rest`
+    component's region is the window, so its two boxes are equal. `records.Component` has no field
+    for the second box, so `DiffSummary.components` holds `RegionComponent`, its subclass.
 """
 from __future__ import annotations
 
@@ -179,8 +186,16 @@ class RegionMetrics:
 
 
 @dataclass
+class RegionComponent(Component):
+    """A `records.Component` that also carries its box relative to its region (choice 16, 9.7)."""
+
+    bbox_region: tuple[int, int, int, int] | None = None   # x, y, w, h from the region's anchored top-left
+
+
+@dataclass
 class ComponentDetail:
-    """One reportable connected component (3.7 granularity 3), in base coordinates."""
+    """One reportable connected component (3.7 granularity 3): `bbox` and `centroid` in base window
+    coordinates, `bbox_region` relative to the owning region's anchored bounds (choice 16)."""
 
     index: int
     area: int
@@ -192,6 +207,7 @@ class ComponentDetail:
     text_edge: bool
     phash: str
     base_phash: str
+    bbox_region: tuple[int, int, int, int]
 
 
 @dataclass(frozen=True)
@@ -881,12 +897,14 @@ def _assemble(ctx: DiffContext, cid: str, reg: RegionsFile, pairs: list[_Pair], 
             text_edge = float(edge[cy, cx].mean()) >= float(gp["component_text_edge_share"])
             cbox = (bbox[0] + pair.offset[0], bbox[1] + pair.offset[1], bbox[2], bbox[3])
             ccrop = component_crop(C, cbox)
+            anchor = loc_b.get(pair.region_id, Rect(0, 0, W, H))      # _rest: the window (choice 16)
             comps.append(ComponentDetail(
                 index=len(comps) + 1, area=area, bbox=bbox,
                 centroid=(float(cx.mean()), float(cy.mean())), region_id=pair.region_id,
                 mean_delta_e=float(de_map[cy, cx].mean()), color_semantic_flip=flip, text_edge=text_edge,
                 phash=phash(ccrop if ccrop.size else component_crop(B, bbox)),
-                base_phash=phash(component_crop(B, bbox))))
+                base_phash=phash(component_crop(B, bbox)),
+                bbox_region=(bbox[0] - anchor.x, bbox[1] - anchor.y, bbox[2], bbox[3])))
             comp_owner.append(own)
 
     # thresholds per region (3.9 table)
@@ -981,7 +999,7 @@ def _assemble(ctx: DiffContext, cid: str, reg: RegionsFile, pairs: list[_Pair], 
         whole_ssim=whole_ssim,
         shift=(window_shift.dx, window_shift.dy) if window_shift.accepted else (0, 0),
         regions=[RegionDiff(m.region_id, m.pixel_fraction, m.ssim, m.above_threshold) for m in metrics],
-        components=[Component(c.area, c.bbox, c.region_id) for c in comps])
+        components=[RegionComponent(c.area, c.bbox, c.region_id, c.bbox_region) for c in comps])
     signal = GlobalShiftSignal(cid, level, any(m.above_floor for m in metrics) or level_above,
                                total_changed, int((changed & edge).sum()), all(c.text_edge for c in comps),
                                ctx.synthetic)

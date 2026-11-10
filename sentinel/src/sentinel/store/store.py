@@ -62,6 +62,12 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
 - Step outcomes become `step_events` rows with source orchestrator, action `step`, gate_decision none (records
   has no gateway event), mode `agent` for an agent rung or fallback, and `finding:<ref>` in `reason`.
 - Run counts exclude synthetic rows (canary mutants are not checkpoints of the run, 10.3).
+- `canary_results` (8.3) holds one row per mutant, safety canary, drill item or path-equivalence pair, which
+  `outcomes`, one record per (run, checkpoint), cannot. 8.3 gives the table no natural key; the store uses
+  (run_id, kind, mutant_id, checkpoint_id), since an `aa_control` entry binds one mutant id to several
+  checkpoints (10.3): a replayed row is a no-op and a different row for the same key an `ImportConflict`
+  (8.2). `created_at` is a write-time argument and not compared. Rows are `canary.CanaryResult`, whose
+  construction enforces the 8.3 CHECKs; the synthetic `harness_error` rows still go through `write_checkpoint`.
 - A finished run is not re-ended with a different outcome (the 10.7 re-evaluation of a returning rig belongs
   to the import, which is not this module).
 - Timestamps are normalised to UTC ISO 8601 seconds on write (8.3).
@@ -81,13 +87,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from importlib import resources
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Sequence
 
 from ..records import (ACTION_VERDICT, DATA_MODES, PERSONAS, RUN_TYPES, CheckpointOutcome, Classification, Component,
                        Decision, DiffSummary, Finding, RegionDiff, RunOutcome, Signature, StepOutcome, now,
                        to_jsonable)
 from ..taxonomy import Taxonomy, TaxonomyError, checkpoint_parts, load
 from .artifacts import ArtifactStore, StoredArtifact, is_visual
+
+if TYPE_CHECKING:
+    from ..canary import CanaryResult
 
 SCHEMA_VERSION = 1
 DEFAULT_TOLERANCE = 8          # 4.14, 9.7: bits of 64
@@ -637,13 +646,22 @@ def apply_inheritance(outcome: CheckpointOutcome, lookup: DecisionLookup) -> Che
 # ---------------------------------------------------------------------------------------------------------------
 # record <-> row
 
+def _component(c: dict) -> Component:
+    """A stored diff component; one with a region-relative box comes back as the engine's `RegionComponent`."""
+    c = {**c, "bbox": tuple(c["bbox"])}
+    if "bbox_region" not in c:
+        return Component(**c)
+    from ..diff.engine import RegionComponent      # records.Component has no bbox_region field (engine choice 16)
+    return RegionComponent(**{**c, "bbox_region": tuple(c["bbox_region"])})
+
+
 def _outcome_from_dict(d: dict) -> CheckpointOutcome:
     d = dict(d)
     if "diff" in d:
         diff = dict(d["diff"])
         diff["shift"] = tuple(diff.get("shift", (0, 0)))
         diff["regions"] = [RegionDiff(**r) for r in diff.get("regions", [])]
-        diff["components"] = [Component(**{**c, "bbox": tuple(c["bbox"])}) for c in diff.get("components", [])]
+        diff["components"] = [_component(c) for c in diff.get("components", [])]
         d["diff"] = DiffSummary(**diff)
     if "classification" in d:
         d["classification"] = Classification(**d["classification"])
@@ -1248,6 +1266,47 @@ class Store:
                 flow_id=c["flow_id"], step_id=c["step_id"]))
             filled.append(cid)
         return filled
+
+    # -- canary results (8.3 canary_results, 10.3) ---------------------------------------------------------
+    _CANARY_KEY = ("run_id", "kind", "mutant_id", "checkpoint_id")
+    _CANARY_FIELDS = ("kind", "mutant_id", "catalog_version", "checkpoint_id", "defect_class", "money_cell", "seed",
+                      "base_sha256", "mutant_sha256", "produced_outcome", "produced_reason", "state", "absorbed_by",
+                      "class_rate", "class_floor", "reviewer_verdict", "reviewer_confidence", "mask_version",
+                      "threshold_version", "model_id", "prompt_hash")
+
+    def write_canary_results(self, run_id: str, results: Iterable[CanaryResult], *,
+                             created_at: str | None = None) -> None:
+        """Write a run's per-mutant canary rows in one batch (8.3 `canary_results`, 10.3 Scoring).
+
+        Each row is re-validated (`CanaryResult` enforces the 8.3 CHECKs; the generated schema refuses the rest).
+        Refuses an unknown or finished run. The same row again is a no-op; a different row for the same
+        (kind, mutant_id, checkpoint_id) is an ImportConflict (module docstring).
+        """
+        rows_in = [dataclasses.replace(r) for r in results]
+        self._running(run_id)
+        at = utc(created_at) or now()
+        where = " AND ".join(f"{k} = ?" for k in self._CANARY_KEY)
+        with self._batch("canary_results") as rows:
+            for r in rows_in:
+                values = {"run_id": run_id, **{f: getattr(r, f) for f in self._CANARY_FIELDS},
+                          "money_cell": int(r.money_cell), "expected_json": json.dumps(list(r.expected))}
+                old = self._one(f"SELECT * FROM canary_results WHERE {where}", [values[k] for k in self._CANARY_KEY])
+                if old is not None:
+                    if {k: old[k] for k in values} == values:
+                        continue
+                    raise ImportConflict(f"{r.mutant_id} on {r.checkpoint_id} in {run_id} already has a canary "
+                                         "result; rows are written once (8.2)")
+                self._insert(rows, "canary_results", {**values, "created_at": at})
+
+    def canary_results(self, run_id: str) -> list[CanaryResult]:
+        """The run's canary rows in the order they were written (8.3 `canary_results`)."""
+        from ..canary import CanaryResult
+        out = []
+        for r in self._conn.execute("SELECT * FROM canary_results WHERE run_id = ? ORDER BY canary_id", (run_id,)):
+            d = {f: r[f] for f in self._CANARY_FIELDS}
+            out.append(CanaryResult(**{**d, "money_cell": bool(r["money_cell"]),
+                                       "expected": json.loads(r["expected_json"])}))
+        return out
 
     # -- reading outcomes, steps, findings ------------------------------------------------------------------
     def _outcome(self, row: sqlite3.Row, record_json: str) -> CheckpointOutcome:

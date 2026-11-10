@@ -56,7 +56,9 @@ Choices where the spec is ambiguous (reported to the coordinator):
    (4.11) does not count. `collateral` or `needs_human` counts for non-controls when it lands
    on the mutated region: a component whose region is the `region_ref` or whose box meets the mutant's
    footprint, a region above threshold that is the `region_ref`, or the classification's region
-   pointer. `gateway` is detected on step status `blocked_by_gateway`; `redaction` on the redaction
+   pointer. The footprint is in frame coordinates, so it is tested against the component's window box
+   `bbox`, never the region-relative `bbox_region` the Diff Engine also records for clustering (its
+   choice 16, 9.7). `gateway` is detected on step status `blocked_by_gateway`; `redaction` on the redaction
    hit (12.5 M19). Borderline Reviewer verdicts must already be re-sampled (3.15) before `score`.
    The below-threshold control `sub_floor` (M20) is detected whenever the path absorbed it, that is
    on any outcome without a finding (`identical` or `noise`, 10.3 class table and 12.5 M20), whatever
@@ -399,10 +401,15 @@ def _direction(rng: np.random.Generator) -> tuple[int, int]:
     return [(1, 0), (-1, 0), (0, 1), (0, -1)][int(rng.integers(4))]
 
 
+def _box_crop(image: Image, box: Box) -> Image:
+    """A copy of the box's pixels, for a recipe that needs no background (so a whole-frame box works)."""
+    x, y, w, h = box
+    return image[y:y + h, x:x + w].copy()
+
+
 def _box_view(image: Image, box: Box, interior: bool = False) -> tuple[Image, NDArray[np.uint8]]:
     """A copy of the box's pixels and its background: the 4 px border, or the interior's dominant color."""
-    x, y, w, h = box
-    crop = image[y:y + h, x:x + w].copy()
+    crop = _box_crop(image, box)
     return crop, interior_background(crop) if interior else border_background(image, box)
 
 
@@ -472,7 +479,7 @@ def transplant(image: Image, box: Box, rng: np.random.Generator, *, source_box: 
 def channel_swap(image: Image, box: Box, rng: np.random.Generator) -> Image:
     """color_swap (M07): swap the red and green channels of the box's colored pixels."""
     b = _check_box(image, box)
-    crop, _ = _box_view(image, b)
+    crop = _box_crop(image, b)
     c = crop.astype(np.int16)
     colored = (c.max(axis=2) - c.min(axis=2)) > CHROMA
     if not colored.any():
@@ -654,7 +661,7 @@ def global_shift(image: Image, box: Box, rng: np.random.Generator, *, dx: int | 
 def remove_study(image: Image, box: Box, rng: np.random.Generator, *, color: Sequence[int], tolerance: int = 40) -> Image:
     """study_removed (M24): erase the study line of RGB `color` from the chart region by inpainting."""
     b = _check_box(image, box)
-    crop, _ = _box_view(image, b)
+    crop = _box_crop(image, b)
     near = np.abs(crop.astype(np.int16) - np.array(color, np.int16)).max(axis=2) <= tolerance
     if not near.any():
         raise GenerationError(f"no pixels of the study color {list(color)} in the chart region")
@@ -684,7 +691,7 @@ def blank_value(image: Image, box: Box, rng: np.random.Generator) -> Image:
 def mismatch_template(image: Image, box: Box, rng: np.random.Generator) -> Image:
     """gateway (M28): the Send control replaced by a non-matching image (mirrored and inverted)."""
     b = _check_box(image, box)
-    crop, _ = _box_view(image, b)
+    crop = _box_crop(image, b)
     return _paste(image, b, 255 - crop[:, ::-1])
 
 
@@ -746,7 +753,7 @@ def composite_error_dialog(image: Image, box: Box, rng: np.random.Generator, *, 
                            message: str = "java.lang.NullPointerException") -> Image:
     """error_dialog (M33): composite a Java exception dialog over the body (synthesized, choice 2)."""
     b = _check_box(image, box)
-    crop, _ = _box_view(image, b)
+    crop = _box_crop(image, b)
     h, w = crop.shape[:2]
     if w < 60 or h < 40:
         raise GenerationError("body too small for the exception dialog")
@@ -961,6 +968,12 @@ class CanaryResult:
     class_rate: float | None = None
     class_floor: float | None = None
     kind: str = "mutant"
+    reviewer_verdict: str | None = None         # the remaining 8.3 columns, set by the caller when known
+    reviewer_confidence: float | None = None
+    mask_version: str | None = None
+    threshold_version: str | None = None
+    model_id: str | None = None
+    prompt_hash: str | None = None
 
     def __post_init__(self) -> None:
         load().check_member("canary_states", self.state)

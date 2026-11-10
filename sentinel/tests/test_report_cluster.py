@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from sentinel.diff.engine import RegionComponent
 from sentinel.records import (Classification, CheckpointOutcome, Component, Decision, DiffSummary, Finding,
                               RegionDiff, Signature, StepOutcome)
 from sentinel.report import build_report, render_pr_comment
@@ -84,6 +85,23 @@ def test_census_rule_phash_within_6_and_boxes_within_4px():
     other_region = _census_member("census/charts.e/ws.x", "0000000000000000", region="rgn.b")
     other_primitive = _census_member("census/charts.f/ws.x", "0000000000000000", primitive="SplitPane")
     assert len(cluster_members([a, other_region, other_primitive])) == 3
+
+
+def test_census_boxes_compare_relative_to_the_region_not_the_window():
+    """9.7: the same defect in a panel that sits elsewhere in the window clusters (engine choice 16)."""
+    def member(cid, window_box, region_box):
+        m = _census_member(cid, "0000000000000000", box=window_box)
+        m.outcome.diff.components = [RegionComponent(500, window_box, "rgn.a", region_box)]
+        return m
+
+    a = member("census/charts.a/ws.x", (10, 10, 100, 20), (4, 30, 100, 20))
+    b = member("census/charts.b/ws.y", (210, 130, 100, 20), (4, 30, 100, 20))      # panel moved by (200, 120)
+    assert [len(c.members) for c in cluster_members([a, b])] == [2]
+    c = member("census/charts.c/ws.x", (10, 10, 100, 20), (4, 45, 100, 20))        # same window box, other place
+    assert sorted(len(cl.members) for cl in cluster_members([a, c])) == [1, 1]
+    legacy = _census_member("census/charts.d/ws.x", "0000000000000000", box=(10, 10, 100, 20))   # no region box
+    assert [len(cl.members) for cl in cluster_members([a, legacy])] == [2]          # both by window box then
+    assert sorted(len(cl.members) for cl in cluster_members([b, legacy])) == [1, 1]
 
 
 def test_census_clusters_are_transitive_and_order_independent():

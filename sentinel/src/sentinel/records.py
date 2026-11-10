@@ -37,8 +37,9 @@ class RegionDiff:
 @dataclass
 class Component:
     area: int
-    bbox: tuple[int, int, int, int]          # x, y, w, h
+    bbox: tuple[int, int, int, int]          # x, y, w, h in window coordinates
     region_id: str | None = None
+    bbox_region: tuple[int, int, int, int] | None = None   # relative to the owning region's anchored bounds (9.7)
 
 
 @dataclass
@@ -321,7 +322,15 @@ def from_dict(cls, data: dict):
         if isinstance(data.get("diff"), dict):
             d = dict(data["diff"])
             d["regions"] = [RegionDiff(**r) for r in d.get("regions", [])]
-            d["components"] = [Component(**c) for c in d.get("components", [])]
+            comps = []
+            for c in d.get("components", []):
+                c = dict(c)
+                c["bbox"] = tuple(c["bbox"])
+                if c.get("bbox_region") is not None:
+                    c["bbox_region"] = tuple(c["bbox_region"])
+                cnames = {f.name for f in dataclasses.fields(Component)}
+                comps.append(Component(**{k: v for k, v in c.items() if k in cnames}))
+            d["components"] = comps
             if "shift" in d:
                 d["shift"] = tuple(d["shift"])
             data["diff"] = DiffSummary(**d)

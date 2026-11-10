@@ -12,10 +12,11 @@ reads as input X of 3.11 (`ScopePlan.x_input`).
 
 Choices where the spec is ambiguous (each is reported to the coordinator):
 
-1. Sweeps and flows follow the change-derived scope, not the smoke census (2.11). The pseudocode
-   sweeps and selects flows over `census_surfaces`, which includes the smoke subset; 1.6, 1.11 and
-   the PR budget of 11.2 (75 sweep steps, 8 tier-1 flows) only hold if the smoke subset adds
-   census checkpoints alone. Here sweeps and flows use declared, map-expanded and static surfaces.
+1. PR sweeps and flows follow the change scope (2.11 `change_surfaces`: declared, map-expanded and
+   static surfaces); the smoke subset adds census checkpoints only (the 11.2 PR budget). In the
+   no-manifest, non-UI case (b) the plan adds the tier-1 flows of class `standard` whose surfaces
+   meet the smoke subset, so a backend change that moves values is still checked. No longer a
+   choice since the spec states it; the number stays for the references to it.
 2. PR census workspaces (2.11, 1.11). The pseudocode visits the canonical workspace only; 1.11
    visits the declared chart cell in both its tier A workspaces. Declared surfaces are visited in
    every workspace of `census.workspaces`; every other surface in the canonical one only.
@@ -44,8 +45,11 @@ Choices where the spec is ambiguous (each is reported to the coordinator):
    carry no registry field here and are not applied.
 9. Static impact (2.10.2): depth 0 is the changed class itself. A surface reached only through its
    own roots is not a map gap (no primitive is involved); a changed class owned by another surface
-   but no primitive is named as the unowned root of the missing edge. Without a dependency index
-   the unowned-root check is skipped with the rest of the static step, so exactly one gap appears.
+   but no primitive is named as the unowned root of the missing edge. A changed class in no
+   primitive's and no surface's roots is an `unowned_root` gap only when the reverse closure from
+   it (same depth bound) reaches a surface's roots (2.11); a backend class reaching no surface is
+   not a gap. Without a dependency index the unowned-root check is skipped with the rest of the
+   static step, so exactly one gap appears.
 10. `missed_in_pr_run` (1.8, 9.4): "had in scope" means the PR's change-derived scope (a smoke-only
     surface does not attribute a merge finding to every PR); "not_run (reason: scope)" means outside
     its census scope. Missable finding kinds are those of the Unexpected list: `collateral`,
@@ -506,8 +510,9 @@ def static_impact(changed_classes: Iterable[str], dep_map: DependencyMap, regist
         elif not any(class_matches(origin, r) for r in registry[sid].roots):   # a surface's own code is no map gap
             gaps.setdefault(("missing_edge", sid, origin),
                             MapGap("missing_edge", sid, unowned_root=origin, evidence=chain))
+    reaching = {origin for _, origin in best}             # 2.11: only a class that reaches a surface is a gap
     for c in sorted(changed):
-        if not owners[c] and not registry.owning_surfaces(c):
+        if not owners[c] and not registry.owning_surfaces(c) and c in reaching:
             gaps.setdefault(("unowned_root", c), MapGap("unowned_root", None, unowned_root=c, evidence=c))
     return StaticImpact(changed, touched, map_expanded, static_surfaces, tuple(gaps.values()), True, paths)
 
@@ -1075,7 +1080,9 @@ def compute_scope(run_type: str, manifest: Manifest | None, dep_map: DependencyM
                 items += _sweep_items(ctx, s)
         touched = impact.touched_primitives
         selected = [f for f in flow_map.values() if f.tier == 1 and
-                    (set(f.surfaces) & scope_surfaces or _flow_primitives(f, registry) & touched)]
+                    (set(f.surfaces) & scope_surfaces or _flow_primitives(f, registry) & touched
+                     or (manifest_state == "no_manifest_nonui" and f.flow_class == "standard"
+                         and set(f.surfaces) & smoke))]          # case (b): smoke flows still check moved values
     else:
         tiers = ("A",) if run_type == "merge" else ("A", "B")
         pass_ws = sorted(w.id for w in wmap.values() if w.tier in tiers)

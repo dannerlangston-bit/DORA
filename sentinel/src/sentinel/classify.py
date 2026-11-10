@@ -344,7 +344,7 @@ def _in_scope(m: DecisionMatch, facts: Facts) -> bool:
     # L-01, F38: the pair the decision was made on is on the Decision record; a DecisionMatch may
     # repeat it. Whichever is set must equal this run's pair.
     pairs = {p for p in (m.build_pair_id, d.build_pair_id) if p is not None}
-    return ((bool(pairs) and pairs == {facts.build_pair_id})
+    return (pairs == {facts.build_pair_id}
             or (d.manifest_entry_ref is not None and d.manifest_entry_ref in facts.manifest_entries)
             or (d.ticket is not None and d.ticket in facts.manifest_tickets))
 

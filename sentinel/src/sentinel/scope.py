@@ -35,9 +35,9 @@ Choices where the spec is ambiguous (each is reported to the coordinator):
 7. Cost on a rig: per-side duration from the run database (defaults 11.2: census visit 12 s, sweep
    or split step 8 s, flow 90 s, soak cycle 15 min) times 2 for a frozen item without a reusable
    base (base then candidate on one rig) and times 1 with one, reuse being decided against the
-   fingerprint of the rig the item is placed on; a `masked_live` item costs its
-   per-side duration on each rig of its pair. Session startups are not modelled. The budget is the
-   pseudocode's B (PR 45 min, merge 3 h, RC 8 h - 10 min - 90 min) unless overridden.
+   fingerprint of the rig the item is placed on; a `masked_live` item costs its per-side duration
+   on each rig of its pair. Session startups are not modelled. The budget is the pseudocode's B
+   (PR 45 min, merge 3 h, RC 8 h - 10 min - 90 min) unless overridden.
 8. Ladder F's ascending pass revisits six grid sizes whose checkpoint ids the grammar of 4.1 cannot
    tell apart from the descending pass; the plan lists each id once. Ladder overrides
    (`size_ladder`), the streaming-surface exclusion and the chart rule under DR-02 branch B of 2.5.3

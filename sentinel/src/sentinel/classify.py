@@ -35,12 +35,15 @@ Choices where the spec is ambiguous (each cites the section it reads):
   a verdict or R `unavailable` (the job gave up); for R `capped`, `done` when the item was queued
   when model calls stopped and `none` when the cap excluded it from the start (never queued).
 - Decision memory (3.11 input M, 9.7). Only active decisions count; an `intended` decision counts
-  only on its build pair or when the run's loaded manifest carries its entry or ticket. Matches
+  only on its build pair (read from the decision record and the match; whichever is set must equal
+  the run's pair) or when the run's loaded manifest carries its entry or ticket, and never on a
+  run without a manifest, where `intended` is disabled (4.3). Matches
   with different verdicts inherit nothing and are listed as conflicting. Otherwise the nearest
   by Hamming distance, then the newest, is inherited. A `confirmed_bug` match is not a row
   selector: the computed outcome stands, the decision is referenced (`decision_ref`) and a
   computed `collateral` takes reason `decision:<id>` (4.13). On rows 7 and 8 a matching decision
-  is a waiver: it is referenced and the outcome never changes. A rescued capture ignores M.
+  is a waiver: it is referenced and the outcome never changes. A rescued capture ignores M
+  entirely: no inheritance, no known-bug reference, no waiver (3.11 notes, 4.14).
 - Other applicable `needs_human` reasons (3.11 notes, F47) go in `detail` as "also: ..." in the
   fixed order of 3.11 on every row from 9 on. `uncalibrated`, `no_manifest` and `global_shift`
   apply only to an above-threshold diff.

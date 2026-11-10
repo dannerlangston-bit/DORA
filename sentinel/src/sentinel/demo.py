@@ -24,13 +24,16 @@ import hashlib
 import shutil
 import sys
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
 import cv2
 
+import yaml
+
 from . import synth
+from .pipeline.orchestration import RigScript
 from .pipeline.reviewer import SIMULATED_MODEL_ID
 from .pipeline.run import (DEFAULT_TODAY, NOT_SIMULATED, NightlyScenario, RunResult, Scenario, record_decisions,
                            run_nightly, run_pipeline)
@@ -38,7 +41,13 @@ from .pipeline.sim import SimBuild
 from .store import Store
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "example"
-SCENARIOS = ("flexgrid-ladder", "clean-pr", "backend-only", "ui-no-manifest", "nightly-canary", "decision-inheritance")
+SCENARIOS = ("flexgrid-ladder", "clean-pr", "backend-only", "ui-no-manifest", "nightly-canary", "decision-inheritance",
+             "wrong-number", "paper-mode-mismatch", "attempted-send", "app-crash", "config-invalid")
+AT = "charts.flexible-grid.active-trader-cell"
+LADDER = "trade.active-trader.ladder"
+STOCK_FLOW = "flow.trade.order-ticket.stock.limit"
+LIVE_ACCOUNT = "12345678SCHW"                    # the live account id format of 6.13 item 5: eight digits, then SCHW
+FREEZE_AT = f"sweep/{AT}/flexgrid/640x480"
 BASE_ID = "main-1998.3.0-2c91ae4"
 GRID_SRC = "desktop/ui/grid/src/main/java/com/tos/desktop/ui/grid"
 GRID_INDEX = {
@@ -209,6 +218,80 @@ def ui_no_manifest_scenario(today: date) -> Scenario:
                     depends_on={})
 
 
+def _backend_pr(sha7: str, pr: int, branch: str, path: str) -> tuple[str, dict[str, str], tuple[str, ...]]:
+    """A PR that changes one backend resource and carries no manifest (the no-manifest case (b) of 4.3)."""
+    return f"branch-1998.3.0-{sha7}", dict([_main_build(), _branch_build(sha7, pr, branch)]), (path,)
+
+
+def wrong_number_scenario(today: date) -> Scenario:
+    """PR 4851: a pricing resource change transposes two digits of the Order Confirmation cost."""
+    cand, overlay, paths = _backend_pr("e5a1c07", 4851, "fix/TOS-48351-cost-format",
+                                       "desktop/trade/pricing/src/main/resources/pricing/cost-format.properties")
+    return Scenario("wrong-number", f"run-{today.isoformat()}-pr-4851-01",
+                    SimBuild(cand, frozenset({"confirm-cost-transposed"})), SimBuild(BASE_ID), pr=4851, author="pchen",
+                    overlay=overlay, changed_paths=paths, depends_on={})
+
+
+def paper_mode_scenario(today: date) -> Scenario:
+    """PR 4852 (the chart header change) on a rig whose account selector shows a live-format account id."""
+    sc = clean_scenario(today)
+    return replace(sc, name="paper-mode-mismatch", run_id=f"run-{today.isoformat()}-pr-4852-01", pr=4852,
+                   rig=RigScript(selector_text=LIVE_ACCOUNT))
+
+
+def attempted_send_scenario(today: date) -> Scenario:
+    """PR 4853: a backend change with no visible effect; the stock ticket flow's Executor presses Enter on the
+    open Order Confirmation dialog."""
+    cand, overlay, paths = _backend_pr("f2b9d44", 4853, "chore/TOS-48353-ticket-timeouts",
+                                       "desktop/trade/orders/src/main/resources/orders/ticket-timeouts.properties")
+    return Scenario("attempted-send", f"run-{today.isoformat()}-pr-4853-01", SimBuild(cand), SimBuild(BASE_ID),
+                    pr=4853, author="okafor", overlay=overlay, changed_paths=paths, depends_on={},
+                    rig=RigScript(enter_after=(STOCK_FLOW, "open-confirm")))
+
+
+def app_crash_scenario(today: date) -> Scenario:
+    """PR 4854: the Active Trader cell's host class changes (declared, no visible change); the app freezes
+    during the Ladder S sweep."""
+    sha7 = "a7c3e19"
+    cand = f"branch-1998.3.0-{sha7}"
+    overlay = dict([_main_build(), _branch_build(sha7, 4854, "fix/TOS-48354-at-cell-qty")])
+    overlay[f"manifests/{cand}.yaml"] = f"""schema_version: 1
+manifest_id: mf-{cand}
+candidate: {cand}
+base: {BASE_ID}
+source: manual
+author: jdoe
+entries:
+  - entry_id: tos-48354-1
+    tickets: [TOS-48354]
+    summary: The Active Trader cell keeps its quantity when the cell is resized
+    declared_surfaces: [{AT}]
+    touched_primitives: []
+    changed_paths:
+      - "desktop/charts/src/main/java/**/cell/ActiveTraderCellHost.java"
+    expected_visual: >
+      No visible change at rest; the quantity field keeps its value after a resize.
+    feature_flags: []
+    must_be_observed: false
+"""
+    return Scenario("app-crash", f"run-{today.isoformat()}-pr-4854-01", SimBuild(cand), SimBuild(BASE_ID), pr=4854,
+                    author="jdoe", overlay=overlay,
+                    changed_paths=("desktop/charts/src/main/java/com/tos/desktop/charts/grid/cell/ActiveTraderCellHost.java",),
+                    depends_on={}, rig=RigScript(freeze_at=FREEZE_AT))
+
+
+def mask_expiry(config_dir: Path) -> date:
+    """The earliest `expires_at` of the config's masks: the first day after it, the config no longer lints."""
+    dates = []
+    for p in sorted((config_dir / "masks").rglob("*.yaml")):
+        doc = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        if doc.get("expires_at"):
+            dates.append(datetime.fromisoformat(str(doc["expires_at"])).date())
+    if not dates:
+        raise ValueError(f"{config_dir} has no mask with an expiry")
+    return min(dates)
+
+
 S07 = "regions/flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07.yaml"
 S07_MASK = "masks/flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07/msk.confirm.clock-01.yaml"
 
@@ -331,8 +414,6 @@ def _count(r: RunResult, surface: str | None = None, outcome: str | None = None,
                and (outcome is None or o.outcome == outcome) and (kind is None or o.test_kind == kind))
 
 
-AT = "charts.flexible-grid.active-trader-cell"
-LADDER = "trade.active-trader.ladder"
 
 
 # ------------------------------------------------------------------------------------------------
@@ -406,9 +487,8 @@ def demo_backend_only(out: Path, today: date = DEFAULT_TODAY, config: Path = EXA
         "change is above threshold and the checkpoint ends needs_human (reason: no_manifest) instead of slipping",
         "through. The dialog checkpoint s07 is recapturable: false in its flow, so its stability is 'unknown'.",
         "",
-        "Simulation note (a reported workaround): the scope module selects flows only from the change-derived scope;",
-        "in case (b) that scope is empty, so no flow would reach the dialog. Following the 2.11 pseudocode, this run",
-        f"adds the tier-1 flows that touch the smoke census: {', '.join(r.extra_flows) or 'none'}.",
+        "Case (b) still runs the smoke flows (2.11): the scope adds the tier-1 standard flows that touch the smoke",
+        "census, so the stock ticket flow reaches the dialog although the change-derived scope is empty.",
     ]
     _write_summary(out, "Scenario backend-only: a money-cell diff with no manifest", story, [r])
     return [r]

@@ -1,0 +1,12 @@
+# The R02 buying power brackets of 2.8.3 (4.1 names this file; its shape is fixed by sentinel.oracle.tables).
+# Unpinned: Phase 0 has not yet read the exact paperMoney formula from twenty staged tickets, so every
+# bracket is the range 2.8.3 states and R02 results carry the label "bracket check".
+schema_version: 1
+pinned: false
+brackets:                 # |buying power effect| lies in [low x base, high x base]
+  - {asset: equity, account: margin, of: notional, low: 0.50, high: 1.00}
+  - {asset: equity, account: ira, of: notional, low: 1.00, high: 1.00}
+  - {asset: option, account: margin, of: notional, low: 1.00, high: 1.00}   # long option: the premium
+  - {asset: option, account: ira, of: notional, low: 1.00, high: 1.00}
+  - {asset: future, account: margin, of: initial_margin, low: 1.00, high: 1.00}
+initial_margin: {MES: 2464.00, ES: 24640.00}   # exchange initial margin per contract, by futures root

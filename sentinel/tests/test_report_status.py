@@ -57,8 +57,8 @@ def test_outcomes_alone_give_the_same_state():
 
 def test_tier_2_and_registry_side_findings_never_fail_the_check():
     s = _decide_tier1(sample())
-    s["outcomes"].append(CheckpointOutcome(run_id=RUN_ID, checkpoint_id="census/unregistered.p3.x/ws.tier-a.active-trader",
-                                           outcome="unregistered_surface", reason="probe:P3", tier=1,
+    s["outcomes"].append(CheckpointOutcome(run_id=RUN_ID, outcome="unregistered_surface", reason="probe:P3", tier=1,
+                                           checkpoint_id="census/unregistered.p3.x/ws.tier-a.active-trader",
                                            workspace_id="ws.tier-a.active-trader", persona="active_trader",
                                            data_mode="frozen"))
     st = commit_status(s["run"], s["outcomes"], "blocking", findings=s["findings"], decisions=s["decisions"],

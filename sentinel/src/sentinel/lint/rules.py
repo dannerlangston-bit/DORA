@@ -1024,3 +1024,935 @@ class _Linter:
         sets = _d(data.get("splitter_sets"))
         if tuple(_l(sets.get("full"))) != SPLIT_FULL or tuple(_l(sets.get("short"))) != SPLIT_SHORT:
             self.add("L-SRF-03", doc.rel, "splitter_sets differ from 2.5.2 (full 0.00..1.00, short 0.15, 0.50, 0.85)", "splitter_sets")
+
+    # -- 4.6 workspaces --------------------------------------------------------------------------
+
+    def check_workspaces(self) -> None:
+        allowed_doc = self.r.one("configs_allowed")
+        allowed = [{k: _d(c).get(k) for k in ("width", "height", "scale_percent", "theme", "font_size")}
+                   for c in _l(_d(allowed_doc.data).get("configs") if allowed_doc else [])]
+        personas: dict[str, list[str]] = {p: [] for p in PERSONAS}
+        flows_by_ws: dict[str, set[str]] = {}
+        for doc in self.flows.values():
+            fl = _d(doc.data)
+            flows_by_ws.setdefault(_s(fl.get("workspace")), set()).add(_s(fl.get("fixture")))
+        for doc in self.r.of("workspace"):
+            w, f = _d(doc.data), doc.rel
+            file = w.get("file")
+            if not (isinstance(file, str) and self.r.exists(file)):
+                self.add("L-WSP-01", f, f"workspace file {file} does not exist", "file")
+            elif file_sha256(self.r.path(file)) != w.get("file_sha256"):
+                self.add("L-WSP-01", f, f"sha256 of {file} does not equal file_sha256", "file_sha256")
+            tier = w.get("tier")
+            if tier == "A":
+                if w.get("persona") in personas:
+                    personas[w["persona"]].append(f)
+                else:
+                    self.add("L-WSP-02", f, "tier A entries name their persona", "persona")
+            if tier == "B":
+                sub = w.get("saved_under_build")
+                if not sub:
+                    self.add("L-WSP-03", f, "tier B entries carry saved_under_build", "saved_under_build")
+                elif _d(self.builds.get(sub)).get("channel", _channel(sub)) != "released":
+                    self.add("L-WSP-03", f, f"saved_under_build {sub} is not a released build", "saved_under_build")
+            if tier == "C":
+                cells = _l(w.get("size_sweep_cells"))
+                if not cells:
+                    self.add("L-WSP-04", f, "tier C entries carry size_sweep_cells", "size_sweep_cells")
+                for i, c in enumerate(map(_d, cells)):
+                    if _d(self.surfaces.get(c.get("hosts"))).get("resizable") is not True:
+                        self.add("L-WSP-04", f, f"sweep cell host {c.get('hosts')} is not a resizable surface", f"size_sweep_cells[{i}].hosts")
+            dc = _d(w.get("display_config"))
+            if {k: dc.get(k) for k in ("width", "height", "scale_percent", "theme", "font_size")} not in allowed:
+                self.add("L-WSP-05", f, "display_config is not listed in configs/allowed.yaml", "display_config")
+            gadgets = [g for g in _l(w.get("gadgets_present"))]
+            panels = {_d(p).get("surface") for p in _l(w.get("active_trader_panels"))}
+            for g in gadgets:
+                if g not in self.surfaces:
+                    self.add("L-WSP-06", f, f"gadget {g} is not in the registry", "gadgets_present")
+                elif self.surfaces[g].get("kind") == "active_trader_panel" and g not in panels:
+                    self.add("L-WSP-06", f, f"Active Trader surface {g} is missing from active_trader_panels (attestation A7)", "active_trader_panels")
+            for p in panels:
+                if p not in self.surfaces:
+                    self.add("L-WSP-06", f, f"active_trader_panels surface {p} is not in the registry", "active_trader_panels")
+            used = flows_by_ws.get(_s(w.get("id"))) or set(self.fixtures)
+            for i, lg in enumerate(map(_d, _l(w.get("link_groups")))):
+                ref = lg.get("symbol_ref")
+                for fx in sorted(x for x in used if x):
+                    syms = {_d(s).get("id") for s in _l(_d(_d(self.fixtures.get(fx)).data if fx in self.fixtures else {}).get("symbols"))}
+                    if ref not in syms:
+                        self.add("L-WSP-07", f, f"symbol_ref {ref} is not a symbol of fixture {fx}", f"link_groups[{i}].symbol_ref")
+                if not used - {""}:
+                    self.add("L-WSP-07", f, f"no fixture defines symbol_ref {ref}", f"link_groups[{i}].symbol_ref")
+        if self.r.of("workspace"):
+            for p, files in personas.items():
+                if len(files) != 1:
+                    self.add("L-WSP-02", "corpus/workspaces", f"persona {p} has {len(files)} tier A entries; exactly one is required")
+
+    # -- 4.7 flows -------------------------------------------------------------------------------
+
+    def check_flows(self) -> None:
+        seen_flow: dict[str, str] = {}
+        seen_cp: dict[str, str] = {}
+        for doc in self.r.of("flow"):
+            fl, f = _d(doc.data), doc.rel
+            fid = _s(fl.get("flow_id"))
+            if fid in seen_flow:
+                self.add("L-FLW-01", f, f"flow_id {fid} is also defined in {seen_flow[fid]}", "flow_id")
+            seen_flow.setdefault(fid, f)
+            self._flow_structure(fl, f)
+            self._flow_targets(fl, f)
+            self._flow_checkpoints(fl, f, fid, seen_cp)
+            self._flow_assertions(fl, f)
+            self._flow_safety(fl, f)
+            self._flow_budget(fl, f, fid)
+
+    def _flow_structure(self, fl: dict, f: str) -> None:
+        ids = [st.get("id") for _sec, st in self._all_steps(fl)]
+        for x in sorted({i for i in ids if ids.count(i) > 1}, key=str):
+            self.add("L-FLW-01", f, f"step id {x} is not unique in the file", "steps")
+        steps, teardown = [_d(x) for x in _l(fl.get("steps"))], [_d(x) for x in _l(fl.get("teardown"))]
+        if not steps or steps[0].get("type") != "reset_input_state":
+            self.add("L-FLW-01", f, "the first step is reset_input_state", "steps[0]")
+        if not teardown or teardown[-1].get("type") != "reset_input_state":
+            self.add("L-FLW-01", f, "the last teardown step is reset_input_state", "teardown")
+        for key in ("surface",):
+            if fl.get(key) not in self.surfaces:
+                self.add("L-FLW-02", f, f"flow surface {fl.get(key)} is not in the registry", key)
+        if fl.get("surface") not in _l(fl.get("surfaces")):
+            self.add("L-FLW-02", f, "the primary surface is listed in surfaces", "surfaces")
+        for s in _l(fl.get("surfaces")):
+            if s not in self.surfaces:
+                self.add("L-FLW-02", f, f"surface {s} is not in the registry", "surfaces")
+        if fl.get("workspace") not in self.workspaces:
+            self.add("L-FLW-00", f, f"workspace {fl.get('workspace')} is not in the corpus", "workspace")
+        if fl.get("fixture") not in self.fixtures:
+            self.add("L-FLW-00", f, f"fixture {fl.get('fixture')} is not in fixtures/", "fixture")
+        pre = [_d(x) for x in _l(fl.get("preconditions"))]
+        checks = {p.get("check") for p in pre}
+        for need in ("paper_mode", "no_modal"):
+            if need not in checks:
+                self.add("L-FLW-12", f, f"preconditions include {need}", "preconditions")
+        if any(self.order_surface(s) for s in _l(fl.get("surfaces"))):
+            if not any(p.get("check") == "working_orders" and p.get("expect") == 0 for p in pre):
+                self.add("L-FLW-12", f, "order flows check working_orders with expect: 0 before the first step", "preconditions")
+            if not any(t.get("type") == "teardown" and t.get("action") == "working_orders_check" and t.get("expect") == 0 for t in teardown):
+                self.add("L-FLW-12", f, "order flows end with a working_orders_check teardown with expect: 0", "teardown")
+        is_quarantine = f.startswith("flows/quarantine/")
+        origin = _d(fl.get("origin"))
+        if origin.get("kind") == "explorer":
+            if not (origin.get("run_id") and origin.get("finding_ref")):
+                self.add("L-FLW-14", f, "explorer flows carry origin.run_id and origin.finding_ref", "origin")
+            if fl.get("class") != "explorer_candidate":
+                self.add("L-FLW-14", f, "explorer flows keep class explorer_candidate until a human promotes them", "class")
+            if not is_quarantine:
+                self.add("L-FLW-14", f, "explorer flows live under flows/quarantine/", "origin")
+        if is_quarantine and fl.get("class") != "explorer_candidate":
+            self.add("L-FLW-14", f, "flows under flows/quarantine/ are class explorer_candidate", "class")
+
+    def _flow_targets(self, fl: dict, f: str) -> None:
+        cls = fl.get("class")
+        for sec, st in self._all_steps(fl):
+            at = f"{sec}[{st.get('id')}]"
+            if st.get("type") == "secret" and cls != "login":
+                self.add("L-FLW-06", f, "secret steps are allowed only in class login flows", at)
+            if st.get("type") == "type_fixture" and isinstance(st.get("value"), str):
+                if credential_hits(f"value: {st['value']}"):
+                    self.add("L-FLW-06", f, "a value literal matches a credential pattern", f"{at}.value")
+            if st.get("type") == "drag":
+                if not (isinstance(st.get("steps"), int) and st["steps"] >= 10):
+                    self.add("L-FLW-09", f, "drag steps is at least 10", f"{at}.steps")
+                if not (isinstance(st.get("hold_ms"), int) and st["hold_ms"] <= 2000):
+                    self.add("L-FLW-09", f, "drag hold_ms is at most 2000", f"{at}.hold_ms")
+            if st.get("type") == "wheel" and st.get("notches") == 0:
+                self.add("L-FLW-09", f, "wheel notches is not 0", f"{at}.notches")
+            for k in TARGET_FIELDS:
+                t = st.get(k)
+                if not isinstance(t, str):
+                    continue
+                ctl = self.controls.get(t)
+                if ctl is None:
+                    self.add("L-FLW-02", f, f"target {t} is not a <surface>.<control> of the registry", f"{at}.{k}")
+                    continue
+                c = ctl[1]
+                if c.get("deny") is True or c.get("id") == "auto-send-checkbox":
+                    self.add("L-FLW-13", f, f"step targets {t}, a denied control", f"{at}.{k}")
+                if self.rungs(t) < 2:
+                    self.add("L-FLW-17", f, f"target {t} resolves on fewer than two rungs (template plus jab or ocr_text)", f"{at}.{k}")
+                cancel_all = c.get("id") == "cancel-all" or _s(c.get("ocr_text")).strip().casefold() == "cancel all"
+                if cancel_all and st.get("type") in ("click_named", "rclick", "dblclick"):
+                    self.add("L-FLW-19", f, f"{st.get('type')} targets Cancel All; only the cancel_all teardown may", f"{at}.{k}")
+        if cls == "login" and fl.get("agent_fallback") != "disabled":
+            self.add("L-FLW-06", f, "login flows have agent_fallback: disabled", "agent_fallback")
+        if cls == "paper_send_ok":
+            sp = self.send_policy
+            if not (sp.get("enabled") is True and sp.get("risk_owner") and sp.get("signature")):
+                self.add("L-FLW-08", f, "class paper_send_ok needs policy/send_policy.yaml enabled: true with a risk-owner signature", "class")
+
+    def _flow_checkpoints(self, fl: dict, f: str, fid: str, seen_cp: dict[str, str]) -> None:
+        surfaces = _l(fl.get("surfaces"))
+        cleared = False
+        for st in self._seq(fl):
+            if st.get("type") == "teardown" and st.get("action") in ("clear_ticket", "close_dialog", "cancel_all"):
+                cleared = True
+            if st.get("type") != "checkpoint":
+                continue
+            at = f"steps[{st.get('id')}]"
+            for need in ("surface_id", "target_window", "data_mode"):
+                if need not in st:
+                    self.add("L-FLW-02", f, f"checkpoint {st.get('id')} carries {need}; nothing is inherited", at)
+            sid = st.get("surface_id")
+            if "surface_id" in st and sid not in self.surfaces:
+                self.add("L-FLW-02", f, f"surface_id {sid} is not in the registry", f"{at}.surface_id")
+            elif "surface_id" in st and sid not in surfaces:
+                self.add("L-FLW-02", f, f"surface_id {sid} is not in the flow's surfaces", f"{at}.surface_id")
+            cid = st.get("checkpoint_id")
+            want = f"flow/{sid}/{fid}/{st.get('id')}"
+            if cid != want:
+                self.add("L-FLW-03", f, f"checkpoint_id must be {want}", f"{at}.checkpoint_id")
+            if isinstance(cid, str):
+                if cid in seen_cp:
+                    self.add("L-FLW-03", f, f"checkpoint_id {cid} is also used in {seen_cp[cid]}", f"{at}.checkpoint_id")
+                seen_cp.setdefault(cid, f)
+            regions, mode = st.get("regions"), st.get("data_mode")
+            if regions == "default":
+                if mode != "frozen":
+                    self.add("L-FLW-04", f, "regions: default (whole-surface diff) is allowed only with data_mode frozen", f"{at}.regions")
+            elif not (isinstance(regions, str) and self.r.exists(regions)):
+                self.add("L-FLW-04", f, f"regions file {regions} does not exist", f"{at}.regions")
+            else:
+                rdoc = self.r.docs.get(regions)
+                if rdoc is None or _d(rdoc.data).get("checkpoint_id") != cid:
+                    self.add("L-FLW-04", f, f"regions file {regions} belongs to another checkpoint", f"{at}.regions")
+            if mode == "masked_live":
+                rmap = self.region_map(regions[len("regions/"):-len(".yaml")]) if isinstance(regions, str) and regions.startswith("regions/") else {}
+                if not any(x.get("type") in ("rule", "mask") for x in rmap.values()):
+                    self.add("L-FLW-05", f, f"masked_live checkpoint {st.get('id')} references no rule or mask region", f"{at}.regions")
+            if cleared and st.get("recapturable", True) is not False:
+                self.add("L-FLW-16", f, f"checkpoint {st.get('id')} follows a clear_ticket, close_dialog or cancel_all and is recapturable: false", f"{at}.recapturable")
+        ticket_surfaces = [s for s in surfaces if _d(self.surfaces.get(s)).get("kind") == "ticket_variant"]
+        steps = [_d(x) for x in _l(fl.get("steps"))]
+        for ts_ in ticket_surfaces:
+            first = next((k for k, st in enumerate(steps) if st.get("type") in ("type_fixture", "click_named")
+                          and _s(st.get("target")).startswith(ts_ + ".") and _s(st.get("target")) != f"{ts_}.symbol-box"), None)
+            if first is not None and not any(st.get("type") == "checkpoint" and st.get("surface_id") == ts_ for st in steps[:first]):
+                self.add("L-FLW-15", f, f"no pre-input checkpoint on {ts_} before step {steps[first].get('id')} (2.6.3)", "steps")
+
+    def _cp_regions(self, st: dict) -> set[str] | None:
+        reg = st.get("regions")
+        if isinstance(reg, str) and reg.startswith("regions/") and reg.endswith(".yaml"):
+            return set(self.region_map(reg[len("regions/"):-len(".yaml")]))
+        return set() if reg == "default" else None
+
+    def _flow_assertions(self, fl: dict, f: str) -> None:
+        steps = [("steps", _d(x)) for x in _l(fl.get("steps"))] + [("teardown", _d(x)) for x in _l(fl.get("teardown"))]
+        cps = [k for k, (_sec, st) in enumerate(steps) if st.get("type") == "checkpoint"]
+        cp_by_id = {steps[k][1].get("id"): k for k in cps}
+        all_regions: set[str] = set()
+        for k in cps:
+            all_regions |= self._cp_regions(steps[k][1]) or set()
+        for k, (sec, st) in enumerate(steps):
+            groups: list[tuple[str, list, set[str] | None, int]] = []
+            if st.get("type") == "checkpoint":
+                groups.append((f"{sec}[{st.get('id')}].expect", _l(st.get("expect")), self._cp_regions(st), k))
+            else:
+                items = _l(st.get("assertions")) if st.get("type") == "assert" else [st["verify"]] if isinstance(st.get("verify"), dict) else []
+                if not items:
+                    continue
+                if sec == "teardown":
+                    base = all_regions
+                else:
+                    before = [c for c in cps if c < k]
+                    after = [c for c in cps if c > k]
+                    pick = before[-1] if before else after[0] if after else None
+                    base = self._cp_regions(steps[pick][1]) if pick is not None else set()
+                groups.append((f"{sec}[{st.get('id')}]", items, base, k))
+            for at, items, base, pos in groups:
+                for a in map(_d, items):
+                    self._assertion(f, at, a, base, pos, steps, cp_by_id)
+
+    def _assertion(self, f: str, at: str, a: dict, base: set[str] | None, pos: int,
+                   steps: list[tuple[str, dict]], cp_by_id: dict[Any, int]) -> None:
+        loc = f"{at}[{a.get('id')}]"
+        allowed = set(base or set())
+        since = a.get("since_step")
+        if a.get("kind") in ("changed_since_previous_step", "unchanged_since_previous_step") or since is not None:
+            k = cp_by_id.get(since)
+            if k is None or k >= pos:
+                self.add("L-FLW-11", f, f"since_step {since} is not an earlier checkpoint", f"{loc}.since_step")
+            else:
+                allowed |= self._cp_regions(steps[k][1]) or set()
+        region = a.get("region")
+        if a.get("kind") != "rule":
+            if region is None:
+                self.add("L-FLW-11", f, f"assertion kind {a.get('kind')} needs a region", loc)
+            elif region not in allowed:
+                self.add("L-FLW-11", f, f"region {region} is not declared on the checkpoint", f"{loc}.region")
+        else:
+            rid = a.get("rule_id")
+            if rid not in RULE_OPERANDS:
+                self.add("L-FLW-11", f, f"rule_id {rid} is not one of R01 to R10 (2.8.3)", f"{loc}.rule_id")
+                return
+            req, opt = RULE_OPERANDS[rid]
+            inputs = _d(a.get("inputs"))
+            if not req <= set(inputs) or not set(inputs) <= req | opt:
+                self.add("L-FLW-11", f, f"inputs of {rid} must be {sorted(req)}" + (f" plus optional {sorted(opt)}" if opt else ""), f"{loc}.inputs")
+            for name, v in inputs.items():
+                if isinstance(v, str) and v not in allowed:
+                    self.add("L-FLW-11", f, f"operand {name} region {v} is not declared on the checkpoint", f"{loc}.inputs.{name}")
+
+    def _flow_safety(self, fl: dict, f: str) -> None:
+        seq = self._seq(fl)
+        start = None
+        for k, st in enumerate(seq):
+            ctl = self.controls.get(_s(st.get("target")))
+            is_cs = ctl is not None and (ctl[1].get("id") == "confirm-and-send" or _s(ctl[1].get("ocr_text")).strip().casefold() == "confirm and send")
+            if is_cs:
+                if st.get("order_stage") is not True:
+                    self.add("L-FLW-07", f, f"step {st.get('id')} targets Confirm and Send without order_stage: true", f"steps[{st.get('id')}]")
+                start = k if start is None else start
+        if start is None:
+            return
+        closed = None
+        for k in range(start + 1, len(seq)):
+            st = seq[k]
+            if st.get("type") == "teardown" and st.get("action") in ("close_dialog", "clear_ticket"):
+                closed = k
+                break
+            keys = [_s(st.get("key")).casefold()] if st.get("type") == "press" else \
+                [_s(x).casefold() for x in _l(st.get("keys"))] if st.get("type") == "key_chord" else []
+            if any(x in ENTER_KEYS for x in keys):
+                self.add("L-FLW-07", f, f"step {st.get('id')} presses Enter or Space while the order is staged", f"steps[{st.get('id')}]")
+        if closed is None:
+            self.add("L-FLW-07", f, "no close_dialog or clear_ticket teardown follows the order-stage step", "teardown")
+        elif not any(st.get("type") == "assert" and any(_d(a).get("kind") == "absent" for a in _l(st.get("assertions"))) for st in seq[closed + 1:]):
+            self.add("L-FLW-07", f, "no absent assertion proves the ticket empty after close_dialog or clear_ticket", "teardown")
+
+    def _flow_budget(self, fl: dict, f: str, fid: str) -> None:
+        b = _d(fl.get("budget"))
+        dur, steps = b.get("max_duration_s"), b.get("max_steps")
+        if fl.get("class") == "explorer_candidate":
+            eb = self.explorer_budget
+            max_steps = min(400, eb.get("max_actions", 400) if isinstance(eb.get("max_actions"), int) else 400)
+            max_dur = min(5400, eb["max_minutes"] * 60 if isinstance(eb.get("max_minutes"), int) else 5400)
+            if not (isinstance(steps, int) and steps <= max_steps):
+                self.add("L-FLW-18", f, f"explorer_candidate max_steps is at most {max_steps}", "budget.max_steps")
+            if not (isinstance(dur, int) and dur <= max_dur):
+                self.add("L-FLW-18", f, f"explorer_candidate max_duration_s is at most {max_dur}", "budget.max_duration_s")
+            return
+        limit = 3 * self.p50[fid] if fid in self.p50 else 300
+        if not (isinstance(dur, (int, float)) and dur <= limit):
+            self.add("L-FLW-10", f, f"max_duration_s {dur} exceeds {limit:g} s (3 x measured p50, 5 minutes until measured; 11.2)", "budget.max_duration_s")
+
+    def check_renames(self) -> None:
+        for i, x in enumerate(self.renames):
+            old, new = x.get("old"), x.get("new")
+            if old in self.defined:
+                self.add("L-FLW-03", self.renames_file, f"renamed or retired id {old} is still defined", f"renames[{i}].old")
+            if new != "retired" and new not in self.defined:
+                self.add("L-FLW-03", self.renames_file, f"rename target {new} is not a defined checkpoint (or 'retired')", f"renames[{i}].new")
+
+    # -- 4.8 regions and masks -------------------------------------------------------------------
+
+    def _cp_mode(self, cid: str) -> str | None:
+        c = self.defined.get(cid)
+        return c.data_mode if c else None
+
+    def check_regions(self) -> None:
+        for cid, doc in self.regions.items():
+            rf, f = _d(doc.data), doc.rel
+            if rf.get("checkpoint_id") != cid:
+                self.add("L-RGN-01", f, f"file path must be regions/{rf.get('checkpoint_id')}.yaml", "checkpoint_id")
+            if cid not in self.defined and cid not in self.retired:
+                self.add("L-RGN-01", f, f"no flow, census, sweep or splitter definition produces {cid}")
+            regions = [_d(x) for x in _l(rf.get("regions"))]
+            ids = [x.get("id") for x in regions]
+            for x in sorted({i for i in ids if ids.count(i) > 1}, key=str):
+                self.add("L-RGN-01", f, f"region id {x} is not unique", "regions")
+            landmarks = {_d(x).get("id") for x in _l(rf.get("landmarks"))}
+            for i, x in enumerate(regions):
+                if x.get("landmark") not in landmarks:
+                    self.add("L-RGN-00", f, f"region landmark {x.get('landmark')} is not a landmark of this file", f"regions[{i}].landmark")
+            for i, a in enumerate(regions):
+                for b in regions[i + 1:]:
+                    ra, rb = _rect(a.get("rect")), _rect(b.get("rect"))
+                    if not (ra and rb) or a.get("landmark") != b.get("landmark") or a.get("type") == b.get("type"):
+                        continue
+                    if _overlap(ra, rb):
+                        ok = (a.get("type") == "mask" and _inside(ra, rb)) or (b.get("type") == "mask" and _inside(rb, ra))
+                        if not ok:
+                            self.add("L-RGN-02", f, f"{a.get('id')} ({a.get('type')}) overlaps {b.get('id')} ({b.get('type')})", "regions")
+            mode = self._cp_mode(cid)
+            for i, x in enumerate(regions):
+                at, t, rid = f"regions[{i}]", x.get("type"), x.get("id")
+                if ("rule" in x) != (t == "rule"):
+                    self.add("L-RGN-03", f, "rule is present if and only if type is rule", at)
+                if ("mask_ref" in x) != (t == "mask"):
+                    self.add("L-RGN-03", f, "mask_ref is present if and only if type is mask", at)
+                elif t == "mask":
+                    mdoc = self.masks.get((cid, _s(x.get("mask_ref"))))
+                    if mdoc is None:
+                        self.add("L-RGN-03", f, f"mask {x.get('mask_ref')} has no record under masks/{cid}/", f"{at}.mask_ref")
+                    elif _d(mdoc.data).get("region_id") != rid:
+                        self.add("L-RGN-03", f, f"mask {x.get('mask_ref')} names region {_d(mdoc.data).get('region_id')}, not {rid}", f"{at}.mask_ref")
+                if ("fixture_dependency" in x) != (t == "freeze"):
+                    self.add("L-RGN-03", f, "fixture_dependency is present if and only if type is freeze", at)
+                fe = x.get("floor_exception")
+                if fe is not None:
+                    fe = _d(fe)
+                    exp = _ts(fe.get("expires_at"))
+                    if not all(fe.get(k) for k in ("approved_by", "reason", "ticket")) or exp is None or exp <= self.now:
+                        self.add("L-RGN-05", f, "floor_exception carries approved_by, reason, ticket and a future expires_at", f"{at}.floor_exception")
+                    if t != "diff":
+                        self.add("L-RGN-05", f, "floor_exception is allowed on diff regions only", f"{at}.floor_exception")
+                if x.get("money_cell") is True:
+                    if t not in ("diff", "freeze"):
+                        self.add("L-RGN-04", f, f"money cell {rid} is {t}; money cells are diff or freeze", at)
+                    if "floor_exception" in x:
+                        self.add("L-RGN-04", f, f"money cell {rid} carries a floor_exception", f"{at}.floor_exception")
+                    c = self.defined.get(cid)
+                    if c and c.kind == "flow" and rid not in self._asserted_regions(c):
+                        self.add("L-RGN-04", f, f"money cell {rid} is not named by an assertion of {cid}", at)
+                if t == "mask" and mode == "frozen" and _s(rid).rsplit(".", 1)[-1] not in FROZEN_MASK_SEGMENTS:
+                    self.add("L-RGN-07", f, f"mask {rid} on a frozen checkpoint; only the clock, connection indicator, caret or parking rectangle", at)
+            self._mask_budget(cid, f, regions)
+
+    def _asserted_regions(self, c: CheckpointDef) -> set[str]:
+        """Regions named by the checkpoint's expect entries and by assert steps before the next checkpoint."""
+        doc = self.flows.get(c.flow or "")
+        out: set[str] = set()
+        seq = self._seq(doc.data if doc else {})
+        k = next((i for i, st in enumerate(seq) if st.get("checkpoint_id") == c.cid), None)
+        if k is None:
+            return out
+        assertions = list(_l(seq[k].get("expect")))
+        for st in seq[k + 1:]:
+            if st.get("type") == "checkpoint":
+                break
+            if st.get("type") == "assert":
+                assertions += _l(st.get("assertions"))
+        for a in map(_d, assertions):
+            if isinstance(a.get("region"), str):
+                out.add(a["region"])
+            out |= {v for v in _d(a.get("inputs")).values() if isinstance(v, str)}
+        return out
+
+    def _mask_budget(self, cid: str, f: str, regions: list[dict]) -> None:
+        doc = self.regions.get(cid)
+        landmarks = {_d(x).get("id") for x in _l(_d(doc.data).get("landmarks") if doc else [])}
+        masks = [x for x in regions if x.get("type") == "mask"]
+        masks += [x for x in self.redaction if x.get("landmark") in landmarks and x.get("identity_field") is not True]
+        for m in masks:
+            rm = _rect(m.get("rect"))
+            for x in regions:
+                rx = _rect(x.get("rect"))
+                if x.get("money_cell") is True and rm and rx and x.get("landmark") == m.get("landmark") and _overlap(rm, rx):
+                    self.add("L-MSK-03", f, f"mask or redaction box {m.get('id')} covers money cell {x.get('id')} (budget 0 percent)")
+        for panel, budget in MASK_BUDGET.items():
+            for lm in landmarks:
+                members = [x for x in regions + masks if x.get("panel", "other") == panel and x.get("landmark") == lm and _rect(x.get("rect"))]
+                masked = sum(_rect(x["rect"])[2] * _rect(x["rect"])[3] for x in masks if x in members)  # type: ignore[index]
+                if not masked:
+                    continue
+                rects = [_rect(x["rect"]) for x in members]
+                x0, y0 = min(r[0] for r in rects), min(r[1] for r in rects)  # type: ignore[index]
+                x1, y1 = max(r[0] + r[2] for r in rects), max(r[1] + r[3] for r in rects)  # type: ignore[index]
+                share = masked / max(1, (x1 - x0) * (y1 - y0))
+                if share > budget:
+                    self.add("L-MSK-03", f, f"{panel} panel is {share:.1%} masked; the budget is {budget:.0%} (mask budget, 4.8)")
+
+    def check_masks(self) -> None:
+        for doc in self.r.of("mask"):
+            m, f = _d(doc.data), doc.rel
+            if m.get("created_by") != "human":
+                self.add("L-MSK-01", f, "created_by is human; the Reviewer may propose a mask, never create one", "created_by")
+            exp = _ts(m.get("expires_at"))
+            if exp is not None and exp <= self.now:
+                self.add("L-MSK-02", f, f"mask expired at {m.get('expires_at')}; renew it with the latest A/A result or remove it", "expires_at")
+            want = f"masks/{m.get('checkpoint_id')}/{m.get('mask_id')}.yaml"
+            cid = _s(m.get("checkpoint_id"))
+            if f != want:
+                self.add("L-RGN-03", f, f"mask record path must be {want}")
+            elif _d(self.region_map(cid).get(_s(m.get("region_id")))).get("mask_ref") != m.get("mask_id"):
+                self.add("L-RGN-03", f, f"no mask region {m.get('region_id')} with mask_ref {m.get('mask_id')} in regions/{cid}.yaml", "region_id")
+
+    # -- 4.9 fixtures ----------------------------------------------------------------------------
+
+    def check_fixtures(self) -> None:
+        al = self.r.one("allowlist")
+        rigs = {_d(x).get("rig"): [a for a in _l(_d(x).get("account_ids"))] for x in _l(_d(al.data).get("rigs") if al else [])}
+        if al:
+            for i, x in enumerate(map(_d, _l(_d(al.data).get("rigs")))):
+                for a in _l(x.get("account_ids")):
+                    if not (isinstance(a, str) and ACCOUNT.match(a)):
+                        self.add("L-FIX-01", al.rel, f"allowlist entry {a!r} is not an exact ^D-[0-9A-Z]+$ id (no patterns, globs or prefixes)", f"rigs[{i}].account_ids")
+        elif self.r.of("fixture"):
+            self.add("L-FIX-01", "gateway/allowlist.yaml", "gateway/allowlist.yaml is missing")
+        send_enabled = self.send_policy.get("enabled") is True
+        for doc in self.r.of("fixture"):
+            fx, f = _d(doc.data), doc.rel
+            accounts = [_d(a) for a in _l(fx.get("accounts"))]
+            symbols = {_d(s).get("id"): _d(s) for s in _l(fx.get("symbols"))}
+            ids = {a.get("account_id") for a in accounts}
+            for i, a in enumerate(accounts):
+                aid = a.get("account_id")
+                if not (isinstance(aid, str) and ACCOUNT.match(aid)):
+                    self.add("L-FIX-01", f, f"account_id {aid!r} does not match ^D-[0-9A-Z]+$", f"accounts[{i}].account_id")
+                if aid not in rigs.get(fx.get("rig"), []):
+                    self.add("L-FIX-01", f, f"account {aid} is not in gateway/allowlist.yaml for rig {fx.get('rig')}", f"accounts[{i}].account_id")
+                if send_enabled and "cash_floor" in a:
+                    self.add("L-FIX-02", f, "cash_floor is omitted when policy/send_policy.yaml is enabled", f"accounts[{i}].cash_floor")
+            roles = [a.get("role") for a in accounts]
+            if roles.count("golden") != 1 or roles.count("empty") > 1:
+                self.add("L-FIX-02", f, f"exactly one golden and at most one empty account (found {roles.count('golden')} and {roles.count('empty')})", "accounts")
+            for sid, s in symbols.items():
+                if s.get("asset") == "future" and set(_l(s.get("purpose"))) & {"ticket", "ladder"}:
+                    rd = _date(s.get("roll_date"))
+                    if not FUTURE_MONTH.match(_s(s.get("symbol"))) or rd is None or rd <= self.today:
+                        self.add("L-FIX-03", f, f"futures symbol {sid} needs a month code, year and a future roll_date (expired contracts fail)", "symbols")
+            if not _s(fx.get("login_ref")).startswith("vault://"):
+                self.add("L-FIX-04", f, "login_ref is a vault:// reference, never the value", "login_ref")
+            for loc, line in _walk_strings(fx):
+                if credential_hits(line):
+                    self.add("L-FIX-04", f, "a field matches a credential pattern", loc)
+            sp, od = self.profiles.get(fx.get("settings_profile")), self.profiles.get(fx.get("order_defaults_profile"))
+            if sp is None or sp.get("kind") != "app_settings":
+                self.add("L-FIX-05", f, f"settings_profile {fx.get('settings_profile')} is not an app_settings profile in profiles/", "settings_profile")
+            else:
+                st = _d(sp.get("settings"))
+                pins = (("order_confirmation", st.get("order_confirmation") is True),
+                        ("shift_click_send", st.get("shift_click_send") in (False, "absent")),
+                        ("active_trader_hotkeys", st.get("active_trader_hotkeys") is False),
+                        ("order_hotkeys", st.get("order_hotkeys") == []))
+                bad = [k for k, ok in pins if not ok]
+                if bad:
+                    self.add("L-FIX-05", f, f"settings profile {sp.get('id')} does not pin {', '.join(bad)} (12.6 A3 to A6)", "settings_profile")
+            if od is None or od.get("kind") != "order_defaults":
+                self.add("L-FIX-05", f, f"order_defaults_profile {fx.get('order_defaults_profile')} is not an order_defaults profile in profiles/", "order_defaults_profile")
+            self._fixture_epoch(fx, f, symbols)
+            self._fixture_positions(fx, f, accounts, symbols, ids)
+
+    def _fixture_epoch(self, fx: dict, f: str, symbols: dict[Any, dict]) -> None:
+        ep = fx.get("epoch")
+        if not isinstance(ep, dict):
+            self.add("L-FIX-06", f, "epoch is missing", "epoch")
+            return
+        if ep.get("epoch_id") != epoch_id(ep):
+            self.add("L-FIX-06", f, f"epoch_id does not recompute; expected {epoch_id(ep)}", "epoch.epoch_id")
+        fm = _d(ep.get("front_month"))
+        for sid, s in symbols.items():
+            m = re.match(r"^/([A-Z0-9]+?)(?:[FGHJKMNQUVXZ][0-9]{2})?$", _s(s.get("symbol")))
+            if s.get("asset") == "future" and m and m.group(1).lower() not in fm:
+                self.add("L-FIX-06", f, f"front_month has no key {m.group(1).lower()} for futures symbol {sid}", "epoch.front_month")
+        branch = self.branches.get("data_fixture")
+        if branch == "A" and not ep.get("dataset_id"):
+            self.add("L-FIX-06", f, "frozen branch A (phase0/branches.yaml) needs epoch.dataset_id", "epoch.dataset_id")
+        if branch == "B" and not ep.get("ondemand_timestamp"):
+            self.add("L-FIX-06", f, "frozen branch B (phase0/branches.yaml) needs epoch.ondemand_timestamp", "epoch.ondemand_timestamp")
+        cal = [_d(x) for x in _l(fx.get("churn_calendar"))]
+        def has(event: str, day: Any) -> bool:
+            return any(c.get("event") == event and c.get("date") == day for c in cal)
+        for sid, s in symbols.items():
+            if s.get("roll_date") and not has("roll", s.get("roll_date")):
+                self.add("L-FIX-07", f, f"churn_calendar has no roll entry on {s.get('roll_date')} for {sid}", "churn_calendar")
+        nme = ep.get("nearest_monthly_expiration")
+        if nme and not has("expiration", nme):
+            self.add("L-FIX-07", f, f"churn_calendar has no expiration entry on {nme}", "churn_calendar")
+        golden = {_d(a).get("account_id") for a in _l(fx.get("accounts")) if _d(a).get("role") == "golden"}
+        exps = _d(ep.get("option_expirations"))
+        dates = [_date(d) for p in map(_d, _l(fx.get("positions"))) if p.get("account_ref") in golden
+                 and _d(symbols.get(p.get("symbol_ref"))).get("asset") in ("option", "future_option")
+                 for d in _l(exps.get(p.get("symbol_ref")))]
+        dates = [d for d in dates if d]
+        if dates and not any(c.get("event") == "reseed_due" and (_date(c.get("date")) or date.max) <= min(dates) for c in cal):
+            self.add("L-FIX-07", f, f"churn_calendar has no reseed_due on or before {min(dates)}, the earliest golden option expiration", "churn_calendar")
+
+    def _fixture_positions(self, fx: dict, f: str, accounts: list[dict], symbols: dict[Any, dict], ids: set) -> None:
+        positions = [_d(p) for p in _l(fx.get("positions"))]
+        for i, p in enumerate(positions):
+            if p.get("account_ref") not in ids:
+                self.add("L-FIX-00", f, f"account_ref {p.get('account_ref')} is not an account of this fixture", f"positions[{i}].account_ref")
+            if p.get("symbol_ref") not in symbols:
+                self.add("L-FIX-00", f, f"symbol_ref {p.get('symbol_ref')} is not a symbol of this fixture", f"positions[{i}].symbol_ref")
+        for key in ("prices", "churn_calendar"):
+            for i, x in enumerate(map(_d, _l(fx.get(key)))):
+                if "symbol_ref" in x and x.get("symbol_ref") not in symbols:
+                    self.add("L-FIX-00", f, f"symbol_ref {x.get('symbol_ref')} is not a symbol of this fixture", f"{key}[{i}].symbol_ref")
+        for i, w in enumerate(map(_d, _l(fx.get("watchlists")))):
+            for s in _l(w.get("symbols")):
+                if s not in symbols:
+                    self.add("L-FIX-00", f, f"watchlist symbol {s} is not a symbol of this fixture", f"watchlists[{i}].symbols")
+        golden = {a.get("account_id") for a in accounts if a.get("role") == "golden"}
+        empty = {a.get("account_id") for a in accounts if a.get("role") == "empty"}
+        gp = [p for p in positions if p.get("account_ref") in golden]
+        asset = lambda p: _d(symbols.get(p.get("symbol_ref"))).get("asset")  # noqa: E731
+        window = _date(_d(fx.get("epoch")).get("window_date")) or self.today
+        exps = _d(_d(fx.get("epoch")).get("option_expirations"))
+        def leaps(p: dict) -> bool:
+            ds = [_date(d) for d in _l(exps.get(p.get("symbol_ref")))]
+            return any(d and (d - window).days > 365 for d in ds)
+        cover = {
+            "an equity below 1 dollar": any(asset(p) == "equity" and (_num(p.get("avg_price")) or 1) < 1 for p in gp),
+            "an equity above 1,000 dollars": any(asset(p) == "equity" and (_num(p.get("avg_price")) or 0) > 1000 for p in gp),
+            "a multi-leg option position": sum(asset(p) == "option" for p in gp) >= 2,
+            "a LEAPS": any(asset(p) == "option" and leaps(p) for p in gp),
+            "a futures position": any(asset(p) == "future" for p in gp),
+            "a forex position": any(asset(p) == "forex" for p in gp),
+        }
+        missing = [k for k, ok in cover.items() if not ok]
+        if golden and missing:
+            self.add("L-FIX-09", f, "golden positions lack " + ", ".join(missing) + " (7.6 golden list)", "positions", self._phase_sev(2))
+        if any(p.get("account_ref") in empty for p in positions) or fx.get("working_orders_expected", 0) != 0:
+            self.add("L-FIX-10", f, "the empty account has no positions and working_orders_expected is 0", "positions")
+
+    # -- 4.10 popups -----------------------------------------------------------------------------
+
+    def _catalog(self, kind: str, key: str) -> tuple[str, list[dict]]:
+        doc = self.r.one(kind)
+        if not doc:
+            return "", []
+        items = doc.data if isinstance(doc.data, list) else _d(doc.data).get(key)
+        return doc.rel, [_d(x) for x in _l(items)]
+
+    def check_popups(self) -> None:
+        f, items = self._catalog("popups", "popups")
+        if not f:
+            return
+        ids = [p.get("popup_id") for p in items]
+        names = [p.get("name") for p in items]
+        released = sorted((t, bid) for bid, b in self.builds.items() if b.get("channel") == "released" and (t := _ts(b.get("released_at"))))
+        for i, p in enumerate(items):
+            at, pid = f"[{i}]", p.get("popup_id")
+            if not (isinstance(pid, str) and POP_ID.match(pid)) or pid not in POP_IDS_12_8:
+                self.add("L-POP-01", f, f"popup_id {pid!r} is not an id of the 12.8 table", f"{at}.popup_id")
+            if ids.count(pid) > 1:
+                self.add("L-POP-01", f, f"popup_id {pid} is not unique", f"{at}.popup_id")
+            if names.count(p.get("name")) > 1:
+                self.add("L-POP-01", f, f"name {p.get('name')} is not unique", f"{at}.name")
+            rx = None
+            try:
+                rx = re.compile(_s(p.get("title_regex")))
+            except re.error as exc:
+                self.add("L-POP-01", f, f"title_regex does not compile: {exc}", f"{at}.title_regex")
+            action, oa = p.get("action"), p.get("on_abort")
+            if action == "dismiss_key" and _s(p.get("key")).replace(" ", "").casefold() in ENTER_KEYS:
+                self.add("L-POP-02", f, f"dismiss key {p.get('key')} is Enter, Space or Ctrl+Enter", f"{at}.key")
+            if rx and any(rx.search(t) for t in ("Order Confirmation", "Confirm", "Send")):
+                oad = _d(oa)
+                if not (p.get("class") == "safety" and action not in ("dismiss_key", "click") and oad.get("outcome") == "aborted_run"
+                        and oad.get("run_outcome") == "aborted_safety" and oad.get("reason") == "kill_switch"):
+                    self.add("L-POP-03", f, "a title matching Order Confirmation, Confirm or Send is class safety with no input and the kill-switch on_abort", at)
+            ctl = self.controls.get(_s(p.get("target")))
+            if action == "click":
+                if not p.get("template"):
+                    self.add("L-POP-04", f, "click entries carry a template", f"{at}.template")
+                if ctl is None:
+                    self.add("L-POP-04", f, f"click target {p.get('target')} is not a registry control", f"{at}.target")
+                elif _s(ctl[1].get("ocr_text")).strip().casefold() in ("accept", "agree", "confirm", "send", "yes"):
+                    self.add("L-POP-03", f, f"click target {p.get('target')} reads {ctl[1].get('ocr_text')}; consent and send labels are refused", f"{at}.target")
+            if action in ("abort", "relogin", "wait") and not isinstance(oa, dict):
+                self.add("L-POP-04", f, f"action {action} requires on_abort", f"{at}.on_abort")
+            if isinstance(oa, dict):
+                self._on_abort(f, at, p, oa)
+            elif p.get("class") == "app_failure":
+                self.add("L-POP-04", f, "app_failure entries route to INV-14 through on_abort", f"{at}.on_abort")
+            last = p.get("last_seen_build")
+            lt = _ts(_d(self.builds.get(last)).get("released_at")) if last else None
+            if lt and sum(1 for t, _ in released if t > lt) > 3:
+                self.add("L-POP-06", f, f"last_seen_build {last} is more than three releases old; flag for removal", f"{at}.last_seen_build")
+
+    def _on_abort(self, f: str, at: str, p: dict, oa: dict) -> None:
+        outcome = oa.get("outcome")
+        if p.get("class") == "app_failure" and not (outcome == "invariant_violation" and oa.get("invariant_id") == "INV-14"):
+            self.add("L-POP-04", f, "app_failure entries route to invariant_violation INV-14", f"{at}.on_abort")
+        named = oa.get("run_outcome") if outcome == "aborted_run" else outcome
+        reason = oa.get("reason")
+        if reason is not None and not self.tax.reason_allowed(_s(named), reason):
+            self.add("L-POP-04", f, f"on_abort.reason {reason} is not in taxonomy.yaml for {named}", f"{at}.on_abort.reason")
+        if outcome == "aborted_run" and not oa.get("run_outcome"):
+            self.add("L-POP-04", f, "on_abort aborted_run names run_outcome", f"{at}.on_abort")
+        if outcome == "env_error" and oa.get("gate") not in self.tax.gates:
+            self.add("L-POP-04", f, f"env_error on_abort names a taxonomy gate, not {oa.get('gate')}", f"{at}.on_abort.gate")
+        inv = oa.get("invariant_id")
+        if (outcome == "invariant_violation" or inv is not None) and inv not in self.tax.data["reasons"]["invariant_violation"]:
+            self.add("L-POP-04", f, f"invariant_id {inv} is not in the 2.7 catalog", f"{at}.on_abort.invariant_id")
+
+    # -- 4.11 mutants ----------------------------------------------------------------------------
+
+    def check_mutants(self) -> None:
+        f, items = self._catalog("mutants", "mutants")
+        if not f:
+            return
+        ids = [m.get("mutant_id") for m in items]
+        invs = self.tax.data["reasons"]["invariant_violation"]
+        detecting = {"collateral", "invariant_violation", "assertion_failed", "landmark_missing"}
+        tier1_classes: dict[str, set[str]] = {}
+        for i, m in enumerate(items):
+            at, mid, cls = f"[{i}]", m.get("mutant_id"), m.get("class")
+            if not (isinstance(mid, str) and MUTANT_ID.match(mid)):
+                self.add("L-MUT-01", f, f"mutant_id {mid!r} does not match ^M[0-9]{{2,}}$", f"{at}.mutant_id")
+            if ids.count(mid) > 1:
+                self.add("L-MUT-01", f, f"mutant_id {mid} is not unique", f"{at}.mutant_id")
+            gen = _d(m.get("generator"))
+            if gen.get("seed", MUTANT_SEED) != MUTANT_SEED:
+                self.add("L-MUT-01", f, f"generator seed {gen.get('seed')} is not the catalog seed {MUTANT_SEED}", f"{at}.generator.seed")
+            cid = _s(m.get("checkpoint_id"))
+            if m.get("region_ref") not in self.region_map(cid):
+                self.add("L-MUT-01", f, f"region_ref {m.get('region_ref')} is not in regions/{cid}.yaml", f"{at}.region_ref")
+            exp = _d(m.get("expected"))
+            outs = set(_l(exp.get("outcomes")))
+            if m.get("money_cell") is True:
+                if cls not in ("aa_control", "sub_floor") and not outs <= detecting:
+                    self.add("L-MUT-02", f, f"money-cell mutant {mid} expects {sorted(outs - detecting)}; only {sorted(detecting)} detect", f"{at}.expected")
+                if outs & {"invariant_violation", "assertion_failed"} and not (exp.get("invariant_id") or exp.get("assertion_id")):
+                    self.add("L-MUT-02", f, f"money-cell mutant {mid} names an invariant_id or assertion_id", f"{at}.expected")
+            exempt = {"aa_control", "sub_floor", "redaction"}
+            if outs & {"identical", "noise"} and cls not in exempt:
+                self.add("L-MUT-02", f, f"only the controls M20 and M25 expect identical or noise, not {mid}", f"{at}.expected")
+            if "needs_human" in outs and cls != "global_shift":
+                self.add("L-MUT-02", f, f"needs_human is expected only for global_shift (reason global_shift), not {cls}", f"{at}.expected")
+            mode, flow = m.get("mode"), m.get("canary_flow")
+            if mode == "behavioral":
+                fdoc = self.flows.get(_s(flow))
+                if fdoc is None or _d(fdoc.data).get("class") != "canary":
+                    self.add("L-MUT-04", f, f"behavioral mutant {mid} needs a canary_flow of class canary (got {flow})", f"{at}.canary_flow")
+                elif any(_s(_d(st).get(k)).endswith(".confirm-and-send") for _sec, st in self._all_steps(fdoc.data) for k in TARGET_FIELDS):
+                    self.add("L-MUT-04", f, f"canary flow {flow} targets confirm-and-send", f"{at}.canary_flow")
+            elif mode == "image" and "canary_flow" in m:
+                self.add("L-MUT-04", f, f"image mutant {mid} carries no canary_flow", f"{at}.canary_flow")
+            if cls == "color_swap" and not ("invariant_violation" in outs and exp.get("invariant_id") == "INV-15"):
+                self.add("L-MUT-05", f, f"color_swap mutant {mid} expects invariant_violation on INV-15", f"{at}.expected")
+            c = self.defined.get(cid)
+            if c and c.tier == 1:
+                tier1_classes.setdefault(_s(cls), set()).add(cid)
+            if "invariant_id" in exp and exp.get("invariant_id") not in invs:
+                self.add("L-MUT-06", f, f"invariant_id {exp.get('invariant_id')} is not in INV-01 to INV-15", f"{at}.expected.invariant_id")
+        for cls in BRIEF_CLASSES:
+            if cls not in tier1_classes:
+                self.add("L-MUT-05", f, f"brief class {cls} is bound to no tier-1 checkpoint")
+
+    # -- 4.12 fingerprint ------------------------------------------------------------------------
+
+    def check_fingerprint_schema(self) -> None:
+        names = schemas.fingerprint_field_names()
+        want = set(schemas.FINGERPRINT_FIELDS_7_4)
+        if names != want:
+            self.add("L-FPR-01", "schemas/fingerprint.schema.json",
+                     f"field set differs from 7.4 plus render_probe_hash: extra {sorted(names - want)}, missing {sorted(want - names)}")
+
+    # -- 4.15 cross-file rules -------------------------------------------------------------------
+
+    def check_xref(self) -> None:
+        self._xref_coverage()
+        self._xref_checkpoint_ids()
+        self._xref_files()
+        self._xref_policy()
+
+    def _xref_coverage(self) -> None:
+        flow_cps = {c.surface for c in self.defined.values() if c.kind == "flow"}
+        census = {c.surface for c in self.defined.values() if c.kind == "census"}
+        money = {c.surface for cid, c in self.defined.items()
+                 if any(x.get("money_cell") is True and x.get("type") in ("diff", "freeze") for x in self.region_map(cid).values())}
+        asserting: set[str] = set()
+        for doc in self.flows.values():
+            fl = _d(doc.data)
+            seq = self._seq(fl)
+            if any(st.get("type") == "assert" or _l(st.get("expect")) for st in seq):
+                asserting |= {s for s in _l(fl.get("surfaces")) if isinstance(s, str)}
+        for sid, s in self.surfaces.items():
+            f = self.surface_file[sid]
+            if sid not in flow_cps and sid not in census:
+                self.add("L-XREF-01", f, f"{sid} is reached by no census workspace and no flow checkpoint")
+            if s.get("tier") == 1 and s.get("kind") != "probe":
+                if sid not in asserting:
+                    self.add("L-XREF-02", f, f"tier-1 surface {sid} has no flow with an assert step or expect entries")
+                if sid not in money:
+                    self.add("L-XREF-02", f, f"tier-1 surface {sid} has no regions file with a diff or freeze money_cell region")
+        for cid, c in self.defined.items():
+            rmap = self.region_map(cid)
+            where = self.regions[cid].rel if cid in self.regions else c.file
+            if c.data_mode == "masked_live" and not any(x.get("type") in ("rule", "mask") for x in rmap.values()):
+                self.add("L-XREF-03", where, f"masked_live checkpoint {cid} has no rule or mask region")
+            if c.data_mode == "frozen":
+                for x in rmap.values():
+                    if "must_change_within_s" in _d(x.get("rule")):
+                        self.add("L-XREF-03", where, f"frozen checkpoint {cid} has a must_change_within_s rule on {x.get('id')}")
+
+    def _xref_checkpoint_ids(self) -> None:
+        refs: list[tuple[str, str, str]] = []
+        for doc in self.r.of("flow"):
+            for st in self._seq(doc.data):
+                if st.get("type") == "checkpoint":
+                    refs.append((doc.rel, f"steps[{st.get('id')}].checkpoint_id", st.get("checkpoint_id")))
+        for cid, doc in self.regions.items():
+            refs.append((doc.rel, "checkpoint_id", _d(doc.data).get("checkpoint_id", cid)))
+        for doc in self.r.of("mask"):
+            refs.append((doc.rel, "checkpoint_id", _d(doc.data).get("checkpoint_id")))
+        f_mut, mutants = self._catalog("mutants", "mutants")
+        for i, m in enumerate(mutants):
+            refs.append((f_mut, f"[{i}].checkpoint_id", m.get("checkpoint_id")))
+            cid = m.get("checkpoint_id")
+            if cid not in self.defined and cid not in self.retired:
+                self.add("L-XREF-04", f_mut, f"checkpoint {cid} is defined by no flow or census and is not retired", f"[{i}].checkpoint_id")
+        for i, x in enumerate(self.renames):
+            refs.append((self.renames_file, f"renames[{i}].old", x.get("old")))
+            if x.get("new") != "retired":
+                refs.append((self.renames_file, f"renames[{i}].new", x.get("new")))
+        q = self.r.one("quarantine")
+        for i, x in enumerate(map(_d, _l(_d(q.data).get("records") if q else []))):
+            refs.append((q.rel if q else "", f"records[{i}].checkpoint", x.get("checkpoint")))
+        for cid, doc in self.regions.items():
+            if cid not in self.defined and cid not in self.retired:
+                self.add("L-XREF-04", doc.rel, f"checkpoint {cid} is defined by no flow or census and is not retired")
+        for file, loc, cid in refs:
+            if not (isinstance(cid, str) and is_checkpoint_id(cid)):
+                self.add("L-XREF-11", file, f"{cid!r} does not match the checkpoint id grammar of 4.1", loc)
+            elif cid.split("/")[1] not in self.surfaces:
+                self.add("L-XREF-11", file, f"surface segment {cid.split('/')[1]} of {cid} is not in the registry", loc)
+
+    def _xref_files(self) -> None:
+        dep_bad = any(v.rule == "L-DEP-05" for v in self.out)
+        if dep_bad:
+            self.add("L-XREF-06", self.depmap_file, "the dependency map and the registry disagree (see L-DEP-05)")
+        for doc in self.r.of("manifest"):
+            stale = sorted({s for e in map(_d, _l(_d(doc.data).get("entries"))) for s in _l(e.get("declared_surfaces")) if s not in self.surfaces}
+                           | {p for e in map(_d, _l(_d(doc.data).get("entries"))) for p in _l(e.get("touched_primitives")) if p not in self.primitives}, key=str)
+            if stale:
+                self.add("L-XREF-06", doc.rel, f"manifest references ids absent from the registry or the map: {', '.join(map(str, stale))}")
+        for rel, text in self.r.text_files():
+            for n, why in credential_hits(text):
+                self.add("L-XREF-07", rel, f"{why}; secrets are vault://<path>#<field> references only", f"line {n}")
+        tdoc = self.r.one("taxonomy")
+        if tdoc:
+            mine, theirs = _d(tdoc.data), self.tax.data
+            keys = sorted(k for k in set(mine) | set(theirs) if k != "generated_from" and mine.get(k) != theirs.get(k))
+            if keys:
+                self.add("L-XREF-08", tdoc.rel, f"differs from the taxonomy generated from the spec in: {', '.join(keys)}")
+        sdir = self.r.root / "schemas"
+        if sdir.is_dir():
+            for name, problem in schemas.check_schemas(sdir):
+                self.add("L-XREF-09", f"schemas/{name}", problem)
+        _f, pops = self._catalog("popups", "popups")
+        if not _f:
+            self.add("L-XREF-12", "popups/catalog.yaml", "popups/catalog.yaml is missing")
+        else:
+            got = {p.get("popup_id") for p in pops}
+            if got != set(POP_IDS_12_8):
+                self.add("L-XREF-12", _f, f"popup ids differ from 12.8: missing {sorted(set(POP_IDS_12_8) - got)}, extra {sorted(map(str, got - set(POP_IDS_12_8)))}")
+        f_mut, mutants = self._catalog("mutants", "mutants")
+        if not f_mut:
+            self.add("L-XREF-12", "canaries/mutants.yaml", "canaries/mutants.yaml is missing")
+        else:
+            got = {m.get("mutant_id") for m in mutants}
+            if got != set(MUTANTS_12_5):
+                self.add("L-XREF-12", f_mut, f"mutant ids differ from M01 to M33 of 12.5: missing {sorted(set(MUTANTS_12_5) - got)}, extra {sorted(map(str, got - set(MUTANTS_12_5)))}")
+            for i, m in enumerate(mutants):
+                want = MUTANTS_12_5.get(_s(m.get("mutant_id")))
+                if want and (m.get("class"), m.get("money_cell")) != want:
+                    self.add("L-XREF-12", f_mut, f"{m.get('mutant_id')} is class {want[0]} with money_cell {want[1]} in 12.5", f"[{i}]")
+
+    def _xref_policy(self) -> None:
+        eb = self.r.one("explorer_budget")
+        if not eb:
+            self.add("L-XREF-14", "policy/explorer_budget.yaml", "policy/explorer_budget.yaml is missing")
+        elif not self.explorer_budget.get("approved_by"):
+            for k, v in EXPLORER_BUDGET_6_8.items():
+                if self.explorer_budget.get(k) != v:
+                    self.add("L-XREF-14", eb.rel, f"{k} is {self.explorer_budget.get(k)}; 6.8 says {v} unless the Explorer owner approves", k)
+        bdoc = self.r.one("branches")
+        f = bdoc.rel if bdoc else "phase0/branches.yaml"
+        if not bdoc:
+            self.add("L-XREF-15", f, "phase0/branches.yaml is missing; it names one branch for each of the seven unknowns")
+            return
+        for k in BRANCH_KEYS:
+            v = self.branches.get(k)
+            if k not in self.branches:
+                self.add("L-XREF-15", f, f"no branch for unknown {k}", k)
+            elif v not in ("A", "B"):
+                self.add("L-XREF-15", f, f"unknown {k} is unresolved ({v!r}); choose A or B", k, self._phase_sev(1))
+        data = self.branches.get("data_fixture")
+        for doc in self.r.of("fixture"):
+            provider = _d(_d(_d(doc.data).get("data_mode")).get("frozen")).get("provider")
+            if (data == "A" and provider not in ("backend_fixture",)) or (data == "B" and provider not in ("ondemand", "none")):
+                self.add("L-XREF-15", doc.rel, f"frozen provider {provider} disagrees with data_fixture branch {data}", "data_mode.frozen.provider")
+        al = self.r.one("allowlist")
+        if al and "ondemand_virtual_account" in _d(al.data) and data != "B":
+            self.add("L-XREF-15", al.rel, "ondemand_virtual_account exists only under frozen branch B", "ondemand_virtual_account")
+        if self.branches.get("computer_use") == "B":
+            for doc in self.r.of("flow"):
+                if _d(doc.data).get("agent_fallback") == "allowed":
+                    self.add("L-XREF-15", doc.rel, "agent_fallback: allowed while computer use is branch B", "agent_fallback")
+
+
+# -- public API ------------------------------------------------------------------------------------
+
+def lint_repo(repo: Repo, phase: int = 0, today: date | None = None,
+              flow_p50_s: dict[str, float] | None = None) -> LintReport:
+    """Lint a loaded repository (4.1, 4.15). `flow_p50_s` gives measured flow p50s for L-FLW-10."""
+    linter = _Linter(repo, phase, today or date.today(), flow_p50_s)
+    skipped = {rid: r.skipped for rid, r in RULES.items() if r.skipped}
+    return LintReport(linter.run(), skipped)
+
+
+def lint(root: str | Path, phase: int = 0, today: date | None = None) -> LintReport:
+    """Load the sentinel-config checkout at `root` and lint it."""
+    return lint_repo(Repo.load(root), phase, today)
+
+
+def _fpr(rule: str, file: str, message: str, path: str = "") -> Violation:
+    return Violation(file, rule, RULES[rule].severity, path, message)
+
+
+def lint_fingerprint(fp: Any, file: str = "fingerprint") -> list[Violation]:
+    """L-FPR-00 and L-FPR-01 on one fingerprint record: schema, non-null match fields, recomputed id."""
+    out = [_fpr("L-FPR-00", file, msg, loc) for loc, msg in schemas.validate("fingerprint", fp)]
+    match = _d(_d(fp).get("match"))
+    for k in sorted(schemas.schema("fingerprint")["properties"]["match"]["properties"]):
+        if match.get(k) is None:
+            out.append(_fpr("L-FPR-01", file, f"match field {k} is null or missing", f"match.{k}"))
+    if isinstance(fp, dict) and fp.get("fingerprint_id") != fingerprint_id(fp):
+        out.append(_fpr("L-FPR-01", file, f"fingerprint_id does not recompute; expected {fingerprint_id(fp)}", "fingerprint_id"))
+    return out
+
+
+def lint_fingerprint_rig_spec(fp: Any, allowlist_sha256: str | None = None, file: str = "fingerprint") -> list[Violation]:
+    """L-FPR-02 at run start: `match` equals the rig specification of 7.1 for the phase 1 config."""
+    m = _d(_d(fp).get("match"))
+    want = {
+        "display.width": 1920, "display.height": 1080, "display.scale_percent": 100, "display.dpi": 96,
+        "display.monitors": 1, "display.bits": 32, "display.frequency": 60,
+        "keyboard.layout": "0x0409", "keyboard.layout_count": 1,
+        "keyboard.toggle_keys.caps": False, "keyboard.toggle_keys.num": True, "keyboard.toggle_keys.scroll": False,
+        "time_zone.os": "Eastern Standard Time", "time_zone.app_display": "America/New_York",
+        "time_zone.chart": "America/New_York", "input_desktop": "Default",
+    }
+    if allowlist_sha256:
+        want["harness.allowlist_sha256"] = allowlist_sha256
+    out = []
+    for path, value in want.items():
+        cur: Any = m
+        for part in path.split("."):
+            cur = _d(cur).get(part) if isinstance(cur, dict) else None
+        if cur != value:
+            out.append(_fpr("L-FPR-02", file, f"{path} is {cur!r}; the rig specification says {value!r}", f"match.{path}"))
+    j2d = _d(m.get("java2d_pipeline"))
+    if j2d.get("confirmed") not in (j2d.get("pinned"), "unknown"):
+        out.append(_fpr("L-FPR-02", file, "java2d_pipeline.confirmed differs from the pinned pipeline", "match.java2d_pipeline"))
+    return out
+
+
+def lint_fingerprint_pair(candidate: Any, base: Any, requested: dict[str, str] | None = None,
+                          file: str = "fingerprint") -> list[Violation]:
+    """L-FPR-03 and L-FPR-05 at run start: the two sides match apart from build_id, which must be
+    each side's requested build (`requested` maps `candidate`/`base` to build ids)."""
+    cm, bm = _d(_d(candidate).get("match")), _d(_d(base).get("match"))
+    out = []
+    differing = sorted(k for k in set(cm) | set(bm) if k not in ("build_id", "render_probe_hash") and cm.get(k) != bm.get(k))
+    if differing:
+        out.append(_fpr("L-FPR-03", file, f"fingerprint_mismatch: {', '.join(differing)} differ between candidate and base", "match"))
+    for side, m in (("candidate", cm), ("base", bm)):
+        if requested and side in requested and m.get("build_id") != requested[side]:
+            out.append(_fpr("L-FPR-03", file, f"{side} build_id {m.get('build_id')} is not the requested {requested[side]} (version_mismatch)", "match.build_id"))
+    if cm.get("render_probe_hash") != bm.get("render_probe_hash"):
+        out.append(_fpr("L-FPR-05", file, "render_probe_hash differs between sides (Hamming 0 required)", "match.render_probe_hash"))
+    return out

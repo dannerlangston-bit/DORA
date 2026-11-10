@@ -97,7 +97,7 @@ def test_supplied_matrix_cells_are_used(tmp_path):
     s = sample()
     s["coverage"]["cells"] = [{"surface": "trade.order-entry.stock", "persona": "beginner", "state": "not_run",
                                "reason": "entitlement"}]
-    page = render_run_report_html(build_report(**s), coverage=s["coverage"])
+    page = render_run_report_html(build_report(**s))
     assert '<td class="cell-notrun">not_run (entitlement)</td>' in page
 
 

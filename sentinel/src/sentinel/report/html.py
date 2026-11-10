@@ -45,11 +45,13 @@ _CSS = """
           --bad:#f85149; --warn:#d29922; --ok:#3fb950; }
 }
 * { box-sizing: border-box; }
-body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+body { margin:0; background:var(--bg); color:var(--fg);
+       font:14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
 main { max-width: 1200px; margin: 0 auto; padding: 16px; }
 h1 { font-size: 20px; margin: 8px 0; } h2 { font-size: 17px; margin: 28px 0 8px; border-bottom: 1px solid var(--line); }
 h3 { font-size: 14px; margin: 0 0 6px; }
-a { color: var(--accent); } code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--panel);
+a { color: var(--accent); }
+code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--panel);
   padding: 0 3px; border-radius: 3px; overflow-wrap: anywhere; }
 .muted { color: var(--muted); } .bad { color: var(--bad); } .ok { color: var(--ok); } .warn { color: var(--warn); }
 pre.banner { background: var(--panel); border-left: 4px solid var(--bad); padding: 8px 12px; white-space: pre-wrap; }
@@ -90,15 +92,16 @@ class _Images:
                 return p
         return None
 
-    def src(self, path: Path, data: bytes | None = None) -> str:
+    def src(self, path: Path) -> str:
         if self.embed or self.page_dir is None:
-            raw = data if data is not None else path.read_bytes()
-            return f"data:{_MEDIA[path.suffix.lower()]};base64,{base64.b64encode(raw).decode('ascii')}"
+            raw = base64.b64encode(path.read_bytes()).decode("ascii")
+            return f"data:{_MEDIA[path.suffix.lower()]};base64,{raw}"
         return Path(os.path.relpath(path, self.page_dir)).as_posix()
 
     def figure(self, img: Image | None, caption: str) -> str:
         if img is None:
-            return f'<figure><div class="missing">no {_e(caption)} crop recorded</div><figcaption>{_e(caption)}</figcaption></figure>'
+            return (f'<figure><div class="missing">no {_e(caption)} crop recorded</div>'
+                    f'<figcaption>{_e(caption)}</figcaption></figure>')
         path = self.path(img.sha)
         if path is None:
             return (f'<figure><div class="missing">{_e(caption)} <code>{_e(img.sha)}</code> not in this '
@@ -170,6 +173,10 @@ def _fields(fields, images: _Images) -> str:
     return f'<ul class="fields">{"".join(lis)}</ul>'
 
 
+def _article(header: Line, fields, images: _Images) -> str:
+    return f'<article class="item"><h3>{_inline(header)}</h3>{_fields(fields, images)}</article>'
+
+
 def _table(head: list[str], rows: list[list[str]]) -> str:
     th = "".join(f"<th>{_e(h)}</th>" for h in head)
     body = "".join("<tr>" + "".join(c if c.startswith("<td") else f"<td>{c}</td>" for c in r) + "</tr>"
@@ -177,9 +184,12 @@ def _table(head: list[str], rows: list[list[str]]) -> str:
     return f"<table><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>"
 
 
-def _matrix(report: RunReport, coverage: dict | None) -> str:
-    """Surface x persona matrix (2.12); a cell never reads "passed"."""
-    cells = (coverage or {}).get("cells")
+def _matrix(report: RunReport) -> str:
+    """Surface x persona matrix (2.12): the summary's cells, else derived from this run's outcomes.
+
+    A cell never reads "passed"; a surface without a checkpoint for a persona says so.
+    """
+    cells = report.coverage_cells
     grid: dict[tuple[str, str], tuple[str, str]] = {}
     if cells:
         for c in cells:
@@ -232,8 +242,8 @@ def _provenance(report: RunReport) -> str:
     return '<dl class="prov">' + "".join(f"<dt>{_e(k)}</dt><dd>{_e(v)}</dd>" for k, v in items) + "</dl>"
 
 
-def render_run_report_html(report: RunReport, *, coverage: dict | None = None, objects_dir: Path | None = None,
-                           embed: bool = True, page_dir: Path | None = None) -> str:
+def render_run_report_html(report: RunReport, *, objects_dir: str | os.PathLike | None = None, embed: bool = True,
+                           page_dir: Path | None = None) -> str:
     """The page as a string (see `render_run_report` to write it to disk)."""
     images = _Images(Path(objects_dir) if objects_dir else None, embed, page_dir)
     run, ctx, st = report.run, report.context, report.status
@@ -261,14 +271,12 @@ def render_run_report_html(report: RunReport, *, coverage: dict | None = None, o
     if report.special is None:
         if report.show_findings:
             parts.append(f'<section id="unexpected"><h2>Unexpected ({report.n_unexpected})</h2>')
-            for item in report.unexpected:
-                parts.append(f'<article class="item"><h3>{_inline(item.header)}</h3>{_fields(item.fields, images)}</article>')
+            parts += [_article(item.header, item.fields, images) for item in report.unexpected]
             parts.append("</section>")
             parts.append(f'<section id="intended"><h2>Intended ({report.n_intended})</h2>')
             if report.manifest_line:
                 parts.append(f"<p>{_inline(report.manifest_line)}</p>")
-            for it in report.intended:
-                parts.append(f'<article class="item"><h3>{_inline(it.header)}</h3>{_fields(it.fields, images)}</article>')
+            parts += [_article(it.header, it.fields, images) for it in report.intended]
             for line in (report.reconciliation, report.needs_baseline_line):
                 if line:
                     parts.append(f"<p>{_inline(line)}</p>")
@@ -278,14 +286,15 @@ def render_run_report_html(report: RunReport, *, coverage: dict | None = None, o
             d: Decision | None = r.decision
             rows.append([f"<code>{_e(r.checkpoint_id)}</code>", f"<code>{_e(r.region or '')}</code>", _e(r.decision_id),
                          _e(f"{d.action} ({d.verdict})" if d else "decision record not loaded"),
-                         _e(f"{d.decided_by}, {d.decided_at[:10]}" if d else ""), _e(d.ticket or "" if d else "")])
+                         _e(f"{d.decided_by}, {d.decided_at[:10]}" if d else ""), _e((d.ticket or "") if d else "")])
         parts.append(f'<section id="suppressed"><h2>Suppressed by decision ({report.n_suppressed})</h2>'
                      + (_table(["Checkpoint", "Region", "Decision", "Action (verdict)", "By", "Ticket"], rows)
                         if rows else '<p class="muted">0 findings matched an earlier decision.</p>') + "</section>")
         cov_rows = [[_e(c) for c in row] for row in report.coverage_rows]
         parts.append('<section id="coverage"><h2>Coverage</h2>'
                      + _table(["Tier", "Registered", "In scope", "Covered", "Not compared", "not_run"], cov_rows)
-                     + f"<p>{_inline(report.scope_line)}</p><h3>Coverage matrix</h3>{_matrix(report, coverage)}</section>")
+                     + f"<p>{_inline(report.scope_line)}</p><h3>Coverage matrix</h3>{_matrix(report)}"
+                     + "</section>")
         parts.append('<section id="health"><h2>Run health</h2>'
                      + _table(["Item", "Value"], [[_e(k), _inline(v)] for k, v in report.health_rows]) + "</section>")
         if report.history:
@@ -307,6 +316,6 @@ def render_run_report(run: RunOutcome, outcomes: list[CheckpointOutcome], findin
     out = Path(out_path)
     report = build_report(run, outcomes, findings, decisions, coverage, health, manifest, context, steps)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(render_run_report_html(report, coverage=coverage, objects_dir=objects_dir, embed=embed,
-                                          page_dir=out.parent), encoding="utf-8")
+    out.write_text(render_run_report_html(report, objects_dir=objects_dir, embed=embed, page_dir=out.parent),
+                   encoding="utf-8")
     return out

@@ -20,9 +20,9 @@ thresholds: every region is `uncalibrated` (threshold 0). A region missing from 
 Choices where the spec is ambiguous (reported to the coordinator):
 
 - The SSIM "floor" is the minimum over the pairs (the worst similarity), stored for ranking only.
-- A non-zero translation floor on a pixel-diffed region is also a fix-list item (cause
-  `landmark_jitter`): 3.2 expects a zero floor on every `diff` and `freeze` region. A non-zero
-  CIEDE2000 floor alone is not an item; it only raises the derived color threshold.
+- A non-zero translation floor on a pixel-diffed region, or on the whole window (`*`), is also a
+  fix-list item (cause `landmark_jitter`): 3.2 expects a zero floor on every `diff` and `freeze`
+  region. A non-zero CIEDE2000 floor alone is not an item; it only raises the color threshold.
 - The cause class is the caller's hint when given; otherwise `landmark_jitter` when the region's
   translation floor is non-zero, else `unknown` (the spec has a human or a heuristic read it off
   the pair). Failed captures map `landmark_missing` to `landmark_jitter` and every other failure
@@ -245,7 +245,7 @@ def calibrate_checkpoint(captures: Sequence[Capture], registry: RegionsFile, *, 
     for rid, fl in floors.items():
         cal.floors[rid] = fl
         cal.thresholds[rid] = derive_threshold(fl, p)
-        if rid == WHOLE_ID or (fl.changed_px == 0 and fl.shift_px == 0):
+        if fl.changed_px == 0 and fl.shift_px == 0:
             continue
         region = by_id.get(rid)
         cause = hints.get(rid) or ("landmark_jitter" if fl.shift_px > 0 else "unknown")

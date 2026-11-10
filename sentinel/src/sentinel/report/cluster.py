@@ -20,7 +20,7 @@ Choices where 9.7 is silent (reported to the coordinator):
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from ..records import CheckpointOutcome, Decision, Finding
 from ..taxonomy import checkpoint_parts
@@ -93,15 +93,10 @@ class Cluster:
     """A report item's checkpoints (9.7): one item, one Reviewer call when it needs one."""
 
     members: list[Member]
-    key: tuple = field(default_factory=tuple)
 
     @property
     def kind(self) -> str:
         return self.members[0].kind
-
-    @property
-    def size(self) -> int:
-        return len(self.members)
 
     @property
     def unsuppressed(self) -> list[Member]:
@@ -183,8 +178,8 @@ def cluster_members(members: list[Member]) -> list[Cluster]:
         else:
             key = (m.kind, m.outcome.primitive, m.region) + _category_key(m)
             census.setdefault(key, []).append(m)
-    out = [Cluster(ms, key) for key, ms in clusters.items()]
-    for key, ms in census.items():
+    out = [Cluster(ms) for ms in clusters.values()]
+    for ms in census.values():
         parent = list(range(len(ms)))
 
         def find(i: int) -> int:
@@ -200,6 +195,6 @@ def cluster_members(members: list[Member]) -> list[Cluster]:
         groups: dict[int, list[Member]] = {}
         for i, m in enumerate(ms):
             groups.setdefault(find(i), []).append(m)
-        out.extend(Cluster(g, key + (g[0].checkpoint_id,)) for g in groups.values())
+        out.extend(Cluster(g) for g in groups.values())
     out.sort(key=lambda c: c.members[0].checkpoint_id)
     return out

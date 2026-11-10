@@ -58,8 +58,7 @@ from dataclasses import dataclass, field, replace
 from ..records import CheckpointOutcome, Decision, Finding, RunOutcome, StepOutcome
 from ..taxonomy import TaxonomyError, checkpoint_parts, load
 from .cluster import Cluster, Member, cluster_members
-from .inline import (C, Image, Line, Link, T, Text, Urls, is_artifact_hash, join_and,
-                     number_word, plain, plural, words_and)
+from .inline import C, Image, Line, Link, T, Urls, join_and, number_word, plural, words_and
 
 CHECK_CONTEXT = "sentinel/pr-run"
 CHECK_MODES = ("informational", "blocking")
@@ -105,7 +104,8 @@ NEEDS_HUMAN_WHY = {
     "reviewer_cap": "Declared surface; beyond the per-run Reviewer call cap or spend ceiling.",
     "no_manifest": "No manifest and no UI code touched; intent cannot be checked (no_manifest).",
     "uncalibrated": "No calibrated floor for this region or fingerprint, so the threshold is 0 (uncalibrated).",
-    "rescued_capture": "Captured after the scripted locator broke (passed_via_agent_fallback); a rescued capture never inherits a decision.",
+    "rescued_capture": ("Captured after the scripted locator broke (passed_via_agent_fallback); a rescued "
+                        "capture never inherits a decision."),
     "global_shift": "Text-edge-only diff under the run-level global_rendering_shift finding.",
     "oracle_unreadable": "The Oracle could not read the value.",
     "bounds_unreadable": "The Invariant Checker could not read the bounds.",
@@ -232,6 +232,7 @@ class RunReport:
     needs_baseline_line: Line | None
     suppressed: list[SuppressedRow]
     coverage_rows: list[tuple[str, ...]]
+    coverage_cells: list[dict]               # 2.12 matrix cells from the summary, when it carries them
     scope_line: Line
     health_rows: list[tuple[str, Line]]
     history: tuple[dict, ...]
@@ -515,7 +516,8 @@ class _Prose:
         o = rep.outcome
         ev = rep.finding.evidence if rep.finding else {}
         parts: list[Line] = []
-        workspaces = list(dict.fromkeys(m.outcome.workspace_id for m in sorted(cl.members, key=lambda m: m.checkpoint_id)))
+        ordered = sorted(cl.members, key=lambda m: m.checkpoint_id)
+        workspaces = list(dict.fromkeys(m.outcome.workspace_id for m in ordered))
         if len(workspaces) == 1:
             head = self._workspace(workspaces[0])
         else:
@@ -534,8 +536,11 @@ class _Prose:
             parts.append(self._layout(cl, rep, ev))
         if rep.region:
             parts.append((T("region "), C(rep.region)))
-        if ev.get("target_window"):
-            parts.append((T(f"window {ev['target_window']}"),))
+        window = ev.get("target_window")
+        if isinstance(window, dict):          # the flow file's {kind, title_regex} (4.7)
+            window = window.get("kind")
+        if window:
+            parts.append((T(f"window {window}"),))
         parts.append((T(f"data mode {o.data_mode}"),))
         return join_and(parts, last=", ")
 
@@ -583,13 +588,14 @@ class _Prose:
             lead = f"{rv['verdict']} {_conf(cls.confidence)}"
         else:
             lead = "description"
-        n = len(cl.unsuppressed) or len(cl.members)
+        called = cl.unsuppressed or cl.members     # a suppressed member skipped the Reviewer (9.7)
+        n = len(called)
         if cl.kind == "sweep" and n > 1:
-            sizes = cl.sizes
+            sizes = Cluster(called).sizes
             call = (f"one call for the sweep cluster with the crops of its smallest and largest steps, "
                     f"{_size(sizes[0])} and {_size(sizes[-1])}")
         elif cl.kind == "split" and n > 1:
-            fr = sorted({m.fraction for m in cl.members})
+            fr = sorted({m.fraction for m in called})
             call = f"one call for the split cluster with the crops of fractions {fr[0]:.2f} and {fr[-1]:.2f}"
         elif n > 1:
             call = "one call for the cluster"
@@ -747,13 +753,13 @@ class _Builder:
                 continue
             f = fmap.get(s.finding_ref) if s.finding_ref else None
             side = (f.evidence.get("side") if f else None) or "candidate"
-            if s.status == "failed" and side != "candidate":
+            if (s.status == "failed" and side != "candidate") or (f is not None and f.decision_ref):
                 continue
             group = STEP_FAILED if s.status == "failed" else AGENT_FALLBACK
             tier = f.tier if f else None
             key = (tier if tier is not None else 4, group, (1, 0), 0, 0, f"{s.flow_id}/{s.step_id}")
-            out.append(Item(0, tier, group, (), [], decided=bool(f and f.decision_ref), pending=False,
-                            reviewer_call=False, step=s, finding=f, sort_key=key))
+            out.append(Item(0, tier, group, (), [], decided=False, pending=False, reviewer_call=False, step=s,
+                            finding=f, sort_key=key))
         return out
 
     def finding_items(self) -> list[Item]:
@@ -779,7 +785,6 @@ class _Builder:
             else:
                 self._fill_finding(item)
             done.append(item)
-        self.prose = prose
 
     def _tier_tag(self, tier: int | None) -> str:
         return f"[Tier {tier}]" if tier is not None else "[Run level]"
@@ -848,7 +853,8 @@ class _Builder:
             rep = cl.representative
             n = len(ms)
             verb = "checkpoint matches" if n == 1 else "checkpoints match"
-            header: Line = (C(surface), T(f", {n} {verb} {entry_id}" if entry_id else f", {plural(n, 'checkpoint')} intended"))
+            header: Line = (C(surface), T(f", {n} {verb} {entry_id}" if entry_id else
+                                          f", {plural(n, 'checkpoint')} intended"))
             entry = self.entry(entry_id) if entry_id else {}
             fields: list[Field] = []
             if entry:
@@ -869,7 +875,8 @@ class _Builder:
             out.append(IntendedItem(surface, header, fields))
         return out, cluster_members(intended)
 
-    def reconciliation(self, intended: list[Member]) -> Line | None:
+    def reconciliation(self) -> Line | None:
+        """9.2 Manifest reconciliation, one clause per entry (2.12 manifest coverage table)."""
         entries = (self.manifest or {}).get("entries", [])
         if not entries:
             return None
@@ -878,15 +885,19 @@ class _Builder:
         author = (self.manifest or {}).get("author", "the PR author")
         for e in entries:
             eid = e.get("entry_id", "?")
-            visible = [m for m in intended if m.outcome.manifest_entry_ref == eid]
-            covering = sorted(o.checkpoint_id for o in self.outcomes
-                              if o.surface_id in e.get("declared_surfaces", []))
+            visible = [o for o in self.outcomes if o.outcome == "intended" and o.manifest_entry_ref == eid]
+            covering = sorted((o for o in self.outcomes if o.surface_id in e.get("declared_surfaces", [])),
+                              key=lambda o: o.checkpoint_id)
+            ids = [o.checkpoint_id for o in covering]
             if visible:
                 parts.append((T(f"{eid}: verified visible on {plural(len(visible), 'checkpoint')}"),))
-            elif covering:
-                parts.append((T(f"{eid}: covering checkpoints "),) + _codes(covering) +
+            elif covering and all(o.outcome in ("identical", "noise") for o in covering):
+                parts.append((T(f"{eid}: covering checkpoints "),) + _codes(ids) +
                              (T(" showed no change above floor ("), C("intended_change_not_observed"),
                               T(f"; a question for {author} and the feature owner, not a bug)")))
+            elif covering:
+                parts.append((T(f"{eid}: not verified; covering checkpoints "),) + _codes(ids) +
+                             (T(" have no intended outcome"),))
             else:
                 task = tasks.get(eid)
                 parts.append((T(f"{eid}: no covering checkpoint; flow-authoring task "
@@ -943,7 +954,8 @@ def status_from_items(run: RunOutcome, items: list[Item], outcomes: list[Checkpo
         return st("success", f"forced success by {ctx.override.get('by', '?')}: {ctx.override.get('reason', '')}")
     failing = [i for i in items if i.tier == 1 and not i.decided and i.group in CHECK_FAILING_GROUPS]
     if failing:
-        return st("failure", f"{len(failing)} tier-1 {'finding has' if len(failing) == 1 else 'findings have'} no decision")
+        noun = "finding has" if len(failing) == 1 else "findings have"
+        return st("failure", f"{len(failing)} tier-1 {noun} no decision")
     open_23 = sum(1 for i in items if i.tier in (2, 3) and not i.decided)
     surfaces, kinds = _not_compared_tier1(outcomes)
     text = f"{len(items)} unexpected ({open_23} tier 2 and 3 open); {len(surfaces)} tier-1 surfaces not compared"
@@ -1018,7 +1030,8 @@ def scope_line(b: _Builder) -> Line:
         line.append(T(")"))
     line.append(T("."))
     if s.get("send_policy"):
-        line += [T(f" Send policy {s['send_policy']}: {plural(int(s.get('order_surfaces_entitlement', 0)), 'order lifecycle surface')} "),
+        orders = plural(int(s.get("order_surfaces_entitlement", 0)), "order lifecycle surface")
+        line += [T(f" Send policy {s['send_policy']}: {orders} "),
                  C("not_run"), T(" (entitlement).")]
     line += [T(" "), Link("Matrix", b.urls.matrix)]
     return tuple(line)
@@ -1102,7 +1115,8 @@ def _safety_row(s: dict) -> Line:
     if not (proof.startswith("PROVEN: ") or proof.startswith("UNPROVEN: ")):
         raise ReportInputError(f"post-run proof verdict {proof!r} (6.6)")
     text = (f"attestation {s.get('attestation', 'unknown')}, paper mode asserted "
-            f"{plural(int(s.get('paper_mode_asserted', 0)), 'time')}, gateway {plural(int(s.get('gateway_drops', 0)), 'drop')}, "
+            f"{plural(int(s.get('paper_mode_asserted', 0)), 'time')}, "
+            f"gateway {plural(int(s.get('gateway_drops', 0)), 'drop')}, "
             f"Cancel All {s.get('cancel_all', 'unknown')}, proof {proof}")
     if proof.startswith("UNPROVEN"):
         text += f"; next run on login {s.get('login', 'unknown')} blocked until a human verifies the account"
@@ -1127,7 +1141,8 @@ def _integrations_row(b: _Builder, items: list[Item]) -> Line:
     posts = slack.get("posts", [])
     known = {it.rank for it in items}
     if posts:
-        out.append(T(f"{len(posts)} posted" + (f" to {words_and(slack.get('to', []))}" if slack.get("to") else "") + " ("))
+        to = f" to {words_and(slack['to'])}" if slack.get("to") else ""
+        out.append(T(f"{len(posts)} posted{to} ("))
         segs = []
         for p in posts:
             if p.get("outcome") not in load().checkpoint_outcomes:
@@ -1148,7 +1163,8 @@ def _integrations_row(b: _Builder, items: list[Item]) -> Line:
 
 def health_rows(b: _Builder, items: list[Item], intended_clusters: list[Cluster]) -> list[tuple[str, Line]]:
     h, os_ = b.health, b.outcomes
-    wall = f"{h.get('wall_clock', 'unknown')} / {h.get('budget', '45:00')} on {plural(int(h.get('shards', 1)), 'shard')}"
+    shards = plural(int(h.get("shards", 1)), "shard")
+    wall = f"{h.get('wall_clock', 'unknown')} / {h.get('budget', '45:00')} on {shards}"
     if b.ctx.report_late:
         wall += "; report_late"
     fp = h.get("fingerprint", {})
@@ -1233,7 +1249,8 @@ def _abort(b: _Builder, members: list[Member]) -> tuple[str | None, str | None, 
         t1 = sum(1 for o in budget if o.tier == 1)
         text = f"Scope not finished: {len(budget)} checkpoints not_run (budget), {t1} of them tier 1"
         if reason == "dollar_cap":
-            text += f"; per-run model spend ceiling reached ({a.get('cost', '?')} of {a.get('cap', '?')}, 11.4 Cost model)"
+            text += (f"; per-run model spend ceiling reached ({a.get('cost', '?')} of {a.get('cap', '?')}, "
+                     f"11.4 Cost model)")
         return None, None, [(T(text),)]
     if run.status == "aborted_safety":
         lines: list[Line] = [(T(f"Trigger: {a.get('trigger', reason)}"),),
@@ -1338,19 +1355,21 @@ def build_report(run: RunOutcome, outcomes: list[CheckpointOutcome], findings: l
         result += f" (reason: {run.reason})"
     elif pending:
         result += f" (unreviewed: {plural(pending, 'item')} pending review)"
-    review_line = (T(f"Reviewer pending: {plural(pending, 'item')}; this comment is edited in place when verdicts land"),) \
-        if pending else None
+    review_line = (T(f"Reviewer pending: {plural(pending, 'item')}; this comment is edited in place when "
+                     f"verdicts land"),) if pending else None
     nb = sum(1 for o in b.outcomes if o.outcome == "needs_baseline" and o.surface_id in b.declared)
     nb_line = (T(f"{nb} checkpoints "), C("needs_baseline"),
-               T(" on declared new surfaces; the merge run produces the candidates, nothing is approved from a PR run")) \
-        if nb else None
+               T(" on declared new surfaces; the merge run produces the candidates, nothing is approved from a "
+                 "PR run")) if nb else None
     return RunReport(
         run=run, context=context, urls=b.urls, status=status, banner=banner, banner_lines=banner_lines,
         result=result, special=special, review_line=review_line, abort_title=abort_title,
-        abort_lines=abort_lines, show_findings=run.status not in ("aborted_safety", "aborted_harness") and special is None,
+        abort_lines=abort_lines,
+        show_findings=run.status not in ("aborted_safety", "aborted_harness") and special is None,
         unexpected=items, intended=intended_items, manifest_line=_manifest_line(b),
-        reconciliation=b.reconciliation(intended), needs_baseline_line=nb_line,
-        suppressed=b.suppressed_rows(clusters), coverage_rows=coverage_rows(b.coverage), scope_line=scope_line(b),
+        reconciliation=b.reconciliation(), needs_baseline_line=nb_line,
+        suppressed=b.suppressed_rows(clusters), coverage_rows=coverage_rows(b.coverage),
+        coverage_cells=list(b.coverage.get("cells", [])), scope_line=scope_line(b),
         health_rows=health_rows(b, items, intended_clusters), history=tuple(context.history), outcomes=b.outcomes)
 
 

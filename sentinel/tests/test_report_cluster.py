@@ -95,10 +95,8 @@ def test_census_clusters_are_transitive_and_order_independent():
 
 
 def test_a_census_checkpoint_never_joins_a_sweep_cluster():
-    s = _sweep_sample()
-    clusters = cluster_members(build_report(**{k: v for k, v in s.items()}).unexpected[0].cluster.members)
-    assert len(clusters) == 1 and clusters[0].kind == "sweep"
-    report = build_report(**s)
+    """Same surface, region and category as the sweep, but a census checkpoint is not a ladder step (9.7)."""
+    report = build_report(**_sweep_sample())
     kinds = [(i.cluster.kind, len(i.cluster.members)) for i in report.unexpected]
     assert kinds == [("sweep", 12), ("census", 1), ("census", 2)]
 

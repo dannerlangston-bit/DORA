@@ -642,14 +642,9 @@ def diff_pair(base: np.ndarray, candidate: np.ndarray, registry: RegionsFile | N
     thresholds[WHOLE_ID] = _threshold(calibration, cid, WHOLE_ID, None)
     any_calibrated = any(src == "calibrated" for _, src in thresholds.values())
 
-    # 5.8: exact hash equality short-circuits
+    # 5.8: exact hash equality short-circuits (no pixel work; regions report zero metrics)
     if base.shape == candidate.shape and np.array_equal(base, candidate):
-        blank = np.zeros((H, W), dtype=bool)
-        summary = DiffSummary(regions=[RegionDiff(r.id, 0.0, 1.0, False) for r in pixel_regions]
-                              + [RegionDiff(REST_ID, 0.0, 1.0, False)])
-        signal = GlobalShiftSignal(cid, "zero", False, 0, 0, True)
-        return DiffResult("zero", "calibrated" if any_calibrated else "uncalibrated", summary, findings,
-                          _heatmap(B, blank, blank, [], [], p), signal=signal, changed_map=blank)
+        return _identical(cid, reg, B, thresholds, findings, p)
 
     # 3.7 landmarks, located in both images
     matches = {lm.id: (locate_landmark(B, lm, p), locate_landmark(C, lm, p)) for lm in reg.landmarks}
@@ -720,6 +715,30 @@ def diff_pair(base: np.ndarray, candidate: np.ndarray, registry: RegionsFile | N
 
     return _assemble(ctx, cid, reg, pairs, whole, thresholds, rel, window_shift, matches, loc_b, budget,
                      findings, B, C, p)
+
+
+def _identical(cid: str, reg: RegionsFile, B: np.ndarray, thresholds: Mapping[str, tuple[RegionThreshold, str]],
+               findings: list[Finding], p: Mapping[str, Any]) -> DiffResult:
+    H, W = B.shape[:2]
+    pos = {}
+    for lm in reg.landmarks:
+        m = locate_landmark(B, lm, p)
+        if m.found:
+            pos[lm.id] = m.pos
+    loc = locate(reg, pos)
+    metrics = []
+    for rid in [r.id for r in reg.regions if r.pixel_diffed] + [REST_ID]:
+        th, src = thresholds[rid]
+        rect = loc.get(rid, Rect(0, 0, W, H) if rid == REST_ID else Rect(0, 0, 0, 0))
+        kind = reg.region(rid).type if rid != REST_ID else "diff"
+        metrics.append(RegionMetrics(rid, kind, rect, rect, rect.area, 0, 0, 0.0, 1.0, 1.0, 0.0, (0, 0), 0, 0, 0,
+                                     None, 0, th, src, False, False, False, ()))
+    any_calibrated = any(src == "calibrated" for _, src in thresholds.values())
+    blank = np.zeros((H, W), dtype=bool)
+    summary = DiffSummary(regions=[RegionDiff(m.region_id, 0.0, 1.0, False) for m in metrics])
+    return DiffResult("zero", "calibrated" if any_calibrated else "uncalibrated", summary, findings,
+                      _heatmap(B, blank, blank, [], [], p), regions=metrics,
+                      signal=GlobalShiftSignal(cid, "zero", False, 0, 0, True), changed_map=blank)
 
 
 def _window_shift(B: np.ndarray, vB: np.ndarray, C: np.ndarray, vC: np.ndarray, excl_b_rects: list[Rect],

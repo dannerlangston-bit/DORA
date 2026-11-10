@@ -70,13 +70,19 @@ class Anchor:
     text: str | None = None
     search: Rect | None = None
 
-    def present(self, frame: Frame, confidence: float) -> bool:
+    def present(self, frame: Frame, confidence: float, seen: dict | None = None) -> bool:
+        """Text match in the frame's OCR words, or template match at `confidence` or better.
+        `seen` caches template results for a frame pixel-identical to the previous one."""
         if self.text is not None and any(self.text.lower() in t.lower() for t in frame.texts):
             return True
-        if self.template is not None:
-            best, _, _ = match_template(frame.image, self.template, self.search)
-            return best >= confidence
-        return False
+        if self.template is None:
+            return False
+        if seen is not None and self.name in seen:
+            return seen[self.name]
+        best, _, _ = match_template(frame.image, self.template, self.search)
+        if seen is not None:
+            seen[self.name] = best >= confidence
+        return best >= confidence
 
 
 @dataclass
@@ -125,7 +131,7 @@ def _ignore_mask(shape: tuple[int, int], spec: SettleSpec, park_px: int) -> np.n
     return m
 
 
-def _failing(frame: Frame, spec: SettleSpec, confidence: float) -> tuple[str, str] | None:
+def _failing(frame: Frame, spec: SettleSpec, confidence: float, seen: dict) -> tuple[str, str] | None:
     """The first failing condition of 3.5 for one frame, as (reason code, detail), or None."""
     if frame.modal_title:
         return f"unexpected_window:{frame.modal_title}", f"modal window {frame.modal_title!r}"
@@ -134,10 +140,10 @@ def _failing(frame: Frame, spec: SettleSpec, confidence: float) -> tuple[str, st
     if not frame.focus_dropped:
         return "anchor_missing", f"condition 2: focus not dropped on {spec.neutral_control}"
     for a in spec.anchors:
-        if not a.present(frame, confidence):
+        if not a.present(frame, confidence, seen):
             return "anchor_missing", f"condition 3: anchor {a.name}"
     for a in spec.anti_anchors:
-        if a.present(frame, confidence):
+        if a.present(frame, confidence, seen):
             return "anti_anchor_present", f"condition 4: anti-anchor {a.name}"
     return None
 
@@ -153,11 +159,15 @@ def settle(frames: Iterable[Frame], spec: SettleSpec, params: Mapping[str, Any] 
     last: Frame | None = None
     last_fail: tuple[str, str] | None = None
     ignore: np.ndarray | None = None
+    seen: dict[str, bool] = {}          # template results, valid while frames stay pixel-identical
     for f in frames:
         if f.t_ms > max_wait:
             break
+        if last is None or not (last.image is f.image or (last.image.shape == f.image.shape
+                                                          and np.array_equal(last.image, f.image))):
+            seen = {}
         last = f
-        fail = _failing(f, spec, confidence)
+        fail = _failing(f, spec, confidence, seen)
         if fail is not None:
             run, last_fail = [], fail
             continue

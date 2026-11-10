@@ -1,0 +1,7 @@
+# Explorer session budgets (6.8); a change needs the Explorer owner's approval in the PR (L-XREF-14).
+schema_version: 1
+max_actions: 400
+max_minutes: 90
+max_no_change_actions: 20
+max_usd_per_session: 25
+max_usd_per_week: 500

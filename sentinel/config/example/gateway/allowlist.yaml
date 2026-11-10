@@ -1,0 +1,4 @@
+# Exact paperMoney account selector strings per rig, compiled into the gateway hook host (4.9, 6.4).
+schema_version: 1
+rigs:
+  - {rig: rig-01, account_ids: [D-20481133, D-20481134], login_ref: vault://sentinel/rigs/rig-01/tos-login}

@@ -256,9 +256,9 @@ def match_template(image: np.ndarray, template: np.ndarray, search: Rect | None 
     """`cv2.matchTemplate` with `TM_CCOEFF_NORMED` inside `search`: (best, second peak outside
     `radius` px of the best, best top-left in image coordinates)."""
     H, W = image.shape[:2]
-    box = search or Rect(0, 0, W, H)
+    box = (search or Rect(0, 0, W, H)).intersect(Rect(0, 0, W, H))
     th, tw = template.shape[:2]
-    if box.w < tw or box.h < th:
+    if box is None or box.w < tw or box.h < th:
         return 0.0, 0.0, None
     sub = image[box.y:box.y + box.h, box.x:box.x + box.w]
     res = cv2.matchTemplate(np.ascontiguousarray(sub), np.ascontiguousarray(template), cv2.TM_CCOEFF_NORMED)

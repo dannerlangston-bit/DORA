@@ -1,0 +1,31 @@
+schema_version: 1
+id: trade.order-entry.stock
+title: Order Entry
+kind: ticket_variant
+tier: 1
+owner: tos-trade-ui
+smoke: true
+path:
+  - {id: p1, type: wait_for, anchor: {landmark: lm.order-entry-header}, timeout_ms: 8000}
+primitives: [OrderTicketCore, Theme]
+roots: ["com.tos.desktop.trade.orderentry"]
+personas: [active_trader, options_trader, swing_trader, beginner]
+entitlements: [margin]
+enumerable_by: P6
+resizable: false
+target_window: {kind: main}
+data_mode: frozen
+account_state: false
+landmarks:
+  - {id: lm.order-entry-header, template: registry/templates/trade/order-entry-header.png, confidence_min: 0.92, must_see: true}
+anti_anchors: [Loading, Reconnecting]
+labels: [Qty, Price, "Confirm and Send"]
+controls:
+  - {id: symbol-box, template: registry/templates/common/symbol-box.png, ocr_text: Symbol}
+  - {id: qty-field, template: registry/templates/trade/qty-field.png, ocr_text: Qty}
+  - {id: price-field, template: registry/templates/trade/price-field.png, ocr_text: Price}
+  - {id: confirm-and-send, jab: {name: Confirm and Send, role: push button}, template: registry/templates/trade/confirm-and-send.png, ocr_text: "Confirm and Send", required: true}
+settle: {max_wait_ms: 8000}
+census:
+  enabled: true
+  workspaces: [ws.tier-a.swing-trader, ws.tier-a.beginner]

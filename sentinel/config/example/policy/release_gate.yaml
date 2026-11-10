@@ -1,0 +1,4 @@
+# Business days of sign-off lead before GA per release train (11.2, 10.9).
+schema_version: 1
+default_business_days: 3
+trains: []

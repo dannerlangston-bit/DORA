@@ -1,0 +1,28 @@
+schema_version: 1
+id: monitor.activity.position-statement
+title: Position Statement
+kind: section
+tier: 1
+owner: tos-monitor-ui
+smoke: true
+path:
+  - {id: p1, type: wait_for, anchor: {landmark: lm.position-statement-header}, timeout_ms: 8000}
+primitives: [Theme]
+roots: ["com.tos.desktop.monitor.positions"]
+personas: [active_trader, options_trader, futures_trader, swing_trader, beginner]
+entitlements: [margin]
+enumerable_by: P2
+resizable: false
+target_window: {kind: main}
+data_mode: masked_live                # marks and P/L by rule R08 on the golden account (12.4)
+account_state: true
+landmarks:
+  - {id: lm.position-statement-header, template: registry/templates/monitor/position-statement-header.png, must_see: true}
+anti_anchors: [Loading, "N/A"]
+labels: [Qty, "Trade Price", Mark, "P/L Open"]
+controls:
+  - {id: section-toggle, template: registry/templates/monitor/position-statement-toggle.png, ocr_text: "Position Statement", required: true}
+settle: {max_wait_ms: 8000}
+census:
+  enabled: true
+  workspaces: [ws.tier-a.active-trader]

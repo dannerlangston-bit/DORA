@@ -1,0 +1,4 @@
+# Display configurations a workspace may declare; phase 1 is 1920x1080 at 100 percent only (7.1, L-WSP-05).
+schema_version: 1
+configs:
+  - {id: cfg.1920x1080-100.dark-medium, width: 1920, height: 1080, scale_percent: 100, theme: dark, font_size: medium}

@@ -1,0 +1,16 @@
+schema_version: 1
+id: ws.tier-a.swing-trader
+tier: A
+persona: swing_trader
+file: corpus/workspaces/ws.tier-a.swing-trader/workspace.sentinel-swing
+file_sha256: "@@FILESHA:corpus/workspaces/ws.tier-a.swing-trader/workspace.sentinel-swing@@"
+display_config: {width: 1920, height: 1080, scale_percent: 100, theme: dark, font_size: medium}
+link_groups:
+  - {color: red, symbol_ref: aapl}
+gadgets_present:
+  - trade.order-entry.stock
+  - charts.flexible-grid.chart-cell
+  - monitor.activity.position-statement
+active_trader_panels: []
+owner: tos-trade-ui
+notes: Order Entry docked under a chart cell; Position Statement on Monitor.

@@ -1,0 +1,18 @@
+schema_version: 1
+id: ws.tier-c.sweep-harness
+tier: C
+file: corpus/workspaces/ws.tier-c.sweep-harness/workspace.sentinel-sweep
+file_sha256: "@@FILESHA:corpus/workspaces/ws.tier-c.sweep-harness/workspace.sentinel-sweep@@"
+display_config: {width: 1920, height: 1080, scale_percent: 100, theme: dark, font_size: medium}
+link_groups:
+  - {color: red, symbol_ref: aapl}
+gadgets_present:
+  - charts.flexible-grid.active-trader-cell
+active_trader_panels:
+  - {panel_id: at-sweep, surface: charts.flexible-grid.active-trader-cell}
+size_sweep_cells:
+  - {cell_id: cell-1, hosts: charts.flexible-grid.active-trader-cell}
+  - {cell_id: cell-2, hosts: charts.flexible-grid.chart-cell}
+  - {cell_id: cell-3, hosts: trade.active-trader.ladder}
+owner: tos-trade-ui
+notes: One Flexible Grid cell, empty sidebar, parking area for detached windows (2.3).

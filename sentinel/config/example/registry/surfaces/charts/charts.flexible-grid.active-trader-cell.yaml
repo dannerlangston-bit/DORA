@@ -1,0 +1,32 @@
+# The Active Trader ladder hosted in a Charts-tab Flexible Grid cell: the surface of the worked
+# example in 1.11, 9.3 and 10.10, swept with host flexgrid.
+schema_version: 1
+id: charts.flexible-grid.active-trader-cell
+title: Active Trader
+kind: active_trader_panel
+tier: 1
+owner: tos-trade-ui
+smoke: true
+path:
+  - {id: p1, type: wait_for, anchor: {landmark: lm.atcell-header}, timeout_ms: 10000}
+primitives: [FlexibleGrid, OrderTicketCore, LadderModel, Theme]
+roots: ["com.tos.desktop.charts.grid.cell"]
+personas: [active_trader]
+entitlements: [margin]
+enumerable_by: P8
+resizable: true
+hosts: [flexgrid]
+target_window: {kind: main}
+data_mode: frozen
+account_state: true
+landmarks:
+  - {id: lm.atcell-header, template: registry/templates/charts/atcell-header.png, must_see: true}
+anti_anchors: [Loading, Reconnecting]
+labels: ["Bid Size", "Ask Size"]
+controls:
+  - {id: auto-send-checkbox, template: registry/templates/active-trader/auto-send.png, ocr_text: "Auto send", required: true}
+  - {id: buy-mkt-button, template: registry/templates/active-trader/buy-mkt.png, ocr_text: "BUY MKT", required: true, deny: true}
+settle: {max_wait_ms: 10000}
+census:
+  enabled: true
+  workspaces: [ws.tier-a.active-trader]

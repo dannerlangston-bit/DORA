@@ -3,7 +3,6 @@ import copy
 import dataclasses
 from datetime import datetime, timedelta, timezone
 
-import numpy as np
 import pytest
 
 from sentinel import synth
@@ -65,6 +64,7 @@ def test_clean_captures_calibrate_to_zero_floors_and_complete():
     caps = [Capture(BASE.image.copy(), time_to_settle_ms=t) for t in (1000, 1200, 1100, 1300, 900, 1250)]
     cal = calibrate_checkpoint(caps, registry(), data_mode="frozen", now=NOW)
     assert cal.accepted and cal.fix_list == [] and cal.settle_p50_ms == 1150
+    assert CalibrationFile("sha256:fp1", "run-cal-1", {CID: cal}).settle_p50_ms(CID) == 1150
     assert set(cal.floors) == {"rgn.watchlist.grid", "_rest", "*"}
     assert all(len(rows) == 15 for rows in cal.pair_stats.values())
     th = cal.thresholds["rgn.watchlist.grid"]
@@ -127,6 +127,14 @@ def test_landmark_jitter_and_failed_captures_are_fix_list_items():
         FixItem(CID, None, "gremlins")
     with pytest.raises(ValueError):
         calibrate_checkpoint(caps[:5], registry(), data_mode="frozen")
+    with pytest.raises(ValueError):
+        calibrate_checkpoint(caps, registry(), data_mode="live")
+    # a landmark lost in r6 is one fix-list item, not one per pair
+    lost = copy.deepcopy(LAYOUT)
+    synth.node(lost, "watchlist")["title"] = ""
+    caps = [Capture(BASE.image.copy()) for _ in range(5)] + [Capture(synth.render(lost, SIZE).image)]
+    cal = calibrate_checkpoint(caps, registry(), data_mode="frozen", now=NOW)
+    assert [(i.cause, i.reason) for i in cal.fix_list] == [("landmark_jitter", "landmark:lm.watchlist")]
 
 
 def test_lookup_cases_and_round_trip(tmp_path, noisy_calibration):

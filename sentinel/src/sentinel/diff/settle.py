@@ -38,24 +38,26 @@ import numpy as np
 
 from . import load_params
 from .engine import match_template
-from .regions import Rect
+from .regions import Rect, park_rect
 
 DEFAULT_ANTI_ANCHOR_TEXTS = ("Loading", "Reconnecting", "Disconnected")
+PARKED_BEFORE_WAIT = -(10 ** 9)
 
 
 @dataclass(frozen=True)
 class Frame:
     """One frame of the settle loop. `t_ms` counts from the start of the wait.
 
-    The platform side reports what it knows about the frame: whether the mouse is parked with the
-    tooltip delay passed, whether focus was dropped on the neutral control (always true for a
-    `keep_focus` checkpoint), the title of an unexpected modal window if one is up, and OCR words
-    for text anti-anchors.
+    The platform side reports what it knows about the frame: when the mouse reached the parking
+    coordinate (`parked_at_ms`, None while it is not there; the default means long before the
+    wait), whether focus was dropped on the neutral control (always true for a `keep_focus`
+    checkpoint), the title of an unexpected modal window if one is up, and OCR words for text
+    anti-anchors.
     """
 
     t_ms: int
     image: np.ndarray
-    parked: bool = True
+    parked_at_ms: int | None = PARKED_BEFORE_WAIT
     focus_dropped: bool = True
     modal_title: str | None = None
     texts: tuple[str, ...] = ()
@@ -122,8 +124,7 @@ def _ignore_mask(shape: tuple[int, int], spec: SettleSpec, park_px: int) -> np.n
     m = np.zeros((h, w), dtype=bool)
     rects = list(spec.ignore)
     if spec.park is not None:
-        px, py = spec.park
-        rects.append(Rect(px - park_px // 2, py - park_px // 2, park_px, park_px))
+        rects.append(park_rect(spec.park, park_px))
     for r in rects:
         i = r.intersect(Rect(0, 0, w, h))
         if i is not None:
@@ -131,11 +132,12 @@ def _ignore_mask(shape: tuple[int, int], spec: SettleSpec, park_px: int) -> np.n
     return m
 
 
-def _failing(frame: Frame, spec: SettleSpec, confidence: float, seen: dict) -> tuple[str, str] | None:
+def _failing(frame: Frame, spec: SettleSpec, confidence: float, tooltip_ms: int,
+             seen: dict) -> tuple[str, str] | None:
     """The first failing condition of 3.5 for one frame, as (reason code, detail), or None."""
     if frame.modal_title:
         return f"unexpected_window:{frame.modal_title}", f"modal window {frame.modal_title!r}"
-    if not frame.parked:
+    if frame.parked_at_ms is None or frame.t_ms - frame.parked_at_ms < tooltip_ms:
         return "park", "condition 1: mouse not parked or tooltip delay not passed"
     if not frame.focus_dropped:
         return "anchor_missing", f"condition 2: focus not dropped on {spec.neutral_control}"
@@ -167,7 +169,7 @@ def settle(frames: Iterable[Frame], spec: SettleSpec, params: Mapping[str, Any] 
                                                           and np.array_equal(last.image, f.image))):
             seen = {}
         last = f
-        fail = _failing(f, spec, confidence, seen)
+        fail = _failing(f, spec, confidence, int(sp["tooltip_delay_ms"]), seen)
         if fail is not None:
             run, last_fail = [], fail
             continue

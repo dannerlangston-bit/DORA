@@ -47,6 +47,7 @@ import cv2
 import numpy as np
 import yaml
 
+from ..records import DATA_MODES
 from . import load_params
 from .engine import DiffContext, DiffResult, Terminal, diff_pair
 from .regions import (
@@ -193,6 +194,8 @@ def calibrate_checkpoint(captures: Sequence[Capture], registry: RegionsFile, *, 
     n_s, n_n = int(cp["session_captures"]), int(cp["next_session_captures"])
     if len(captures) != n_s + n_n:
         raise ValueError(f"calibration needs {n_s + n_n} captures, got {len(captures)}")
+    if data_mode not in DATA_MODES:
+        raise ValueError(f"data_mode {data_mode!r}")
     cid = registry.checkpoint_id
     cal = CheckpointCalibration(cid, data_mode)
     hints = cause_hints or {}
@@ -214,8 +217,10 @@ def calibrate_checkpoint(captures: Sequence[Capture], registry: RegionsFile, *, 
         res = diff_pair(a.image, b.image, registry, redactions=redactions,
                         context=DiffContext(run_id="calibration", checkpoint_id=cid), params=p)
         if res.terminal is not None:
-            cause = "landmark_jitter" if res.terminal.outcome == "landmark_missing" else "settle"
-            cal.fix_list.append(FixItem(cid, None, cause, outcome=res.terminal.outcome, reason=res.terminal.reason))
+            t = res.terminal
+            cause = "landmark_jitter" if t.outcome == "landmark_missing" else "settle"
+            if not any((f.outcome, f.reason) == (t.outcome, t.reason) for f in cal.fix_list):
+                cal.fix_list.append(FixItem(cid, None, cause, outcome=t.outcome, reason=t.reason))
             continue
         if res.window_shift is not None and res.window_shift.accepted:
             floors[WHOLE_ID].shift_px = max(floors[WHOLE_ID].shift_px,

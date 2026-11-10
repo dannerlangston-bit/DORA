@@ -85,6 +85,13 @@ class Rect:
         return Rect(x0, y0, x1 - x0, y1 - y0)
 
 
+def park_rect(coord: tuple[int, int], size: int = 16) -> Rect:
+    """The system mask around the mouse parking coordinate (3.5 condition 1): `size` x `size` px,
+    centered on the coordinate, applied on both sides."""
+    x, y = coord
+    return Rect(x - size // 2, y - size // 2, size, size)
+
+
 def _ts(value: Any) -> datetime:
     if isinstance(value, datetime):
         dt = value
@@ -97,14 +104,14 @@ def _ts(value: Any) -> datetime:
 class Landmark:
     """A landmark template (cut 1:1 from the approved base) and where to look for it (3.7, 4.8).
 
-    `expected` is the template's top-left in the approved base; the search box is that position
+    `confidence_min` overrides the configured 0.92 for this landmark. `expected` is the template's top-left in the approved base; the search box is that position
     plus or minus the configured margin (200 px). `search_rect` overrides it; with neither, the
     whole image is searched (choice).
     """
 
     id: str
     template: np.ndarray
-    confidence_min: float = 0.92
+    confidence_min: float | None = None
     search_rect: Rect | None = None
     expected: tuple[int, int] | None = None
 
@@ -265,7 +272,8 @@ class RegionsFile:
             sr = lm.get("search_rect")
             ex = lm.get("expected")
             lms.append(Landmark(
-                id=str(lm["id"]), template=tpl, confidence_min=float(lm.get("confidence_min", 0.92)),
+                id=str(lm["id"]), template=tpl,
+                confidence_min=float(lm["confidence_min"]) if "confidence_min" in lm else None,
                 search_rect=Rect(sr["x"], sr["y"], sr["w"], sr["h"]) if sr else None,
                 expected=(int(ex["x"]), int(ex["y"])) if ex else None,
             ))

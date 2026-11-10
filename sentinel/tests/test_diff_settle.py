@@ -88,8 +88,13 @@ def test_anti_anchor_present_by_text_or_template():
     _reason_is_legal(res)
 
 
+def test_tooltip_delay_of_one_second_after_parking():
+    res = settle(frames([IMG] * 8, parked_at_ms=0), spec())
+    assert res.settled and res.capture_t_ms == 1000 and res.time_to_settle_ms == 1500
+
+
 def test_timeout_when_the_mouse_never_parks_or_frames_are_too_few():
-    res = settle(frames([IMG] * 61, parked=False), spec())
+    res = settle(frames([IMG] * 61, parked_at_ms=None), spec())
     assert res.reason == "timeout" and "condition 1" in res.detail
     res = settle([Frame(0, IMG), Frame(250, IMG)], spec())
     assert res.reason == "timeout" and "fewer than 3 frames" in res.detail

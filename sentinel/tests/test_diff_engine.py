@@ -13,7 +13,7 @@ from sentinel.diff.engine import (
     locate_landmark, max_delta, pixel_diff, yiq_delta,
 )
 from sentinel.diff import load_params
-from sentinel.diff.regions import FloorException, Landmark, Rect, RedactionBox, Region, RegionsFile
+from sentinel.diff.regions import FloorException, Landmark, Rect, RedactionBox, Region, RegionsFile, park_rect
 from sentinel.records import DiffSummary, Finding
 
 CID = "census/trade.order-entry.stock/ws.tier-a.active-trader"
@@ -318,6 +318,14 @@ def test_masked_and_redacted_pixels_are_never_diffed():
               calibration=calibrated(registry()))
     assert res.terminal is None and res.level == "zero"
     assert run(cand, calibration=calibrated(registry())).level == "above"
+
+
+def test_parking_rectangle_is_a_system_mask_on_both_sides():
+    cursor = BASE.image.copy()
+    cursor[388:396, 626:634] = 255                       # a tooltip remnant at the parking coordinate
+    assert run(cursor).level == "above"
+    res = run(cursor, system_masks=[park_rect((630, 392))])
+    assert res.level == "zero" and res.terminal is None
 
 
 def test_mask_over_budget_is_harness_error():

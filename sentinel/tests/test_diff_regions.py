@@ -39,6 +39,7 @@ def test_regions_file_from_the_4_8_yaml_shape():
                  "mask_ref": "msk.confirm.timestamp-01"}]}
     rf = RegionsFile.from_dict(data, templates={"lm.order-confirmation-title": TPL})
     assert rf.landmark("lm.order-confirmation-title").confidence_min == 0.93
+    assert Landmark("lm.x", TPL).confidence_min is None                  # falls back to diff_engine.yaml
     assert rf.region("rgn.confirm.qty").money_cell and rf.region("rgn.confirm.qty").rect == Rect(90, 48, 48, 20)
     assert locate(rf, {"lm.order-confirmation-title": (100, 50)})["rgn.confirm.qty"] == Rect(190, 98, 48, 20)
 

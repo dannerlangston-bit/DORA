@@ -46,6 +46,11 @@ Choices where the spec is ambiguous (each reported to the coordinator):
     pixels lie on the dilated Canny edges of the base crop. A checkpoint is text-edge-only when all
     its reportable components are text-edge components (vacuously so with none). In the run-level
     share, a run whose above-floor checkpoints changed no pixel at all meets the text-edge test.
+11. Any landmark missing on either side refuses the whole checkpoint (3.7, 4.8), whatever the
+    panel's tier. 5.8's "skipped-region finding otherwise" contradicts 3.7, and 5.8 says nothing in
+    it overrides 3.7.
+12. Money cells count any changed pixel as above threshold (3.11 note on row 11), although the 3.9
+    table alone would give 4 px; their component and shift minimums are 1 as well.
 """
 from __future__ import annotations
 
@@ -64,7 +69,7 @@ from ..taxonomy import load as load_taxonomy
 from . import load_params
 from .phash import component_crop, phash
 from .regions import (
-    REST_ID, UNCALIBRATED, WHOLE_ID, BudgetResult, Rect, RedactionBox, Region, RegionsFile,
+    REST_ID, UNCALIBRATED, WHOLE_ID, BudgetResult, Landmark, Rect, RedactionBox, Region, RegionsFile,
     RegionThreshold, locate, mask_budget, money_cell_threshold,
 )
 
@@ -270,14 +275,15 @@ def match_template(image: np.ndarray, template: np.ndarray, search: Rect | None 
     return float(best), second, (box.x + bx, box.y + by)
 
 
-def locate_landmark(image: np.ndarray, lm: Any, params: Mapping[str, Any]) -> Match:
-    """Accept a landmark when the best score is at least its `confidence_min` (0.92 default) and
-    the second peak outside 5 px is below 0.85 (3.7)."""
+def locate_landmark(image: np.ndarray, lm: Landmark, params: Mapping[str, Any]) -> Match:
+    """Accept a landmark when the best score is at least its `confidence_min` (else the configured
+    0.92) and the second peak outside 5 px is below 0.85 (3.7)."""
     p = params["landmarks"]
     H, W = image.shape[:2]
     box = lm.search_box(W, H, int(p["search_margin_px"]))
     best, second, pos = match_template(image, lm.template, box, int(p["second_peak_radius_px"]))
-    ok = pos is not None and best >= float(lm.confidence_min) and second < float(p["second_peak_max"])
+    floor = float(p["confidence_min"] if lm.confidence_min is None else lm.confidence_min)
+    ok = pos is not None and best >= floor and second < float(p["second_peak_max"])
     return Match(ok, best, second, pos if ok else None)
 
 
@@ -499,16 +505,12 @@ def _try_shift(B: np.ndarray, C: np.ndarray, vb: np.ndarray, vc: np.ndarray, exc
     if resp < float(p["response_min"]) or not (int(p["shift_min_px"]) <= mag <= int(p["shift_max_px"])) \
             or unshifted == 0 or abs(dx) >= w or abs(dy) >= h:
         return Shift(dx, dy, float(resp), False, unshifted), None
-    sb, sc = _overlap(h, w, dx, dy)
-    excl = excl_b[sb] | excl_c[sc]
-    both = vb[sb] & vc[sc] & ~excl
-    forced = (vb[sb] ^ vc[sc]) & ~excl
-    changed, aa = pixel_diff(B[sb], C[sc], params, valid=both, edge_tolerance_px=tol)
-    changed |= forced
-    residual = int(changed.sum())
+    sb, sc = _overlap(h, w, dx, dy)        # shift the candidate back; borders are cropped
+    moved = _compare("", B[sb], C[sc], vb[sb], vc[sc], excl_b[sb] | excl_c[sc], (0, 0), (0, 0), params, tol)
+    residual = int(moved.changed.sum())
     accepted = residual < float(p["residual_max_ratio"]) * unshifted
-    shift = Shift(dx, dy, float(resp), accepted, unshifted, residual, _count_components(changed, params))
-    return shift, (sb, sc, both | forced, changed, aa)
+    shift = Shift(dx, dy, float(resp), accepted, unshifted, residual, _count_components(moved.changed, params))
+    return shift, (sb, sc, moved.compared, moved.changed, moved.aa)
 
 
 # --------------------------------------------------------------------------------------------
@@ -611,14 +613,17 @@ def _terminal_result(terminal: Terminal, findings: list[Finding], base: np.ndarr
 
 def diff_pair(base: np.ndarray, candidate: np.ndarray, registry: RegionsFile | None = None, *,
               calibration: "CalibrationFile | None" = None, redactions: Sequence[RedactionBox] = (),
-              panel_bounds: Mapping[str, Mapping[str, Rect]] | None = None,
+              system_masks: Sequence[Rect] = (), panel_bounds: Mapping[str, Mapping[str, Rect]] | None = None,
               context: DiffContext | None = None, params: Mapping[str, Any] | None = None) -> DiffResult:
     """Diff one redacted base/candidate pair of one checkpoint (3.7). Images are RGB uint8.
 
     `registry` is the effective Region Registry entry (see `regions.effective_registry`); None means
     no declared regions, so the whole window is `_rest`. `calibration` is the file for the run's
     fingerprint, or None when none exists (every region `uncalibrated`, 3.9 step 6).
-    `panel_bounds[side][panel]` overrides the mask-budget panel bounds.
+    `redactions` are Capture's boxes (3.6, budgeted unless identity fields); `system_masks` are
+    the other system-owned exclusions, such as `regions.park_rect` around the parking coordinate
+    (3.5), excluded on both sides and never budgeted. `panel_bounds[side][panel]` overrides the
+    mask-budget panel bounds.
     """
     p = params or load_params()
     ctx = context or DiffContext()
@@ -670,7 +675,7 @@ def diff_pair(base: np.ndarray, candidate: np.ndarray, registry: RegionsFile | N
 
     masks_b = [loc_b[r.id] for r in reg.regions if r.type == "mask"]
     masks_c = [loc_c[r.id] for r in reg.regions if r.type == "mask"]
-    red = [b.rect for b in redactions]
+    red = [b.rect for b in redactions] + list(system_masks)
 
     # 3.7 granularity 1: whole window, translation only
     window_shift = _window_shift(B, vB, C, vC, masks_b + red, masks_c + red, p)
@@ -720,12 +725,8 @@ def diff_pair(base: np.ndarray, candidate: np.ndarray, registry: RegionsFile | N
 def _identical(cid: str, reg: RegionsFile, B: np.ndarray, thresholds: Mapping[str, tuple[RegionThreshold, str]],
                findings: list[Finding], p: Mapping[str, Any]) -> DiffResult:
     H, W = B.shape[:2]
-    pos = {}
-    for lm in reg.landmarks:
-        m = locate_landmark(B, lm, p)
-        if m.found:
-            pos[lm.id] = m.pos
-    loc = locate(reg, pos)
+    matches = {lm.id: locate_landmark(B, lm, p) for lm in reg.landmarks}
+    loc = locate(reg, {k: m.pos for k, m in matches.items() if m.found})
     metrics = []
     for rid in [r.id for r in reg.regions if r.pixel_diffed] + [REST_ID]:
         th, src = thresholds[rid]
@@ -738,6 +739,7 @@ def _identical(cid: str, reg: RegionsFile, B: np.ndarray, thresholds: Mapping[st
     summary = DiffSummary(regions=[RegionDiff(m.region_id, 0.0, 1.0, False) for m in metrics])
     return DiffResult("zero", "calibrated" if any_calibrated else "uncalibrated", summary, findings,
                       _heatmap(B, blank, blank, [], [], p), regions=metrics,
+                      landmarks={k: (m, m) for k, m in matches.items()},
                       signal=GlobalShiftSignal(cid, "zero", False, 0, 0, True), changed_map=blank)
 
 

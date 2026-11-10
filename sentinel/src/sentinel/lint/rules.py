@@ -1709,7 +1709,7 @@ class _Linter:
             self.add("L-POP-04", f, "app_failure entries route to invariant_violation INV-14", f"{at}.on_abort")
         named = oa.get("run_outcome") if outcome == "aborted_run" else outcome
         reason = oa.get("reason")
-        if reason is not None and not self.tax.reason_allowed(_s(named), reason):
+        if reason is not None and not (isinstance(reason, str) and self.tax.reason_allowed(_s(named), reason)):
             self.add("L-POP-04", f, f"on_abort.reason {reason} is not in taxonomy.yaml for {named}", f"{at}.on_abort.reason")
         if outcome == "aborted_run" and not oa.get("run_outcome"):
             self.add("L-POP-04", f, "on_abort aborted_run names run_outcome", f"{at}.on_abort")

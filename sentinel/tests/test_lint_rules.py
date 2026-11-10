@@ -439,3 +439,24 @@ def test_fingerprint_rig_spec_and_pair():
     base["match"]["render_probe_hash"] = "e3b0c44298fc1c15"
     assert {v.rule for v in lint_fingerprint_pair(fp, base)} == {"L-FPR-03", "L-FPR-05"}
     assert [v.rule for v in lint_fingerprint_pair(fp, fp, {"base": "main-1998.2.0-4f1c9a2"})] == ["L-FPR-03"]
+
+
+@pytest.mark.parametrize("rel,path,bad,rule", [
+    (DEPMAP, ("edges", 0, "surface"), ["x"], "L-DEP-00"),
+    (FLOW, ("steps", 1, "target"), {"a": 1}, "L-FLW-00"),
+    (FIXTURE, ("accounts", 0, "account_id"), [], "L-FIX-00"),
+    (MUTANTS, (0, "checkpoint_id"), [], "L-MUT-00"),
+    (POPUPS, (0, "popup_id"), {}, "L-POP-00"),
+    (WS_AT, ("gadgets_present",), "trade.active-trader.ladder", "L-WSP-00"),
+    (S07, ("regions", 0, "landmark"), [], "L-RGN-00"),
+    (STOCK, ("parent",), [], "L-SRF-00"),
+    (POPUPS, (0, "on_abort", "reason"), 7, "L-POP-04"),
+])
+def test_malformed_values_do_not_crash(base, rel, path, bad, rule):
+    """A list or map where a scalar belongs fails the schema; the rules still run (schemas.coerce_shapes)."""
+    r = copy.deepcopy(base)
+    cur = r.docs[rel].data
+    for p in path[:-1]:
+        cur = cur[p]
+    cur[path[-1]] = bad
+    assert rule in lint_repo(r, 1, TODAY).rules()

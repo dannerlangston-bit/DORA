@@ -43,11 +43,20 @@ Choices (reported):
 6. Every proof records what `Cancel All` did (`Proof.cancel_all`: `not_needed`, `done` or `failed`).
    `cancel_new_working` is the one Cancel All and re-read loop of 6.6 step 5, used by the kill switch
    sequence and by the recovery proof of machine.py.
+7. An undeclared row found by the teardown proof is one incident and gets one page (6.6 step 4, 9.10 safety
+   routing): the page is sent after the kill switch sequence, never at the teardown read, so it carries the
+   sequence's proof and what `Cancel All` finally did (`teardown_incident`). The teardown read's line ("Cancel All
+   not needed": it clicked nothing) is not paged.
+8. Every proof carries the sha256 of the start and end Monitor reads it compared (`book_sha256`, 8.3
+   `post_run_proofs.start_snapshot_sha256` and `end_snapshot_sha256`), None for a read it did not have; and its
+   8.3 row form (`verdict_code`, `cancel_all_code`, `counts`), from which `proof_line` gives the 6.6 text back.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 
 from . import alerts
 from .clock import Clock
@@ -68,6 +77,10 @@ UNPROVEN = "UNPROVEN"
 ORDERS_SENT = "ORDERS SENT: undeclared rows"      # the fifth verdict, the most severe (6.6, choice 5)
 # what Cancel All did, as the ORDERS SENT line prints it (6.6)
 CANCEL_ALL_TEXT = {"done": "verified", "failed": "failed", "not_needed": "not needed"}
+# the 8.3 `post_run_proofs` codes of a proof's verdict and of what Cancel All did (choice 8)
+VERDICT_CODES = {PROVEN_NONE: "proven_no_sends", PROVEN_DECLARED: "proven_declared_sends",
+                 PROVEN_NO_SESSION: "proven_no_session", UNPROVEN: "unproven", ORDERS_SENT: "orders_sent"}
+CANCEL_ALL_CODES = {"not_needed": "not_needed", "done": "performed_verified", "failed": "performed_unverified"}
 UNPROVEN_REASONS = ("recovery_login_failed", "monitor_unreadable", "cancel_all_failed", "snapshot_missing",
                     "session_unavailable")
 # 4.13 aborted_safety codes a trigger keeps as the run reason (choice 1)
@@ -173,6 +186,8 @@ class Proof:
     declared: tuple[OrderRow, ...] = ()
     rows: tuple[ProofRow, ...] = ()
     cancel_all: str = "not_needed"              # what Cancel All did before the final read (choice 6)
+    start_sha256: str | None = None             # the Monitor reads the proof compared (choice 8)
+    end_sha256: str | None = None
 
     def __post_init__(self):
         if self.verdict not in (PROVEN_NONE, PROVEN_DECLARED, PROVEN_NO_SESSION, UNPROVEN, ORDERS_SENT):
@@ -194,12 +209,52 @@ class Proof:
         """The VERDICT line in the text form of 6.6, as the Reporter's Safety row and abort block print it (9.2):
         `PROVEN: ...`, `UNPROVEN: <reason>`, or `ORDERS SENT: undeclared rows (<rows>); Cancel All <verified|failed>`
         (`Cancel All not needed` when no undeclared row was Working, choice 5)."""
-        if self.verdict == ORDERS_SENT:
-            rows = ", ".join(r.key for r in self.undeclared)
-            return f"{ORDERS_SENT} ({rows}); Cancel All {CANCEL_ALL_TEXT[self.cancel_all]}"
-        if self.verdict == UNPROVEN:
-            return f"{UNPROVEN}: {self.reason}"
-        return self.verdict
+        return proof_line(self.verdict_code, self.reason, [r.key for r in self.undeclared], self.cancel_all_code)
+
+    @property
+    def verdict_code(self) -> str:
+        """The 8.3 `post_run_proofs.verdict` of this proof."""
+        return VERDICT_CODES[self.verdict]
+
+    @property
+    def cancel_all_code(self) -> str:
+        """The 8.3 `post_run_proofs.cancel_all` of this proof."""
+        return CANCEL_ALL_CODES[self.cancel_all]
+
+    @property
+    def counts(self) -> dict:
+        """The 8.3 `post_run_proofs.counts_json` of this proof: per table line (working, filled and canceled
+        orders, position statement rows: start, end, new, expected; net liq: start, end, drift) and its verdict,
+        and the undeclared and declared row keys the ORDERS SENT and declared-sends lines name (choice 8)."""
+        rows: dict[str, dict] = {}
+        for r in self.rows:
+            if r.name == "net liq":
+                drift = None if r.start is None or r.end is None else round(abs(r.end - r.start), 2)
+                rows[r.name] = {"start": r.start, "end": r.end, "drift": drift, "verdict": r.verdict}
+            else:
+                rows[r.name] = {"start": r.start, "end": r.end, "new": r.new, "expected": r.expected,
+                                "verdict": r.verdict}
+        return {"rows": rows, "undeclared": [r.key for r in self.undeclared],
+                "declared": [r.key for r in self.declared]}
+
+
+def proof_line(verdict_code: str, reason: str | None, undeclared: Sequence[str], cancel_all_code: str) -> str:
+    """The 6.6 VERDICT line of a proof from its 8.3 row (verdict and cancel_all codes, the reason and the undeclared
+    row keys of counts_json), so a proof read back from the store prints as `Proof.line` does (choice 8)."""
+    verdict = next(v for v, c in VERDICT_CODES.items() if c == verdict_code)
+    if verdict == ORDERS_SENT:
+        cancel = next(k for k, c in CANCEL_ALL_CODES.items() if c == cancel_all_code)
+        return f"{ORDERS_SENT} ({', '.join(undeclared)}); Cancel All {CANCEL_ALL_TEXT[cancel]}"
+    if verdict == UNPROVEN:
+        return f"{UNPROVEN}: {reason}"
+    return verdict
+
+
+def book_sha256(book: OrderBook | None) -> str | None:
+    """The sha256 of a Monitor read in canonical JSON form (8.3 `start_snapshot_sha256`, choice 8); None for none."""
+    if book is None:
+        return None
+    return hashlib.sha256(json.dumps(asdict(book), sort_keys=True).encode()).hexdigest()
 
 
 def _new_rows(start: OrderBook, end: OrderBook) -> dict[str, list[OrderRow]]:
@@ -213,7 +268,7 @@ def _new_rows(start: OrderBook, end: OrderBook) -> dict[str, list[OrderRow]]:
 def post_run_proof(p: ProofInputs) -> Proof:
     """The proof verdict from the inputs (6.6 Post-run proof, Runs without a usable session), with what
     Cancel All did recorded on it."""
-    return replace(_proof(p), cancel_all=p.cancel_all)
+    return replace(_proof(p), cancel_all=p.cancel_all, start_sha256=book_sha256(p.start), end_sha256=book_sha256(p.end))
 
 
 def _proof(p: ProofInputs) -> Proof:
@@ -358,3 +413,22 @@ def execute_kill_switch(rig: Rig, decision: ControlResult, *, clock: Clock, allo
     steps.append(("revert_snapshot", clock.monotonic()))
     return KillSwitchReport(decision, proof, proof_result(proof, run_so_far=run_so_far or decision.run,
                                                           unproven_streak=unproven_streak), steps)
+
+
+def teardown_incident(found: Proof, decision: ControlResult, ks: KillSwitchReport) -> ControlResult:
+    """The one control result, so the one 9.10 page, of an undeclared row found by the teardown proof (6.6, 9.10).
+
+    `found` is the teardown read's ORDERS SENT proof, `decision` its `proof_result` (the `aborted_safety` that ran
+    the kill switch sequence) and `ks` what the sequence did. The incident pages once, after the sequence, with what
+    `Cancel All` finally did (choice 7): the sequence's own result when its proof is ORDERS SENT; otherwise (the
+    recovery login failed, or the fresh Monitor read was unreadable) the decision's safety page, run outcome and
+    unreached outcome, with the sequence's actions and findings added and both reads named in the detail.
+    """
+    final = ks.proof_effect
+    if ks.proof.verdict == ORDERS_SENT:
+        return final
+    rows = ", ".join(r.key for r in found.undeclared)
+    return replace(decision, actions=tuple(dict.fromkeys(decision.actions + final.actions)),
+                   findings=decision.findings + final.findings,
+                   detail=f"{ORDERS_SENT} ({rows}) at teardown; after the kill switch sequence: {ks.proof.line}",
+                   evidence={**final.evidence, "teardown_undeclared": [r.key for r in found.undeclared]})

@@ -17,8 +17,10 @@ How a run ends, by the result that stopped it:
   for the proof, UNPROVEN `session_unavailable` when that fails twice;
 - otherwise: teardown (`check_teardown`) and the proof from the session's own Monitor read; when that
   proof finds an undeclared row, the 6.6 sequence runs as for any `aborted_safety` (deny-all, the tree
-  killed, a fresh scripted login, verified Cancel All, re-read, the proof, the revert; 1.10). The recovery
-  proof after a killed tree clicks Cancel All on a new Working row too (6.6 step 5).
+  killed, a fresh scripted login, verified Cancel All, re-read, the proof, the revert; 1.10), and the
+  incident's one safety page is recorded after the sequence with its final proof
+  (`killswitch.teardown_incident`), not at the teardown read. The recovery proof after a killed tree clicks
+  Cancel All on a new Working row too (6.6 step 5).
 
 Unreached checkpoints are written once the run outcome is known, with the unreached outcome of the result
 that decided it, so a recovery proof that turns an earlier abort into `aborted_safety` gives them that
@@ -52,7 +54,7 @@ from .gates import (AccountExpectation, WorkspaceExpectation, check_authenticate
                     check_launched, check_provisioned, check_teardown, check_workspace, decide_run_outcome)
 from .identity import READ_GAP_S, Allowlist, judge_fixture_account, judge_identity, readable as selector_readable
 from .killswitch import (ORDERS_SENT, KillSwitchReport, Proof, ProofInputs, cancel_new_working, execute_kill_switch,
-                         post_run_proof, proof_result, recovery_login)
+                         post_run_proof, proof_result, recovery_login, teardown_incident)
 from .alerts import AlertRoute
 from .results import ControlResult, OutcomeSink, RunVerdict, write_unreached
 from .rig import OrderBook, Rig
@@ -314,14 +316,16 @@ class Orchestrator:
             end = rig.read_orders()
             proof = post_run_proof(ProofInputs(start=self.start_book, end=end,
                                                cancel_all="not_needed" if obs.cancel_all_verified else "failed"))
-            effect = self.apply(proof_result(proof, run_so_far=so_far, unproven_streak=streak))
+            effect = proof_result(proof, run_so_far=so_far, unproven_streak=streak)
             if proof.verdict == ORDERS_SENT:
-                # 1.10, 6.6: an undeclared row at teardown is an aborted_safety; the kill switch sequence cancels it
+                # 1.10, 6.6: an undeclared row at teardown is an aborted_safety; the kill switch sequence cancels it,
+                # and the incident pages once, after the sequence, with what Cancel All finally did (9.10)
                 ks = execute_kill_switch(rig, effect, clock=self.clock, allowlist=ctx.allowlist, start=self.start_book,
                                          fixture_account=ctx.fixture_account, run_so_far=effect.run,
                                          unproven_streak=streak)
+                effect = teardown_incident(proof, effect, ks)
                 proof = ks.proof
-                self.apply(ks.proof_effect)
+            self.apply(effect)
         report = RunReport(ctx.run_id, ctx.run_type, RunVerdict("complete"), last_gate, proof, kill_switch=ks)
         any_env = any(o is not None and o.outcome == "env_error"
                       for r in self.results for o in (r.unreached, r.checkpoint, *[s.outcome for s in r.outcomes]))

@@ -751,6 +751,9 @@ def demo_app_crash(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPL
         "  per shard), logs in and asserts paper mode again, then resumes with the next unit of work: the census",
         "  checkpoints after the ladder are captured and compared as usual.",
         "- The run ends complete; the check fails on the tier-1 app_alive item.",
+        "- Coverage: the table counts surface-and-persona cells (2.12) and the ladder's cell shows its worst outcome,",
+        "  the app_alive failure, so its not_run column reads 0 app_crash; the line under the table counts the",
+        "  checkpoints: \"Checkpoints not run: 7 app_crash (sweep steps after the crash)\".",
     ]
     _write_summary(out, "Scenario app-crash: a frozen app mid-sweep, a relaunch, and the run goes on", story, [r],
                    _safety_lines(r))
@@ -817,7 +820,8 @@ INDEX = {
     "app-crash": ("The app freezes during a sweep step; the Watchdog decides, the Executor relaunches and the run goes "
                   "on (10.2).",
                   "that step is assertion_failed (assertion: app_alive) with an app_crash finding, the rest of the "
-                  "ladder is not_run (app_crash) and the census checkpoints after it were still compared."),
+                  "ladder is not_run (app_crash), counted under the Coverage table as \"Checkpoints not run: 7 "
+                  "app_crash\", and the census checkpoints after it were still compared."),
     "config-invalid": ("An expired mask fails config lint at preflight G1 and the run ends before any product action.",
                        "the run is aborted_harness (config_invalid), the comment's abort block names L-MSK-02 and "
                        "alerts.json has the P1 aborted_harness page."),

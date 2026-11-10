@@ -23,9 +23,11 @@ checkpoint sequence of 5.17 with the rig replaced by `sim`:
    (task A for declared surfaces, task B descriptions for `collateral`; never for invariants or
    assertions, never for a member that inherited a decision), up to the PR cap of 60 calls.
 7. Everything goes through `store.Store` (single writer) and `store.ArtifactStore` (content
-   addressed, redaction header set: synthetic screens carry no account data). The coverage matrix
-   (`coverage.build_matrix`) and the Reporter's PR comment, commit status and static HTML report
-   are rendered from what the store returns.
+   addressed, redaction header set: synthetic screens carry no account data), each shard's post-run
+   proof included (one 8.3 `post_run_proofs` row per shard, keyed by the rig's login alias). The coverage
+   matrix (`coverage.build_matrix`) and the Reporter's PR comment, commit status and static HTML report
+   are rendered from what the store returns: the proof line, what Cancel All did and the blocked login's
+   readable label (`orchestration.login_label`, never the vault alias) come from the stored proofs.
 
 `run_nightly` is the canary pass of a Nightly run (10.3): `canary.generate` mutates approved
 captures of the base build, every mutant goes through the same `evaluate` path as a PR checkpoint
@@ -91,12 +93,12 @@ from ..lint import lint
 from ..records import PERSONAS, CheckpointOutcome, Decision, Finding, RunOutcome, Signature, StepOutcome
 from ..report import ReportContext, build_report, render_pr_comment, render_run_report
 from ..report.cluster import Member, cluster_members
-from ..report.model import worst_proof
+from ..report.model import proof_severity, worst_proof
 from ..scope import (DependencyIndex, Manifest, PlannedCheckpoint, Rig, ScopeConfigError, ScopePlan, classes_in,
                      compute_scope)
 from ..store import ArtifactStore, Store
 from ..store.artifacts import ManifestHeader, Redaction, StoredArtifact
-from ..store.store import RunPlan, ScopeEntry, ShardPlan
+from ..store.store import PostRunProof, RunPlan, ScopeEntry, ShardPlan
 from ..taxonomy import checkpoint_parts, load
 from ..oracle.assertions import AssertionResult, step_assertions
 from ..oracle.tables import OracleConfigError
@@ -105,6 +107,7 @@ from ..orchestrator.clock import ManualClock
 from ..orchestrator.gates import check_authenticated, check_build_unchanged, check_launched
 from ..orchestrator.gateway import VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB, Action, DropLedger, drain, refusal
 from ..orchestrator.identity import judge_identity
+from ..orchestrator.killswitch import proof_line
 from ..orchestrator.machine import Orchestrator, RunContext, RunReport
 from ..orchestrator.results import ControlResult, Outcome, RunVerdict, worse
 from ..orchestrator.rig import CrashSignal
@@ -117,7 +120,7 @@ from ..reviewer.adapter import ModelReviewer, ReviewerUnavailable
 from ..reviewer.config import ReviewerConfig
 from ..reviewer.job import ReviewerJob
 from .live import CollectingReviewer, ItemBuilder
-from .orchestration import RigScript, ShardSink, alert_entry, persisted_actions, shard_setup
+from .orchestration import RigScript, ShardSink, alert_entry, login_alias, login_label, persisted_actions, shard_setup
 from .reviewer import ReviewerAdapter, ReviewRequest, SimulatedReviewer, change_types, to_review, validate
 from .sim import Capture, SimApp, SimBuild, observe
 
@@ -878,7 +881,7 @@ def coverage_summary(cfg: SentinelConfig, plan: ScopePlan, outcomes: Sequence[Ch
 
 def _register(store: Store, cfg: SentinelConfig, builds: Iterable[str]) -> None:
     for i, rig in enumerate(RIGS, 1):
-        store.register_rig(rig, login_alias=f"vault://sentinel/rigs/{rig}/tos-login", owner="asmith",
+        store.register_rig(rig, login_alias=login_alias(rig), owner="asmith",
                            snapshot_id=f"snap-{rig}-2026-11-01", allowlist_entry=i)
     for bid in builds:
         doc = cfg.builds.get(bid)
@@ -1036,8 +1039,7 @@ class _ShardWork:
         a = alert_entry(sc.run_id, st.shard_id, r)
         if a is not None:
             self.alerts.append(a)
-        self.actions += persisted_actions(sc.run_id, st.shard_id, st.rig_id, str(self.cfg.fixture.get("login_ref", "")),
-                                          r, flow_id)
+        self.actions += persisted_actions(sc.run_id, st.shard_id, st.rig_id, r, flow_id)
         for spec in r.findings:
             n = len(self.findings) + 1
             extra: dict[str, Any] = {"created_at": _ts(self.today, sc.clock, 900)}
@@ -1276,29 +1278,60 @@ class _ShardWork:
             v = worse(v, rep.verdict)
         return v or RunVerdict("complete")
 
+    def write_proofs(self) -> None:
+        """One 8.3 `post_run_proofs` row per shard proof (6.6), through the store, keyed by the shard's login alias;
+        `proofs` reads them back for the report. A shard's gateway drops are its step events the hook dropped or the
+        slow half refused (the rows `write_steps` stores, 9.11); its events are every one the gateway decided."""
+        sc = self.scenario
+        for st, rep in self.reports:
+            p, log = rep.proof, st.rig.gateway_log()
+            pm = [r for r in rep.results if r.control == "paper_mode"]
+            drops = sum(1 for s, sid in self.steps
+                        if sid == st.shard_id and (s.gateway_event or {}).get("decision") in ("dropped", "refused"))
+            self.store.write_proof(PostRunProof(
+                shard_id=st.shard_id, run_id=sc.run_id, login_alias=login_alias(st.rig_id), verdict=p.verdict_code,
+                reason=p.reason, send_policy_ref=self.cfg.send_policy_ref, counts=p.counts,
+                cancel_all=p.cancel_all_code, paper_mode_assertions=sum(1 for r in pm if r.passed),
+                paper_mode_mismatches=sum(1 for r in pm if r.run_status == "aborted_safety"),
+                gateway_events=log.allowed + log.drops + log.refusals, gateway_drops=drops,
+                start_snapshot_sha256=p.start_sha256, end_snapshot_sha256=p.end_sha256,
+                produced_at=st.clock.now().isoformat()))
+
+    def proofs(self) -> list[tuple[_Shard, PostRunProof, str]]:
+        """Each shard's stored proof (8.3 `post_run_proofs`) with its 6.6 VERDICT line, in shard order."""
+        by = {st.shard_id: st for st, _ in self.reports}
+        return [(by[p.shard_id], p, proof_line(p.verdict, p.reason, p.counts.get("undeclared", ()), p.cancel_all))
+                for p in self.store.post_run_proofs(self.scenario.run_id)]
+
     def proof(self) -> str:
-        """The run's proof line (`Proof.line`, 6.6) for run health and the abort block: the most severe of the
-        shards' (ORDERS SENT, then UNPROVEN, then PROVEN; 8.2), the stopping shard's among equals."""
-        lines = [r.proof.line for _, r in self.reports]
+        """The run's proof line (6.6) for run health and the abort block, from the stored proofs: the most severe of
+        the shards' (ORDERS SENT, then UNPROVEN, then PROVEN; 8.2), the stopping shard's among equals."""
+        stored = self.proofs()
+        lines = [line for _, _, line in stored]
         stop = self.stop()
         if stop is not None:
-            lines.insert(0, next(r.proof.line for s, r in self.reports if s is stop[0]))
+            lines.insert(0, next(line for st, _, line in stored if st is stop[0]))
         return worst_proof(lines) if lines else "UNPROVEN: no shard ran"
 
     def safety(self) -> dict:
-        """Run health's safety facts (9.11), from what the shards' controls returned. The gateway drops are the
-        run's stored `step_events` rows the hook dropped or the slow half refused (9.11), so it runs after
-        `write_steps`."""
+        """Run health's safety facts (9.11), from what the shards' controls returned and the stored proofs (6.6):
+        what Cancel All did, the run's proof and the readable label of each login the worst proof blocks (never the
+        vault alias). The gateway drops are the run's stored `step_events` rows the hook dropped or the slow half
+        refused (9.11), so it runs after `write_steps` and `write_proofs`."""
         results = [r for _, rep in self.reports for r in rep.results]
         att = [r for r in results if r.gate == "settings_attested" and r.control == "attestation"]
-        did = {rep.proof.cancel_all for _, rep in self.reports}          # what Cancel All did per shard (6.6)
-        cancel = "failed" if "failed" in did else "verified" if "done" in did else "not needed"
+        stored = self.proofs()
+        did = {p.cancel_all for _, p, _ in stored}                     # what Cancel All did per shard (6.6)
+        cancel = ("failed" if "performed_unverified" in did else "verified" if "performed_verified" in did
+                  else "not needed")
+        proof = self.proof()
+        worst = proof_severity(proof) if stored else None
+        logins = [login_label(st.rig_id) for st, _, line in stored if proof_severity(line) == worst]
         return {"attestation": ("passed" if att and all(r.passed for r in att) else
                                 "not reached" if not att else "failed"),
                 "paper_mode_asserted": sum(1 for r in results if r.control == "paper_mode" and r.passed),
                 "gateway_drops": self.store.gateway_drops(self.scenario.run_id), "cancel_all": cancel,
-                "proof": self.proof(),
-                "login": str(self.cfg.fixture.get("login_ref", "unknown"))}
+                "proof": proof, "login": logins[0] if len(logins) == 1 else logins}
 
     def write(self, extra: Mapping[str, Any] | None = None) -> None:
         """`alerts.json` and `orchestrator.json` in the scenario output (appended to by every run there)."""
@@ -1493,6 +1526,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         verdict = work.verdict()
         stop = work.stop()
         reported = {st.shard_id: rep for st, rep in work.reports}
+        work.write_proofs()                               # 8.3 post_run_proofs, one per shard (6.6)
         for sp in shards:
             v = reported[sp.shard_id].verdict
             store.end_shard(sp.shard_id, v.status, v.reason)
@@ -1525,6 +1559,9 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                "2 percent of pairs are above floor and more than 70 percent of their changed pixels are on text "
                "edges)"))
         result.disabled_invariants = run.disabled
+        lines = {st.shard_id: line for st, _, line in work.proofs()}  # each shard's proof as the store holds it
+        for summary in work.summaries:
+            summary["proof"] = lines[summary["shard_id"]]
         result.alerts, result.shards, result.proof = work.alerts, work.summaries, work.proof()
         work.write()
         (out / "reviewer-calls.json").write_text(json.dumps(calls, indent=1, sort_keys=True, default=str) + "\n")
@@ -1785,6 +1822,14 @@ def _static_capture(cid: str, img: np.ndarray, model: inv.ScreenModel, template:
     return Capture(cid, "candidate", frames, screen, model, template.info)
 
 
+def _end_nightly_shard(store: Store, work: _ShardWork, st: _Shard, report: RunReport) -> None:
+    """The Nightly run's one shard at teardown: its post-run proof (8.3 `post_run_proofs`, 6.6), its outcome and
+    the import mark (8.2)."""
+    work.write_proofs()
+    store.end_shard(st.shard_id, report.verdict.status, report.verdict.reason)
+    store.mark_shard_imported(st.shard_id)
+
+
 def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str | Path, today: date = DEFAULT_TODAY,
                 history: Mapping[str, Sequence[float]] | None = None) -> RunResult:
     """The canary pass of one Nightly run (module docstring). Writes `canary-results.json`,
@@ -1871,6 +1916,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
 
         shard = orch.run(canary_pass)
         st = _Shard(ctx.shard_id, cfg.fixture.get("rig", "rig-01"), [], orch, orch.rig, orch.sink, clock, ctx)
+        work.reports.append((st, shard))
+        shard_plan = (ShardPlan(ctx.shard_id, st.rig_id, scope_count=0),)
         for r in shard.results:
             work._note(st, r)
         work.summaries.append({"shard_id": ctx.shard_id, "rig": st.rig_id, "verdict": shard.verdict.status,
@@ -1881,7 +1928,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         work.write()
         if "report" not in done:                 # a gate stopped the Nightly run before the canary pass
             _register(store, cfg, [scenario.build.build_id])
-            store.begin_run(_run_plan(scenario.run_id, "nightly", cfg.root, (), (), started, None, None, None))
+            store.begin_run(_run_plan(scenario.run_id, "nightly", cfg.root, (), shard_plan, started, None, None, None))
+            _end_nightly_shard(store, work, st, shard)
             runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", shard.verdict.status, shard.last_gate,
                                               reason=shard.verdict.reason, started_at=started,
                                               ended_at=_ts(today, scenario.clock, 600)))
@@ -1894,7 +1942,7 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         store.register_checkpoints([ScopeEntry(cp.checkpoint_id, cp.workspace_id, cp.persona, cp.tier, cp.data_mode,
                                                flow_class=_flow_class(cfg, cp)) for cp in cps.values()],
                                    config_commit=tree_sha256(cfg.root)[:12])
-        store.begin_run(_run_plan(scenario.run_id, "nightly", cfg.root, (), (), started, None, None, None))
+        store.begin_run(_run_plan(scenario.run_id, "nightly", cfg.root, (), shard_plan, started, None, None, None))
         written: set[str] = set()
         for row in report.outcome_rows:
             if row.checkpoint_id in written:
@@ -1911,6 +1959,7 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                     f"{r.absorbed_by or 'not recorded'}", scenario.run_id, checkpoint_id=r.checkpoint_id, tier=1,
                     evidence={"raw_values": {"state": r.state, "money_cell": str(r.money_cell)}},
                     created_at=_ts(today, scenario.clock, 1800)))
+        _end_nightly_shard(store, work, st, shard)
         runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", shard.verdict.status, "reported",
                                           reason=shard.verdict.reason, started_at=started,
                                           ended_at=_ts(today, scenario.clock, 2 * 3600)))

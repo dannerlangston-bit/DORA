@@ -214,12 +214,13 @@ def _suppressed(r: RunReport, collapsed: bool) -> list[str]:
 
 
 def _coverage(r: RunReport) -> list[str]:
+    not_run = [] if r.not_run_line is None else ["", _md(r.not_run_line)]   # checkpoints, under the 2.12 table
     if not r.coverage_rows:                           # the run stopped before scope: no table to show
-        return ["", "**Coverage**", _md(r.scope_line)]
+        return ["", "**Coverage**", _md(r.scope_line)] + not_run
     lines = ["", "**Coverage**", "| Tier | Registered | In scope | Covered | Not compared | not_run |",
              "|---|---|---|---|---|---|"]
     lines += [_row(list(row)) for row in r.coverage_rows]
-    return lines + ["", _md(r.scope_line)]
+    return lines + not_run + ["", _md(r.scope_line)]
 
 
 def _health(r: RunReport) -> list[str]:

@@ -70,6 +70,10 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   checkpoints (10.3): a replayed row is a no-op and a different row for the same key an `ImportConflict`
   (8.2). `created_at` is a write-time argument and not compared. Rows are `canary.CanaryResult`, whose
   construction enforces the 8.3 CHECKs; the synthetic `harness_error` rows still go through `write_checkpoint`.
+- `post_run_proofs` (8.3) take `PostRunProof` rows through `write_proof`, one per shard, written once while the run
+  is open, and come back through `post_run_proofs`. `counts_json` holds the 6.6 table lines and, beside the counts
+  8.3 names, the undeclared and declared row keys, since an ORDERS SENT verdict lists every undeclared row (6.6)
+  and no other column can hold them.
 - A finished run is not re-ended with a different outcome (the 10.7 re-evaluation of a returning rig belongs
   to the import, which is not this module).
 - Timestamps are normalised to UTC ISO 8601 seconds on write (8.3).
@@ -123,6 +127,9 @@ RUN_SEVERITY = ("complete", "complete_with_env_errors", "aborted_budget", "abort
 DECISION_REASON_VERDICT = {"noise": "noise", "intended": "intended", "collateral": "confirmed_bug"}
 LOCATOR_LEVELS = ("jab", "image", "ocr", "agent")
 GATEWAY_EVENT_KEYS = frozenset({"decision", "reason", "class"})   # 4.13 step_outcome.gateway_event
+# 8.3 post_run_proofs CHECKs (6.6): the five verdicts and what Cancel All did
+PROOF_VERDICTS = ("proven_no_sends", "proven_declared_sends", "proven_no_session", "unproven", "orders_sent")
+PROOF_CANCEL_ALL = ("not_needed", "performed_verified", "performed_unverified")
 NETWORK_FS = frozenset({"nfs", "nfs4", "cifs", "smb3", "smbfs", "afs", "ncpfs", "fuse.sshfs"})
 _PHASH_RE = re.compile(r"^[0-9a-f]{16}$")
 _DECISION_RE = re.compile(r"^dec-(\d+)$")
@@ -199,6 +206,40 @@ class RunPlan:
     pr_ref: str | None = None
     pr_author: str | None = None
     started_at: str = field(default_factory=now)
+
+
+@dataclass(frozen=True)
+class PostRunProof:
+    """One 8.3 `post_run_proofs` row: the ORDER SAFETY PROOF of one shard (6.6). `counts` is `counts_json`; it
+    names the undeclared rows an `orders_sent` verdict lists (`counts["undeclared"]`, 6.6)."""
+    shard_id: str
+    run_id: str
+    login_alias: str                       # the vault alias the store keys logins by (8.3); never printed
+    verdict: str
+    send_policy_ref: str
+    counts: dict
+    cancel_all: str
+    paper_mode_assertions: int
+    paper_mode_mismatches: int
+    gateway_events: int
+    gateway_drops: int
+    produced_at: str
+    reason: str | None = None
+    start_snapshot_sha256: str | None = None
+    end_snapshot_sha256: str | None = None
+    verified_by: str | None = None
+    verified_at: str | None = None
+
+    def __post_init__(self):
+        if self.verdict not in PROOF_VERDICTS:
+            raise StoreRefused(f"post-run proof verdict {self.verdict!r}; one of {PROOF_VERDICTS} (8.3)")
+        if self.cancel_all not in PROOF_CANCEL_ALL:
+            raise StoreRefused(f"post-run proof cancel_all {self.cancel_all!r}; one of {PROOF_CANCEL_ALL} (8.3)")
+        if (self.verdict == "unproven") != (self.reason is not None):
+            raise StoreRefused(f"post-run proof {self.verdict} with reason {self.reason!r}: a reason exactly when "
+                               "the verdict is unproven (6.6, 8.3)")
+        if self.verdict == "orders_sent" and not self.counts.get("undeclared"):
+            raise StoreRefused("an orders_sent proof names its undeclared rows (counts_json undeclared, 6.6)")
 
 
 @dataclass(frozen=True)
@@ -1331,6 +1372,36 @@ class Store:
             out.append(CanaryResult(**{**d, "money_cell": bool(r["money_cell"]),
                                        "expected": json.loads(r["expected_json"])}))
         return out
+
+    # -- post-run proofs -------------------------------------------------------------------------------------
+    _PROOF_COLUMNS = ("shard_id", "run_id", "login_alias", "verdict", "reason", "send_policy_ref", "cancel_all",
+                      "paper_mode_assertions", "paper_mode_mismatches", "gateway_events", "gateway_drops",
+                      "start_snapshot_sha256", "end_snapshot_sha256", "produced_at", "verified_by", "verified_at")
+
+    def write_proof(self, proof: PostRunProof) -> None:
+        """Write a shard's post-run proof (8.3 `post_run_proofs`, 6.6): one per shard, written once, before the run
+        ends. Refuses a shard not of the run, an unregistered login and a finished run; the same row again is a
+        no-op, a different row for the shard an ImportConflict (8.2)."""
+        p = dataclasses.replace(proof)                  # re-validates
+        self._running(p.run_id)
+        shard = self._one("SELECT run_id FROM shards WHERE shard_id = ?", (p.shard_id,))
+        if shard is None or shard["run_id"] != p.run_id:
+            raise StoreRefused(f"{p.shard_id} is not a shard of run {p.run_id} (8.3)")
+        values = {c: getattr(p, c) for c in self._PROOF_COLUMNS}
+        values.update(counts_json=_json(p.counts), produced_at=utc(p.produced_at), verified_at=utc(p.verified_at))
+        old = self._one("SELECT * FROM post_run_proofs WHERE shard_id = ?", (p.shard_id,))
+        if old is not None:
+            if {k: old[k] for k in values} == values:
+                return
+            raise ImportConflict(f"{p.shard_id} already has a post-run proof; one per shard, written once (8.2)")
+        with self._batch("post_run_proof") as rows:
+            self._insert(rows, "post_run_proofs", values)
+
+    def post_run_proofs(self, run_id: str) -> list[PostRunProof]:
+        """The run's post-run proofs, one per shard, in shard order (8.3 `post_run_proofs`)."""
+        return [PostRunProof(**{c: r[c] for c in self._PROOF_COLUMNS}, counts=json.loads(r["counts_json"]))
+                for r in self._conn.execute("SELECT * FROM post_run_proofs WHERE run_id = ? ORDER BY shard_id",
+                                            (run_id,))]
 
     # -- reading outcomes, steps, findings ------------------------------------------------------------------
     def _outcome(self, row: sqlite3.Row, record_json: str) -> CheckpointOutcome:

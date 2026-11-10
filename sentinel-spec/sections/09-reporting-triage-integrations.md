@@ -78,6 +78,8 @@ Manifest reconciliation: {repeat per entry} {manifest_entry_id}: {"verified visi
 |---|---|---|---|---|---|
 | {tier} | {n} | {n} | {n} ({pct} of comparable scope) | {n} ({outcome}: {n}, ...) | {n} scope, {n} budget, {n} entitlement, {n} quarantine, {n} step_failed, {n} base_step_failed, {n} app_crash, {n} model_unavailable |
 
+{not_run_line: "Checkpoints not run: {n} {reason} ({which checkpoints}), ..." | omitted}
+
 Scope: {n_declared} declared surfaces, expanded through {n_edges} dependency-map edges and the static impact step, plus the smoke census ({n} checkpoints). {n} `unregistered_surface`, {n} `dependency_map_gap` ({pr_links}). Send policy {policy}: {n} order lifecycle surfaces `not_run` (entitlement). [Matrix]({matrix_url})
 
 **Run health**
@@ -97,6 +99,8 @@ Scope: {n_declared} declared surfaces, expanded through {n_edges} dependency-map
 
 <details><summary>Run history</summary>{run, candidate, result, counts, reported, per earlier run}</details>
 ```
+
+Coverage counts matrix cells, not checkpoints: a cell is (surface, persona, entitlement profile) and a covered cell takes the worst of its checkpoints' outcomes (2.12 Coverage accounting and the matrix), so the `not_run` column counts only cells with no usable checkpoint, and the rest of a ladder that is `not_run (reason: app_crash)` after an `app_alive` failure in the same cell does not appear in it. The line under the table counts checkpoints: every `not_run` reason among the run's checkpoint outcomes, in the column's order, with its count and which checkpoints they are, for example "Checkpoints not run: 7 app_crash (sweep steps after the crash)"; a `step_failed:<step>` reason counts under `step_failed`. The line is omitted when no checkpoint is `not_run`, and the static HTML report (9.5 Report UI pages) prints the same line under its Coverage table.
 
 The commit status. The context `sentinel/pr-run` is posted on the candidate commit with the run page as target URL. It has two modes, set in configuration and recorded with the date of every change:
 

@@ -16,9 +16,12 @@ the post-run proof follow. The shard's checkpoints are the Executor's work in `r
   whole run, so a shard's unreached outcomes are held here and written with the shard's other records;
 - `alert_entry`, `persisted_actions`: the 9.10 route of every control result for `alerts.json`, and
   the actions the Orchestrator asks for but does not perform itself (quarantine records, blocked
-  logins, a disabled rig, maintenance tasks, a withheld report) for `orchestrator.json`.
+  logins, a disabled rig, maintenance tasks, a withheld report) for `orchestrator.json`;
+- `login_alias`, `login_label`: a rig's login as the store keys it (the vault alias of 8.3 `logins`) and as
+  every report, summary, alert and persisted action names it.
 
-The post-run proof reaches the report as `Proof.line`, the 6.6 text form the Reporter prints.
+Each shard's post-run proof is written to the store (8.3 `post_run_proofs`, `run._ShardWork.write_proofs`) and
+reaches the report read back from it, in the 6.6 text form the Reporter prints (`killswitch.proof_line`).
 
 Choices (reported):
 
@@ -34,6 +37,10 @@ Choices (reported):
   text shows on every shard.
 - The fixture account a PR shard selects (A2) is the fixture's empty account, the account order-stage
   flows stage tickets in (6.3, 7.7 step 7).
+- A login is named by a readable label, `<rig> paper login` (the rig's one scripted paperMoney login, 6.4),
+  wherever a person reads it (9.2 "login {alias}", the persisted `block_login` action). Its vault path is a
+  `vault://` reference (4.9 `login_ref`, L-FIX-04): the store keys `logins` by it (8.3), and nothing a person
+  reads prints it.
 """
 from __future__ import annotations
 
@@ -141,6 +148,18 @@ def shard_setup(cfg: SentinelConfig, *, run_id: str, run_type: str, shard_id: st
     return ctx, scenario
 
 
+# -- logins ---------------------------------------------------------------------------------------------------
+def login_alias(rig: str) -> str:
+    """The rig's scripted login as the store keys it (8.3 `logins.login_alias`, 4.9 `login_ref`): a vault alias,
+    never a credential and never printed where a person reads it (`login_label`)."""
+    return f"vault://sentinel/rigs/{rig}/tos-login"
+
+
+def login_label(rig: str) -> str:
+    """The readable name of the rig's scripted paperMoney login (module docstring), e.g. `rig-01 paper login`."""
+    return f"{rig} paper login"
+
+
 # -- what the run writes besides the store ----------------------------------------------------------------
 def alert_entry(run_id: str, shard_id: str, r: ControlResult) -> dict | None:
     """One `alerts.json` entry: the 9.10 route of a control result, or None when it pages nobody."""
@@ -152,13 +171,13 @@ def alert_entry(run_id: str, shard_id: str, r: ControlResult) -> dict | None:
             "incident": r.incident, "run_outcome": r.run_status, "run_reason": r.run_reason, "detail": r.detail}
 
 
-def persisted_actions(run_id: str, shard_id: str, rig: str, login: str, r: ControlResult,
-                      flow_id: str | None) -> list[dict]:
-    """The actions of a control result the Orchestrator does not perform itself (module docstring)."""
+def persisted_actions(run_id: str, shard_id: str, rig: str, r: ControlResult, flow_id: str | None) -> list[dict]:
+    """The actions of a control result the Orchestrator does not perform itself (module docstring); the login is
+    the rig's `login_label`."""
     out = []
     for act in r.actions:
         if act in PERSISTED:
             out.append({"run_id": run_id, "shard_id": shard_id, "action": act, "what": PERSISTED[act],
-                        "control": r.control, "gate": r.gate, "rig": rig, "login": login,
+                        "control": r.control, "gate": r.gate, "rig": rig, "login": login_label(rig),
                         "flow_id": flow_id if act == "quarantine_flow" else None, "detail": r.detail})
     return out

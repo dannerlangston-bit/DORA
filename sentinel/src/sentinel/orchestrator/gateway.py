@@ -516,7 +516,10 @@ class Action:
 
 @dataclass(frozen=True)
 class SafetyContext:
-    """What stage 4 reads: the flag and order dialog from a fresh synchronous enumeration (5.4.3)."""
+    """What stage 4 reads: the flag and order dialog from a fresh synchronous enumeration (5.4.3).
+
+    `order_stage` is the flow's sticky `order_stage` declaration (5.4.6 source 3): while it is held the
+    slow half applies the flag rules even if the enumeration and the detector see nothing yet."""
 
     flag: Flag = Flag.CLEAR
     order_dialog_present: bool = False
@@ -527,11 +530,15 @@ class SafetyContext:
     paper_assertion_current: bool = False
     deny_list_hit: str | None = None            # the Explorer deny list entry the target matches (explorer.py)
     hook_alive: bool = True
+    order_stage: bool = False                   # the sticky order_stage declaration is held (5.4.6 source 3)
 
 
 @dataclass(frozen=True)
 class SlowDecision:
-    """Stage 4's answer: refused with a reason, or cleared with `dialog_ok` for the click token."""
+    """Stage 4's answer: refused with a reason, or cleared with `dialog_ok` for the click token.
+
+    `flag_abort` marks the refusal of an agent or Explorer action while the flag is set or unknown (5.4.6):
+    the caller takes `agent_flag_abort` or `explorer.ExplorerSession.order_stage` for it, not a plain count."""
 
     refused: bool
     reason: str | None = None
@@ -539,6 +546,7 @@ class SlowDecision:
     detail: str | None = None
     attempted_send: bool = False
     unknown_dialog: bool = False
+    flag_abort: bool = False
 
     def __post_init__(self):
         if self.refused and self.reason not in SLOW_REFUSALS:

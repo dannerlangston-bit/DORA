@@ -109,15 +109,20 @@ def test_backend_only_money_cell_diff_needs_a_human(runs):
     text = assert_outputs(out)
     outs, finds, counts = stored(out, r.run_id)
     assert_legal(outs)
-    (s07,) = [o for o in outs if o.checkpoint_id == S07]
-    assert (s07.outcome, s07.reason) == ("needs_human", "no_manifest")
+    (s07,) = [o for o in outs if o.checkpoint_id == S07]           # case (b): the scope plans the smoke flows
+    # The Oracle's R02 bracket (2.8.3: 50 to 100 percent of notional on margin) catches the 0.05 percent surcharge;
+    # an assertion outranks the comparison rows, which alone would give needs_human (no_manifest) (3.11 row 8).
+    assert (s07.outcome, s07.reason, s07.assertion_ids) == ("assertion_failed", "assertion:R02", ["R02"])
     assert (s07.stability, s07.stability_cause) == ("unknown", "not_recapturable")
     assert any(rd.region_id == "rgn.confirm.bp-effect" and rd.above_threshold for rd in s07.diff.regions)
-    assert counts["needs_human"] == 1 and counts["collateral"] == 0 and counts["intended"] == 0
-    assert not [f for f in finds if f.kind == "manifest_missing"]
-    assert "flow.trade.order-ticket.stock.limit" in r.extra_flows
+    assert counts["assertion_failed"] == 1 and counts["needs_human"] == 0 and counts["collateral"] == 0
+    assert counts["intended"] == 0 and not [f for f in finds if f.kind == "manifest_missing"]
     assert "No manifest and no UI code touched" in text and "needs_human (reason: no_manifest)" in text
-    assert "-15,032.51" in [f for f in finds if f.checkpoint_id == S07][0].description
+    (f07,) = [f for f in finds if f.checkpoint_id == S07]
+    assert "-15,032.51" in f07.description and f07.region_id == "rgn.confirm.bp-effect"
+    raw = f07.evidence["raw_values"]
+    assert raw["candidate.rgn.confirm.bp-effect.ocr"].startswith("'-15,032.51'")
+    assert raw["base.rgn.confirm.bp-effect.ocr"].startswith("'-15,025.00'") and raw["label"] == "bracket check"
 
 
 def test_ui_change_without_a_manifest_is_collateral(runs):

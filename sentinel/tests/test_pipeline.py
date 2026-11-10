@@ -1,5 +1,5 @@
-"""The simulated pipeline's parts: the synthetic app, the simulated Reviewer, the config abort and the
-case (b) flow workaround (sentinel.pipeline)."""
+"""The simulated pipeline's parts: the synthetic app, the simulated Reviewer, the config abort and the case (b)
+smoke flows the scope plans (sentinel.pipeline)."""
 from __future__ import annotations
 
 from dataclasses import replace
@@ -13,7 +13,7 @@ from sentinel.diff.settle import settle
 from sentinel.pipeline.config import SentinelConfig
 from sentinel.pipeline.reviewer import (SIMULATED_MODEL_ID, ModelReviewerAdapter, ReviewRequest, SimulatedReviewer,
                                         to_review, validate)
-from sentinel.pipeline.run import _case_b_flows, run_pipeline
+from sentinel.pipeline.run import run_pipeline
 from sentinel.pipeline.sim import Observation, SimApp, SimBuild, observe
 from sentinel.scope import PlannedCheckpoint, Rig, compute_scope
 from sentinel.store import Store
@@ -147,14 +147,15 @@ def test_a_lint_error_aborts_the_run_config_invalid(tmp_path):
 
 
 def test_case_b_adds_the_smoke_flows_only_when_the_change_scope_is_empty(cfg):
+    """2.11: in case (b) the scope itself plans the tier-1 standard flows that touch the smoke census, so the
+    Order Confirmation's money cells are captured; case (a) plans only what the change reaches."""
     from sentinel.scope import DependencyIndex
     common = dict(dep_map=cfg.dep_map, registry=cfg.registry, run_id="run-x", workspaces=cfg.workspaces,
                   flows=cfg.flows, entitlements=cfg.entitlements, rigs=[Rig("rig-01", "fp"), Rig("rig-02", "fp")])
     b = compute_scope("pr", None, dep_index=DependencyIndex({}), changed_classes=(), **common)
-    assert b.manifest_state == "no_manifest_nonui"
-    extra = _case_b_flows(cfg, b)
-    assert S07 in {cp.checkpoint_id for cp in extra}
-    assert all(cfg.flow_docs[cp.flow_id]["class"] == "standard" for cp in extra)
+    assert b.manifest_state == "no_manifest_nonui" and not b.scope_surfaces
+    flows = {cp.flow_id for cp in b.planned if cp.test_kind == "flow"}
+    assert S07 in b.planned_ids and all(cfg.flow_docs[f]["class"] == "standard" for f in flows)
     a = compute_scope("pr", None, dep_index=DependencyIndex({}),
                       changed_classes=("com.tos.desktop.charts.grid.level2cell.Level2SizeRenderer",), **common)
-    assert a.manifest_state == "no_manifest_ui" and _case_b_flows(cfg, a) == []
+    assert a.manifest_state == "no_manifest_ui" and S07 not in a.planned_ids

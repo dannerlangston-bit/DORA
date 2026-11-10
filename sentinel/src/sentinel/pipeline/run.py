@@ -60,6 +60,7 @@ Choices (reported):
 from __future__ import annotations
 
 import dataclasses
+from collections import abc
 import hashlib
 import json
 import math
@@ -107,7 +108,9 @@ from ..orchestrator.watchdog import (HANG_FLOOR_S, Heartbeat, HeartbeatUnwritabl
                                      edt_frozen, heartbeat_failed)
 from .assertions import FlowOracle, OracleCheck
 from .config import SentinelConfig, as_dict, materialize, parse_time, tree_sha256
-from ..reviewer.adapter import ReviewerUnavailable
+from ..reviewer.adapter import ModelReviewer, ReviewerUnavailable
+from ..reviewer.job import ReviewerJob
+from .live import ItemBuilder
 from .orchestration import PipelineRig, RigScript, ShardSink, alert_entry, persisted_actions, proof_text, shard_setup
 from .reviewer import ReviewerAdapter, ReviewRequest, SimulatedReviewer, change_types, to_review, validate
 from .sim import Capture, SimApp, SimBuild, observe
@@ -964,20 +967,45 @@ class _ShardWork:
         self.calibrated = False
         self.frozen: set[str] = set()
 
-    # -- one shard ---------------------------------------------------------------------------------
-    def shard(self, shard_id: str, shard_no: int, rig_id: str, cps: Sequence[PlannedCheckpoint]) -> RunReport:
+    # -- the shards -------------------------------------------------------------------------------------
+    def run_shards(self, specs: Sequence[tuple[str, int, str, list[PlannedCheckpoint]]]) -> None:
+        """Every shard through its Orchestrator, as parallel shards on their rigs would run (module docstring):
+        each shard's gates in rig order, then every shard that reached `running` captures its checkpoints in
+        plan order across the shards, then each shard tears down and proves."""
+        self._specs = list(specs)
+        self._running: list[_Shard] = []
+        self._chain(0)
+        self.reports.sort(key=lambda sr: sr[0].ctx.shard)
+        self.summaries.sort(key=lambda d: d["shard_id"])
+
+    def _chain(self, k: int) -> None:
+        """Shard k's Orchestrator, whose `running` hands over to shard k+1's; the last one runs the captures."""
+        if k == len(self._specs):
+            self._capture_all()
+            return
+        shard_id, shard_no, rig_id, cps = self._specs[k]
         sc = self.scenario
         clock = ManualClock(start=self.run.now.astimezone(timezone.utc), mono=1000.0 + 10_000 * shard_no)
         ctx, sim = shard_setup(self.cfg, run_id=sc.run_id, run_type="pr", shard_id=shard_id, shard_no=shard_no,
-                               build_id=sc.candidate.build_id, workspace_id=cps[0].workspace_id, script=self.script,
-                               first_shard=not self.reports)
+                               build_id=sc.candidate.build_id, workspace_id=cps[0].workspace_id, script=self.script)
         rig = PipelineRig(sim, clock=clock, build_id=sc.candidate.build_id)
         sink = ShardSink([cp.checkpoint_id for cp in cps])
         hb = HeartbeatWriter(self.out / "heartbeat" / f"shard-{shard_no}.json", clock)
         orch = Orchestrator(rig, ctx, sink, clock=clock, ledger=self.ledger, heartbeat=hb,
                             watchdog_status=lambda: (1.0, True))
         st = _Shard(shard_id, rig_id, list(cps), orch, rig, sink, clock, ctx)
-        report = orch.run(lambda o: self._work(st))
+        entered: list[bool] = []
+
+        def work(o: Orchestrator) -> None:
+            entered.append(True)
+            for r in list(o.results):                   # gate results may name parts of the scope
+                self._subsets(st, r)
+            self._running.append(st)
+            self._chain(k + 1)
+
+        report = orch.run(work)
+        if not entered:                                  # stopped at a gate; the other shards still run
+            self._chain(k + 1)
         for r in report.results:
             self._note(st, r)
         for cid, o in sink.filled.items():
@@ -991,7 +1019,6 @@ class _ShardWork:
             "gates": [{"control": r.control, "gate": r.gate, "passed": r.passed, "detail": r.detail}
                       for r in report.results],
             "unreached_filled": sorted(sink.filled)})
-        return report
 
     def _note(self, st: _Shard, r: ControlResult, checkpoint: PlannedCheckpoint | None = None,
               flow_id: str | None = None) -> None:
@@ -1047,28 +1074,31 @@ class _ShardWork:
                 st.sink.done.add(cp.checkpoint_id)
 
     # -- running --------------------------------------------------------------------------------------
-    def _work(self, st: _Shard) -> None:
-        orch = st.orch
-        for r in list(orch.results):                    # gate results may name parts of the scope
-            self._subsets(st, r)
+    def _capture_all(self) -> None:
+        """The Executor's work of every shard in `running`, unit by unit in plan order (3.10's re-run budget is
+        then spent in the plan's tier order, as the run budget of max(30, 10 percent) is shared by the run)."""
+        if not self._running:
+            return
         if not self.calibrated:                         # the Calibration run of 1.6, before any threshold
             self.run.calibrate(self.planned, self.out)
             self.calibrated = True
-        for unit in _units(st.cps):
-            if orch.stop is not None:
-                return
-            if not [cp for cp in unit if cp in self._todo(st)]:
+        index = {cp.checkpoint_id: i for i, cp in enumerate(self.planned)}
+        units = sorted(((st, u) for st in self._running for u in _units(st.cps)),
+                       key=lambda su: min(index[cp.checkpoint_id] for cp in su[1]))
+        for st, unit in units:
+            orch = st.orch
+            if orch.stop is not None or not [cp for cp in unit if cp in self._todo(st)]:
                 continue
             r = orch.apply(check_build_unchanged(st.rig.read_title_build_id(), st.ctx.expected_build))
             self._note(st, r)
             if not r.passed:
-                return
+                continue
             if unit[0].test_kind == "flow":
                 self._flow(st, unit)
             else:
                 for i, cp in enumerate(unit):
                     self._heartbeat(st, None, None, cp)
-                    if not self._capture(st, cp, unit[i + 1:]):
+                    if not self._capture(st, cp, unit[i + 1:]) or orch.stop is not None:
                         break
 
     def _heartbeat(self, st: _Shard, flow_id: str | None, step_id: str | None, cp: PlannedCheckpoint | None) -> None:
@@ -1272,6 +1302,22 @@ class _ShardWork:
             "gateway_events": [s.to_dict() for s, _ in self.steps], **dict(extra or {})}])
 
 
+class _EvalIndex(abc.Mapping):
+    """The run's evaluated checkpoints by checkpoint id, as the shards produce them (for `ItemBuilder`)."""
+
+    def __init__(self, work: _ShardWork):
+        self.work = work
+
+    def __getitem__(self, cid: str) -> Evaluated:
+        return next(ev for ev in self.work.evals if ev.cp.checkpoint_id == cid)
+
+    def __iter__(self):
+        return (ev.cp.checkpoint_id for ev in self.work.evals)
+
+    def __len__(self) -> int:
+        return len(self.work.evals)
+
+
 def _append_json(path: Path, entries: Sequence[Any]) -> None:
     old = json.loads(path.read_text()) if path.exists() else []
     path.write_text(json.dumps(old + list(entries), indent=1, sort_keys=True, default=str) + "\n")
@@ -1320,8 +1366,10 @@ def _abort_config(store: Store, scenario: Scenario, cfg_root: Path, errors: list
 
 
 def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path, today: date = DEFAULT_TODAY,
-                 reviewer: ReviewerAdapter | None = None) -> RunResult:
-    """One simulated PR run from webhook to PR comment (module docstring). Writes into `out_dir`:
+                 reviewer: ReviewerAdapter | None = None, live: ReviewerJob | None = None) -> RunResult:
+    """One simulated PR run from webhook to PR comment (module docstring). The Reviewer is `reviewer`, else
+    with `live` (a `reviewer.ReviewerJob`, `pipeline.live.live_job`) the real adapter `ModelReviewer`, else
+    the offline `SimulatedReviewer`. Writes into `out_dir`:
     `config/<run_id>/`, `sentinel.db` (shared by every run of the directory), `artifacts/`,
     `calibration/`, `heartbeat/`, `pr-comment.md`, `commit-status.json`, `report.html`,
     `reviewer-calls.json`, and appends to `alerts.json` and `orchestrator.json`."""
@@ -1380,13 +1428,14 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         mtext = (cfg.root / "manifests" / f"{scenario.candidate.build_id}.yaml")
         store.begin_run(_run_plan(scenario.run_id, "pr", cfg.root, scope_entries, shards, started,
                                   mtext.read_text() if mtext.exists() else None, scenario.pr, scenario.author))
-        rev = reviewer or SimulatedReviewer()
-        # -- 5.2: every shard through the Orchestrator; 5.17 per checkpoint inside `running`
         work = _ShardWork(run, cfg, scenario, out, oracle, store, planned, plan, today)
-        for i, r in enumerate(used, 1):
-            rep = work.shard(shard_of[r], i, r, [cp for cp in planned if rig_of[cp.checkpoint_id] == r])
-            if rep.verdict.aborted:
-                break
+        rev = reviewer or SimulatedReviewer()
+        if reviewer is None and live is not None:          # 3.12: the real Reviewer; crops from the artifact store
+            rev = ModelReviewer(live, ItemBuilder(scenario.run_id, arts, REDACTION, _EvalIndex(work), manifest=manifest,
+                                                  epoch=run.epoch, flow_docs=cfg.flow_docs, pad=live.config.crop.pad_px))
+        # -- 5.2: every shard through the Orchestrator; 5.17 per checkpoint inside `running`
+        work.run_shards([(shard_of[r], i, r, [cp for cp in planned if rig_of[cp.checkpoint_id] == r])
+                         for i, r in enumerate(used, 1)])
         evals = work.evals
         shift = global_shift_prepass([ev.diff.signal for ev in evals if ev.diff is not None and ev.diff.signal is not None],
                                      params=run.params)
@@ -1430,13 +1479,9 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                 store.write_checkpoint(dataclasses.replace(c.outcome(scenario.run_id), recorded_at=started))
         verdict = work.verdict()
         stop = work.stop()
-        if stop is not None and stop[1].unreached is not None:     # 1.10: the abort's outcome on every silent checkpoint
-            u = stop[1].unreached
-            store.fill_unreached(scenario.run_id, u.outcome, u.reason, gate=u.gate, detail=u.detail)
         reported = {st.shard_id: rep for st, rep in work.reports}
         for sp in shards:
-            rep = reported.get(sp.shard_id)
-            v = rep.verdict if rep is not None else verdict        # a shard the abort kept from starting
+            v = reported[sp.shard_id].verdict
             store.end_shard(sp.shard_id, v.status, v.reason)
             store.mark_shard_imported(sp.shard_id)
         arts.write_manifest(ManifestHeader(config_commit=tree_sha256(cfg.root)[:12], harness_commit="sentinel-core-0.1.0",

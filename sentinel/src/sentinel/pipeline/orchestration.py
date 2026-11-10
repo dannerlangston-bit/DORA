@@ -9,8 +9,7 @@ the post-run proof follow. The shard's checkpoints are the Executor's work in `r
 (`run._ShardWork`). This module holds what that needs besides the core:
 
 - `RigScript`: what a scenario makes the rig do (a live-format account id in the selector, a scripted
-  Enter on the open Order Confirmation dialog, an EDT freeze during a checkpoint, a failed preflight
-  item);
+  Enter on the open Order Confirmation dialog, an EDT freeze during a checkpoint);
 - `PipelineRig`, `shard_setup`: the rig and the `RunContext` of one shard, from the config;
 - `ShardSink`: the Orchestrator's `OutcomeSink` for one shard. The store's `fill_unreached` fills the
   whole run, so a shard's unreached outcomes are held here and written with the shard's other records;
@@ -24,9 +23,13 @@ Choices (reported):
 - The example config describes one rig's fixture and allowlist (`fx.rig-01.paper`, rig-01). Every
   shard's simulated rig asserts paper mode against that rig's allowlist entries and verifies that
   fixture; the shard keeps its own rig id for the store and the report.
-- Shards run one after the other in rig order. A shard that ends its run `aborted_*` stops the run:
-  later shards are not started and their checkpoints take the abort's unreached outcome (1.10); a
-  shard that ends `complete_with_env_errors` fills only its own checkpoints and the next shard runs.
+- Shards run as parallel shards on their own rigs would, in one deterministic order: every shard's
+  gates in rig order, then the captures of every shard that reached `running` in plan order (so the
+  run's shared re-run budget of 3.10 is spent in the plan's tier order, as the single-rig run did),
+  then each shard's teardown and proof. A shard whose control result stops it fills its own unreached
+  checkpoints (1.10) and the other shards go on; the run outcome is the worst of the shards' (8.2).
+- Every shard's simulated rig reads the same identity (choice above), so a scripted account selector
+  text shows on every shard.
 - The fixture account a PR shard selects (A2) is the fixture's empty account, the account order-stage
   flows stage tickets in (6.3, 7.7 step 7).
 
@@ -38,7 +41,7 @@ returns the title build id of its last launch. Reported to the coordinator.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -75,10 +78,9 @@ PERSISTED = {
 class RigScript:
     """What a scenario makes the simulated rig do; every field defaults to a clean run."""
 
-    selector_text: str | None = None                 # the first shard's first account selector read (6.4)
+    selector_text: str | None = None                 # each shard's first account selector read (6.4)
     enter_after: tuple[str, str] | None = None       # (flow id, step id): a scripted Enter on the open dialog after it
     freeze_at: str | None = None                     # checkpoint id: the app's EDT freezes while it is captured
-    preflight_failures: Mapping[str, str | None] = field(default_factory=dict)
 
 
 class PipelineRig(SimulatedRig):
@@ -133,7 +135,7 @@ def _accounts(fixture: Mapping[str, Any]) -> tuple[dict[str, AccountExpectation]
 
 
 def shard_setup(cfg: SentinelConfig, *, run_id: str, run_type: str, shard_id: str, shard_no: int, build_id: str,
-                workspace_id: str, script: RigScript, first_shard: bool) -> tuple[RunContext, SimScenario]:
+                workspace_id: str, script: RigScript) -> tuple[RunContext, SimScenario]:
     """The `RunContext` of one shard and the `SimScenario` its simulated rig observes (module docstring)."""
     fx = cfg.fixture
     rig = str(fx.get("rig", "rig-01"))
@@ -155,9 +157,8 @@ def shard_setup(cfg: SentinelConfig, *, run_id: str, run_type: str, shard_id: st
                      default_order_chords=tuple(Chord.parse(c) for c in DEFAULT_CHORDS), shard=shard_no)
     settings = dict(default_settings(), A7={p: False for p in panels})
     reads = [SelectorRead(script.selector_text, crop_sha256=hashlib.sha256(script.selector_text.encode()).hexdigest())
-             ] if (script.selector_text and first_shard) else []
-    scenario = SimScenario(preflight_failures=dict(script.preflight_failures) if first_shard else {},
-                           launches=[LaunchObservation(True, build_id, waited_s=40.0)] * LAUNCHES,
+             ] if script.selector_text else []
+    scenario = SimScenario(launches=[LaunchObservation(True, build_id, waited_s=40.0)] * LAUNCHES,
                            selector_reads=reads, selected=empty, settings=settings,
                            workspace=WorkspaceObservation(ws_sha, True, TABS, 1), accounts=states)
     return ctx, scenario

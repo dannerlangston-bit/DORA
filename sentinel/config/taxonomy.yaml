@@ -1,0 +1,339 @@
+# GENERATED from the spec by tools/gen_taxonomy.py. Do not edit by hand.
+schema_version: 1
+generated_from: sentinel-spec sections 1.10, 4.1, 4.13, 4.14, 12.7 (tools/gen_taxonomy.py)
+checkpoint_outcomes:
+- identical
+- noise
+- intended
+- collateral
+- needs_human
+- invariant_violation
+- assertion_failed
+- not_settled
+- not_comparable
+- landmark_missing
+- env_error
+- harness_error
+- not_run
+- unregistered_surface
+- needs_baseline
+step_outcomes:
+- passed
+- passed_after_retry
+- passed_via_agent_fallback
+- failed
+- blocked_by_gateway
+run_outcomes:
+- complete
+- complete_with_env_errors
+- aborted_safety
+- aborted_budget
+- aborted_harness
+reasons:
+  noise:
+  - below_floor
+  - decision:<id>
+  intended:
+  - decision:<id>
+  collateral:
+  - decision:<id>
+  - manifest_missing
+  needs_human:
+  - reviewer_uncertain
+  - reviewer_no_match
+  - reviewer_unavailable
+  - reviewer_cap
+  - no_manifest
+  - uncalibrated
+  - rescued_capture
+  - global_shift
+  - oracle_unreadable
+  - bounds_unreadable
+  invariant_violation:
+  - INV-01
+  - INV-02
+  - INV-03
+  - INV-04
+  - INV-05
+  - INV-06
+  - INV-07
+  - INV-08
+  - INV-09
+  - INV-10
+  - INV-11
+  - INV-12
+  - INV-13
+  - INV-14
+  - INV-15
+  assertion_failed:
+  - assertion:<id>
+  not_settled:
+  - frames_unstable
+  - anchor_missing
+  - anti_anchor_present
+  - timeout
+  - unexpected_window:<title>
+  - unstable
+  - aa_drift
+  not_comparable:
+  - fingerprint_mismatch
+  - window_mismatch
+  - surface_mismatch
+  landmark_missing:
+  - landmark:<id>
+  - locator:<step>
+  - redaction_landmark:<id>
+  - probe:<Pn>
+  env_error:
+  - gate
+  - version_mismatch
+  - version_changed_mid_run
+  - rig_spec_mismatch
+  - fingerprint_unreadable:<field>
+  - snapshot_revert_failed
+  - install_failed
+  - session_kicked
+  - authentication_challenge
+  - authentication_failed
+  - timeout
+  - relogin_budget
+  - vault_unreachable
+  - agreement_pending
+  - live_mode_selected
+  - attestation_unreadable
+  - identity_unreadable
+  - fixture_drift
+  - fixture_maintenance_needed
+  - delay_state
+  - data_epoch_mismatch
+  - prices_stale
+  - ondemand_timeout
+  - ondemand_state
+  - precondition:<check>
+  - backend_degraded
+  - occluded
+  - maintenance
+  harness_error:
+  - registry_entry_not_found
+  - bounds_source_unavailable
+  - ocr_calibration
+  - export_header_mismatch
+  - mask_budget_exceeded
+  - store_write_failed
+  - artifact_persist_failed
+  - redaction_version_missing
+  - hook_lost
+  - orchestrator_died
+  - detector_blind
+  - detector_degraded
+  - safety_canary_blind:<canary>
+  - canary_generation_failed
+  - canary_path_divergence
+  - drill_failed:<item>
+  - validation_self_test
+  - chaos_unobserved
+  - aa_drift_global
+  - chaos_rule_stuck
+  - invariant_on_aa
+  - exception:<class>
+  not_run:
+  - entitlement
+  - budget
+  - scope
+  - quarantine
+  - step_failed:<step>
+  - base_step_failed
+  - app_crash
+  - model_unavailable
+  unregistered_surface:
+  - probe:<Pn>
+  needs_baseline:
+  - new_surface
+  - base_not_settled
+  - base_env_error
+  - base_harness_error
+  - lineage_missing
+  - reuse_missing
+  - explorer_replay
+  aborted_safety:
+  - paper_mode_mismatch
+  - attestation_mismatch
+  - unexpected_working_order
+  - kill_switch
+  - attempted_send
+  - undeclared_order_row
+  - live_identity
+  - drill_order_placed
+  - unknown_dialog_in_order_stage
+  aborted_budget:
+  - wall_clock
+  - app_restart_budget
+  - dollar_cap
+  - pool_saturated
+  - rate_cap
+  - superseded
+  aborted_harness:
+  - config_invalid
+  - preflight.<item>
+  - dead_man
+  - start_failed
+  - secret_leaked
+  - secret_scan_unavailable
+  - egress_unlogged
+  - base_build_missing
+  - taxonomy_check_failed
+  - orchestrator_restart_budget
+  - hook_lost
+  - watchdog_dead
+  - heartbeat_unwritable
+  - disk_full
+  - rig_lost
+  - dpi_awareness
+  - store_write_failed
+  - artifact_persist_failed
+  - import_conflict
+  - canary_generation_failed
+  complete_with_env_errors:
+  - unproven_proof
+  - teardown_fault
+  - relogin_budget
+  identical: []
+reason_inheritance:
+  env_error: aborted_safety
+  harness_error: aborted_harness
+assertion_builtins:
+- app_alive
+- size_reached
+- soak.<metric>
+app_alive_causes:
+- jvm_crash
+- hang
+- oom
+- process_exit
+gates:
+- provisioned
+- launched
+- authenticated
+- paper_mode_asserted
+- settings_attested
+- workspace_loaded
+- fixture_verified
+- canary_flow_passed
+- running
+- teardown
+- reported
+- connectivity
+- rig_lost
+- preflight.R1
+- preflight.R2
+- preflight.R3
+- preflight.R4
+- preflight.R5
+- preflight.R6
+- preflight.R7
+- preflight.B1
+- preflight.B2
+- preflight.B3
+- preflight.H1
+- preflight.H2
+- preflight.H3
+- preflight.H4
+- preflight.H5
+- preflight.H6
+- preflight.H7
+- preflight.H8
+- preflight.H9
+- preflight.H10
+- preflight.N1
+- preflight.N2
+- preflight.N3
+- preflight.N4
+- preflight.N5
+- preflight.N6
+- preflight.N7
+- preflight.G1
+- preflight.G2
+- preflight.G3
+- preflight.G4
+- preflight.G5
+finding_kinds:
+- collateral
+- intended
+- needs_human
+- invariant_violation
+- assertion_failed
+- landmark_missing
+- needs_baseline
+- unregistered_surface
+- dependency_map_gap
+- manifest_missing
+- unknown_popup
+- popup_rate_increase
+- locator_failure
+- app_crash
+- explorer_candidate
+- layout_shift
+- landmark_moved
+- color_shift
+- window_geometry_changed
+- global_rendering_shift
+- settle_regression
+- gateway_integrity
+- new_log_signature
+- jab_tree_changed
+- mask_budget_exceeded
+- mask_expired
+- floor_exception_expired
+- invariant_exception_expired
+- redaction_miss
+- secret_leaked
+- explorer_order_stage
+- missed_in_pr_run
+- artifact_missing
+- orphaned_baseline
+- canary_miss
+- intended_change_not_observed
+- flow_maintenance_needed
+- harness_error
+- memory_warning
+- hardening
+triage_states:
+- open
+- confirmed_bug
+- intended
+- noise
+- agent_mistake
+- expected_behavior
+- fixed_pending_verify
+- closed
+decision_actions:
+- confirm_bug
+- mark_intended
+- request_mask
+- noise_signature
+- agent_mistake
+- expected_behavior
+- approve_baseline
+- reject_baseline
+- fixed_in_build
+decision_verdicts:
+- confirmed_bug
+- intended
+- noise
+canary_states:
+- detected
+- missed
+- detector_blind
+- detector_degraded
+- generation_failed
+review_states:
+- none
+- pending
+- done
+reviewer_verdicts:
+- matches_manifest
+- partially_matches_manifest
+- does_not_match_manifest
+- no_visible_difference
+- cannot_judge
+- not_applicable

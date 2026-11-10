@@ -46,8 +46,11 @@ Choices where the spec is ambiguous (reported):
   epoch says `realtime`), within the assertion's `tol` or one tick, and exactly (tolerance 0, a
   `tol` notwithstanding) only when the symbol's last session closed more than the delay before
   capture and the symbol is absent from the 24-hour trading list. Under `frozen` it is taken as
-  of the fixture's frozen timestamp and compared exactly unless the assertion gives a `tol` (the
-  study-label row of 2.8.2 gives 0.5 percent that way). An unknown session close is not "closed".
+  of the fixture's pinned moment, `data_mode.frozen.timestamp`, else the pinned OnDemand timestamp
+  `epoch.ondemand_timestamp` (DR-02 branch B, 2.8.1, 4.9), and compared exactly unless the assertion
+  gives a `tol` (the study-label row of 2.8.2 gives 0.5 percent that way); a frozen fixture with
+  neither is a config error, never a comparison with today's value as of capture. An unknown session
+  close is not "closed".
 - Ticks: equities 0.01 (0.0001 below one dollar), options and indexes 0.01, forex 0.00001,
   futures by root (`FUTURE_TICKS`); a root with no tick fails loudly, never a guessed tick.
 - Multipliers (2.8.3): equity and index options 100, futures by root (`FUTURE_MULTIPLIERS`),
@@ -419,7 +422,12 @@ def api_comparison(context: EvalContext, fixture: Mapping[str, Any]) -> ApiCompa
         frozen = ((fixture.get("data_mode") or {}).get("frozen")) or {}
         if frozen.get("timestamp"):
             return ApiComparison(_as_datetime(frozen["timestamp"]), "frozen", "frozen: as of the fixture timestamp")
-        return ApiComparison(capture, "frozen", "frozen: as of capture")
+        ondemand = (fixture.get("epoch") or {}).get("ondemand_timestamp")
+        if ondemand:
+            return ApiComparison(_as_datetime(ondemand), "frozen",
+                                 "frozen (OnDemand, DR-02 branch B): as of the pinned OnDemand timestamp")
+        raise OracleConfigError("a frozen API cross-check needs data_mode.frozen.timestamp or "
+                                "epoch.ondemand_timestamp (2.8.1, 4.9); it is never compared as of capture")
     if context.data_mode != "masked_live":
         raise OracleConfigError("an API cross-check needs the checkpoint's data mode")
     symbol = context.need_symbol("an API cross-check")

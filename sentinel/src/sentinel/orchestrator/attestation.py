@@ -30,7 +30,8 @@ Choices (reported): A11 names no reason and `aborted_harness` requires one; `art
 floor, 5.4.6) and 90 for OCR until Phase 0 pins them. When several rows fail, the order is: a safety
 mismatch (A8 before A3 to A7, S1 before S2), then an unreadable row, then profile drift, since an unread
 safety setting is the graver unknown. A Hot Keys binding whose text cannot be parsed as a chord makes A6
-unreadable, because it cannot be loaded into the chord list.
+unreadable, because it cannot be loaded into the chord list. A7 is a mismatch when any panel in the read,
+named by the profile or not, shows Auto Send anything but Off.
 """
 from __future__ import annotations
 
@@ -138,7 +139,8 @@ def matches(read: SettingRead, profile: AttestationProfile) -> bool:
     if read.item == "A6":
         return all(not r.binding or r.action in profile.non_order_actions for r in v if ORDER_WORDS.search(r.action))
     if read.item == "A7":
-        return all(v[p] is False for p in profile.active_trader_panels)
+        # "Off on all" (6.3): the profile's panels, and any other Active Trader panel the read shows
+        return all(v[p] is False for p in profile.active_trader_panels) and all(x is False for x in v.values())
     if read.item == "A8":
         return v == 0
     raise ValueError(f"not an attestation row read here: {read.item}")

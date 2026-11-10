@@ -12,6 +12,9 @@ Formats (`FORMATS`): the `format` enum of 4.7 (`money`, `price`, `int`, `percent
 Display conventions assumed (2.8.1 leaves them to the implementation; checked against the
 example config and `sentinel.synth` screens, and re-checked against the real app in Phase 0):
 
+- Digits are ASCII `0` to `9` only, in every format: a cell drawn in fullwidth, Arabic-Indic or any
+  other script's digits is a locale defect and fails R10, although Python's Unicode digit class and
+  `Decimal` would accept it (every pattern here is compiled with `re.ASCII`).
 - Numbers use `,` as the thousands separator in groups of exactly three and `.` as the decimal
   point, or no separator at all (`15025.00` and `15,025.00` are both valid; `1,50,25.00`,
   `15,02.00` and `1.234,56` are a misplaced separator).
@@ -48,17 +51,17 @@ Value = Decimal | date | time | str
 
 _NUM = r"(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?|\.\d+"
 _NUMBER = re.compile(
-    rf"^(?P<open>\()?(?P<s1>[+\-−])?(?P<cur>\$)?(?P<s2>[+\-−])?(?P<num>{_NUM})(?P<pct>%)?(?P<close>\))?$")
-_LOOSE_DIGITS = re.compile(r"^[(+\-−$]*[\d.,]+[%)]*$")
+    rf"^(?P<open>\()?(?P<s1>[+\-−])?(?P<cur>\$)?(?P<s2>[+\-−])?(?P<num>{_NUM})(?P<pct>%)?(?P<close>\))?$", re.ASCII)
+_LOOSE_DIGITS = re.compile(r"^[(+\-−$]*[\d.,]+[%)]*$", re.ASCII)
 _PLACEHOLDERS = {"nan": "NaN", "infinity": "Infinity", "inf": "Infinity", "∞": "Infinity", "null": "null",
                  "none": "null", "n/a": "N/A", "na": "N/A", "--": "placeholder --", "-": "placeholder -",
                  "—": "placeholder —"}
 _MONTHS = {m: i for i, m in enumerate(("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT",
                                        "NOV", "DEC"), start=1)}
-_DATE_SLASH = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})$")
-_DATE_ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
-_DATE_CHAIN = re.compile(r"^(\d{1,2}) ([A-Za-z]{3}) (\d{2}|\d{4})$")
-_TIME = re.compile(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?(?: ?([AaPp][Mm]))?(?: (?:ET|EST|EDT))?$")
+_DATE_SLASH = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{2}|\d{4})$", re.ASCII)
+_DATE_ISO = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$", re.ASCII)
+_DATE_CHAIN = re.compile(r"^(\d{1,2}) ([A-Za-z]{3}) (\d{2}|\d{4})$", re.ASCII)
+_TIME = re.compile(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?(?: ?([AaPp][Mm]))?(?: (?:ET|EST|EDT))?$", re.ASCII)
 
 
 class FormatError(ValueError):
@@ -79,7 +82,7 @@ def rows(text: str | None) -> list[str]:
 
 def digit_count(text: str | None) -> int:
     """Number of ASCII digits in a read (the two-pass check of 2.8.1 compares this)."""
-    return sum(c.isdigit() for c in text or "")
+    return sum("0" <= c <= "9" for c in text or "")
 
 
 def _number(fmt: str, text: str) -> Decimal:

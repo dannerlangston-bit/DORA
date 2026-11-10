@@ -89,6 +89,16 @@ SCHEMA_HASH = hashlib.sha256(SCHEMA_JSON.encode()).hexdigest()
 _VALIDATOR = Draft202012Validator(SCHEMA)
 
 
+def _unit_interval(c: Any) -> bool:
+    """A JSON number in [0, 1], compared without a float conversion: JSON integers have no size limit, so an
+    integer too large for a float is simply out of range (3.13), never an OverflowError."""
+    if isinstance(c, bool) or not isinstance(c, (int, float)):
+        return False
+    if isinstance(c, int):
+        return 0 <= c <= 1
+    return math.isfinite(c) and 0.0 <= c <= 1.0
+
+
 def check_answer(answer: Any, *, task: str, entry_id: str | None,
                  crop_sizes: Mapping[str, Sequence[tuple[int, int]]]) -> list[str]:
     """The schema plus the client-side checks of 3.13 for one answer to one item.
@@ -99,8 +109,7 @@ def check_answer(answer: Any, *, task: str, entry_id: str | None,
     if errors:
         return [f"schema: {'/'.join(map(str, e.absolute_path)) or '(root)'}: {e.message}" for e in errors]
     out: list[str] = []
-    c = answer["confidence"]
-    if isinstance(c, bool) or not math.isfinite(float(c)) or not 0.0 <= float(c) <= 1.0:
+    if not _unit_interval(answer["confidence"]):
         out.append("confidence outside [0, 1]")
     if answer["task"] != task:
         out.append(f"task {answer['task']!r} answers a {task!r} item")

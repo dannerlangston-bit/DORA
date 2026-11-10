@@ -23,7 +23,8 @@ Choices where the notation is silent or ambiguous (4.1; reported):
 6. `enum[1|2|3]` holds integers (YAML reads `tier: 1` as an int); every other enum holds strings.
 7. A build file carries `build`, `build_pair` or both, as the 4.2 worked example does.
 8. Files whose path 4.1 names but whose shape section 4 does not write (ladders, renames, policies,
-   Phase 0 branches, profiles, allowed display configurations, redaction anchors, quarantine) get
+   Phase 0 branches, profiles, allowed display configurations, redaction anchors, quarantine, the R02
+   margin brackets of `fixtures/margin_rules.yaml`, whose shape `sentinel.oracle.tables` fixes) get
    the shapes in AUX_NOTATION, chosen here from the prose that names their fields.
 """
 from __future__ import annotations
@@ -496,6 +497,11 @@ step_teardown:
 
 # Shapes chosen here for files 4.1 names but section 4 does not write (choices 7 and 8).
 AUX_NOTATION = """\
+margin_rules_file:
+  schema_version: int = 1
+  pinned: bool = false
+  brackets: list[{asset: enum[equity|option|future|future_option|forex|index], account: enum[margin|ira], of: enum[notional|initial_margin], low: num, high: num}]
+  initial_margin: map[str, num]?
 build_file:
   schema_version: int = 1
   build: build?
@@ -574,6 +580,7 @@ SPEC_SCHEMAS: dict[str, str] = {
     "fingerprint": "fingerprint",
 }
 AUX_SCHEMAS: dict[str, str] = {
+    "margin-rules": "margin_rules_file",
     "ladders": "ladders_file",
     "renames": "renames_file",
     "send-policy": "send_policy",

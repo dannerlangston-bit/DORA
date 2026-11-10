@@ -495,8 +495,8 @@ _SCHEMA_OF: dict[str, tuple[str, str]] = {      # doc kind -> (schema name, rule
     "ladders": ("ladders", "L-SRF-03"), "workspace": ("workspace", "L-WSP-00"),
     "flow": ("flow", "L-FLW-00"), "renames": ("renames", "L-FLW-03"), "regions": ("regions", "L-RGN-00"),
     "redaction": ("redaction", "L-MSK-03"), "mask": ("mask", "L-MSK-00"), "fixture": ("fixture", "L-FIX-00"),
-    "allowlist": ("allowlist", "L-FIX-00"), "profile": ("profile", "L-FIX-05"),
-    "configs_allowed": ("configs-allowed", "L-WSP-05"), "send_policy": ("send-policy", "L-FLW-08"),
+    "allowlist": ("allowlist", "L-FIX-00"), "margin_rules": ("margin-rules", "L-FIX-00"),
+    "profile": ("profile", "L-FIX-05"), "configs_allowed": ("configs-allowed", "L-WSP-05"), "send_policy": ("send-policy", "L-FLW-08"),
     "explorer_budget": ("explorer-budget", "L-XREF-14"), "branches": ("branches", "L-XREF-15"),
     "quarantine": ("quarantine", "L-XREF-11"),
 }

@@ -35,12 +35,16 @@ Choices (reported):
 5. 6.6 names four verdicts and none fits a clean read that finds an undeclared row; such a proof has the
    verdict `ORDERS SENT: undeclared rows` and lists the rows, and the run effect is `aborted_safety
    (reason: undeclared_order_row)`. With `Cancel All` failed as well the verdict is UNPROVEN
-   (`cancel_all_failed`) and the rows are still listed and still abort the run.
+   (`cancel_all_failed`) and the rows are still listed and still abort the run. The abort is decided at
+   `teardown`, so unreached checkpoints carry `env_error (gate: teardown, reason: undeclared_order_row)`.
+6. Every proof records what `Cancel All` did (`Proof.cancel_all`: `not_needed`, `done` or `failed`).
+   `cancel_new_working` is the one Cancel All and re-read loop of 6.6 step 5, used by the kill switch
+   sequence and by the recovery proof of machine.py.
 """
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from . import alerts
 from .clock import Clock
@@ -163,10 +167,13 @@ class Proof:
     undeclared: tuple[OrderRow, ...] = ()
     declared: tuple[OrderRow, ...] = ()
     rows: tuple[ProofRow, ...] = ()
+    cancel_all: str = "not_needed"              # what Cancel All did before the final read (choice 6)
 
     def __post_init__(self):
         if self.verdict not in (PROVEN_NONE, PROVEN_DECLARED, PROVEN_NO_SESSION, UNPROVEN, ORDERS_SENT):
             raise ValueError(f"proof verdict {self.verdict!r}")
+        if self.cancel_all not in ("not_needed", "done", "failed"):
+            raise ValueError(f"cancel_all {self.cancel_all!r}")
         if (self.verdict == UNPROVEN) != (self.reason is not None) or (self.reason and self.reason not in UNPROVEN_REASONS):
             raise ValueError(f"proof reason {self.reason!r} with {self.verdict}")
 
@@ -189,7 +196,12 @@ def _new_rows(start: OrderBook, end: OrderBook) -> dict[str, list[OrderRow]]:
 
 
 def post_run_proof(p: ProofInputs) -> Proof:
-    """The proof verdict from the inputs (6.6 Post-run proof, Runs without a usable session)."""
+    """The proof verdict from the inputs (6.6 Post-run proof, Runs without a usable session), with what
+    Cancel All did recorded on it."""
+    return replace(_proof(p), cancel_all=p.cancel_all)
+
+
+def _proof(p: ProofInputs) -> Proof:
     if p.session == "never" and p.tokens_issued == 0:
         return Proof(PROVEN_NO_SESSION)
     if p.session == "kicked" and not p.kicked_login_ok:
@@ -198,8 +210,9 @@ def post_run_proof(p: ProofInputs) -> Proof:
         return Proof(UNPROVEN, "recovery_login_failed")
     if p.start is None:
         return Proof(UNPROVEN, "snapshot_missing")
-    if p.end is None or not (p.end.readable and p.end.copy_all_agrees and p.start.readable):
-        return Proof(UNPROVEN, "monitor_unreadable")
+    if p.end is None or not (p.end.readable and p.end.copy_all_agrees and p.start.readable
+                             and p.start.copy_all_agrees):
+        return Proof(UNPROVEN, "monitor_unreadable")         # either Monitor read failed its cross-check (6.6)
     new = _new_rows(p.start, p.end)
     declared = tuple(r for g in ("working", "canceled") for r in new[g] if r.key in p.declared_sends)
     undeclared = tuple(r for g in GRIDS for r in new[g] if r.key not in p.declared_sends or g == "filled")
@@ -227,10 +240,11 @@ def proof_result(proof: Proof, *, run_so_far: RunVerdict | None = None, unproven
 
     `unproven_streak` counts the UNPROVEN results on this login just before this one.
     """
-    ev = {"verdict": proof.line, "undeclared": [r.key for r in proof.undeclared]}
+    ev = {"verdict": proof.line, "undeclared": [r.key for r in proof.undeclared], "cancel_all": proof.cancel_all}
     if proof.undeclared:
         acts = ("block_login", "disable_rig")
-        return ControlResult("proof", False, "teardown", run=RunVerdict("aborted_safety", "undeclared_order_row"),
+        run, un = safety_abort_outcome("teardown", "undeclared_order_row")
+        return ControlResult("proof", False, "teardown", run=run, unreached=un,
                              alert=alerts.safety_abort().plus(paged=("login_owner",)) if not proof.proven
                              else alerts.safety_abort(), actions=acts, incident="S1",
                              detail="undeclared new order rows: " + ", ".join(r.key for r in proof.undeclared),
@@ -277,8 +291,33 @@ def recovery_login(rig: Rig, allowlist: Allowlist, clock: Clock, fixture_account
         return False
     if fixture_account is not None and reads[-1].text != fixture_account:
         rig.select_account(fixture_account)
-        return rig.read_account_selector().text == fixture_account
+        after = rig.read_account_selector().text
+        return after == fixture_account and after in allowlist      # A1 holds for the selected account too (6.4)
     return True
+
+
+def cancel_new_working(rig: Rig, start: OrderBook | None, end: OrderBook, *, clock: Clock,
+                       declared_sends: Sequence[str] = (),
+                       steps: list[tuple[str, float]] | None = None) -> tuple[str, OrderBook]:
+    """6.6 step 5: when a fresh read of Working shows a row not in the start snapshot, click `Cancel All` and
+    re-read every 5 s until no new undeclared row is Working or 60 s pass (choice 4). Returns what Cancel All
+    did (`not_needed`, `done`, `failed`) and the last read."""
+    if start is None or not end.readable or not _new_rows(start, end)["working"]:
+        return "not_needed", end
+    res = rig.cancel_all()
+    if steps is not None:
+        steps.append(("cancel_all", clock.monotonic()))
+    deadline = clock.monotonic() + CANCEL_REREAD_S
+    cancel = "done" if res.located and res.clicked else "failed"
+    while cancel == "done":
+        end = rig.read_orders()
+        if not [r for r in _new_rows(start, end)["working"] if r.key not in declared_sends]:
+            break
+        if clock.monotonic() >= deadline:
+            cancel = "failed"
+            break
+        clock.sleep(CANCEL_POLL_S)
+    return cancel, end
 
 
 def execute_kill_switch(rig: Rig, decision: ControlResult, *, clock: Clock, allowlist: Allowlist,
@@ -297,20 +336,8 @@ def execute_kill_switch(rig: Rig, decision: ControlResult, *, clock: Clock, allo
     login_ok = recovery_login(rig, allowlist, clock, fixture_account)
     steps.append(("recovery_login", clock.monotonic()))
     if login_ok:
-        end = rig.read_orders()
-        if start is not None and end.readable and _new_rows(start, end)["working"]:
-            res = rig.cancel_all()
-            steps.append(("cancel_all", clock.monotonic()))
-            deadline = clock.monotonic() + CANCEL_REREAD_S
-            cancel = "done" if res.located and res.clicked else "failed"
-            while cancel == "done":
-                end = rig.read_orders()
-                if not [r for r in _new_rows(start, end)["working"] if r.key not in declared_sends]:
-                    break
-                if clock.monotonic() >= deadline:
-                    cancel = "failed"
-                    break
-                clock.sleep(CANCEL_POLL_S)
+        cancel, end = cancel_new_working(rig, start, rig.read_orders(), clock=clock, declared_sends=declared_sends,
+                                         steps=steps)
     proof = post_run_proof(ProofInputs(start=start, end=end, recovery_login_ok=login_ok, cancel_all=cancel,
                                        declared_sends=frozenset(declared_sends)))
     steps.append(("proof", clock.monotonic()))

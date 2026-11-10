@@ -390,7 +390,7 @@ def test_bp_effect_outside_bracket_is_r02_with_bracket_label():
 def test_example_position_statement_r08_masked_live():
     cp = next(s for s in READ_BACK["steps"] if s["id"] == "cp-positions")
     ocr = GroundTruthReader({"rgn.ps.qty": "100", "rgn.ps.trade-price": "180.25", "rgn.ps.mark": "181.40",
-                             "rgn.ps.pl-open": "+115.00"})
+                             "rgn.ps.pl-open": "+115.00", "rgn.ps.instrument": "AAPL"})
     results = evaluate_assertions(cp, {"ocr": ocr}, {}, FIXTURE, context=EvalContext(symbol="AAPL"))
     assert [r.status for r in results] == ["passed", "passed"]
     off = GroundTruthReader(dict(ocr.values, **{"rgn.ps.pl-open": "+115.02"}))

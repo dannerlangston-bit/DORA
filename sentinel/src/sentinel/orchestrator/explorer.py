@@ -69,10 +69,12 @@ DEFAULT_DENY_LIST: tuple[DenyEntry, ...] = (
 
 
 def match_deny(*, title: str | None, labels: Sequence[str], target_kind: str | None,
-               deny_list: Sequence[DenyEntry] = DEFAULT_DENY_LIST) -> str | None:
-    """The first deny-list entry the target hits (title, label or geometry), for `SafetyContext.deny_list_hit`."""
+               deny_list: Sequence[DenyEntry] = DEFAULT_DENY_LIST, end_kind: str | None = None) -> str | None:
+    """The first deny-list entry the target hits (title, label or geometry), for `SafetyContext.deny_list_hit`.
+    `end_kind` is a drag's end target: a gesture that ends on denied geometry is denied too (6.8)."""
     for e in deny_list:
-        if e.hit(title=title, labels=labels, target_kind=target_kind):
+        if e.hit(title=title, labels=labels, target_kind=target_kind) or (
+                end_kind is not None and e.hit(title=None, labels=(), target_kind=end_kind)):
             return e.name
     return None
 

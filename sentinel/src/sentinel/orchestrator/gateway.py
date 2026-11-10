@@ -24,12 +24,15 @@ Choices where the spec is ambiguous (reported):
    send label), `dialog_allowlist` (a click in an order dialog that is not on the dismiss allowlist),
    `deny_profile` (a hit on the active profile's own list: Cancel All outside `cancel_all`, Working Orders
    cancel or replace outside `paper_send_ok`, Application Settings and the Explorer deny list for agent and
-   Explorer, `drag_named` on anything but splitters and detach handles, keys outside the agent toolset, a
-   ladder order cell or order bubble outside an order-stage step (5.4.10), and `Confirm and Send` from a
-   scripted step that is not an order-stage step or before attestation and a current paper-mode
-   assertion), `guarded_key_refused` (a guarded key: Enter, Space, an F-key or a blocked chord under the
-   flag; Enter or Space not declared by the step outside it), `shift_click_dialog` and `deny_rect` (the
-   flag re-check's click rules, named as the hook names them) and `hook_host_dead`. An ambiguous
+   Explorer, an action kind outside the 5.6 toolset (`secret`, `dblclick`, `rclick`; `drag` under profile
+   agent), `drag_named` on anything but splitters and detach handles, keys or modifiers outside the agent
+   toolset whatever the action kind, a ladder order cell or order bubble at the start or end of a gesture
+   outside an order-stage step of a scripted flow, in every profile (5.4.10), any agent or Explorer action
+   while the flag is set or unknown (choice 8), and `Confirm and Send` from a scripted step that is not an
+   order-stage step or before attestation and a current paper-mode assertion), `guarded_key_refused` (a
+   guarded key: Enter, Space, an F-key or a blocked chord under the flag or in an order-stage step; Enter or
+   Space not declared by the step outside it), `shift_click_dialog` and `deny_rect` (the flag re-check's
+   click rules, named as the hook names them) and `hook_host_dead`. An ambiguous
    resolution has no code in that list although 5.4.8 counts it; it is refused `deny_profile` with the
    detail "ambiguous name" (reported as a taxonomy gap).
 2. Whether a refusal is an attempted send follows 5.4.3 stage 4 and is carried as a flag, since a code can
@@ -52,6 +55,13 @@ Choices where the spec is ambiguous (reported):
 7. Explorer refusals that are not attempted sends leave the session running until the third (6.8, 2.9:
    "three denied attempts end the session"), although 5.4.3 says a refusal ends "the flow or session";
    scripted flows and agent rescues end at the first.
+8. The flag in the slow half is the fresh enumeration OR the flow's sticky `order_stage` declaration
+   (`SafetyContext.order_stage`, or the action's own `order_stage_step`, since the declaration sets the flag
+   before the step's events are emitted, 6.2). So a guarded key in an order-stage step is refused as an
+   attempted send even in the action that clicks `Confirm and Send`. While the flag is up, every agent or
+   Explorer action is refused before any token is written (5.4.6 "drops all input from that moment"): a
+   guarded key, Shift+click or deny-rectangle click as the attempted send it is, anything else `deny_profile`
+   with `flag_abort` set, which the caller routes to `agent_flag_abort` or `ExplorerSession.order_stage`.
 """
 from __future__ import annotations
 
@@ -83,6 +93,12 @@ BLOCKED_VK = frozenset({VK_RETURN, VK_SPACE}) | FKEYS
 GUARDED_VK = frozenset({VK_RETURN, VK_SPACE})          # outside the flag: only by explicit declaration
 # 2.9, 5.6: the only keys the agent and Explorer `press` tool offers
 AGENT_KEYS = frozenset({VK_TAB, VK_ESCAPE, VK_PRIOR, VK_NEXT, VK_END, VK_HOME, VK_LEFT, VK_UP, VK_RIGHT, VK_DOWN})
+# 5.6: the action kinds the agent and Explorer tools resolve to (`click_named`, `scroll`, `press`, `type_fixture`;
+# `key_chord` only as Shift+Tab; `drag_named` under profile explorer only)
+TOOLSET_KINDS = {"agent": frozenset({"click", "wheel", "press", "key_chord", "type_fixture"}),
+                 "explorer": frozenset({"click", "wheel", "press", "key_chord", "type_fixture", "drag"})}
+# 5.4.10, 6.2: order geometry, a deny target outside an order-stage step of a scripted flow
+ORDER_GEOMETRY = frozenset({"ladder_order_cell", "order_bubble"})
 
 TOLERANCE_PX = 2                 # 5.4.5
 TOKEN_EXPIRY_S = 0.5             # 5.4.3 stage 5
@@ -570,6 +586,20 @@ def _in_deny_rect(point: tuple[int, int] | None, rects: tuple[DenyRect, ...]) ->
     return next((d for d in rects if d.rect.contains(*point)), None)
 
 
+def _flag_rules(a: Action, ctx: SafetyContext) -> SlowDecision | None:
+    """The flag re-check's refusals (the hook's rule 2 applied in stage 4): a guarded key or blocked chord, a
+    Shift+click and a click in a deny rectangle. Each is an attempted send (5.4.3 stage 4, 6.2)."""
+    if a.keys and (a.mods & CHORD_MODS or any(Chord(a.mods, k) in ctx.chords or k in BLOCKED_VK for k in a.keys)):
+        return _refuse("guarded_key_refused", "guarded key or blocked chord under the flag", send=True)
+    if a.is_pointer:
+        if "shift" in a.mods:
+            return _refuse("shift_click_dialog", send=True)
+        hit = _in_deny_rect(a.point, ctx.deny_rects)
+        if hit is not None:
+            return _refuse("deny_rect", f"point in the deny rectangle of {hit.label!r}", send=True)
+    return None
+
+
 def slow_half(a: Action, ctx: SafetyContext) -> SlowDecision:
     """Stage 4 of 5.4.3 (and the liveness check of stage 6), in the spec's order; first refusal wins."""
     if not ctx.hook_alive:
@@ -580,6 +610,10 @@ def slow_half(a: Action, ctx: SafetyContext) -> SlowDecision:
     lowered = {s.lower() for s in labels}
     confirm = CONFIRM_AND_SEND in lowered
     pointer = a.is_pointer
+    # The flag as stage 4 applies it: set or unknown in the fresh enumeration, or held by the flow's sticky
+    # order_stage declaration, which an order-stage step sets before its own events are emitted (6.2: "so
+    # Enter is already blocked when the dialog appears"), including the step that clicks Confirm and Send.
+    flag_up = ctx.flag != Flag.CLEAR or ctx.order_stage or a.order_stage_step
     # never-tokenize (exact list anywhere; the send-like regex outside the Order Confirmation dialog)
     if pointer:
         if any(NEVER_TOKENIZE_RE.match(s) for s in labels):
@@ -609,28 +643,33 @@ def slow_half(a: Action, ctx: SafetyContext) -> SlowDecision:
             return _refuse("dialog_allowlist", f"label {labels} is neither allowlisted nor send-like", unknown=True)
     # deny profile
     if a.profile in ("agent", "explorer"):
+        if flag_up:
+            # 5.4.6, 6.8: from the moment the flag is set or unknown no agent or Explorer input reaches the app;
+            # a guarded key, a Shift+click or a deny-rectangle click is still the attempted send it is (choice 8)
+            return _flag_rules(a, ctx) or SlowDecision(
+                True, "deny_profile", detail=f"flag set or unknown in an {a.profile} session: all input dropped",
+                flag_abort=True)
         if ctx.deny_list_hit:
             return _refuse("deny_profile", ctx.deny_list_hit)
-        if a.kind == "drag" and a.profile == "explorer" and not (
+        if a.kind not in TOOLSET_KINDS[a.profile]:
+            return _refuse("deny_profile", f"{a.kind} is not in the {a.profile} toolset (5.6)")
+        if a.kind == "drag" and not (
                 a.target_kind in ("splitter", "detach_handle") and a.end_kind in ("splitter", "detach_handle")):
             return _refuse("deny_profile", "drag_named resolves only splitters and detach handles")
-        if a.kind in ("press", "key_chord", "type_fixture") and (a.mods & CHORD_MODS or
-                                                                 any(k not in AGENT_KEYS for k in a.keys)):
-            return _refuse("deny_profile", "key outside the agent toolset")
-    elif pointer and (a.target_kind in ("ladder_order_cell", "order_bubble")
-                      or a.end_kind in ("ladder_order_cell", "order_bubble")) and not a.order_stage_step:
-        return _refuse("deny_profile", f"{a.target_kind or a.end_kind} outside an order-stage step")
-    # flag re-check from the fresh enumeration
-    if ctx.flag != Flag.CLEAR:
-        if a.keys and (a.mods & CHORD_MODS or any(Chord(a.mods, k) in ctx.chords or k in BLOCKED_VK
-                                                   for k in a.keys)):
-            return _refuse("guarded_key_refused", "guarded key or blocked chord under the flag", send=True)
+        shift_tab = a.kind in ("press", "key_chord") and bool(a.keys) and set(a.keys) <= {VK_TAB}
+        if a.mods & CHORD_MODS or any(k not in AGENT_KEYS for k in a.keys) or ("shift" in a.mods and not shift_tab):
+            return _refuse("deny_profile", "key or modifier outside the agent toolset")
+    # order geometry: a ladder order cell or an order bubble at either end of the gesture is deny geometry except
+    # in an order-stage step of a scripted flow (5.4.10, 6.2, 6.8)
+    geometry = next((k for k in (a.target_kind, a.end_kind) if k in ORDER_GEOMETRY), None)
+    if pointer and geometry and (a.profile != "scripted" or not a.order_stage_step):
+        return _refuse("deny_profile", f"{geometry} outside an order-stage step of a scripted flow")
+    # flag re-check from the fresh enumeration (and the sticky declaration)
+    if flag_up:
+        hit = _flag_rules(a, ctx)
+        if hit is not None:
+            return hit
         if pointer:
-            if "shift" in a.mods:
-                return _refuse("shift_click_dialog", send=True)
-            hit = _in_deny_rect(a.point, ctx.deny_rects)
-            if hit is not None:
-                return _refuse("deny_rect", f"point in the deny rectangle of {hit.label!r}", send=True)
             dialog_ok = dialog_ok or not ctx.order_dialog_present
     elif any(k in GUARDED_VK for k in a.keys) and not (a.profile == "scripted" and a.declared_guarded):
         return _refuse("guarded_key_refused", "Enter or Space not declared by the step")

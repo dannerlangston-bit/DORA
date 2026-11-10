@@ -157,6 +157,10 @@ def test_nightly_canary_goes_blind_on_a_money_cell(runs):
     assert body["detector_state"] == "detector_blind" and body["not_simulated"]
     detected = {r.mutant_id for r in n1.canary["report"].results if r.state == "detected"}
     assert {"M01", "M02", "M03", "M04", "M05", "M12", "M26", "M28"} <= detected
+    runs_ = json.loads((out / "orchestrator.json").read_text())       # every run went through the gate machine
+    assert [r["run_id"] for r in runs_] == [n1.run_id, n2.run_id, pr.run_id]
+    assert all(s["verdict"] == "complete" and s["proof"] == "PROVEN: no orders sent" for r in runs_ for s in r["shards"])
+    assert n1.shards[0]["gates"][3]["control"] == "paper_mode" and json.loads((out / "alerts.json").read_text()) == []
 
 
 def test_decision_inheritance_suppresses_and_inherits(runs):

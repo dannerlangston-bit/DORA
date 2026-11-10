@@ -15,11 +15,19 @@ How a run ends, by the result that stopped it:
 - the login never authenticated: `PROVEN: no session established` when the gateway issued no session
   token, else the recovery path; a kicked session waits `session_release_wait` and logs in once more
   for the proof, UNPROVEN `session_unavailable` when that fails twice;
-- otherwise: teardown (`check_teardown`) and the proof from the session's own Monitor read.
+- otherwise: teardown (`check_teardown`) and the proof from the session's own Monitor read; when that
+  proof finds an undeclared row, the 6.6 sequence runs as for any `aborted_safety` (deny-all, the tree
+  killed, a fresh scripted login, verified Cancel All, re-read, the proof, the revert; 1.10). The recovery
+  proof after a killed tree clicks Cancel All on a new Working row too (6.6 step 5).
 
-Choices (reported): the run-start order snapshot is read right after `paper_mode_asserted` passes, the
-first moment identity is known and before A9 touches a ticket, so a later gate failure still has a
-snapshot to prove against; the hook is armed once the main frame is up, so the LOGIN flow's input goes
+Unreached checkpoints are written once the run outcome is known, with the unreached outcome of the result
+that decided it, so a recovery proof that turns an earlier abort into `aborted_safety` gives them that
+abort's gate and reason (1.10).
+
+Choices (reported): the run-start order snapshot is read as soon as A1 passes (the selector text is an
+allowlist entry), the first moment identity is known, before A2 selects an account and before A9 touches a
+ticket, so a later gate failure, an A2 failure included, still has a snapshot to prove against; the
+account A2 selects is judged against the allowlist like A1 (6.4); the hook is armed once the main frame is up, so the LOGIN flow's input goes
 through it; the no-session rule counts the tokens issued outside `class: login` flows
 (`GatewayLog.tokens_issued`), since before authentication there is no session in which anything could
 be pressed (F43 names an authentication failure as a no-session case although its credentials were typed). A session
@@ -43,8 +51,8 @@ from .gateway import Chord, DropLedger
 from .gates import (AccountExpectation, WorkspaceExpectation, check_authenticated, check_canary_flow, check_fixture,
                     check_launched, check_provisioned, check_teardown, check_workspace, decide_run_outcome)
 from .identity import READ_GAP_S, Allowlist, judge_fixture_account, judge_identity, readable as selector_readable
-from .killswitch import (KillSwitchReport, Proof, ProofInputs, execute_kill_switch, post_run_proof, proof_result,
-                         recovery_login)
+from .killswitch import (KillSwitchReport, Proof, ProofInputs, cancel_new_working, execute_kill_switch, post_run_proof,
+                         proof_result, recovery_login)
 from .alerts import AlertRoute
 from .results import ControlResult, OutcomeSink, RunVerdict, write_unreached
 from .rig import OrderBook, Rig
@@ -198,7 +206,6 @@ class Orchestrator:
         self.session = "established"
         if not self._gate("paper_mode_asserted") or not self._paper_mode():
             return False
-        self.start_book = rig.read_orders()
         if not self._gate("settings_attested") or not self._attest():
             return False
         if not self._gate("workspace_loaded"):
@@ -237,11 +244,18 @@ class Orchestrator:
         if r.has("rearm"):
             rig.set_hook_state(armed=True, deny_all=False)
         self._a1 = reads[-1].crop_sha256
+        self.start_book = rig.read_orders()                  # identity known: the run-start snapshot (choice)
         selected = reads[-1].text or ""
         if selected != ctx.fixture_account:
             rig.select_account(ctx.fixture_account)
             after = rig.read_account_selector()
             self._a2 = after.crop_sha256
+            if selector_readable(after):
+                # 6.4: the selector text must equal an allowlist entry before every flow, the selected one too
+                r = self.apply(judge_identity([after], ctx.allowlist,
+                                              unreadable_streak=ctx.history.identity_unreadable_streak))
+                if not r.passed:
+                    return False
             r = self.apply(judge_fixture_account(selected, ctx.fixture_account, after_select=after.text))
             return r.passed
         self._a2 = reads[-1].crop_sha256
@@ -274,8 +288,6 @@ class Orchestrator:
         stop, rig, ctx = self.stop, self.rig, self.ctx
         report = RunReport(ctx.run_id, ctx.run_type, RunVerdict("complete"), self.state)
         last_gate = self.state
-        if stop is not None:
-            report.filled = write_unreached(self.sink, ctx.run_id, stop)
         streak = ctx.history.unproven_streak
         so_far = stop.run if stop else None
         kill_switch_path = stop is not None and (stop.run_status == "aborted_safety" or stop.has("kill_switch"))
@@ -302,11 +314,23 @@ class Orchestrator:
             end = rig.read_orders()
             report.proof = post_run_proof(ProofInputs(start=self.start_book, end=end,
                                                       cancel_all="not_needed" if obs.cancel_all_verified else "failed"))
-            self.apply(proof_result(report.proof, run_so_far=so_far, unproven_streak=streak))
+            effect = self.apply(proof_result(report.proof, run_so_far=so_far, unproven_streak=streak))
+            if report.proof.undeclared:
+                # 1.10, 6.6: an undeclared row at teardown is an aborted_safety; the kill switch sequence cancels it
+                ks = execute_kill_switch(rig, effect, clock=self.clock, allowlist=ctx.allowlist, start=self.start_book,
+                                         fixture_account=ctx.fixture_account, run_so_far=effect.run,
+                                         unproven_streak=streak)
+                report.kill_switch, report.proof = ks, ks.proof
+                self.apply(ks.proof_effect)
         any_env = any(o is not None and o.outcome == "env_error"
                       for r in self.results for o in (r.unreached, r.checkpoint, *[s.outcome for s in r.outcomes]))
         report.verdict = decide_run_outcome([r.run for r in self.results], any_env_error=any_env,
                                             scope_finished=stop is None)
+        # unreached checkpoints carry the abort that decided the run (1.10), which a proof can make worse than
+        # the stop that ended the work
+        decider = next((r for r in self.results if r.run == report.verdict and r.unreached is not None), stop)
+        if decider is not None:
+            report.filled = write_unreached(self.sink, ctx.run_id, decider)
         report.results = list(self.results)
         report.last_gate = stop.gate if stop is not None and stop.gate else last_gate
         return report
@@ -323,6 +347,10 @@ class Orchestrator:
             if ok:
                 break
         end = rig.read_orders() if ok else None
+        cancel = "not_needed"
+        if end is not None:
+            cancel, end = cancel_new_working(rig, self.start_book, end, clock=self.clock)    # 6.6 step 5
         if kicked:
-            return post_run_proof(ProofInputs(start=self.start_book, end=end, session="kicked", kicked_login_ok=ok))
-        return post_run_proof(ProofInputs(start=self.start_book, end=end, recovery_login_ok=ok))
+            return post_run_proof(ProofInputs(start=self.start_book, end=end, session="kicked", kicked_login_ok=ok,
+                                              cancel_all=cancel))
+        return post_run_proof(ProofInputs(start=self.start_book, end=end, recovery_login_ok=ok, cancel_all=cancel))

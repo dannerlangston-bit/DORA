@@ -3,7 +3,11 @@
 Nothing in this package opens a connection unless a caller builds an `AnthropicTransport`, which
 `AnthropicTransport.from_env` refuses to do unless the caller passes `allow_network=True` and
 `ANTHROPIC_API_KEY` is set; the key is passed to the client explicitly, so no other credential source
-(a CLI profile, a federation token) is ever picked up. Tests use a fake transport.
+(a CLI profile, a federation token) is ever picked up. The endpoint is passed explicitly too: the
+reviewer config's `endpoint_base_url` (the security-approved endpoint, 3.12) or else the documented
+production endpoint `DEFAULT_BASE_URL`, so the SDK never takes `ANTHROPIC_BASE_URL` (or a profile's base
+URL) from the process environment; the SDK's OpenTelemetry spans are switched off explicitly, so no
+environment variable can turn on request-content tracing. Tests use a fake transport.
 
 SDK usage follows the claude-api skill (Python SDK, read 2026-11-10): `client.messages.create`,
 `client.messages.batches.create / retrieve / results`, `client.models.retrieve`; the SDK's default
@@ -18,6 +22,7 @@ from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Protocol, Sequence
 
 TRANSIENT_KINDS = frozenset({"timeout", "rate_limit", "server", "connection"})
+DEFAULT_BASE_URL = "https://api.anthropic.com"     # the documented production endpoint (Claude API docs)
 BATCH_RESULT_KINDS = ("succeeded", "errored", "canceled", "expired")
 
 
@@ -120,17 +125,21 @@ class AnthropicTransport:
     @classmethod
     def from_env(cls, *, allow_network: bool, env: Mapping[str, str] | None = None,
                  base_url: str | None = None) -> "AnthropicTransport":
-        """A live transport, only with `allow_network=True` and `ANTHROPIC_API_KEY` set."""
+        """A live transport, only with `allow_network=True` and `ANTHROPIC_API_KEY` set. `base_url` is the
+        reviewer config's `endpoint_base_url`; without one the client is pinned to `DEFAULT_BASE_URL`, never
+        to an endpoint named by the process environment."""
         env = os.environ if env is None else env
         if not allow_network:
             raise NetworkNotAllowed("live Reviewer calls need allow_network=True")
         key = env.get("ANTHROPIC_API_KEY", "")
         if not key:
             raise NetworkNotAllowed("live Reviewer calls need ANTHROPIC_API_KEY")
+        import inspect
+
         import anthropic
-        kwargs: dict[str, Any] = {"api_key": key}
-        if base_url:
-            kwargs["base_url"] = base_url
+        kwargs: dict[str, Any] = {"api_key": key, "base_url": base_url or DEFAULT_BASE_URL}
+        if "open_telemetry" in inspect.signature(anthropic.Anthropic.__init__).parameters:
+            kwargs["open_telemetry"] = False             # no span, so no env switch can export request content
         return cls(anthropic.Anthropic(**kwargs))
 
     def _call(self, fn: Any, *args: Any, **kwargs: Any) -> Any:

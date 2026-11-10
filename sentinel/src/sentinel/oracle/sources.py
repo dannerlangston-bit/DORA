@@ -42,6 +42,9 @@ Choices where the spec is ambiguous (reported):
   `oracle_source_fallback` (2.8.1 Grid copy).
 - Calibration: a sample is missed when it reads below its floor, when its passes disagree on digit
   count, or when its text differs from the known value after trimming (H9: "exact match").
+- An OCR read of a typed field (every format but `text`) with no 2x second pass is unreadable: the
+  digit-count agreement of the two passes is its only digit-level check (2.8.1), so a single pass is
+  never accepted as if confirmed. A `text` read needs no second pass (no digit count is compared).
 """
 from __future__ import annotations
 
@@ -294,6 +297,8 @@ def problem(reading: Reading | None, fmt: str) -> str | None:
         return "nothing read"
     if reading.confidence < floor(fmt):
         return f"confidence {reading.confidence:.0f} below the {fmt} floor {floor(fmt):.0f}"
+    if reading.source == "ocr" and fmt != "text" and reading.second_pass is None:
+        return f"2x pass missing: an OCR read of a {fmt} field is confirmed only by both passes"
     if reading.second_pass is not None and digit_count(reading.text) != digit_count(reading.second_pass):
         return (f"3x and 2x passes disagree on digit count ({digit_count(reading.text)} in {reading.text!r}, "
                 f"{digit_count(reading.second_pass)} in {reading.second_pass!r})")

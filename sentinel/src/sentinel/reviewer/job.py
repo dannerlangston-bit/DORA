@@ -33,10 +33,14 @@ Choices where the spec is ambiguous:
   within 0.10 of it (inclusive) triggers it. The vote is over the valid answers: two or more agreeing
   give that verdict with the median of their confidences (the agreeing answer nearest that median is
   kept, lowest copy first); otherwise the item is `cannot_judge` (R `unsure`) at the median of all.
-  A copy that fails terminally (refusal, second violation) is not a vote; a copy stopped by a dollar
-  ceiling makes the item `capped`, and a transient failure leaves it `pending`. The Batch path sends
-  the three copies up front and decides on the lowest valid copy once every lower copy is resolved,
-  so the outcome never depends on result order.
+  A copy answered by a model other than the pin makes the item `unavailable` (`model_mismatch`, 3.12:
+  every response model must equal the pin); another terminal failure of an extra copy (refusal,
+  max_tokens, second violation) is not a vote; a copy stopped by a dollar ceiling makes the item
+  `capped`, and a transient failure leaves it `pending`. Copy 0 is the primary on both paths: a terminal
+  failure of copy 0 makes the item `unavailable`. The Batch path sends the three copies up front, decides
+  on copy 0 once it is resolved and, when copy 0 is borderline, votes once every copy is resolved, so
+  the Batch and synchronous paths map the same responses to the same verdict and the outcome never
+  depends on result order.
 - "3 consecutive failures" counts transient failures only (a refusal is about one item, not the
   endpoint). "A queue over 20 items" (10.7) is not a trigger here: 3.15 sends every PR item
   synchronously and the PR cap is 60.
@@ -492,7 +496,7 @@ class ReviewerJob:
             k, v = self._attempt(item, params, acc)
             if k == "answer":
                 answers.append(v)
-            elif k in ("transient", "stopped"):
+            elif k in ("transient", "stopped") or v == "model_mismatch":
                 return self._unanswered(item, k, v, acc, path="sync")
         answer, votes = vote(answers)
         return self._answered(item, answer, acc, path="sync", votes=votes)
@@ -624,23 +628,24 @@ class ReviewerJob:
         st.all_ids.append(bid)
 
     def _try_finalize(self, key: str) -> Verdict | None:
+        """The synchronous path's mapping over the copies sent up front (module docstring): copy 0 decides,
+        and only a borderline copy 0 consults the extra copies."""
         st = self._batch
         item, acc, copies = st.items[key], st.acc[key], st.copies[key]
-        first = next((i for i, c in enumerate(copies) if c.status == "answer"), None)
-        if first is None:
-            if any(c.status == "waiting" for c in copies):
-                return None
-            if any(c.cause == "dollar_cap" for c in copies):
-                return self._capped(item, self.ledger.stop_reason() or "run", queued=True, acc=acc)
-            return self._verdict(item, "unavailable", acc, path="batch", cause=copies[0].cause)
-        if any(c.status == "waiting" for c in copies[:first]):
+        primary = copies[0]
+        if primary.status == "waiting":
             return None
-        primary = copies[first].answer
-        if item.task != TASK_A or not self._borderline(primary["confidence"]):
-            return self._answered(item, primary, acc, path="batch")
+        if primary.status == "failed":
+            if primary.cause == "dollar_cap":
+                return self._capped(item, self.ledger.stop_reason() or "run", queued=True, acc=acc)
+            return self._verdict(item, "unavailable", acc, path="batch", cause=primary.cause)
+        if item.task != TASK_A or not self._borderline(primary.answer["confidence"]):
+            return self._answered(item, primary.answer, acc, path="batch")
         if any(c.status == "waiting" for c in copies):
             return None
         if any(c.cause == "dollar_cap" for c in copies):
             return self._capped(item, self.ledger.stop_reason() or "run", queued=True, acc=acc)
+        if any(c.cause == "model_mismatch" for c in copies):
+            return self._verdict(item, "unavailable", acc, path="batch", cause="model_mismatch")
         answer, votes = vote([c.answer for c in copies if c.status == "answer"])
         return self._answered(item, answer, acc, path="batch", votes=votes)

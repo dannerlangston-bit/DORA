@@ -4,8 +4,9 @@
 checkpoint sequence of 5.17 with the rig replaced by `sim`:
 
 1. T+0:00. The config the run pins (the given directory plus the PR's manifest and build records,
-   4.3) is linted; any error ends the run `aborted_harness (reason: config_invalid)` with the abort
-   block in the PR comment. The build pair is read from the candidate's build record.
+   4.3) is linted; any error is preflight item G1 (12.7): the shard's Orchestrator stops at
+   `provisioned` and the run ends `aborted_harness (reason: config_invalid)` with the abort block in
+   the PR comment. The build pair is read from the candidate's build record.
 2. T+0:01 to 0:02. The manifest for the candidate is loaded (or not: the two no-manifest cases),
    the changed paths go through the static impact step and `scope.compute_scope` plans the run.
 3. Before any threshold is used (3.9, 1.6 Calibration run) an A/A calibration of the base build is
@@ -37,10 +38,11 @@ The Orchestrator (5.2): every shard goes through `orchestrator.Orchestrator` on 
 the example allowlist, settings attestation, workspace, fixture verification and the canary flow, then
 `running`, where the Executor (`_ShardWork`) re-reads the build id before each flow, writes a heartbeat
 at every step, sends each input-bearing flow step through the gateway (`Rig.send_input`, the drop
-ledger of 5.4.8) and captures the shard's checkpoints in order; then teardown and the post-run proof.
-A gate failure ends the shard, or the run, with the Orchestrator's exact outcome and its unreached
-checkpoints (1.10). The first shard to reach `running` runs the A/A calibration, so a run stopped at a
-gate captures nothing. Every control result's 9.10 route goes to `alerts.json`; the shards, their
+ledger of 5.4.8), runs the Watchdog's hang detector, and captures the checkpoints of every shard in
+`running` in plan order; then each shard's teardown and post-run proof. A control result that stops
+a shard gives its unreached checkpoints the Orchestrator's exact outcome (1.10); the run outcome is the
+worst of the shards' (8.2). The A/A calibration runs once a shard reaches `running`, so a run whose
+shards all stop at a gate captures nothing. Every control result's 9.10 route goes to `alerts.json`; the shards, their
 gates, proofs and the actions the Orchestrator does not perform itself go to `orchestrator.json`.
 
 The Oracle (2.8, `pipeline.assertions`): every flow checkpoint that declares assertions is evaluated
@@ -109,8 +111,9 @@ from ..orchestrator.watchdog import (HANG_FLOOR_S, Heartbeat, HeartbeatUnwritabl
 from .assertions import FlowOracle, OracleCheck
 from .config import SentinelConfig, as_dict, materialize, parse_time, tree_sha256
 from ..reviewer.adapter import ModelReviewer, ReviewerUnavailable
+from ..reviewer.config import ReviewerConfig
 from ..reviewer.job import ReviewerJob
-from .live import ItemBuilder
+from .live import CollectingReviewer, ItemBuilder
 from .orchestration import PipelineRig, RigScript, ShardSink, alert_entry, persisted_actions, proof_text, shard_setup
 from .reviewer import ReviewerAdapter, ReviewRequest, SimulatedReviewer, change_types, to_review, validate
 from .sim import Capture, SimApp, SimBuild, observe
@@ -950,8 +953,8 @@ class _ShardWork:
     """The Executor's side of every shard of one run (module docstring): build re-read, heartbeats, gateway
     input, captures, the Watchdog's hang detector, the subset outcomes control results return."""
 
-    def __init__(self, run: _Run, cfg: SentinelConfig, scenario: Scenario, out: Path, oracle: FlowOracle,
-                 store: Store, planned: Sequence[PlannedCheckpoint], plan: ScopePlan, today: date):
+    def __init__(self, run: _Run, cfg: SentinelConfig, scenario: Scenario, out: Path, oracle: FlowOracle | None,
+                 store: Store, planned: Sequence[PlannedCheckpoint], plan: ScopePlan | None, today: date):
         self.run, self.cfg, self.scenario, self.out, self.oracle = run, cfg, scenario, out, oracle
         self.store, self.planned, self.plan, self.today = store, list(planned), plan, today
         self.script: RigScript = scenario.rig
@@ -1344,12 +1347,12 @@ def _abort_config(store: Store, scenario: Scenario, cfg_root: Path, errors: list
                                    ended_at=_ts(today, scenario.clock, 60)))
     alerts = [a for r in report.results if (a := alert_entry(scenario.run_id, ctx.shard_id, r)) is not None]
     _append_json(out_dir / "alerts.json", alerts)
-    _append_json(out_dir / "orchestrator.json", [{"run_id": scenario.run_id, "shards": [{
-        "shard_id": ctx.shard_id, "verdict": report.verdict.status, "reason": report.verdict.reason,
-        "last_gate": report.last_gate, "proof": proof_text(report.proof),
-        "gates": [{"control": r.control, "gate": r.gate, "passed": r.passed, "detail": r.detail}
-                  for r in report.results]}], "persisted_actions": [], "gateway_events": [],
-        "lint_errors": errors}])
+    shard = {"shard_id": ctx.shard_id, "rig": "none (stopped at provisioned)", "verdict": report.verdict.status,
+             "reason": report.verdict.reason, "last_gate": report.last_gate, "proof": proof_text(report.proof),
+             "gates": [{"control": r.control, "gate": r.gate, "passed": r.passed, "detail": r.detail}
+                       for r in report.results]}
+    _append_json(out_dir / "orchestrator.json", [{"run_id": scenario.run_id, "shards": [shard], "persisted_actions": [],
+                                                  "gateway_events": [], "lint_errors": errors}])
     ctx_r = ReportContext(pr=scenario.pr or 0, candidate_build=scenario.candidate.build_id,
                           base_build=scenario.base.build_id,
                           abort={"rule_ids": rule_ids, "requeued": "not re-queued: a config fix is needed first"})
@@ -1361,7 +1364,7 @@ def _abort_config(store: Store, scenario: Scenario, cfg_root: Path, errors: list
     (out_dir / "commit-status.json").write_text(json.dumps(_status_json(rep.status), indent=2) + "\n")
     render_run_report(run, [], [], [], {}, health, None, ctx_r, out_dir / "report.html")
     return RunResult(scenario.run_id, scenario.run_type, run.status, run.reason, out_dir, comment=comment,
-                     commit_status=_status_json(rep.status), lint_errors=errors, alerts=alerts,
+                     commit_status=_status_json(rep.status), lint_errors=errors, alerts=alerts, shards=[shard],
                      proof=proof_text(report.proof))
 
 
@@ -1430,9 +1433,12 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                                   mtext.read_text() if mtext.exists() else None, scenario.pr, scenario.author))
         work = _ShardWork(run, cfg, scenario, out, oracle, store, planned, plan, today)
         rev = reviewer or SimulatedReviewer()
+        items = ItemBuilder(scenario.run_id, arts, REDACTION, _EvalIndex(work), manifest=manifest, epoch=run.epoch,
+                            flow_docs=cfg.flow_docs, pad=(live.config if live else ReviewerConfig()).crop.pad_px)
         if reviewer is None and live is not None:          # 3.12: the real Reviewer; crops from the artifact store
-            rev = ModelReviewer(live, ItemBuilder(scenario.run_id, arts, REDACTION, _EvalIndex(work), manifest=manifest,
-                                                  epoch=run.epoch, flow_docs=cfg.flow_docs, pad=live.config.crop.pad_px))
+            rev = ModelReviewer(live, items)
+        if isinstance(rev, CollectingReviewer):
+            rev.item_for = items
         # -- 5.2: every shard through the Orchestrator; 5.17 per checkpoint inside `running`
         work.run_shards([(shard_of[r], i, r, [cp for cp in planned if rig_of[cp.checkpoint_id] == r])
                          for i, r in enumerate(used, 1)])
@@ -1690,8 +1696,9 @@ NOT_SIMULATED = {
     "M07": "color_swap expects INV-15; the registry declares no signed P/L column and palette for the synthetic app",
     "M10": "clipped_label needs OCR to read the cropped header word; the synthetic OCR reads drawn text, not pixels",
     "M11": "clipped_label (ellipsis) needs OCR of the pixels, as M10",
-    "M13": "missing_row expects an Oracle assertion (R08); the core has no Oracle",
-    "M15": "placeholder lands on a rule region, asserted by the Oracle, which the core lacks",
+    "M13": "missing_row expects an Oracle assertion (R08); the simulated Oracle reads what synth drew, not a mutant's "
+           "pixels, so the Nightly pass runs without it",
+    "M15": "placeholder lands on a rule region asserted by the Oracle, which reads drawn text, not a mutant's pixels",
     "M16": "font_height needs OCR cap heights from the pixels",
     "M17": "scrollbar needs a template match of the drawn thumb",
     "M19": "redaction is proven by the redaction stage and the egress log, which the simulation has no rig for",
@@ -1794,49 +1801,85 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         bound = sorted({e.checkpoint_id for e in entries} | {str(e.params.get("donor_checkpoint")) for e in entries
                                                               if e.params.get("donor_checkpoint")})
         cps = {cid: planned_for(cfg, cid) for cid in bound}
-        run.budget = RerunBudget(len(cps), run.params)
-        run.calibrate(list(cps.values()), out)
-        approved: dict[str, Capture] = {cid: run.capture(cp, "base") for cid, cp in cps.items()}
-        boxes: dict[str, dict[str, tuple[int, int, int, int]]] = {}
-        for cid, cp in cps.items():
-            reg = run.registry(cp, approved[cid])
-            lm = {l.id: l.expected for l in reg.landmarks}
-            boxes[cid] = {r.id: (r.rect.x + lm[r.landmark][0], r.rect.y + lm[r.landmark][1], r.rect.w, r.rect.h)
-                          for r in reg.regions if lm.get(r.landmark) is not None}
-        gen = cn.generate(entries, {cid: c.screen.image for cid, c in approved.items()}, boxes)
-        results: list[cn.MutantResult] = []
-        produced: dict[str, CheckpointOutcome] = {}
-        writer = _Writer(run, ArtifactStore(out / "artifacts", f"runs/{scenario.run_id}"), today, scenario.clock)
-        rows_meta = []
-        arts_by_sha: dict[str, StoredArtifact] = {}
-        for m in gen.mutants:
-            cp = cps[m.checkpoint_id]
-            if m.failed or m.image is None:
-                results.append(cn.MutantResult(m))
-                continue
-            base_cap = approved[m.checkpoint_id]
-            model = _mutant_model(base_cap.model, m, boxes[m.checkpoint_id])
-            image = m.image
-            if m.defect_class == "window_offscreen":
-                image = base_cap.screen.image    # Capture grabs the window by its DWM bounds (5.7): same pixels
-            mutant_cap = _static_capture(m.checkpoint_id, image, model, base_cap)
-            ev = evaluate(run, cp, base_cap, mutant_cap, x="undeclared", primitive=None, entry_ref=None,
-                          recapture=lambda c=mutant_cap: c, recapturable=_recapturable(cfg, cp), synthetic=True,
-                          injected=True)
-            rec, _, stored = writer.records(ev, synthetic=True, tag=m.mutant_id)
-            arts_by_sha.update({a.sha256: a for a in stored})
-            step_status = None
-            if m.defect_class == "gateway":
-                step_status = "blocked_by_gateway"       # the simulated gateway refuses the unmatched Send template
-            absorbed = None
-            if ev.classified.outcome in ("identical", "noise"):
-                masks = [f"mask {r.mask_ref} (region {r.id})" for r in ev.registry.regions if r.type == "mask"]
-                absorbed = ", ".join(masks) if masks else None
-            results.append(cn.MutantResult(m, rec, absorbed_by=absorbed, step_status=step_status))
-            produced[m.key] = rec
-            rows_meta.append((m, ev))
-        report = cn.score(results, history=history or {}, since=f"{today.isoformat()} {scenario.clock[:5]} ET",
-                          context=cn.RowContext(scenario.run_id, "ws.tier-a.swing-trader", "swing_trader", "frozen"))
+        work = _ShardWork(run, cfg, Scenario(scenario.name, scenario.run_id, scenario.build, scenario.build,
+                                             run_type="nightly", clock=scenario.clock), out, None, store, (), None,
+                          today)
+        clock = ManualClock(start=now.astimezone(timezone.utc))
+        ctx, sim = shard_setup(cfg, run_id=scenario.run_id, run_type="nightly", shard_id=f"{scenario.run_id}/1",
+                               shard_no=1, build_id=scenario.build.build_id, workspace_id="ws.tier-a.swing-trader",
+                               script=RigScript())
+        orch = Orchestrator(PipelineRig(sim, clock=clock, build_id=scenario.build.build_id), ctx, ShardSink(()),
+                            clock=clock, heartbeat=HeartbeatWriter(out / "heartbeat" / f"{scenario.run_id}.json", clock),
+                            watchdog_status=lambda: (1.0, True))
+        done: dict[str, Any] = {}
+
+        def canary_pass(_: Orchestrator) -> None:
+            """The Nightly run's work in `running` (5.2): the canary pass of 10.3."""
+            run.budget = RerunBudget(len(cps), run.params)
+            run.calibrate(list(cps.values()), out)
+            approved: dict[str, Capture] = {cid: run.capture(cp, "base") for cid, cp in cps.items()}
+            boxes: dict[str, dict[str, tuple[int, int, int, int]]] = {}
+            for cid, cp in cps.items():
+                reg = run.registry(cp, approved[cid])
+                lm = {l.id: l.expected for l in reg.landmarks}
+                boxes[cid] = {r.id: (r.rect.x + lm[r.landmark][0], r.rect.y + lm[r.landmark][1], r.rect.w, r.rect.h)
+                              for r in reg.regions if lm.get(r.landmark) is not None}
+            gen = cn.generate(entries, {cid: c.screen.image for cid, c in approved.items()}, boxes)
+            results: list[cn.MutantResult] = []
+            produced: dict[str, CheckpointOutcome] = {}
+            writer = _Writer(run, ArtifactStore(out / "artifacts", f"runs/{scenario.run_id}"), today, scenario.clock)
+            rows_meta = []
+            arts_by_sha: dict[str, StoredArtifact] = {}
+            for m in gen.mutants:
+                cp = cps[m.checkpoint_id]
+                if m.failed or m.image is None:
+                    results.append(cn.MutantResult(m))
+                    continue
+                base_cap = approved[m.checkpoint_id]
+                model = _mutant_model(base_cap.model, m, boxes[m.checkpoint_id])
+                image = m.image
+                if m.defect_class == "window_offscreen":
+                    image = base_cap.screen.image    # Capture grabs the window by its DWM bounds (5.7): same pixels
+                mutant_cap = _static_capture(m.checkpoint_id, image, model, base_cap)
+                ev = evaluate(run, cp, base_cap, mutant_cap, x="undeclared", primitive=None, entry_ref=None,
+                              recapture=lambda c=mutant_cap: c, recapturable=_recapturable(cfg, cp), synthetic=True,
+                              injected=True)
+                rec, _, stored = writer.records(ev, synthetic=True, tag=m.mutant_id)
+                arts_by_sha.update({a.sha256: a for a in stored})
+                step_status = None
+                if m.defect_class == "gateway":
+                    step_status = "blocked_by_gateway"       # the simulated gateway refuses the unmatched Send template
+                absorbed = None
+                if ev.classified.outcome in ("identical", "noise"):
+                    masks = [f"mask {r.mask_ref} (region {r.id})" for r in ev.registry.regions if r.type == "mask"]
+                    absorbed = ", ".join(masks) if masks else None
+                results.append(cn.MutantResult(m, rec, absorbed_by=absorbed, step_status=step_status))
+                produced[m.key] = rec
+                rows_meta.append((m, ev))
+            report = cn.score(results, history=history or {}, since=f"{today.isoformat()} {scenario.clock[:5]} ET",
+                              context=cn.RowContext(scenario.run_id, "ws.tier-a.swing-trader", "swing_trader", "frozen"))
+            done.update(report=report, rows_meta=rows_meta, produced=produced, writer=writer, arts_by_sha=arts_by_sha)
+
+        shard = orch.run(canary_pass)
+        st = _Shard(ctx.shard_id, cfg.fixture.get("rig", "rig-01"), [], orch, orch.rig, orch.sink, clock, ctx)
+        for r in shard.results:
+            work._note(st, r)
+        work.summaries.append({"shard_id": ctx.shard_id, "rig": st.rig_id, "verdict": shard.verdict.status,
+                               "reason": shard.verdict.reason, "last_gate": shard.last_gate,
+                               "proof": proof_text(shard.proof),
+                               "gates": [{"control": r.control, "gate": r.gate, "passed": r.passed, "detail": r.detail}
+                                         for r in shard.results]})
+        work.write()
+        if "report" not in done:                 # a gate stopped the Nightly run before the canary pass
+            _register(store, cfg, [scenario.build.build_id])
+            store.begin_run(_run_plan(scenario.run_id, "nightly", cfg.root, (), (), started, None, None, None))
+            runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", shard.verdict.status, shard.last_gate,
+                                              reason=shard.verdict.reason, started_at=started,
+                                              ended_at=_ts(today, scenario.clock, 600)))
+            return RunResult(scenario.run_id, "nightly", runrec.status, runrec.reason, out, alerts=work.alerts,
+                             shards=work.summaries, proof=proof_text(shard.proof))
+        report, rows_meta = done["report"], done["rows_meta"]
+        produced, writer, arts_by_sha = done["produced"], done["writer"], done["arts_by_sha"]
         # -- store: identity, the run, synthetic rows (one per checkpoint at most, run docstring)
         _register(store, cfg, [scenario.build.build_id])
         store.register_checkpoints([ScopeEntry(cp.checkpoint_id, cp.workspace_id, cp.persona, cp.tier, cp.data_mode,
@@ -1859,7 +1902,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                     f"{r.absorbed_by or 'not recorded'}", scenario.run_id, checkpoint_id=r.checkpoint_id, tier=1,
                     evidence={"raw_values": {"state": r.state, "money_cell": str(r.money_cell)}},
                     created_at=_ts(today, scenario.clock, 1800)))
-        runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", "complete", "reported", started_at=started,
+        runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", shard.verdict.status, "reported",
+                                          reason=shard.verdict.reason, started_at=started,
                                           ended_at=_ts(today, scenario.clock, 2 * 3600)))
         money = [r for r in report.results if r.money_cell and r.state != "generation_failed"]
         other = [r for r in report.results if not r.money_cell and r.state != "generation_failed"]
@@ -1888,7 +1932,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         render_run_report(runrec, outcomes, store.findings(scenario.run_id), [], {}, health, None, ctx,
                           out / f"nightly-report-{scenario.run_id}.html")
         res = RunResult(scenario.run_id, "nightly", runrec.status, runrec.reason, out, outcomes,
-                        store.findings(scenario.run_id))
+                        store.findings(scenario.run_id), alerts=work.alerts, shards=work.summaries,
+                        proof=proof_text(shard.proof))
         res.canary = {"report": report, "health": canary_health, "produced": produced, "evals": rows_meta,
                       "simulated": sorted(wanted)}
         return res

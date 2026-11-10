@@ -8,7 +8,7 @@ the schemas of 4.1 can check their RFC 3339 form) and reads only `true` and `fal
 Choices where 4.1 names a directory but not a file name (reported):
 
 - a workspace corpus entry is any `corpus/workspaces/<id>/*.yaml` next to its workspace file;
-- `fixtures/margin_rules.yaml` is not a fixture (4.1 lists it separately);
+- `fixtures/margin_rules.yaml` is not a fixture (4.1 lists it separately); it is read as `margin_rules`;
 - `flows/RENAMES.yaml` is the rename map, every other `flows/**/*.yaml` is a flow file.
 """
 from __future__ import annotations
@@ -61,6 +61,7 @@ LAYOUT: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("workspace", ("corpus/workspaces/*/*.yaml",)),
     ("regions", ("regions/**/*.yaml",)),
     ("mask", ("masks/**/*.yaml",)),
+    ("margin_rules", ("fixtures/margin_rules.yaml",)),
     ("fixture", ("fixtures/*.yaml",)),
     ("profile", ("profiles/*.yaml",)),
     ("allowlist", ("gateway/allowlist.yaml",)),

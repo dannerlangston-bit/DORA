@@ -23,7 +23,9 @@ Choices (reported): the `<item>` parameter is `item1` to `item5`, or the precond
 (`hook_open`, `attestation`, `injector`, `account`) for a failed precondition; with several failed items
 the first names the reason and the rest go in `detail`. The gateway attempts are refused with the slow-half codes of 4.13
 (gateway.py choice 1): `guarded_key_refused` for the keys and chords of items 1 and 3, `deny_profile` for
-the ladder cell of item 2 (deny geometry outside an order-stage step) and `shift_click_dialog` for item 4.
+the ladder cell of item 2 (deny geometry outside an order-stage step), and for item 4 `shift_click_dialog` on
+the ticket's Buy button and `deny_profile` on the ladder cell, because the deny profile runs before the flag
+re-check in stage 4 of 5.4.3 (the hook drops both raw attempts `shift_click_dialog`).
 """
 from __future__ import annotations
 
@@ -63,8 +65,11 @@ def expected_records(chords: Sequence[Chord]) -> Counter[DrillRecord]:
     for _ in chords:
         exp[DrillRecord(3, "gateway", "refused", "guarded_key_refused")] += 1
         exp[DrillRecord(3, "raw", "dropped", "blocked_chord_dialog")] += 1
+    # item 4: the slow half runs the deny profile before the flag re-check (5.4.3 stage 4), so the ladder cell is
+    # refused as order geometry outside an order-stage step before its Shift is seen; the hook drops both raw
+    exp[DrillRecord(4, "gateway", "refused", "shift_click_dialog")] += 1         # ticket Buy button
+    exp[DrillRecord(4, "gateway", "refused", "deny_profile")] += 1               # ladder cell
     for _ in ("ticket buy button", "ladder cell"):
-        exp[DrillRecord(4, "gateway", "refused", "shift_click_dialog")] += 1
         exp[DrillRecord(4, "raw", "dropped", "shift_click_dialog")] += 1
     return exp
 

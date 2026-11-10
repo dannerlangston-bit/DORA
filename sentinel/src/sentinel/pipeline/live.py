@@ -2,7 +2,9 @@
 
 The default Reviewer of every run is the offline `SimulatedReviewer`. `--reviewer live` (`sentinel demo`,
 `sentinel run`) gives `run.run_pipeline` a PR-run `reviewer.ReviewerJob` from `live_job`, which exists only
-when `ANTHROPIC_API_KEY` is set (`reviewer.NetworkNotAllowed` otherwise, before any client is built). The
+when `ANTHROPIC_API_KEY` is set (`reviewer.NetworkNotAllowed` otherwise, before any client is built), with
+the settings of a `reviewer:` block (`load_reviewer_config`, `--reviewer-config FILE`; the example config
+has no such block, so the defaults of `reviewer.config` apply unless a file is given). The
 run then builds `ModelReviewer(job, ItemBuilder(...))`: the pipeline's `ReviewRequest` carries no pixels,
 so `ItemBuilder` turns each request into the full 3.12 `ReviewItem`:
 
@@ -16,25 +18,39 @@ so `ItemBuilder` turns each request into the full 3.12 `ReviewItem`:
   untrusted screen text, the manifest entry (task A) or dependency edge (task B), and the version fields
   of the verdict cache (base and candidate crop hashes, mask, redaction and registry versions).
 
-`review_requests` builds the items of a finished run for `sentinel review --live`, which hands them to
-`reviewer.review_live` (network only with `allow_network=True` and a key).
+`CollectingReviewer` answers a run offline and keeps every request's `ReviewItem`; `sentinel review --live`
+hands them to `reviewer.review_live` (network only with `allow_network=True` and a key).
 """
 from __future__ import annotations
 
 import hashlib
-from typing import Any, Callable, Mapping, Sequence
+from pathlib import Path
+from typing import Any, Callable, Mapping
 
 import cv2
 import numpy as np
+import yaml
 
-from ..reviewer import ReviewerConfig, ReviewerJob
+from ..reviewer import ConfigError, ReviewerConfig, ReviewerJob
 from ..reviewer.images import crop_box
 from ..reviewer.prompt import DependencyEdge, DiffMetrics, FlowContext, ManifestEntryRef, ReviewItem, StepCrops
 from ..reviewer.transport import AnthropicTransport
 from ..store.artifacts import ArtifactStore, Redaction
-from .reviewer import ReviewRequest
+from .reviewer import ReviewRequest, SimulatedReviewer
 
 Box = tuple[int, int, int, int]
+
+
+def load_reviewer_config(path: str | Path | None) -> ReviewerConfig:
+    """The `reviewer:` block of a YAML file through `ReviewerConfig.from_mapping` (unknown keys refused);
+    the defaults (the model pin of `reviewer.config`) without a file."""
+    if path is None:
+        return ReviewerConfig()
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    block = data.get("reviewer") if isinstance(data, dict) else None
+    if not isinstance(block, dict):
+        raise ConfigError(f"{path}: no `reviewer:` mapping")
+    return ReviewerConfig.from_mapping(block)
 
 
 def live_job(env: Mapping[str, str] | None = None, config: ReviewerConfig | None = None) -> ReviewerJob:
@@ -150,7 +166,18 @@ class ItemBuilder:
             mask_version=masks or "none", redaction_version=self.redaction.version, registry_version=registry)
 
 
-def review_requests(collected: Sequence[tuple[ReviewRequest, dict]], item_for: Callable[[ReviewRequest], ReviewItem]
-                    ) -> list[ReviewItem]:
-    """The `ReviewItem`s of the requests a run sent its Reviewer, for `reviewer.review_live`."""
-    return [item_for(req) for req, _ in collected]
+class CollectingReviewer:
+    """The offline `SimulatedReviewer` answering a run, keeping the `ReviewItem` of every request it got, for
+    `sentinel review --live` to hand to `reviewer.review_live`. The run sets `item_for` (an `ItemBuilder`)."""
+
+    def __init__(self) -> None:
+        self.sim = SimulatedReviewer()
+        self.model_id, self.prompt_hash = self.sim.model_id, self.sim.prompt_hash
+        self.item_for: Callable[[ReviewRequest], ReviewItem] | None = None
+        self.items: list[ReviewItem] = []
+
+    def review(self, request: ReviewRequest) -> dict:
+        if self.item_for is None:
+            raise RuntimeError("the run has not bound an ItemBuilder to this reviewer")
+        self.items.append(self.item_for(request))
+        return self.sim.review(request)

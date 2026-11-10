@@ -10,6 +10,14 @@ flag and writes the Send deny rectangle), `Delete` closes it, and an Enter, a Sp
 that reaches the app while the dialog is open sends an order, which appears as a new Working row. So a
 bypass that the gateway failed to stop is visible to the post-run proof exactly as on a real rig.
 
+As on a real rig, the flag has three sources (5.4.6): the dialog by enumeration, the docked ticket by the
+detector, and the flow's sticky `order_stage` declaration. A cleared action of an order-stage step sets the
+sticky flag before its first event is emitted; a `close_dialog` or `clear_ticket` teardown action that
+completes with the dialog and the ticket absent releases it, and so does killing the process tree. The
+Watcher is polled again after every emitted event, so the hook reads the flag per event: an Enter that
+follows the `Confirm and Send` click in the same action meets the open dialog's flag. An agent or Explorer
+action refused because the flag is up is listed in `flag_aborts` (the caller takes the 5.4.6 path).
+
 `MemorySink` is an in-memory `OutcomeSink` over a list of scoped checkpoint ids, and `default_context`
 builds the `RunContext` that matches the default scenario (the example config's rig-01 accounts).
 """
@@ -93,6 +101,8 @@ class SimulatedRig(Rig):
         self.selected = self.s.selected
         self.dialog_open = False
         self.ticket_visible = False
+        self.order_stage = False                  # the sticky order_stage declaration (5.4.6 source 3)
+        self.flag_aborts: list[str] = []          # profiles of agent or Explorer actions refused under the flag
         self.attested = False
         self.app_running = False
         self.book = self.s.book
@@ -192,8 +202,9 @@ class SimulatedRig(Rig):
     def _watch(self) -> None:
         """One Window Watcher poll: the dialog sets the flag and its Send button is a deny rectangle (5.4.6)."""
         now = self.clock.monotonic()
-        flag = self.watcher.poll(enumeration_hit=self.dialog_open, detector_hit=self.ticket_visible, sticky=False)
-        if not (self.dialog_open or self.ticket_visible) and flag != Flag.CLEAR:
+        flag = self.watcher.poll(enumeration_hit=self.dialog_open, detector_hit=self.ticket_visible,
+                                 sticky=self.order_stage)
+        if not (self.dialog_open or self.ticket_visible or self.order_stage) and flag != Flag.CLEAR:
             flag = self.watcher.poll(enumeration_hit=False, detector_hit=False, sticky=False)
         self.gw.stamp_watcher(flag, now)
         self.gw.write_deny_rects([DenyRect(SEND_RECT, "Send")] if self.dialog_open else [])
@@ -215,13 +226,15 @@ class SimulatedRig(Rig):
     # -- input ------------------------------------------------------------------------------------------
     def _emit(self, a: Action, dialog_ok: bool) -> list[tuple[InputEvent, Any]]:
         """Stages 5 to 7 for one cleared action: the absolute move (before any token is pending, so the hook's
-        move rule allows it), the tokens, then each event through the hook and the app."""
+        move rule allows it), the tokens, then each event through the hook and the app, with a Watcher poll
+        after every event so the hook acts on the flag as the app has just changed it (5.4.6)."""
         now = self.clock.monotonic()
         steps: list[InputEvent] = []
         out: list[tuple[InputEvent, Any]] = []
 
         def run(e: InputEvent) -> None:
             out.append((e, self._through(a, e, now)))
+            self._watch()
 
         before = self.gw.tokens_issued
         if a.is_pointer and a.point is not None:
@@ -279,14 +292,23 @@ class SimulatedRig(Rig):
         ctx = SafetyContext(flag=self.gw.effective_flag(now), order_dialog_present=self.dialog_open,
                             deny_rects=tuple(self.gw.deny_rects), chords=tuple(self.gw.chords),
                             attestation_passed=self.attested, paper_assertion_current=True,
-                            deny_list_hit=match_deny(title=title, labels=action.labels, target_kind=action.target_kind)
-                            if action.profile != "scripted" else None, hook_alive=self.gw.hook_alive(now))
+                            deny_list_hit=match_deny(title=title, labels=action.labels, target_kind=action.target_kind,
+                                                     end_kind=action.end_kind)
+                            if action.profile != "scripted" else None, hook_alive=self.gw.hook_alive(now),
+                            order_stage=self.order_stage)
         s = slow_half(action, ctx)
         if s.refused:
             self.refusals += 1
+            if s.flag_abort:
+                self.flag_aborts.append(action.profile)
             return EmitResult(refused=s)
+        if action.order_stage_step and not self.order_stage:
+            self.order_stage = True              # the declaration sets the flag before the click is emitted (6.2)
+            self._watch()
         out = self._emit(action, s.dialog_ok)
         self._frame += 1
+        if action.teardown_action in ("close_dialog", "clear_ticket") and not (self.dialog_open or self.ticket_visible):
+            self.order_stage = False             # the teardown completed and the dialog and ticket are absent
         self._watch()
         return EmitResult(decisions=tuple(d for _, d in out), events=tuple(e for e, _ in out))
 
@@ -323,6 +345,7 @@ class SimulatedRig(Rig):
         self._log("kill_process_tree")
         self.app_running = False
         self.dialog_open = False
+        self.order_stage = False                 # the flow that declared it is gone with the tree
         return True
 
     def teardown(self) -> TeardownObservation:

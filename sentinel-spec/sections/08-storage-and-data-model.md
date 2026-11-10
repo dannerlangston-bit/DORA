@@ -870,7 +870,7 @@ CREATE TABLE post_run_proofs (              -- 6.6: ORDER SAFETY PROOF, one per 
   shard_id          TEXT PRIMARY KEY REFERENCES shards(shard_id),
   run_id            TEXT NOT NULL REFERENCES runs(run_id),
   login_alias       TEXT NOT NULL REFERENCES logins(login_alias),
-  verdict           TEXT NOT NULL CHECK (verdict IN ('proven_no_sends','proven_declared_sends','proven_no_session','unproven')),   -- proven_no_session: no token issued, read from the gateway log (6.6)
+  verdict           TEXT NOT NULL CHECK (verdict IN ('proven_no_sends','proven_declared_sends','proven_no_session','unproven','orders_sent')),   -- proven_no_session: no token issued, read from the gateway log; orders_sent: a clean read found an undeclared row (6.6)
   reason            TEXT,
   send_policy_ref   TEXT NOT NULL,          -- risk owner decision id from policy/send_policy.yaml
   counts_json       TEXT NOT NULL,          -- working, filled, canceled, position rows: start, end, new, expected; net liq start, end, drift

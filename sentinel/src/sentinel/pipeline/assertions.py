@@ -26,15 +26,12 @@ What the Oracle is given (4.7, 2.8.1):
 An `OracleConfigError` at run time (a flow the lint accepted but the Oracle cannot evaluate) is a
 harness fault, `harness_error (reason: exception:OracleConfigError)`, never a pass or a product failure.
 
-WORKAROUND(oracle): `present` and `absent` with a `format` and no `pattern` parse the region's whole
-text as one value, so a column region (the example's `ps_qty` over seven Qty rows) can never hold "an
-int value". When such an assertion meets a region that reads more than one row, `FlowOracle` evaluates
-it once per row with the Oracle itself and keeps the first row that does not pass (every row passes:
-passed). Reported to the coordinator.
+A column region reads one row per line (`sim.region_values`), so a format-only `present` or `absent` over
+it (the example's `ps_qty` over seven Qty rows) is judged row by row by the Oracle itself (oracle choice).
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Mapping
@@ -48,7 +45,6 @@ from .config import SentinelConfig
 from .sim import Capture, region_values
 
 OCR_CONFIDENCE = 95.0                  # what the simulated OCR reports for a drawn glyph (above every floor, 2.8.1)
-MULTI_ROW_KINDS = ("present", "absent")
 
 
 @dataclass
@@ -107,7 +103,6 @@ class FlowOracle:
         prev = self.previous.setdefault((side, flow_id), {})
         ctx = self.context(flow_id, step, data_mode)
         results = oracle.evaluate_assertions(step, sources, prev, self.cfg.fixture, self.rules, context=ctx)
-        results = [self._per_row(a, r, values, sources, prev, ctx) for a, r in zip(step_assertions(step), results)]
         reads = {rid: extract(rid, "text", {"ocr": sources["ocr"]}, "ocr") for rid in values}
         for r in results:
             for ext in r.operands.values():
@@ -115,23 +110,3 @@ class FlowOracle:
                     reads[ext.field] = ext
         prev[step_id] = reads
         return OracleCheck(oracle.summarize(results), values)
-
-    def _per_row(self, a: Mapping[str, Any], r: AssertionResult, values: Mapping[str, str | None],
-                 sources: Mapping[str, Any], prev: Mapping[str, Mapping[str, Extraction]],
-                 ctx: EvalContext) -> AssertionResult:
-        """WORKAROUND(oracle): a format-only `present` or `absent` over a column, row by row (module docstring)."""
-        text = values.get(str(a.get("region"))) or ""
-        rows = text.split("\n")
-        if a.get("kind") not in MULTI_ROW_KINDS or a.get("pattern") is not None or a.get("format") in (None, "text") \
-                or len(rows) < 2:
-            return r
-        per = []
-        for row in rows:
-            one = dict(values, **{str(a["region"]): row})
-            srcs = dict(sources, ocr=GroundTruthReader(one, confidence=OCR_CONFIDENCE))
-            per.append(oracle.evaluate_assertions({"expect": [a]}, srcs, prev, self.cfg.fixture, self.rules,
-                                                  context=ctx)[0])
-        worst = next((x for x in per if x.status != "passed"), None)
-        if worst is None:
-            return replace(per[0], extracted=repr(text), operands=r.operands)
-        return worst

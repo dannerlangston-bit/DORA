@@ -291,10 +291,13 @@ def render_run_report_html(report: RunReport, *, objects_dir: str | os.PathLike 
                      + (_table(["Checkpoint", "Region", "Decision", "Action (verdict)", "By", "Ticket"], rows)
                         if rows else '<p class="muted">0 findings matched an earlier decision.</p>') + "</section>")
         cov_rows = [[_e(c) for c in row] for row in report.coverage_rows]
-        parts.append('<section id="coverage"><h2>Coverage</h2>'
-                     + _table(["Tier", "Registered", "In scope", "Covered", "Not compared", "not_run"], cov_rows)
-                     + f"<p>{_inline(report.scope_line)}</p><h3>Coverage matrix</h3>{_matrix(report)}"
-                     + "</section>")
+        if cov_rows:
+            parts.append('<section id="coverage"><h2>Coverage</h2>'
+                         + _table(["Tier", "Registered", "In scope", "Covered", "Not compared", "not_run"], cov_rows)
+                         + f"<p>{_inline(report.scope_line)}</p><h3>Coverage matrix</h3>{_matrix(report)}"
+                         + "</section>")
+        else:                                         # the run stopped before scope
+            parts.append(f'<section id="coverage"><h2>Coverage</h2><p>{_inline(report.scope_line)}</p></section>')
         parts.append('<section id="health"><h2>Run health</h2>'
                      + _table(["Item", "Value"], [[_e(k), _inline(v)] for k, v in report.health_rows]) + "</section>")
         if report.history:

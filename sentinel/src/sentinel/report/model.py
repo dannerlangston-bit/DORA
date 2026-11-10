@@ -17,7 +17,8 @@ Inputs beyond the records, and where each comes from:
   `wall_clock`, `budget`, `shards`, `fingerprint` {candidate, base}, `reviewer` {cost_usd, tier,
   top_tier_usd}, `canary` {money_detected, money_total, other_detected, other_total,
   detector_state, date}, `safety` {attestation, paper_mode_asserted, gateway_drops, cancel_all,
-  proof, login}, `integrations` {pr_comment {state, time}, jira_queued, slack {queued, to, posts}},
+  proof (a 6.6 verdict in one of the `PROOF_FORMS`), login}, `integrations` {pr_comment {state, time},
+  jira_queued, slack {queued, to, posts}},
   optional `env_errors` [{gate, shard, screenshot}], `shard_rerun_queued`, `steps` (counts).
   Counts that outcome rows determine (env and harness errors, not settled, re-runs, Reviewer
   calls, layout shift) are computed here, never read from `health`.
@@ -50,6 +51,11 @@ Choices where 9.2 is silent (reported to the coordinator):
   per surface" (9.3 says "per cell" for its Flexible Grid cells; no record carries that noun).
 - Comparable scope for the coverage percent is in-scope cells minus `not_run (entitlement)`
   minus not-compared (blocked) cells (2.12: blocked cells are not in the coverage percent).
+- A run that stopped before scope (no coverage tiers and no scope facts) prints "Scope not computed" in place
+  of an empty Coverage table, and an unread fingerprint prints "not read". An `aborted_safety` that disabled
+  several rigs names them all; an `aborted_harness` that re-queuing cannot fix prints "Not re-queued: {why}"
+  (abort key `not_requeued`). ORDERS SENT, the most severe proof verdict (6.6), adds the blocked login and
+  disabled rig to the Safety row and the abort block (`ORDERS_SENT_NOTE`).
 - `aborted_safety` and `aborted_harness` replace Unexpected and Intended with the abort block
   and keep Suppressed, Coverage and Run health; `pool_saturated` and `dead_man` comments carry
   only the header and the abort text; a secret leak carries only the header, result, check and
@@ -122,6 +128,30 @@ class ReportInputError(ValueError):
     """The inputs cannot be rendered faithfully (unknown mode, vocabulary or shape)."""
 
 
+# 6.6: the post-run proof verdict forms the Reporter prints (`Proof.line`), least to most severe. ORDERS SENT means
+# a clean read found an undeclared order row: an order was sent (the run is aborted_safety, S1).
+PROOF_FORMS = ("PROVEN: ", "UNPROVEN: ", "ORDERS SENT: ")
+PROVEN_PROOF, UNPROVEN_PROOF, ORDERS_SENT_PROOF = range(3)
+ORDERS_SENT_NOTE = ("an order reached the account: login {login} blocked and rig disabled until a human verifies "
+                    "the account and the incident closes")
+
+
+def proof_severity(proof: str) -> int:
+    """How severe a post-run proof verdict is: `PROVEN_PROOF`, `UNPROVEN_PROOF` or `ORDERS_SENT_PROOF`, the most
+    severe (6.6). Any other text is refused."""
+    for severity, form in enumerate(PROOF_FORMS):
+        if proof.startswith(form):
+            return severity
+    raise ReportInputError(f"post-run proof verdict {proof!r} (6.6)")
+
+
+def worst_proof(proofs: list[str]) -> str:
+    """The most severe of several proof verdicts (one per shard), the first of equals; 6.6, 8.2."""
+    if not proofs:
+        raise ReportInputError("no post-run proof verdict (6.6)")
+    return max(proofs, key=proof_severity)
+
+
 @dataclass(frozen=True)
 class ReportContext:
     """Run-level facts 9.2 prints that no outcome record holds."""
@@ -134,7 +164,7 @@ class ReportContext:
     base_reused_from: str | None = None          # merge run whose frozen base captures were reused (3.1)
     detector_banner: str | None = None           # 10.3 banner text, verbatim
     reviewer_disabled: dict | None = None        # {"since": date, "gate": eval gate name} (10.4)
-    abort: dict = field(default_factory=dict)    # abort block facts, see `_abort_block`
+    abort: dict = field(default_factory=dict)    # abort block facts, see `_abort`
     history: tuple[dict, ...] = ()               # earlier runs: {run_id, candidate, result, counts, reported}
     marker_recreated: bool = False               # 9.1: the marker comment was missing; a new one was made
     report_late: bool = False                    # 9.1: posted after the PR run's budget deadline
@@ -402,6 +432,8 @@ class _Prose:
         else:
             text = self.b.description(cl) or (rep.finding.description if rep.finding else "") or ""
         rng = self.range_summary(cl, rep, group)
+        if text and rng and not text.endswith((".", "!", "?")):
+            text += "."                                   # a record's description may lack the full stop
         return (T(" ".join(x for x in (text, rng) if x)),)
 
     def range_summary(self, cl: Cluster, rep: Member, group: int) -> str:
@@ -1011,6 +1043,8 @@ def coverage_rows(coverage: dict) -> list[tuple[str, ...]]:
 
 
 def scope_line(b: _Builder) -> Line:
+    if not b.coverage.get("tiers") and not b.coverage.get("scope"):
+        return (T(f"Scope not computed: the run stopped at {b.run.last_gate} before it planned any checkpoint."),)
     s = b.coverage.get("scope", {})
     n_decl = int(s.get("declared_surfaces", len(b.declared)))
     edges = int(s.get("edges", 0))
@@ -1117,14 +1151,16 @@ def _canary_row(c: dict) -> Line:
 
 def _safety_row(s: dict) -> Line:
     proof = s.get("proof", "unknown")
-    if not (proof.startswith("PROVEN: ") or proof.startswith("UNPROVEN: ")):
-        raise ReportInputError(f"post-run proof verdict {proof!r} (6.6)")
+    severity = proof_severity(proof)
     text = (f"attestation {s.get('attestation', 'unknown')}, paper mode asserted "
             f"{plural(int(s.get('paper_mode_asserted', 0)), 'time')}, "
             f"gateway {plural(int(s.get('gateway_drops', 0)), 'drop')}, "
             f"Cancel All {s.get('cancel_all', 'unknown')}, proof {proof}")
-    if proof.startswith("UNPROVEN"):
-        text += f"; next run on login {s.get('login', 'unknown')} blocked until a human verifies the account"
+    login = s.get("login", "unknown")
+    if severity == ORDERS_SENT_PROOF:
+        text += "; " + ORDERS_SENT_NOTE.format(login=login)
+    elif severity == UNPROVEN_PROOF:
+        text += f"; next run on login {login} blocked until a human verifies the account"
     return (T(text),)
 
 
@@ -1175,7 +1211,9 @@ def health_rows(b: _Builder, items: list[Item], intended_clusters: list[Cluster]
     fp = h.get("fingerprint", {})
     cand, base = fp.get("candidate", "unknown"), fp.get("base", "unknown")
     fp_text = f"candidate {cand} = base {base}" if cand == base else f"candidate {cand} != base {base}"
-    if cand == base and b.ctx.candidate_build != b.ctx.base_build:
+    if "unknown" in (cand, base):
+        fp_text = "not read"
+    elif cand == base and b.ctx.candidate_build != b.ctx.base_build:
         fp_text += " (build id differs, as expected)"
     if b.ctx.base_reused_from:
         fp_text += f"; base captures reused from {b.ctx.base_reused_from}"
@@ -1263,9 +1301,17 @@ def _abort(b: _Builder, members: list[Member]) -> tuple[str | None, str | None, 
         img = b.urls.image("screenshot", a.get("screenshot"))
         if img is not None:
             lines.append((T("Last screenshot: "), Link("screenshot", img.url)))
-        proof = a.get("proof") or b.health.get("safety", {}).get("proof", "unknown")
-        lines += [(T(f"Post-run proof: {proof}"),), (T(f"Incident: {a.get('incident', 'unknown')}"),),
-                  (T(f"No run starts on rig {a.get('rig', 'unknown')} until the incident closes."),)]
+        safety = b.health.get("safety", {})
+        proof = a.get("proof") or safety.get("proof", "unknown")
+        lines.append((T(f"Post-run proof: {proof}"),))
+        if proof != "unknown" and proof_severity(proof) == ORDERS_SENT_PROOF:
+            note = ORDERS_SENT_NOTE.format(login=a.get("login") or safety.get("login", "unknown"))
+            lines.append((T(note[0].upper() + note[1:] + "."),))
+        rigs = a.get("rig", "unknown")
+        rigs = [rigs] if isinstance(rigs, str) else list(rigs)
+        lines += [(T(f"Incident: {a.get('incident', 'unknown')}"),),
+                  (T(f"No run starts on {'rig' if len(rigs) == 1 else 'rigs'} {words_and(rigs)} until the incident "
+                     "closes."),)]
         listed = [m for m in members if not m.suppressed]
         if listed:
             lines.append((T(f"{plural(len(listed), 'finding')} recorded before the abort, collapsed on the "),
@@ -1288,7 +1334,10 @@ def _abort(b: _Builder, members: list[Member]) -> tuple[str | None, str | None, 
         img = b.urls.image("screenshot", a.get("screenshot"))
         if img is not None:
             lines.append((T("Screenshot: "), Link("screenshot", img.url)))
-        lines.append((T(f"Re-queued once: {a.get('requeued') or 'already re-queued'}"),))
+        if a.get("not_requeued"):                        # re-queuing cannot help, e.g. a config that fails lint
+            lines.append((T(f"Not re-queued: {a['not_requeued']}"),))
+        else:
+            lines.append((T(f"Re-queued once: {a.get('requeued') or 'already re-queued'}"),))
         return special, "Abort", lines
     return None, None, []
 

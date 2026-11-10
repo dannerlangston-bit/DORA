@@ -214,6 +214,8 @@ def _suppressed(r: RunReport, collapsed: bool) -> list[str]:
 
 
 def _coverage(r: RunReport) -> list[str]:
+    if not r.coverage_rows:                           # the run stopped before scope: no table to show
+        return ["", "**Coverage**", _md(r.scope_line)]
     lines = ["", "**Coverage**", "| Tier | Registered | In scope | Covered | Not compared | not_run |",
              "|---|---|---|---|---|---|"]
     lines += [_row(list(row)) for row in r.coverage_rows]

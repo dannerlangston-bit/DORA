@@ -13,13 +13,14 @@ attestation mismatch at any read; a dead Orchestrator heartbeat while the ticket
 scripted login with A1 and A2, Working read, `Cancel All` when a row is new, re-read until clean or
 60 s, the Monitor reads, the proof, and the snapshot revert.
 
-`post_run_proof` gives one of the four verdicts: `PROVEN: no orders sent`, `PROVEN: only declared
-sends` (gated branch), `PROVEN: no session established`, or `UNPROVEN` with `recovery_login_failed`,
-`monitor_unreadable`, `cancel_all_failed`, `snapshot_missing` or `session_unavailable`. `proof_result`
-turns it into the run effect: an undeclared new row is `aborted_safety (reason: undeclared_order_row)`
-after the fact (S1); UNPROVEN is `complete_with_env_errors (reason: unproven_proof)` unless the run is
-already `aborted_safety`, blocks the next run on the login, and a second UNPROVEN in a row on one login
-disables the rig and files a `harness_error` finding against the proof flow.
+`post_run_proof` gives one of the five verdicts: `PROVEN: no orders sent`, `PROVEN: only declared
+sends` (gated branch), `PROVEN: no session established`, `UNPROVEN` with `recovery_login_failed`,
+`monitor_unreadable`, `cancel_all_failed`, `snapshot_missing` or `session_unavailable`, or `ORDERS SENT`
+when a clean read finds an undeclared new Working, Filled or Canceled row, the most severe. `proof_result`
+turns it into the run effect: ORDERS SENT is `aborted_safety (reason: undeclared_order_row)` after the fact
+(S1), with the login blocked and the rig disabled; UNPROVEN is `complete_with_env_errors (reason:
+unproven_proof)` unless the run is already `aborted_safety`, blocks the next run on the login, and a second
+UNPROVEN in a row on one login disables the rig and files a `harness_error` finding against the proof flow.
 
 Choices (reported):
 
@@ -32,13 +33,13 @@ Choices (reported):
 3. The no-session rule is applied literally: the login never authenticated and the gateway issued no
    token in the run. A login that typed credentials issued secret tokens, so it takes the normal path.
 4. `Cancel All` re-reads Working every 5 s until it shows no new row or 60 s pass.
-5. 6.6 names four verdicts and none fits a clean read that finds an undeclared row; such a proof has the
-   verdict `ORDERS SENT: undeclared rows` and lists the rows, and the run effect is `aborted_safety
-   (reason: undeclared_order_row)`. With `Cancel All` failed as well the verdict is UNPROVEN
-   (`cancel_all_failed`) and the rows are still listed and still abort the run. `Proof.line` writes the
-   text form of 6.6 (`PROVEN: ...`, `UNPROVEN: <reason>`), and for undeclared rows
-   `UNPROVEN: undeclared_order_row (<rows>)`, the run's abort reason naming the rows. The abort is decided at
-   `teardown`, so unreached checkpoints carry `env_error (gate: teardown, reason: undeclared_order_row)`.
+5. Undeclared rows found by a clean read are ORDERS SENT whatever `Cancel All` did, so `Cancel All` failing
+   on undeclared rows reads `ORDERS SENT: ...; Cancel All failed`; UNPROVEN `cancel_all_failed` is left for
+   a Cancel All that failed with no undeclared row (declared sends of the gated branch left Working, or a
+   teardown Cancel All not verified). When no undeclared row is Working, `Cancel All` was not
+   needed and the line says so (`Cancel All not needed`; 6.6 writes the form with `verified` and `failed`).
+   The abort is decided at `teardown`, so unreached checkpoints carry `env_error (gate: teardown, reason:
+   undeclared_order_row)`.
 6. Every proof records what `Cancel All` did (`Proof.cancel_all`: `not_needed`, `done` or `failed`).
    `cancel_new_working` is the one Cancel All and re-read loop of 6.6 step 5, used by the kill switch
    sequence and by the recovery proof of machine.py.
@@ -64,7 +65,9 @@ PROVEN_NONE = "PROVEN: no orders sent"
 PROVEN_DECLARED = "PROVEN: only declared sends"
 PROVEN_NO_SESSION = "PROVEN: no session established"
 UNPROVEN = "UNPROVEN"
-ORDERS_SENT = "ORDERS SENT: undeclared rows"      # outside the four verdicts (choice 5)
+ORDERS_SENT = "ORDERS SENT: undeclared rows"      # the fifth verdict, the most severe (6.6, choice 5)
+# what Cancel All did, as the ORDERS SENT line prints it (6.6)
+CANCEL_ALL_TEXT = {"done": "verified", "failed": "failed", "not_needed": "not needed"}
 UNPROVEN_REASONS = ("recovery_login_failed", "monitor_unreadable", "cancel_all_failed", "snapshot_missing",
                     "session_unavailable")
 # 4.13 aborted_safety codes a trigger keeps as the run reason (choice 1)
@@ -178,6 +181,9 @@ class Proof:
             raise ValueError(f"cancel_all {self.cancel_all!r}")
         if (self.verdict == UNPROVEN) != (self.reason is not None) or (self.reason and self.reason not in UNPROVEN_REASONS):
             raise ValueError(f"proof reason {self.reason!r} with {self.verdict}")
+        if (self.verdict == ORDERS_SENT) != bool(self.undeclared):
+            raise ValueError(f"{self.verdict} with {len(self.undeclared)} undeclared row(s): ORDERS SENT exactly when "
+                             "a row is undeclared (6.6)")
 
     @property
     def proven(self) -> bool:
@@ -185,14 +191,14 @@ class Proof:
 
     @property
     def line(self) -> str:
-        """The VERDICT line in the text form of 6.6 and the Reporter's Safety row (9.x): `PROVEN: ...` or
-        `UNPROVEN: <reason>`. Undeclared rows (choice 5) read `UNPROVEN: undeclared_order_row (<rows>)`, the
-        run's abort reason naming the rows, since the Reporter knows only those two forms."""
-        rows = ", ".join(r.key for r in self.undeclared)
+        """The VERDICT line in the text form of 6.6, as the Reporter's Safety row and abort block print it (9.2):
+        `PROVEN: ...`, `UNPROVEN: <reason>`, or `ORDERS SENT: undeclared rows (<rows>); Cancel All <verified|failed>`
+        (`Cancel All not needed` when no undeclared row was Working, choice 5)."""
         if self.verdict == ORDERS_SENT:
-            return f"{UNPROVEN}: undeclared_order_row ({rows})"
+            rows = ", ".join(r.key for r in self.undeclared)
+            return f"{ORDERS_SENT} ({rows}); Cancel All {CANCEL_ALL_TEXT[self.cancel_all]}"
         if self.verdict == UNPROVEN:
-            return f"{UNPROVEN}: {self.reason}" + (f" (undeclared rows: {rows})" if rows else "")
+            return f"{UNPROVEN}: {self.reason}"
         return self.verdict
 
 
@@ -235,29 +241,27 @@ def _proof(p: ProofInputs) -> Proof:
     drift = None if p.start.net_liq is None or p.end.net_liq is None else abs(p.end.net_liq - p.start.net_liq)
     rows.append(ProofRow("net liq", p.start.net_liq, p.end.net_liq, 0, 0,
                          "ok" if drift is not None and drift <= p.net_liq_tolerance else "drift"))
-    if p.cancel_all == "failed":
-        return Proof(UNPROVEN, "cancel_all_failed", undeclared, declared, tuple(rows))
-    if undeclared:
+    if undeclared:                                       # a clean read: an order was sent (choice 5)
         return Proof(ORDERS_SENT, None, undeclared, declared, tuple(rows))
+    if p.cancel_all == "failed":                         # with no undeclared row (choice 5)
+        return Proof(UNPROVEN, "cancel_all_failed", (), declared, tuple(rows))
     if pos_change != 0 or drift is None or drift > p.net_liq_tolerance:
         return Proof(UNPROVEN, "monitor_unreadable", (), declared, tuple(rows))
     return Proof(PROVEN_DECLARED if declared else PROVEN_NONE, None, (), declared, tuple(rows))
 
 
 def proof_result(proof: Proof, *, run_so_far: RunVerdict | None = None, unproven_streak: int = 0) -> ControlResult:
-    """The run effect of a proof (6.6): undeclared row, UNPROVEN, or a passing proof.
+    """The run effect of a proof (6.6): ORDERS SENT (undeclared rows), UNPROVEN, or a passing proof.
 
     `unproven_streak` counts the UNPROVEN results on this login just before this one.
     """
     ev = {"verdict": proof.line, "undeclared": [r.key for r in proof.undeclared], "cancel_all": proof.cancel_all}
-    if proof.undeclared:
+    if proof.verdict == ORDERS_SENT:
         acts = ("block_login", "disable_rig")
         run, un = safety_abort_outcome("teardown", "undeclared_order_row")
         return ControlResult("proof", False, "teardown", run=run, unreached=un,
-                             alert=alerts.safety_abort().plus(paged=("login_owner",)) if not proof.proven
-                             else alerts.safety_abort(), actions=acts, incident="S1",
-                             detail="undeclared new order rows: " + ", ".join(r.key for r in proof.undeclared),
-                             evidence=ev)
+                             alert=alerts.safety_abort().plus(paged=("login_owner",)), actions=acts, incident="S1",
+                             detail=proof.line, evidence=ev)
     if not proof.proven:
         keep = run_so_far is not None and run_so_far.status == "aborted_safety"
         twice = unproven_streak + 1 >= 2

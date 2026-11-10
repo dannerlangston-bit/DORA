@@ -51,8 +51,8 @@ from .gateway import Chord, DropLedger
 from .gates import (AccountExpectation, WorkspaceExpectation, check_authenticated, check_canary_flow, check_fixture,
                     check_launched, check_provisioned, check_teardown, check_workspace, decide_run_outcome)
 from .identity import READ_GAP_S, Allowlist, judge_fixture_account, judge_identity, readable as selector_readable
-from .killswitch import (KillSwitchReport, Proof, ProofInputs, cancel_new_working, execute_kill_switch, post_run_proof,
-                         proof_result, recovery_login)
+from .killswitch import (ORDERS_SENT, KillSwitchReport, Proof, ProofInputs, cancel_new_working, execute_kill_switch,
+                         post_run_proof, proof_result, recovery_login)
 from .alerts import AlertRoute
 from .results import ControlResult, OutcomeSink, RunVerdict, write_unreached
 from .rig import OrderBook, Rig
@@ -91,14 +91,15 @@ class RunContext:
 
 @dataclass
 class RunReport:
-    """Everything one shard decided: the verdict, the last gate, every control result, the proof and fills."""
+    """Everything one shard decided: the verdict, the last gate, the post-run proof (every run ends with one, 6.6),
+    every control result, the kill switch sequence when it ran, and the unreached checkpoints filled."""
 
     run_id: str
     run_type: str
     verdict: RunVerdict
     last_gate: str
+    proof: Proof
     results: list[ControlResult] = field(default_factory=list)
-    proof: Proof | None = None
     kill_switch: KillSwitchReport | None = None
     filled: list[str] = field(default_factory=list)
 
@@ -286,8 +287,8 @@ class Orchestrator:
     # -- ending ----------------------------------------------------------------------------------------
     def _finish(self) -> RunReport:
         stop, rig, ctx = self.stop, self.rig, self.ctx
-        report = RunReport(ctx.run_id, ctx.run_type, RunVerdict("complete"), self.state)
         last_gate = self.state
+        ks: KillSwitchReport | None = None
         streak = ctx.history.unproven_streak
         so_far = stop.run if stop else None
         kill_switch_path = stop is not None and (stop.run_status == "aborted_safety" or stop.has("kill_switch"))
@@ -296,32 +297,32 @@ class Orchestrator:
         if kill_switch_path:
             ks = execute_kill_switch(rig, stop, clock=self.clock, allowlist=ctx.allowlist, start=self.start_book,
                                      fixture_account=ctx.fixture_account, run_so_far=so_far, unproven_streak=streak)
-            report.kill_switch, report.proof = ks, ks.proof
+            proof = ks.proof
             self.apply(ks.proof_effect)
         elif self.session == "never" or (self.session == "established" and self.start_book is None
                                          and rig.gateway_log().tokens_issued == 0):
             tokens = rig.gateway_log().tokens_issued
             proof = post_run_proof(ProofInputs(start=None, end=None, session="never", tokens_issued=tokens))
-            report.proof = proof
             self.apply(proof_result(proof, run_so_far=so_far, unproven_streak=streak))
         elif self.session == "kicked" or (stop is not None and stop.has("kill_tree")):
-            report.proof = self._recovery_proof(kicked=self.session == "kicked")
-            self.apply(proof_result(report.proof, run_so_far=so_far, unproven_streak=streak))
+            proof = self._recovery_proof(kicked=self.session == "kicked")
+            self.apply(proof_result(proof, run_so_far=so_far, unproven_streak=streak))
         else:
             self.state = last_gate = "teardown"
             obs = rig.teardown()
             self.apply(check_teardown(obs))
             end = rig.read_orders()
-            report.proof = post_run_proof(ProofInputs(start=self.start_book, end=end,
-                                                      cancel_all="not_needed" if obs.cancel_all_verified else "failed"))
-            effect = self.apply(proof_result(report.proof, run_so_far=so_far, unproven_streak=streak))
-            if report.proof.undeclared:
+            proof = post_run_proof(ProofInputs(start=self.start_book, end=end,
+                                               cancel_all="not_needed" if obs.cancel_all_verified else "failed"))
+            effect = self.apply(proof_result(proof, run_so_far=so_far, unproven_streak=streak))
+            if proof.verdict == ORDERS_SENT:
                 # 1.10, 6.6: an undeclared row at teardown is an aborted_safety; the kill switch sequence cancels it
                 ks = execute_kill_switch(rig, effect, clock=self.clock, allowlist=ctx.allowlist, start=self.start_book,
                                          fixture_account=ctx.fixture_account, run_so_far=effect.run,
                                          unproven_streak=streak)
-                report.kill_switch, report.proof = ks, ks.proof
+                proof = ks.proof
                 self.apply(ks.proof_effect)
+        report = RunReport(ctx.run_id, ctx.run_type, RunVerdict("complete"), last_gate, proof, kill_switch=ks)
         any_env = any(o is not None and o.outcome == "env_error"
                       for r in self.results for o in (r.unreached, r.checkpoint, *[s.outcome for s in r.outcomes]))
         report.verdict = decide_run_outcome([r.run for r in self.results], any_env_error=any_env,

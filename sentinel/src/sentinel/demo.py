@@ -18,7 +18,7 @@ and its calibration):
   dialog; the Oracle's R01 fails (`assertion_failed (assertion: cost_math)`).
 - `paper-mode-mismatch`: the account selector reads a live-format account id; the paper-mode gate
   aborts the run (`aborted_safety (reason: live_identity)`) before any capture.
-- `attempted-send`: the Executor presses Enter on the open Order Confirmation; the gateway refuses it,
+- `attempted-send`: the Executor presses Enter on the open Order Confirmation; the gateway blocks it,
   the run is `aborted_safety (reason: attempted_send)` and the proof shows no order went out.
 - `app-crash`: the app freezes during a sweep step; `assertion_failed (assertion: app_alive)`, the rest
   of the ladder `not_run (reason: app_crash)`, a relaunch, and the run goes on.
@@ -389,7 +389,11 @@ def _run_block(r: RunResult) -> list[str]:
     for f in r.findings:
         kinds[f.kind] = kinds.get(f.kind, 0) + 1
     if kinds:
-        lines.append("Findings stored: " + ", ".join(f"{n} {k}" for k, n in sorted(kinds.items())) + ".")
+        decided = sum(1 for f in r.findings if f.decision_ref)
+        lines.append("Findings stored: " + ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
+                     + (f"; {decided} of them carry an earlier human decision (the PR comment's 'Suppressed by "
+                        "decision' table; a finding keeps its kind, the decision sets the outcome)" if decided else "")
+                     + ".")
     if r.reviewer_calls:
         tasks: dict[str, int] = {}
         for c in r.reviewer_calls:
@@ -412,7 +416,8 @@ FILES = """Files in this folder:
   pr-comment.md       the PR comment Sentinel would post (9.2), exactly as rendered
   report.html         the static run report (9.5); open it in a browser, crops are embedded at 1:1
   commit-status.json  the sentinel/pr-run commit status (9.2)
-  sentinel.db         the SQLite store (8.3): runs, outcomes, findings, decisions, artifacts index
+  sentinel.db         the SQLite store (8.3): runs, outcomes, findings, decisions, step events (with each
+                      gateway block and its reason code), artifacts index
   artifacts/          content-addressed crops and heatmaps (8.4) with manifest.json
   calibration/        the A/A calibration file of the run's fingerprint (3.9)
   config/<run id>/    the exact config each run linted and used (the example plus the PR's files)
@@ -691,7 +696,9 @@ def demo_paper_mode_mismatch(out: Path, today: date = DEFAULT_TODAY, config: Pat
         "- The gate fails with aborted_safety (reason: live_identity): the hook goes to deny-all, the process tree",
         "  is killed, the login is blocked and the 9.10 safety route pages the harness on-call at P1 (incident S1).",
         "- The kill switch of 6.6 runs: a recovery login, the Monitor read and the proof. The run had no order",
-        "  snapshot yet (it stopped before one was taken), so the proof is UNPROVEN (snapshot_missing).",
+        "  snapshot yet (it stopped before one was taken), so the proof is UNPROVEN (snapshot_missing): with",
+        "  nothing to compare against it cannot show that no order was sent. UNPROVEN pages a second time",
+        "  (safety:unproven_proof) and keeps the login blocked until a human checks the account by hand.",
         "- Every shard's rig shows the same selector (the example config has one rig identity), so every shard",
         "  stops at that gate. Nothing was captured: no calibration, no crops, no diff. Every scoped checkpoint is",
         "  env_error with the aborting gate and reason (gate paper_mode_asserted, reason live_identity).",
@@ -713,15 +720,19 @@ def demo_attempted_send(out: Path, today: date = DEFAULT_TODAY, config: Path = E
         "key that would send the order (a step `config lint` refuses in a flow file, L-FLW-07; here it comes from",
         "the Executor, as a mis-resolved or rescued step would).",
         "",
-        "- The gateway's slow half refuses it before any token is written (guarded_key_refused: Enter under the",
-        "  ticket-or-dialog flag). Nothing reaches the app; the simulated rig sent 0 orders.",
+        "- The gateway blocks it: its slow half refuses the key before any input token is written (reason code",
+        "  guarded_key_refused: Enter while a ticket or dialog is open). Nothing reaches the app; the simulated rig",
+        "  sent 0 orders.",
         "- One attempted send on a scripted flow is enough (5.4.8 rule 1): aborted_safety (reason: attempted_send),",
-        "  the flow is quarantined and the kill switch runs. Its proof diffs the Monitor against the run-start",
-        "  snapshot: PROVEN: no orders sent.",
-        "- s07 and every checkpoint not yet captured are env_error (gate running, reason attempted_send); the",
-        "  checkpoints captured before the abort keep their outcomes. The step event shows blocked_by_gateway.",
+        "  the flow is quarantined and the kill switch runs on that shard's rig. Its proof compares the Monitor's",
+        "  order grids with the snapshot taken at run start: PROVEN: no orders sent.",
+        "- On that shard, s07 and every checkpoint not yet captured are env_error (gate running, reason",
+        "  attempted_send); the checkpoints captured before the abort keep their outcomes. The other shard runs on",
+        "  its own rig and finishes normally; the run takes the worst shard's result (8.2).",
+        "- The blocked step is stored as blocked_by_gateway with the gateway's decision (refused), reason code",
+        "  (guarded_key_refused) and class (safety); run health counts it as 1 gateway drop.",
     ]
-    _write_summary(out, "Scenario attempted-send: the gateway drops an Enter on the Order Confirmation", story, [r],
+    _write_summary(out, "Scenario attempted-send: the gateway blocks an Enter on the Order Confirmation", story, [r],
                    _safety_lines(r))
     return [r]
 
@@ -758,7 +769,8 @@ def demo_config_invalid(out: Path, today: date = DEFAULT_TODAY, config: Path = E
         "",
         "- The PR comment carries the abort block with the failing lint rules; the check is error.",
         "- aborted_harness pages the harness on-call at P1 (9.10); see alerts.json.",
-        "- The post-run proof is PROVEN: no session established.",
+        "- The post-run proof is PROVEN: no session established: the app was never started, so nothing could",
+        "  have been sent, and no login is blocked.",
     ]
     _write_summary(out, "Scenario config-invalid: an expired mask stops the run at preflight", story, [r],
                    _safety_lines(r), abort_expected=True)
@@ -799,7 +811,7 @@ INDEX = {
                             "the run is aborted_safety (live_identity), nothing was captured, every checkpoint is "
                             "env_error (paper_mode_asserted, live_identity), the comment has the abort block and "
                             "alerts.json has a P1 S1 safety page."),
-    "attempted-send": ("The gateway drops a scripted Enter on the open Order Confirmation dialog (6.2).",
+    "attempted-send": ("The gateway blocks a scripted Enter on the open Order Confirmation dialog (6.2).",
                        "the run is aborted_safety (attempted_send), the step is blocked_by_gateway, the proof reads "
                        "PROVEN: no orders sent and the flow has a quarantine record in orchestrator.json."),
     "app-crash": ("The app freezes during a sweep step; the Watchdog decides, the Executor relaunches and the run goes "

@@ -180,6 +180,10 @@ def test_decision_inheritance_suppresses_and_inherits(runs):
     assert "mark_intended (intended)" in text and r2.commit_status["state"] == "success"
     assert r1.commit_status["state"] == "failure"
     assert {f.decision_ref for f in stored(out, r1.run_id)[1] if f.decision_ref}   # the first run's findings carry them
+    # the summary explains why the second run still stores 20 collateral findings with only 2 collateral outcomes
+    second = (out / "summary.txt").read_text().split(f"Run {r2.run_id}", 1)[1]
+    assert "Findings stored: 20 collateral, 4 intended, 8 invariant_violation" in second
+    assert "; 26 of them carry an earlier human decision (the PR comment's 'Suppressed by decision' table" in second
 
 
 def test_same_scenario_twice_gives_identical_outcomes_and_comment(tmp_path, runs):

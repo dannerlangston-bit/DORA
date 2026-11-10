@@ -1,7 +1,7 @@
 """The Orchestrator on the simulated run: one shard per rig through the 5.2 gate machine (6.2 to 6.6, 9.10, 10.2).
 
-`run.run_pipeline` drives every shard of a PR run with `orchestrator.Orchestrator` over a
-`PipelineRig`, the Orchestrator's `SimulatedRig` set up from the run's config: the paper-mode assertion
+`run.run_pipeline` drives every shard of a PR run with `orchestrator.Orchestrator` over the
+Orchestrator's `SimulatedRig`, set up from the run's config: the paper-mode assertion
 reads the account selector against `gateway/allowlist.yaml` (6.4), settings attestation reads the rows
 the pinned app-settings profile expects with the shard's workspace's Active Trader panels (6.3), the
 fixture gate reads the accounts of `fixtures/<fixture>.yaml` (7.6), and the canary flow, teardown and
@@ -10,13 +10,15 @@ the post-run proof follow. The shard's checkpoints are the Executor's work in `r
 
 - `RigScript`: what a scenario makes the rig do (a live-format account id in the selector, a scripted
   Enter on the open Order Confirmation dialog, an EDT freeze during a checkpoint);
-- `PipelineRig`, `shard_setup`: the rig and the `RunContext` of one shard, from the config;
+- `shard_setup`: the `RunContext` of one shard and the `SimScenario` its rig observes, from the config
+  (the rig launches the build under test, so the Executor's build re-read before each flow sees it);
 - `ShardSink`: the Orchestrator's `OutcomeSink` for one shard. The store's `fill_unreached` fills the
   whole run, so a shard's unreached outcomes are held here and written with the shard's other records;
 - `alert_entry`, `persisted_actions`: the 9.10 route of every control result for `alerts.json`, and
   the actions the Orchestrator asks for but does not perform itself (quarantine records, blocked
-  logins, a disabled rig, maintenance tasks, a withheld report) for `orchestrator.json`;
-- `proof_text`: the proof verdict in the Reporter's run-health form.
+  logins, a disabled rig, maintenance tasks, a withheld report) for `orchestrator.json`.
+
+The post-run proof reaches the report as `Proof.line`, the 6.6 text form the Reporter prints.
 
 Choices (reported):
 
@@ -32,11 +34,6 @@ Choices (reported):
   text shows on every shard.
 - The fixture account a PR shard selects (A2) is the fixture's empty account, the account order-stage
   flows stage tickets in (6.3, 7.7 step 7).
-
-WORKAROUND(orchestrator): `SimulatedRig.read_title_build_id` returns the module constant `BUILD`
-whatever the launch observation said, so the Executor's build re-read before each flow (5.2,
-`gates.check_build_unchanged`) could never see the build the `launched` gate accepted. `PipelineRig`
-returns the title build id of its last launch. Reported to the coordinator.
 """
 from __future__ import annotations
 
@@ -47,15 +44,13 @@ from typing import Any, Mapping, Sequence
 
 from ..orchestrator.alerts import AlertRoute
 from ..orchestrator.attestation import AttestationProfile
-from ..orchestrator.clock import Clock
 from ..orchestrator.gates import AccountExpectation, WorkspaceExpectation
 from ..orchestrator.gateway import Chord
 from ..orchestrator.identity import load_allowlist
-from ..orchestrator.killswitch import ORDERS_SENT, UNPROVEN, Proof
 from ..orchestrator.machine import RunContext
 from ..orchestrator.results import ControlResult, Outcome
 from ..orchestrator.rig import AccountState, LaunchObservation, SelectorRead, WorkspaceObservation
-from ..orchestrator.simrig import TABS, SimScenario, SimulatedRig, default_settings
+from ..orchestrator.simrig import TABS, SimScenario, default_settings
 from .config import SentinelConfig
 
 LAUNCHES = 8                    # the first launch, three relaunches (10.2) and room for a recovery login
@@ -81,24 +76,6 @@ class RigScript:
     selector_text: str | None = None                 # each shard's first account selector read (6.4)
     enter_after: tuple[str, str] | None = None       # (flow id, step id): a scripted Enter on the open dialog after it
     freeze_at: str | None = None                     # checkpoint id: the app's EDT freezes while it is captured
-
-
-class PipelineRig(SimulatedRig):
-    """The Orchestrator's `SimulatedRig`, launching the build under test (module docstring)."""
-
-    def __init__(self, scenario: SimScenario, *, clock: Clock, build_id: str):
-        super().__init__(scenario, clock=clock)
-        self.build_id = build_id
-        self._title: str | None = None
-
-    def launch(self) -> LaunchObservation:
-        obs = super().launch()
-        self._title = obs.title_build_id
-        return obs
-
-    def read_title_build_id(self) -> str | None:
-        # WORKAROUND(orchestrator): the base class answers its constant BUILD (module docstring)
-        return self._title if self.app_running else None
 
 
 class ShardSink:
@@ -185,17 +162,3 @@ def persisted_actions(run_id: str, shard_id: str, rig: str, login: str, r: Contr
                         "control": r.control, "gate": r.gate, "rig": rig, "login": login,
                         "flow_id": flow_id if act == "quarantine_flow" else None, "detail": r.detail})
     return out
-
-
-def proof_text(proof: Proof | None) -> str:
-    """The proof as the Reporter's run-health row prints it (`PROVEN: ...` or `UNPROVEN: ...`, 6.6).
-
-    `ORDERS SENT: undeclared rows` (killswitch choice 5) has no form there; it is printed as an
-    UNPROVEN line that names the rows (reported as a Reporter gap)."""
-    if proof is None:
-        return "UNPROVEN: no proof ran"
-    if proof.verdict == UNPROVEN:
-        return f"UNPROVEN: {proof.reason}"
-    if proof.verdict == ORDERS_SENT:
-        return f"UNPROVEN: {proof.verdict} ({', '.join(r.key for r in proof.undeclared)})"
-    return proof.verdict

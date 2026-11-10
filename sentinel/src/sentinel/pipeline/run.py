@@ -42,8 +42,10 @@ ledger of 5.4.8), runs the Watchdog's hang detector, and captures the checkpoint
 `running` in plan order; then each shard's teardown and post-run proof. A control result that stops
 a shard gives its unreached checkpoints the Orchestrator's exact outcome (1.10); the run outcome is the
 worst of the shards' (8.2). The A/A calibration runs once a shard reaches `running`, so a run whose
-shards all stop at a gate captures nothing. Every control result's 9.10 route goes to `alerts.json`; the shards, their
-gates, proofs and the actions the Orchestrator does not perform itself go to `orchestrator.json`.
+shards all stop at a gate captures nothing. Every gateway drop or refusal is a `step_events` row in the store with
+its `gateway_event` (8.3 `gate_decision`, `gate_reason`, `gate_class`), and the Safety row counts those rows. Every
+control result's 9.10 route goes to `alerts.json`; the shards, their gates and proofs (`Proof.line`, 6.6), the
+gateway events and the actions the Orchestrator does not perform itself go to `orchestrator.json`.
 
 The Oracle (2.8, `pipeline.assertions`): every flow checkpoint that declares assertions is evaluated
 on both builds; the candidate's verdict feeds `classify.Facts` (3.11 G and H) and the failed
@@ -89,6 +91,7 @@ from ..lint import lint
 from ..records import PERSONAS, CheckpointOutcome, Decision, Finding, RunOutcome, Signature, StepOutcome
 from ..report import ReportContext, build_report, render_pr_comment, render_run_report
 from ..report.cluster import Member, cluster_members
+from ..report.model import worst_proof
 from ..scope import (DependencyIndex, Manifest, PlannedCheckpoint, Rig, ScopeConfigError, ScopePlan, classes_in,
                      compute_scope)
 from ..store import ArtifactStore, Store
@@ -114,7 +117,7 @@ from ..reviewer.adapter import ModelReviewer, ReviewerUnavailable
 from ..reviewer.config import ReviewerConfig
 from ..reviewer.job import ReviewerJob
 from .live import CollectingReviewer, ItemBuilder
-from .orchestration import PipelineRig, RigScript, ShardSink, alert_entry, persisted_actions, proof_text, shard_setup
+from .orchestration import RigScript, ShardSink, alert_entry, persisted_actions, shard_setup
 from .reviewer import ReviewerAdapter, ReviewRequest, SimulatedReviewer, change_types, to_review, validate
 from .sim import Capture, SimApp, SimBuild, observe
 
@@ -941,7 +944,7 @@ class _Shard:
     rig_id: str
     cps: list[PlannedCheckpoint]
     orch: Orchestrator
-    rig: PipelineRig
+    rig: SimulatedRig
     sink: ShardSink
     clock: ManualClock
     ctx: RunContext
@@ -991,7 +994,7 @@ class _ShardWork:
         clock = ManualClock(start=self.run.now.astimezone(timezone.utc), mono=1000.0 + 10_000 * shard_no)
         ctx, sim = shard_setup(self.cfg, run_id=sc.run_id, run_type="pr", shard_id=shard_id, shard_no=shard_no,
                                build_id=sc.candidate.build_id, workspace_id=cps[0].workspace_id, script=self.script)
-        rig = PipelineRig(sim, clock=clock, build_id=sc.candidate.build_id)
+        rig = SimulatedRig(sim, clock=clock)
         sink = ShardSink([cp.checkpoint_id for cp in cps])
         hb = HeartbeatWriter(self.out / "heartbeat" / f"shard-{shard_no}.json", clock)
         orch = Orchestrator(rig, ctx, sink, clock=clock, ledger=self.ledger, heartbeat=hb,
@@ -1017,7 +1020,7 @@ class _ShardWork:
         self.summaries.append({
             "shard_id": shard_id, "rig": rig_id, "simulated_rig_identity": ctx.allowlist.rig,
             "checkpoints": len(cps), "verdict": report.verdict.status, "reason": report.verdict.reason,
-            "last_gate": report.last_gate, "proof": proof_text(report.proof),
+            "last_gate": report.last_gate, "proof": report.proof.line,
             "kill_switch": [name for name, _ in report.kill_switch.steps] if report.kill_switch else None,
             "gates": [{"control": r.control, "gate": r.gate, "passed": r.passed, "detail": r.detail}
                       for r in report.results],
@@ -1274,27 +1277,27 @@ class _ShardWork:
         return v or RunVerdict("complete")
 
     def proof(self) -> str:
-        """The proof line for run health: the stopping shard's, else the first UNPROVEN one, else the first."""
+        """The run's proof line (`Proof.line`, 6.6) for run health and the abort block: the most severe of the
+        shards' (ORDERS SENT, then UNPROVEN, then PROVEN; 8.2), the stopping shard's among equals."""
+        lines = [r.proof.line for _, r in self.reports]
         stop = self.stop()
         if stop is not None:
-            rep = next(r for s, r in self.reports if s is stop[0])
-            return proof_text(rep.proof)
-        texts = [proof_text(r.proof) for _, r in self.reports]
-        return next((t for t in texts if not t.startswith("PROVEN")), texts[0] if texts else "UNPROVEN: no shard ran")
+            lines.insert(0, next(r.proof.line for s, r in self.reports if s is stop[0]))
+        return worst_proof(lines) if lines else "UNPROVEN: no shard ran"
 
     def safety(self) -> dict:
-        """Run health's safety facts (9.11), from what the shards' controls returned."""
+        """Run health's safety facts (9.11), from what the shards' controls returned. The gateway drops are the
+        run's stored `step_events` rows the hook dropped or the slow half refused (9.11), so it runs after
+        `write_steps`."""
         results = [r for _, rep in self.reports for r in rep.results]
         att = [r for r in results if r.gate == "settings_attested" and r.control == "attestation"]
-        ks = [rep.kill_switch for _, rep in self.reports if rep.kill_switch is not None]
-        cancel = "not needed"
-        if ks:
-            cancel = ("run by the kill switch" if any(n == "cancel_all" for k in ks for n, _ in k.steps)
-                      else "not needed (kill switch: no new Working row)")
+        did = {rep.proof.cancel_all for _, rep in self.reports}          # what Cancel All did per shard (6.6)
+        cancel = "failed" if "failed" in did else "verified" if "done" in did else "not needed"
         return {"attestation": ("passed" if att and all(r.passed for r in att) else
                                 "not reached" if not att else "failed"),
                 "paper_mode_asserted": sum(1 for r in results if r.control == "paper_mode" and r.passed),
-                "gateway_drops": len(self.steps), "cancel_all": cancel, "proof": self.proof(),
+                "gateway_drops": self.store.gateway_drops(self.scenario.run_id), "cancel_all": cancel,
+                "proof": self.proof(),
                 "login": str(self.cfg.fixture.get("login_ref", "unknown"))}
 
     def write(self, extra: Mapping[str, Any] | None = None) -> None:
@@ -1348,16 +1351,20 @@ def _abort_config(store: Store, scenario: Scenario, cfg_root: Path, errors: list
     alerts = [a for r in report.results if (a := alert_entry(scenario.run_id, ctx.shard_id, r)) is not None]
     _append_json(out_dir / "alerts.json", alerts)
     shard = {"shard_id": ctx.shard_id, "rig": "none (stopped at provisioned)", "verdict": report.verdict.status,
-             "reason": report.verdict.reason, "last_gate": report.last_gate, "proof": proof_text(report.proof),
+             "reason": report.verdict.reason, "last_gate": report.last_gate, "proof": report.proof.line,
              "gates": [{"control": r.control, "gate": r.gate, "passed": r.passed, "detail": r.detail}
                        for r in report.results]}
     _append_json(out_dir / "orchestrator.json", [{"run_id": scenario.run_id, "shards": [shard], "persisted_actions": [],
                                                   "gateway_events": [], "lint_errors": errors}])
     ctx_r = ReportContext(pr=scenario.pr or 0, candidate_build=scenario.candidate.build_id,
                           base_build=scenario.base.build_id,
-                          abort={"rule_ids": rule_ids, "requeued": "not re-queued: a config fix is needed first"})
-    health = {"safety": {"attestation": "not reached", "paper_mode_asserted": 0, "gateway_drops": 0,
-                         "cancel_all": "not needed", "proof": proof_text(report.proof)}}
+                          abort={"rule_ids": rule_ids,
+                                 "not_requeued": "the same config would fail again; fix it first"})
+    health = {"wall_clock": _mmss(60), "budget": "45:00", "shards": 1,
+              "safety": {"attestation": "not reached", "paper_mode_asserted": 0, "gateway_drops": 0,
+                         "cancel_all": "not needed", "proof": report.proof.line},
+              "integrations": {"pr_comment": {"state": "posted", "time": "(simulated: written to pr-comment.md)"},
+                               "jira_queued": 0, "slack": {"queued": 0}}}
     comment = render_pr_comment(run, [], [], [], {}, health, None, ctx_r)
     rep = build_report(run, [], [], [], {}, health, None, ctx_r)
     (out_dir / "pr-comment.md").write_text(comment, encoding="utf-8")
@@ -1365,7 +1372,7 @@ def _abort_config(store: Store, scenario: Scenario, cfg_root: Path, errors: list
     render_run_report(run, [], [], [], {}, health, None, ctx_r, out_dir / "report.html")
     return RunResult(scenario.run_id, scenario.run_type, run.status, run.reason, out_dir, comment=comment,
                      commit_status=_status_json(rep.status), lint_errors=errors, alerts=alerts, shards=[shard],
-                     proof=proof_text(report.proof))
+                     proof=report.proof.line)
 
 
 def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path, today: date = DEFAULT_TODAY,
@@ -1478,7 +1485,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         for fs in by_cp.values():
             for f in fs:
                 store.write_finding(f)
-        for s, sid in work.steps:
+        for s, sid in work.steps:                         # each with its gateway_event (8.3 gate_* columns)
             store.write_steps([s], shard_id=sid, side="candidate")
         for c in plan.cuts:
             if c.checkpoint is not None:
@@ -1503,8 +1510,9 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         abort = {}
         if stop is not None and runrec.status == "aborted_safety":
             st, r = stop
+            stopped = [s.rig_id for s, rep in work.reports if rep.verdict.status == "aborted_safety"]
             abort = {"trigger": r.run_reason, "gate": r.gate, "proof": work.proof(), "incident": r.incident or "unknown",
-                     "rig": st.rig_id}
+                     "rig": stopped or [st.rig_id]}                    # every rig the abort disabled (6.6 step 6)
         result = _report(store, cfg, plan, run, scenario, runrec, manifest, mdoc, out, today, wall, len(work.reports),
                          safety=work.safety(), abort=abort)
         result.reviewer_calls = calls
@@ -1513,8 +1521,9 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
             f"global-shift pre-pass (3.7) over {n_pairs} diffed pairs: "
             + ("not evaluated (it needs at least 20 pairs)" if not shift.evaluated else
                f"{'raised' if shift.raised else 'not raised'} ({shift.fraction_above_floor:.1%} of pairs above floor, "
-               f"{shift.text_edge_share:.1%} of their changed pixels on text edges; it is raised above 2 percent "
-               f"and 70 percent)"))
+               f"{shift.text_edge_share:.1%} of their changed pixels on text edges; it is raised only when more than "
+               "2 percent of pairs are above floor and more than 70 percent of their changed pixels are on text "
+               "edges)"))
         result.disabled_invariants = run.disabled
         result.alerts, result.shards, result.proof = work.alerts, work.summaries, work.proof()
         work.write()
@@ -1808,7 +1817,7 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         ctx, sim = shard_setup(cfg, run_id=scenario.run_id, run_type="nightly", shard_id=f"{scenario.run_id}/1",
                                shard_no=1, build_id=scenario.build.build_id, workspace_id="ws.tier-a.swing-trader",
                                script=RigScript())
-        orch = Orchestrator(PipelineRig(sim, clock=clock, build_id=scenario.build.build_id), ctx, ShardSink(()),
+        orch = Orchestrator(SimulatedRig(sim, clock=clock), ctx, ShardSink(()),
                             clock=clock, heartbeat=HeartbeatWriter(out / "heartbeat" / f"{scenario.run_id}.json", clock),
                             watchdog_status=lambda: (1.0, True))
         done: dict[str, Any] = {}
@@ -1866,7 +1875,7 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
             work._note(st, r)
         work.summaries.append({"shard_id": ctx.shard_id, "rig": st.rig_id, "verdict": shard.verdict.status,
                                "reason": shard.verdict.reason, "last_gate": shard.last_gate,
-                               "proof": proof_text(shard.proof),
+                               "proof": shard.proof.line,
                                "gates": [{"control": r.control, "gate": r.gate, "passed": r.passed, "detail": r.detail}
                                          for r in shard.results]})
         work.write()
@@ -1877,7 +1886,7 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                                               reason=shard.verdict.reason, started_at=started,
                                               ended_at=_ts(today, scenario.clock, 600)))
             return RunResult(scenario.run_id, "nightly", runrec.status, runrec.reason, out, alerts=work.alerts,
-                             shards=work.summaries, proof=proof_text(shard.proof))
+                             shards=work.summaries, proof=shard.proof.line)
         report, rows_meta = done["report"], done["rows_meta"]
         produced, writer, arts_by_sha = done["produced"], done["writer"], done["arts_by_sha"]
         # -- store: identity, the run, synthetic rows (one per checkpoint at most, run docstring)
@@ -1933,7 +1942,7 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                           out / f"nightly-report-{scenario.run_id}.html")
         res = RunResult(scenario.run_id, "nightly", runrec.status, runrec.reason, out, outcomes,
                         store.findings(scenario.run_id), alerts=work.alerts, shards=work.summaries,
-                        proof=proof_text(shard.proof))
+                        proof=shard.proof.line)
         res.canary = {"report": report, "health": canary_health, "produced": produced, "evals": rows_meta,
                       "simulated": sorted(wanted)}
         return res

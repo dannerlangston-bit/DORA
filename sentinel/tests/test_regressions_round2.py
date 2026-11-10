@@ -27,6 +27,7 @@ from sentinel.orchestrator.gateway import (VK_F1, VK_RETURN, VK_TAB, Action, Fla
                                            slow_half)
 from sentinel.orchestrator.explorer import match_deny
 from sentinel.orchestrator.killswitch import PROVEN_NO_SESSION, PROVEN_NONE, ProofInputs, post_run_proof, recovery_login
+from sentinel.report.model import ORDERS_SENT_PROOF, PROOF_FORMS, proof_severity
 from sentinel.orchestrator.machine import Orchestrator
 from sentinel.orchestrator.rig import (ConfirmationCheck, HotkeyRow, LaunchObservation, OrderBook, OrderRow,
                                        SelectorRead, SettingRead)
@@ -635,10 +636,10 @@ def test_followup_the_proof_line_is_the_6_6_text_form():
     assert post_run_proof(ProofInputs(start=clean, end=clean)).line == "PROVEN: no orders sent"
     assert post_run_proof(ProofInputs(None, None, session="never", tokens_issued=0)).line == PROVEN_NO_SESSION
     assert post_run_proof(ProofInputs(start=None, end=clean)).line == "UNPROVEN: snapshot_missing"
-    sent = post_run_proof(ProofInputs(start=clean, end=OrderBook(working=(row,), net_liq=2500.0)))
-    assert sent.line == "UNPROVEN: undeclared_order_row (x1)"
+    sent = post_run_proof(ProofInputs(start=clean, end=OrderBook(working=(row,), net_liq=2500.0), cancel_all="done"))
+    assert sent.line == "ORDERS SENT: undeclared rows (x1); Cancel All verified"          # the fifth verdict
     failed = post_run_proof(ProofInputs(start=clean, end=OrderBook(working=(row,), net_liq=2500.0),
                                         cancel_all="failed"))
-    assert failed.line == "UNPROVEN: cancel_all_failed (undeclared rows: x1)"
+    assert failed.line == "ORDERS SENT: undeclared rows (x1); Cancel All failed"
     for p in (sent, failed):
-        assert p.line.startswith(("PROVEN: ", "UNPROVEN: "))                   # the Reporter's Safety row forms
+        assert p.line.startswith(PROOF_FORMS) and proof_severity(p.line) == ORDERS_SENT_PROOF   # the Reporter's forms

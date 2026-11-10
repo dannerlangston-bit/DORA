@@ -16,8 +16,8 @@ from sentinel.orchestrator.gateway import Chord, DropLedger, GatewayDrop
 from sentinel.orchestrator.identity import (Allowlist, assertion_due, classify, judge_fixture_account,
                                             judge_identity, load_allowlist, send_frame_fresh)
 from sentinel.orchestrator.killswitch import (ORDERS_SENT, PROVEN_DECLARED, PROVEN_NO_SESSION, PROVEN_NONE,
-                                              UNPROVEN, ProofInputs, TripWires, check_tripwires, execute_kill_switch,
-                                              kill_switch, post_run_proof, proof_result)
+                                              UNPROVEN, Proof, ProofInputs, TripWires, check_tripwires,
+                                              execute_kill_switch, kill_switch, post_run_proof, proof_result)
 from sentinel.orchestrator.results import RunVerdict
 from sentinel.orchestrator.rig import (ConfirmationCheck, HotkeyRow, NotificationsRead, OrderBook, OrderRow, Rig,
                                        SelectorRead, SettingRead)
@@ -264,6 +264,31 @@ def test_proof_undeclared_row_is_aborted_safety_after_the_fact():
     assert post_run_proof(ProofInputs(start=START, end=rejected)).undeclared
 
 
+@pytest.mark.parametrize("cancel,text", [("done", "verified"), ("failed", "failed"), ("not_needed", "not needed")])
+def test_orders_sent_is_the_fifth_verdict_and_names_the_rows_and_cancel_all(cancel, text):
+    end = OrderBook(working=(OrderRow("x1", "working", "WORKING"),), filled=(OrderRow("f1", "filled", "FILLED"),),
+                    net_liq=2400.0, position_rows=1)
+    p = post_run_proof(ProofInputs(start=START, end=end, cancel_all=cancel))
+    assert (p.verdict, p.reason, p.proven) == (ORDERS_SENT, None, False)
+    assert p.line == f"ORDERS SENT: undeclared rows (x1, f1); Cancel All {text}"   # 6.6 text form
+    r = proof_result(p, run_so_far=RunVerdict("aborted_safety", "attempted_send"))
+    assert (r.run_status, r.run_reason, r.gate, r.incident) == ("aborted_safety", "undeclared_order_row", "teardown",
+                                                              "S1")
+    assert r.has("block_login") and r.has("disable_rig") and "login_owner" in r.alert.paged
+    assert r.detail == p.line and r.evidence["verdict"] == p.line and r.evidence["undeclared"] == ["x1", "f1"]
+
+
+def test_a_failed_cancel_of_declared_sends_alone_is_unproven_and_the_verdicts_are_consistent():
+    declared = OrderBook(working=(OrderRow("s1", "working", "WORKING"),), net_liq=2500.0)
+    p = post_run_proof(ProofInputs(start=START, end=declared, cancel_all="failed", declared_sends=frozenset({"s1"})))
+    assert (p.verdict, p.reason, p.line) == (UNPROVEN, "cancel_all_failed", "UNPROVEN: cancel_all_failed")
+    row = (OrderRow("x1", "working", "WORKING"),)
+    with pytest.raises(ValueError, match="ORDERS SENT"):
+        Proof(ORDERS_SENT)                                       # ORDERS SENT always names its rows
+    with pytest.raises(ValueError, match="ORDERS SENT"):
+        Proof(UNPROVEN, "cancel_all_failed", row)                # undeclared rows are never only UNPROVEN
+
+
 def test_proof_only_declared_sends_in_the_gated_branch():
     end = OrderBook(canceled=(OrderRow("s1", "canceled", "CANCELED"),), net_liq=2500.0)
     p = post_run_proof(ProofInputs(start=START, end=end, declared_sends=frozenset({"s1"})))
@@ -323,7 +348,7 @@ def test_kill_switch_cancels_a_sent_order_and_the_proof_names_the_row():
     assert rep.proof.verdict == ORDERS_SENT and rep.proof_effect.run_reason == "undeclared_order_row"
 
 
-def test_kill_switch_proof_unproven_recovery_login_failed_and_cancel_all_failed():
+def test_kill_switch_proof_unproven_recovery_login_failed_and_orders_sent_with_cancel_all_failed():
     clock = ManualClock()
     rig = SimulatedRig(SimScenario(recovery_login_fails=1), clock=clock)
     rig.login()
@@ -334,8 +359,9 @@ def test_kill_switch_proof_unproven_recovery_login_failed_and_cancel_all_failed(
     start = rig2.read_orders()
     rig2._send()
     rep2 = _ks(rig2, clock, start)
-    assert rep2.proof.reason == "cancel_all_failed" and rep2.proof_effect.run_reason == "undeclared_order_row"
-    assert "login_owner" in rep2.proof_effect.alert.paged
+    assert (rep2.proof.verdict, rep2.proof.cancel_all) == (ORDERS_SENT, "failed")       # the read itself was clean
+    assert rep2.proof.line == "ORDERS SENT: undeclared rows (sim-order-1); Cancel All failed"
+    assert rep2.proof_effect.run_reason == "undeclared_order_row" and "login_owner" in rep2.proof_effect.alert.paged
 
 
 def test_kill_switch_proof_monitor_unreadable():

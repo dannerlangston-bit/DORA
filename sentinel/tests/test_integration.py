@@ -14,9 +14,12 @@ from sentinel.demo import (AT, EXAMPLE, FREEZE_AT, INDEX, INDEX_FILES, LIVE_ACCO
                            clean_scenario, main, mask_expiry, run_demo, write_index)
 from sentinel.oracle.tables import MarginRules
 from sentinel.orchestrator.clock import ManualClock
-from sentinel.pipeline.assertions import FlowOracle
+from sentinel.oracle import evaluate_assertions
+from sentinel.oracle.sources import GroundTruthReader
+from sentinel.pipeline.assertions import OCR_CONFIDENCE, FlowOracle
 from sentinel.pipeline.config import SentinelConfig, materialize
-from sentinel.pipeline.orchestration import PipelineRig, RigScript, ShardSink, proof_text, shard_setup
+from sentinel.orchestrator.simrig import SimulatedRig
+from sentinel.pipeline.orchestration import RigScript, ShardSink, shard_setup
 from sentinel.pipeline.run import planned_for, run_pipeline
 from sentinel.pipeline.sim import SimApp, SimBuild
 from sentinel.records import CheckpointOutcome
@@ -99,16 +102,17 @@ def test_the_oracle_reads_what_synth_drew_and_catches_a_transposed_cost(cfg):
     assert surcharge.verdict.failed == ("R02",) and surcharge.verdict.results[5].label == "bracket check"
 
 
-def test_a_format_only_present_over_a_column_is_judged_row_by_row(cfg):
-    """WORKAROUND(oracle): `ps_qty` (present, format int) over the seven Qty rows passes row by row and
-    fails on the first row that is not an int."""
+def test_a_format_only_present_over_a_column_is_judged_row_by_row_by_the_oracle(cfg):
+    """`ps_qty` (present, format int) over the seven Qty rows: the pipeline hands the whole column to the Oracle,
+    which passes it row by row and fails it on the first row that is not an int."""
     chk = _check(cfg, SimBuild("b"), "cp-positions", "flow.trade.active-trader.read-back")
     assert chk.values["rgn.ps.qty"].count("\n") == 6 and chk.verdict.results[0].status == "passed"
+    assert not hasattr(FlowOracle, "_per_row")                 # no per-row loop left in the pipeline
     fo = FlowOracle.load(cfg, datetime(2026, 11, 10, tzinfo=timezone.utc))
     step = cfg.flow_step("flow.trade.active-trader.read-back", "cp-positions")
-    a = step["expect"][0]
-    first = chk.verdict.results[0]
-    bad = fo._per_row(a, first, {"rgn.ps.qty": "100\nabc\n1"}, {}, {}, fo.context("x", step, "masked_live"))
+    reader = GroundTruthReader({"rgn.ps.qty": "100\nabc\n1"}, confidence=OCR_CONFIDENCE)
+    (bad,) = evaluate_assertions({"expect": [step["expect"][0]]}, {"ocr": reader}, {}, cfg.fixture, fo.rules,
+                                 context=fo.context("flow.trade.active-trader.read-back", step, "masked_live"))
     assert bad.status == "failed" and "'abc'" in bad.detail
 
 
@@ -134,12 +138,12 @@ def test_a_shard_context_from_the_config_passes_every_gate_on_the_simulated_rig(
     assert ctx.allowlist.entries == ("D-20481133", "D-20481134") and ctx.fixture_account == "D-20481134"
     assert ctx.profile.active_trader_panels == ("at-main", "at-grid")
     clock = ManualClock()
-    rig = PipelineRig(sim, clock=clock, build_id="b-1")
+    rig = SimulatedRig(sim, clock=clock)
     sink = ShardSink([c.checkpoint_id for c in cps])
     seen: list[str | None] = []
     report = Orchestrator(rig, ctx, sink, clock=clock).run(lambda o: (seen.append(rig.read_title_build_id()),
                                                                       sink.done.add(S07)))
-    assert report.verdict.status == "complete" and proof_text(report.proof) == "PROVEN: no orders sent"
+    assert report.verdict.status == "complete" and report.proof.line == "PROVEN: no orders sent"
     assert seen == ["b-1"]                      # the build re-read sees the build the launched gate accepted
     assert [r.gate for r in report.results][:8] == ["provisioned", "launched", "authenticated", "paper_mode_asserted",
                                                     "settings_attested", "workspace_loaded", "fixture_verified",
@@ -202,6 +206,7 @@ def test_paper_mode_mismatch_aborts_safety_before_any_capture(runs):
     assert (run.status, run.reason, run.last_gate) == ("aborted_safety", "live_identity", "paper_mode_asserted")
     text = (out / "pr-comment.md").read_text()
     assert "**Abort**" in text and "Trigger: live_identity" in text and "Gate: paper_mode_asserted" in text
+    assert "No run starts on rigs rig-01, rig-02, rig-03 and rig-04 until the incident closes." in text
     assert "Incident: S1" in text and "**Unexpected (" not in text and r.commit_status["state"] == "error"
     s1 = [a for a in alerts(out) if a["incident"] == "S1"]
     assert s1 and all(a["priority"] == "P1" and a["rule"] == "safety:aborted_safety" and "harness_on_call" in a["paged"]
@@ -220,16 +225,59 @@ def test_attempted_send_is_dropped_by_the_gateway_and_proven_harmless(runs):
     assert by[S03].outcome == by[S06].outcome == "identical"           # captured before the abort
     (blocked,) = [s for s in steps if s.status == "blocked_by_gateway"]
     assert (blocked.flow_id, blocked.step_id) == (STOCK_FLOW, "open-confirm+enter")
+    # the gateway event goes through the store (8.3 step_events gate_decision, gate_reason, gate_class)
+    assert blocked.gateway_event == {"decision": "refused", "reason": "guarded_key_refused", "class": "safety"}
+    with Store(out / "sentinel.db") as store:
+        rows = store.conn.execute("SELECT gate_decision, gate_reason, gate_class FROM step_events WHERE run_id = ? "
+                                  "AND gate_decision <> 'none'", (r.run_id,)).fetchall()
+        assert [tuple(x) for x in rows] == [("refused", "guarded_key_refused", "safety")]
+        assert store.gateway_drops(r.run_id) == 1
     (run,) = orchestrator(out)
-    (event,) = run["gateway_events"]                 # the store keeps no gateway_event column; orchestrator.json does
-    assert event["gateway_event"] == {"decision": "refused", "reason": "guarded_key_refused", "class": "safety"}
+    (event,) = run["gateway_events"]                 # orchestrator.json keeps its copy
+    assert event["gateway_event"] == blocked.gateway_event
     shard = next(s for s in run["shards"] if s["verdict"] == "aborted_safety")
     assert shard["proof"] == "PROVEN: no orders sent" and "recovery_login" in shard["kill_switch"]
     assert [a for a in run["persisted_actions"] if a["action"] == "quarantine_flow"][0]["flow_id"] == STOCK_FLOW
     text = (out / "pr-comment.md").read_text()
     assert "Trigger: attempted_send" in text and "Post-run proof: PROVEN: no orders sent" in text
+    assert "gateway 1 drop, Cancel All not needed, proof PROVEN: no orders sent |" in text
+    summary = (out / "summary.txt").read_text()
+    assert "WORKAROUND" not in text + summary and "proof PROVEN: no orders sent" in summary
+    assert "reason code\n  (guarded_key_refused)" in summary and "run health counts it as 1 gateway drop" in summary
     (page,) = alerts(out)
     assert page["incident"] == "S2" and "flow_owner" in page["paged"] and page["safety_table"]
+
+
+def test_an_order_that_got_out_is_orders_sent_and_the_run_stays_aborted_safety(tmp_path, monkeypatch):
+    """The fifth proof verdict end to end (6.6): an order the gateway never saw (the server accepted it) is found by
+    one shard's teardown proof, the kill switch cancels it, the run is aborted_safety (undeclared_order_row) and the
+    report prints that shard's `Proof.line` as the run's proof, the most severe of the four shards'."""
+    import sentinel.pipeline.run as pipeline_run
+
+    class LeakyRig(SimulatedRig):
+        leaked = 0
+
+        def teardown(self):
+            if LeakyRig.leaked == 0:
+                LeakyRig.leaked += 1
+                self._send()
+            return super().teardown()
+
+    monkeypatch.setattr(pipeline_run, "SimulatedRig", LeakyRig)
+    r = run_pipeline(EXAMPLE, clean_scenario(date(2026, 11, 10)), tmp_path)
+    line = "ORDERS SENT: undeclared rows (sim-order-1); Cancel All verified"
+    assert (r.status, r.reason, r.proof) == ("aborted_safety", "undeclared_order_row", line)
+    assert sorted(s["proof"] for s in r.shards) == [line] + ["PROVEN: no orders sent"] * 3
+    with Store(tmp_path / "sentinel.db") as store:
+        run = store.run_outcome(r.run_id)
+    assert (run.status, run.reason, run.last_gate) == ("aborted_safety", "undeclared_order_row", "teardown")
+    text = (tmp_path / "pr-comment.md").read_text()
+    assert "Trigger: undeclared_order_row" in text and f"Post-run proof: {line}" in text
+    assert "An order reached the account: login " in text and "Incident: S1" in text
+    assert f"Cancel All verified, proof {line}; an order reached the account" in text
+    assert "UNPROVEN" not in text and r.commit_status["state"] == "error"
+    *_, page = [a for a in alerts(tmp_path) if a["run_reason"] == "undeclared_order_row"]   # the kill switch's proof
+    assert page["incident"] == "S1" and "login_owner" in page["paged"] and page["detail"] == line
 
 
 def test_app_crash_fails_app_alive_skips_the_ladder_and_resumes_after_a_relaunch(runs):
@@ -253,7 +301,9 @@ def test_app_crash_fails_app_alive_skips_the_ladder_and_resumes_after_a_relaunch
     resumed = [o for o in outs if o.test_kind == "census" and o.checkpoint_id.startswith("census/trade.")]
     assert resumed and {o.outcome for o in resumed} == {"identical"}     # the units after the ladder ran
     assert r.status == "complete" and r.commit_status["state"] == "failure"
-    assert "assertion_failed (assertion: app_alive)" in (out / "pr-comment.md").read_text()
+    text = (out / "pr-comment.md").read_text()
+    assert "assertion_failed (assertion: app_alive)" in text
+    assert "What moved: thinkorswim hang (screenshot_staleness). Fails at height 480 for width 640" in text
 
 
 def test_config_invalid_aborts_harness_at_preflight_g1(runs):
@@ -267,6 +317,11 @@ def test_config_invalid_aborts_harness_at_preflight_g1(runs):
     assert (page["rule"], page["priority"], page["paged"]) == ("aborted_harness", "P1", ["harness_on_call"])
     text = (out / "pr-comment.md").read_text()
     assert "**Abort**" in text and "`config_invalid` (rules L-MSK-02)" in text and r.commit_status["state"] == "error"
+    assert "- Not re-queued: the same config would fail again; fix it first" in text and "Re-queued once" not in text
+    assert "Scope not computed: the run stopped at provisioned before it planned any checkpoint." in text
+    assert "| Tier |" not in text and "| Fingerprint | not read |" in text
+    assert "| Wall clock / budget | 1:00 / 45:00" in text
+    assert "PR comment posted (simulated: written to pr-comment.md)" in text and "unknown" not in text
 
 
 def test_config_invalid_runs_the_day_after_the_first_mask_expiry(runs):

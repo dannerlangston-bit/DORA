@@ -45,6 +45,18 @@ Choices where the spec is ambiguous (reported):
     upper case, lower case and digits whose character class changes at least every 2.5 characters
     (random keys do, branch names and class names do not); `//` URIs and vault references are exempt.
 12. `today` (default: the current date) decides expiries, roll dates and the 90-day verification age.
+13. File shapes the rules read: `phase0/branches.yaml` has the keys of BRANCH_KEYS with `A` or `B`
+    (under DR-07 branch B a flow's `agent_fallback: allowed` disagrees, L-XREF-15);
+    `policy/send_policy.yaml` is enabled by `enabled: true` with `risk_owner` and `signature`
+    (L-FLW-08); an `approved_by` in `policy/explorer_budget.yaml` stands for the Explorer owner's PR
+    approval (L-XREF-14); the settings profile pins `order_confirmation: true`, `shift_click_send:
+    false` (or `absent`), `active_trader_hotkeys: false`, `order_hotkeys: []` (L-FIX-05).
+14. `taxonomy.yaml` and `schemas/` are optional in a config checkout (this harness carries both);
+    when present they must equal the harness's (L-XREF-08, L-XREF-09). The popup and mutant
+    catalogs are bare lists (4.10, 4.11) or a map with `schema_version` and the list.
+15. "The fixture the run uses" (L-WSP-07) is every fixture a flow on that workspace names, or any
+    fixture when no flow uses the workspace. The masked_live rule of L-SRF-08 covers census, sweep
+    and split checkpoints; flow checkpoints carry their own data mode (L-FLW-05).
 
 Rules checked only in part from files (the rest needs live state, history or a store; reported):
 L-DEP-07 (the 90 days after the first Phase 1 scan), L-FLW-03 (that a removed id was renamed needs

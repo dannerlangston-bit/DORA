@@ -92,3 +92,4 @@ def test_cli_json_lines(tmp_path, capsys):
 def test_cli_usage_error_returns_2(capsys):
     assert main([]) == 2
     assert main([str(EXAMPLE), "--phase", "7"]) == 2
+    assert main([str(EXAMPLE / "missing-dir")]) == 2

@@ -2,7 +2,7 @@
 
 Prints one line per violation, `L-XXX-nn severity file: [location: ]message`, or with `--json` the
 JSON line of 4.15 (`rule`, `severity`, `file`, `path`, `message`); a count goes to stderr. Returns 1
-when any `error` was found, 0 otherwise, 2 on a usage error.
+when any `error` was found, 0 otherwise, 2 on a usage error or a missing directory.
 """
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import argparse
 import json
 import sys
 from datetime import date
+from pathlib import Path
 
 from .rules import lint
 
@@ -34,6 +35,9 @@ def main(argv: list[str] | None = None) -> int:
         args = _parser().parse_args(args_in)
     except SystemExit as exc:
         return int(exc.code or 0)
+    if not Path(args.config_dir).is_dir():
+        print(f"sentinel lint: {args.config_dir} is not a directory", file=sys.stderr)
+        return 2
     report = lint(args.config_dir, phase=args.phase, today=args.today)
     for v in report.violations:
         print(json.dumps(v.as_dict()) if args.json else v.line())

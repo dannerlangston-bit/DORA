@@ -21,12 +21,17 @@ Choices where the spec is ambiguous (each is reported to the coordinator):
 4. Blocked cells (`not_run (blocked:<outcome>)`) stay in the coverage denominator, which drops only
    `not_run (entitlement)` and `not_run (scope)` cells (2.12, 9.11); they are also counted apart
    for run health. Synthetic rows and synthetic (canary) outcome records count nowhere in percent.
-5. The quarantine ceiling is measured in cells as 2.12 states (10.5 says checkpoints): tier-1 cells
-   `not_run (quarantine)` over every tier-1 cell of a registered row; strictly above 2 percent is red.
+5. The quarantine ceiling is counted in checkpoints (2.12, 10.5, 1.5): distinct tier-1 checkpoint
+   ids `not_run (quarantine)`, from outcome records or quarantine cuts, over every tier-1 checkpoint
+   id of a registered row in the records and cuts, less those `not_run (entitlement)` or `not_run
+   (scope)`; strictly above 2 percent is red. The cell share is for display (`quarantine_cells`).
 6. Manifest coverage: an entry's covering checkpoints are every outcome on its declared surfaces;
    "a diff above the noise floor" is an outcome `intended`, `collateral` or `needs_human`, or a
-   region diff above threshold. A covered entry with none of these is `intended_change_not_observed`
-   when `must_be_observed` is true, as is one whose 3.12 task C answer is `not_visible` or `unsure`.
+   region diff above threshold. A `needs_human` for `oracle_unreadable`, `bounds_unreadable` or
+   `rescued_capture` (rows 9a, 11a and 19) counts only with a region above threshold, since rows 9a
+   and 11a give it for a zero or below-floor diff. A covered entry with none of these is
+   `intended_change_not_observed` when `must_be_observed` is true, as is one whose 3.12 task C
+   answer is `not_visible` or `unsure`.
 """
 from __future__ import annotations
 
@@ -45,6 +50,7 @@ NOT_RUN_ORDER = ("entitlement", "budget", "scope", "quarantine", "step_failed", 
 DENOMINATOR_EXCLUDED = frozenset({"entitlement", "scope"})
 QUARANTINE_CEILING = 0.02
 OBSERVED_OUTCOMES = frozenset({"intended", "collateral", "needs_human"})
+BELOW_FLOOR_NEEDS_HUMAN = frozenset({"oracle_unreadable", "bounds_unreadable", "rescued_capture"})   # 3.11 9a, 11a
 UNOBSERVED_VISIBILITY = frozenset({"not_visible", "unsure"})
 
 
@@ -112,13 +118,14 @@ class TierCoverage:
 
 @dataclass(frozen=True)
 class QuarantineShare:
-    """Tier-1 cells `not_run (quarantine)`; above 2 percent run health is red and the RC gate blocks."""
+    """Tier-1 checkpoints `not_run (quarantine)` over registered tier-1 checkpoints (10.5, 1.5);
+    above 2 percent run health is red and the RC gate blocks."""
     quarantined: int
-    cells: int
+    checkpoints: int
 
     @property
     def share(self) -> float:
-        return 0.0 if self.cells == 0 else self.quarantined / self.cells
+        return 0.0 if self.checkpoints == 0 else self.quarantined / self.checkpoints
 
     @property
     def red(self) -> bool:
@@ -134,6 +141,8 @@ class CoverageMatrix:
     rows: list[str]
     synthetic_rows: frozenset[str]
     cells: dict[tuple[str, str, str], Cell]
+    tier1_checkpoints: frozenset[str] = frozenset()
+    tier1_quarantined: frozenset[str] = frozenset()
 
     def cell(self, surface_id: str, persona: str, profile: str) -> Cell:
         return self.cells[(surface_id, persona, profile)]
@@ -145,8 +154,13 @@ class CoverageMatrix:
                             needs_baseline_only=sum(c.state == "covered" and c.needs_baseline == c.count for c in cells))
 
     def quarantine_share(self) -> QuarantineShare:
+        """The 2 percent ceiling, in tier-1 checkpoints (choice 5)."""
+        return QuarantineShare(len(self.tier1_quarantined), len(self.tier1_checkpoints))
+
+    def quarantine_cells(self) -> tuple[int, int]:
+        """Tier-1 cells `not_run (quarantine)` and all tier-1 cells of registered rows, for display only."""
         cells = [c for c in self.cells.values() if c.tier == 1 and c.surface_id not in self.synthetic_rows]
-        return QuarantineShare(sum(c.state == "not_run" and c.reason == "quarantine" for c in cells), len(cells))
+        return sum(c.state == "not_run" and c.reason == "quarantine" for c in cells), len(cells)
 
     def to_rows(self) -> list[dict]:
         """One `coverage_cells` row per cell (stored for merge, RC and Nightly runs, 8.3)."""
@@ -226,7 +240,20 @@ def build_matrix(run_id: str, registry: Registry, profiles: Sequence[Profile],
             for prof in profiles:
                 cells[(sid, persona, prof.id)] = Cell(sid, persona, prof.id, 1, "not_registered")
     rows = [s.id for s in registry] + sorted(synthetic)
-    return CoverageMatrix(run_id, tuple(personas), tuple(profiles), rows, frozenset(synthetic), cells)
+    tier1 = {s.id for s in registry if s.tier == 1}
+    t1_ids: set[str] = set()
+    t1_quarantined: set[str] = set()
+    seen = [(o.checkpoint_id, o.surface_id, o.reason if o.outcome == "not_run" else None)
+            for (sid, _, _), records in grouped.items() if sid in tier1 for o in records]
+    seen += [(c.checkpoint.checkpoint_id, c.surface_id, c.reason) for c in cuts if c.checkpoint is not None]
+    for cid, sid, not_run_reason in seen:
+        if sid not in tier1 or not_run_reason in DENOMINATOR_EXCLUDED:
+            continue
+        t1_ids.add(cid)
+        if not_run_reason == "quarantine":
+            t1_quarantined.add(cid)
+    return CoverageMatrix(run_id, tuple(personas), tuple(profiles), rows, frozenset(synthetic), cells,
+                          frozenset(t1_ids), frozenset(t1_quarantined))
 
 
 # -- manifest coverage table (2.12, 9.2) ------------------------------------------------------
@@ -250,7 +277,10 @@ class ManifestCoverageRow:
 
 
 def _observed(o: CheckpointOutcome) -> bool:
-    return o.outcome in OBSERVED_OUTCOMES or bool(o.diff and any(r.above_threshold for r in o.diff.regions))
+    above = bool(o.diff and any(r.above_threshold for r in o.diff.regions))
+    if o.outcome == "needs_human" and o.reason in BELOW_FLOOR_NEEDS_HUMAN:
+        return above                                     # L-11: rows 9a and 11a are zero or below floor
+    return o.outcome in OBSERVED_OUTCOMES or above
 
 
 def manifest_coverage(run_id: str, manifest: Manifest, outcomes: Iterable[CheckpointOutcome],

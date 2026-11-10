@@ -273,9 +273,14 @@ def test_builds_and_fixed_in_build(store):
     store.register_build("branch-1998.3.0-7be42d0", **facts)
     with pytest.raises(ImportConflict):
         store.register_build("branch-1998.3.0-7be42d0", **{**facts, "source_commit": "other"})
+    store.register_build("branch-1998.2.0-1aa2b3c", **{**facts, "source_commit": "1aa2b3c"},
+                         first_seen_at="2026-01-01T00:00:00+00:00")
     with pytest.raises(StoreRefused):                       # fixed_in_build needs the build (8.3 CHECK)
-        record(store, "dec-000001", "fixed_in_build", "confirmed_bug")
-    d = record(store, "dec-000001", "fixed_in_build", "confirmed_bug", fixed_in_build_id="branch-1998.3.0-7be42d0")
+        record(store, "dec-000001", "fixed_in_build", "confirmed_bug", build_id="branch-1998.2.0-1aa2b3c")
+    with pytest.raises(StoreRefused):                       # ... and the older build it is newer than (L-DEC-08)
+        record(store, "dec-000001", "fixed_in_build", "confirmed_bug", fixed_in_build_id="branch-1998.3.0-7be42d0")
+    d = record(store, "dec-000001", "fixed_in_build", "confirmed_bug", build_id="branch-1998.2.0-1aa2b3c",
+               fixed_in_build_id="branch-1998.3.0-7be42d0")
     assert d.action == "fixed_in_build" and d.ticket == "TOS-1"
 
 
@@ -390,7 +395,8 @@ def test_human_decision_wins_over_a_late_verdict(store):
 
 def test_decision_ref_is_set_once(store):
     store.write_checkpoint(out(SWEEP, "invariant_violation", reason="INV-01", invariant_ids=["INV-01"]))
-    record(store, "dec-000001", "mark_intended", "intended", category="invariant_violation")
+    record(store, "dec-000001", "mark_intended", "intended", category="invariant_violation",
+           expires_at="2026-12-01T00:00:00+00:00")                  # a waiver expires within 30 days (L-DEC-07)
     record(store, "dec-000002", "confirm_bug", "confirmed_bug", category="invariant_violation", phash=ph(range(20)))
     o = store.set_decision_ref(RUN, SWEEP, "dec-000001")
     assert (o.outcome, o.decision_ref) == ("invariant_violation", "dec-000001")

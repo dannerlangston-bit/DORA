@@ -141,13 +141,22 @@ def test_coverage_percent_drops_entitlement_and_scope_cells_only(registry):
         assert (r["state"] == "covered") == (r["worst_outcome"] is not None)
 
 
-def test_quarantine_ceiling_is_2_percent_of_tier1_cells():
+def test_quarantine_ceiling_is_2_percent_of_tier1_checkpoints():
     surfaces = [Surface(id=f"monitor.s{i:02d}", tier=1, kind="section") for i in range(20)]
-    reg = Registry.from_entries(surfaces)                       # 20 surfaces x 5 personas = 100 tier-1 cells
-    two = [cut(f"monitor.s{i:02d}", "quarantine", "active_trader") for i in range(2)]
-    m = build_matrix(RUN, reg, [MARGIN], {}, two)
+    reg = Registry.from_entries(surfaces)                       # 20 surfaces x 5 personas = 100 tier-1 checkpoints
+    every = [(f"monitor.s{i:02d}", p) for i in range(20) for p in WS]
+
+    def matrix(quarantined, off=()):
+        cuts = [cut(s, "quarantine", p) for s, p in quarantined] + [cut(s, "entitlement", p) for s, p in off]
+        ran = [out(s, "identical", p) for s, p in every if (s, p) not in quarantined and (s, p) not in off]
+        return build_matrix(RUN, reg, [MARGIN], {MARGIN.id: ran}, cuts)
+
+    two = [("monitor.s00", "active_trader"), ("monitor.s01", "active_trader")]
+    m = matrix(two)
     assert m.quarantine_share() == QuarantineShare(2, 100) and not m.quarantine_share().red
-    m3 = build_matrix(RUN, reg, [MARGIN], {}, two + [cut("monitor.s02", "quarantine", "beginner")])
+    assert matrix(two, off=every[-10:]).quarantine_share() == QuarantineShare(2, 90)   # entitlement cuts drop out
+    assert m.quarantine_cells() == (2, 100)                     # the cell share, for display
+    m3 = matrix(two + [("monitor.s02", "beginner")])
     share = m3.quarantine_share()
     assert share.share == 0.03 > QUARANTINE_CEILING and share.red
     assert m3.cell("monitor.s02", "beginner", MARGIN.id).display == "not_run (quarantine)"

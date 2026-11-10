@@ -180,14 +180,17 @@ def _row(metrics: Any) -> dict:
 
 
 def calibrate_checkpoint(captures: Sequence[Capture], registry: RegionsFile, *, data_mode: str,
-                         redactions: Sequence[RedactionBox] = (), now: datetime | None = None,
-                         cause_hints: Mapping[str, str] | None = None,
+                         redactions: Sequence[RedactionBox] = (), system_masks: Sequence[Rect] = (),
+                         panel_bounds: Mapping[str, Mapping[str, Rect]] | None = None,
+                         now: datetime | None = None, cause_hints: Mapping[str, str] | None = None,
                          params: Mapping[str, Any] | None = None) -> CheckpointCalibration:
     """Run 3.9 steps 3 to 5 for one checkpoint over its six captures (r1..r5, r6).
 
     `registry` is the effective Region Registry entry; a region's live `floor_exception` (not
     expired at `now`) closes its non-zero-floor item. Region floors and thresholds are kept for
-    every pixel-diffed region plus `_rest` and the whole window (`*`).
+    every pixel-diffed region plus `_rest` and the whole window (`*`). `redactions`,
+    `system_masks` (the parking rectangle, `regions.park_rect`) and `panel_bounds` are passed to
+    every `diff_pair` exactly as a product run passes them (3.9 step 2, 3.5).
     """
     p = params or load_params()
     cp = p["calibration"]
@@ -214,8 +217,9 @@ def calibrate_checkpoint(captures: Sequence[Capture], registry: RegionsFile, *, 
         a, b = captures[i], captures[j]
         if a.image is None or b.image is None:
             continue
-        res = diff_pair(a.image, b.image, registry, redactions=redactions,
-                        context=DiffContext(run_id="calibration", checkpoint_id=cid), params=p)
+        res = diff_pair(a.image, b.image, registry, redactions=redactions, system_masks=system_masks,
+                        panel_bounds=panel_bounds, context=DiffContext(run_id="calibration", checkpoint_id=cid),
+                        params=p)
         if res.terminal is not None:
             t = res.terminal
             cause = "landmark_jitter" if t.outcome == "landmark_missing" else "settle"
@@ -380,12 +384,12 @@ def _exception_dict(exc: FloorException | None) -> dict | None:
 
 
 def aa_false_positive_rate(results: Iterable[DiffResult]) -> float:
-    """3.9 step 7: region pairs over threshold divided by region pairs compared."""
+    """3.9 step 7: region pairs over floor divided by region pairs compared."""
     over = compared = 0
     for res in results:
         for m in res.regions:
             compared += 1
-            over += int(m.above_threshold)
+            over += int(m.above_floor)
     return over / compared if compared else 0.0
 
 
@@ -400,15 +404,20 @@ class AADrift:
 
 def aa_drift(results: Mapping[str, DiffResult], frozen: Iterable[str],
              params: Mapping[str, Any] | None = None) -> AADrift:
-    """Nightly A/A on one build. A frozen checkpoint whose calibrated zero-floor region shows any
-    change is `not_settled (reason: aa_drift)`; more than 2 percent of checkpoints above floor is
-    `harness_error (reason: aa_drift_global)`. Uncalibrated results are left to
-    `needs_human (reason: uncalibrated)` (10.6) and never drift."""
+    """Nightly A/A on one build. A frozen checkpoint with any calibrated diff above its floor is
+    `not_settled (reason: aa_drift)` (10.6): a calibrated region above its floor or its threshold,
+    or an accepted whole-window shift (regions are measured relative to it, so they alone miss a
+    shifted window; a shift is a change, never noise, 3.7). More than 2 percent of checkpoints above
+    floor is `harness_error (reason: aa_drift_global)`. Uncalibrated results are left to
+    `needs_human (reason: uncalibrated)` (10.6) and never drift. Synthetic results (canary
+    mutants, `DiffContext(synthetic=True)`) are left out entirely, the denominator included."""
     p = params or load_params()
     frozen_set = set(frozen)
     drifted: dict[str, Terminal] = {}
     above = 0
-    for cid, res in results.items():
+    real = {cid: res for cid, res in results.items()
+            if not (res.synthetic or (res.signal is not None and res.signal.synthetic))}
+    for cid, res in real.items():
         if res.terminal is not None:
             continue
         if res.signal is not None and res.signal.above_floor and res.threshold_source == "calibrated":
@@ -416,12 +425,14 @@ def aa_drift(results: Mapping[str, DiffResult], frozen: Iterable[str],
         if cid not in frozen_set:
             continue
         hits = [m.region_id for m in res.regions if m.threshold_source == "calibrated"
-                and m.threshold.floor_changed_px == 0 and m.threshold.floor_shift_px == 0
-                and (m.changed_px > 0 or m.shift_px > 0)]
+                and (m.above_floor or m.above_threshold)]
+        ws = res.window_shift
+        if ws is not None and ws.accepted and res.threshold_source == "calibrated":
+            hits.append(f"window shift ({ws.dx}, {ws.dy})")
         if hits:
             drifted[cid] = Terminal("not_settled", "aa_drift", detail="regions: " + ", ".join(hits))
-    frac = above / len(results) if results else 0.0
+    frac = above / len(real) if real else 0.0
     glob = None
     if frac > float(p["calibration"]["aa_drift_global_fraction"]):
-        glob = Terminal("harness_error", "aa_drift_global", detail=f"{above} of {len(results)} checkpoints above floor")
+        glob = Terminal("harness_error", "aa_drift_global", detail=f"{above} of {len(real)} checkpoints above floor")
     return AADrift(drifted, glob, frac)

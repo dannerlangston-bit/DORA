@@ -43,7 +43,8 @@ class Member:
 
     @property
     def suppressed(self) -> bool:
-        return self.decision_id is not None
+        """Only an active decision suppresses: a reopened one returns the finding to Unexpected, undecided (9.7)."""
+        return self.decision_id is not None and (self.decision is None or self.decision.status == "active")
 
     @property
     def checkpoint_id(self) -> str:

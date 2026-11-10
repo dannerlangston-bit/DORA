@@ -756,3 +756,14 @@ WHEN NEW.outcome = {{run_outcomes:complete}} AND EXISTS (
   SELECT 1 FROM run_scope s WHERE s.run_id = NEW.run_id AND NOT EXISTS (
     SELECT 1 FROM outcomes o WHERE o.run_id = s.run_id AND o.checkpoint_id = s.checkpoint_id AND o.synthetic = 0))
 BEGIN SELECT RAISE(ABORT, 'run cannot be complete: a scoped checkpoint has no outcome'); END;
+
+-- 1.10 per run and 8.2: `complete` also needs no not_comparable (fingerprint_mismatch) checkpoint, no UNPROVEN
+-- post-run proof (6.6) and no shard that ended worse than complete (the run outcome is the worst of the shards').
+CREATE TRIGGER trg_run_complete_env BEFORE UPDATE OF outcome ON runs
+WHEN NEW.outcome = {{run_outcomes:complete}} AND (
+     EXISTS (SELECT 1 FROM outcomes o WHERE o.run_id = NEW.run_id AND o.synthetic = 0
+             AND o.outcome = {{checkpoint_outcomes:not_comparable}} AND o.reason = {{reason_codes:fingerprint_mismatch}})
+  OR EXISTS (SELECT 1 FROM post_run_proofs p WHERE p.run_id = NEW.run_id AND p.verdict = 'unproven'
+             AND p.verified_by IS NULL)
+  OR EXISTS (SELECT 1 FROM shards s WHERE s.run_id = NEW.run_id AND s.shard_outcome <> {{run_outcomes:complete}}))
+BEGIN SELECT RAISE(ABORT, 'run cannot be complete: fingerprint mismatch, unproven post-run proof or a shard worse than complete'); END;

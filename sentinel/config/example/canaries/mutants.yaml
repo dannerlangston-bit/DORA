@@ -199,7 +199,7 @@
   money_cell: false
   generator: {op: translate, params: {dx: 1}, seed: 20260101}
   region_ref: rgn.order-entry.divider
-  expected: {outcomes: [noise]}   # control: any finding is the miss
+  expected: {outcomes: [identical, noise]}   # control: absorbed below threshold; any finding is the miss
   owner: sentinel-canaries
 - mutant_id: M21
   name: mut.chart.global-shift
@@ -237,7 +237,7 @@
   class: study_removed
   mode: image
   money_cell: false
-  generator: {op: erase, params: {color: [0, 200, 255]}, seed: 20260101}
+  generator: {op: erase, params: {color: [255, 200, 0]}, seed: 20260101}
   region_ref: rgn.chart.plot
   expected: {outcomes: [collateral]}
   owner: sentinel-canaries

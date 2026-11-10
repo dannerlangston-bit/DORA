@@ -19,7 +19,7 @@ BOX = dict(
     control=(140, 64, 18, 12), divider=(176, 70, 70, 1), strip=(176, 160, 160, 20),
     viewport=(176, 180, 160, 40), empty=(8, 160, 120, 70), buy=(176, 230, 40, 20), sell=(226, 230, 40, 20),
 )
-YELLOW = (0, 220, 220)
+YELLOW = (220, 220, 0)                                # RGB, the channel order of every frame
 CONFIRM = "flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07"
 POSITIONS = "census/monitor.activity.position-statement/ws.tier-a.active-trader"
 FLEXGRID = "sweep/charts.flexible-grid.active-trader-cell/flexgrid/480x360"
@@ -44,7 +44,7 @@ def canvas() -> np.ndarray:
     for i, s in enumerate(["A 101", "B 102", "C 103", "D 104"]):
         text(s, (12, 94 + 14 * i), 0.4)
     text("+12.50", (180, 30), 0.5, (0, 160, 0))
-    text("-3.10", (180, 48), 0.5, (0, 0, 200))
+    text("-3.10", (180, 48), 0.5, (200, 0, 0))
     x, y, _, _ = BOX["chart"]
     for k in range(8):
         cv2.rectangle(img, (x + 8 + 15 * k, y + 20 + (k % 3) * 5), (x + 14 + 15 * k, y + 45), (120, 120, 120), -1)
@@ -172,8 +172,8 @@ def test_parameters_stay_in_the_spec_ranges():
     with pytest.raises(C.GenerationError, match="15 to 40"):
         C.clip_label(BASE, BOX["label"], rng(), fraction=0.5)
     red = C.global_shift(BASE, FRAME, rng(), delta=6)
-    assert np.array_equal(red[..., :2], BASE[..., :2])
-    assert np.array_equal(red[..., 2].astype(int), np.minimum(BASE[..., 2].astype(int) + 6, 255))
+    assert np.array_equal(red[..., 1:], BASE[..., 1:])                       # M23: red is channel 0 (RGB)
+    assert np.array_equal(red[..., 0].astype(int), np.minimum(BASE[..., 0].astype(int) + 6, 255))
     one = C.global_shift(BASE, FRAME, rng())
     assert np.array_equal(one[:, 1:], BASE[:, :-1])                          # M21: 1 px right
     off = C.move_offscreen(BASE, FRAME, rng())

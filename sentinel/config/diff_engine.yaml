@@ -21,7 +21,8 @@ pixel:                          # 3.7 granularity 2 (pixelmatch-style)
   t: 0.1                        # changed when delta > max_delta_scale * t^2 (352.15)
   max_delta_scale: 35215
   detect_antialiasing: true
-  edge_tolerance_px: 1          # applied only on a region with a human-approved floor_exception
+  # edge tolerance: not set here; each region with a human-approved floor_exception uses that
+  # exception's own edge_tolerance_px (4.8, default 1; 0 turns it off), and no other region has one
 
 ssim:                           # 3.7 SSIM per region (ranking, heatmap, Reviewer; decides nothing)
   sigma: 1.5
@@ -34,7 +35,8 @@ color:                          # 3.7 color_shift and color_semantic_flip
   color_shift_delta_e: 2.0      # region mean CIEDE2000 above this while the per-pixel map is nearly empty
   flip_share_min: 0.5           # choice: share of a component's changed pixels that must cross bands
   green_band: {hue_deg: [75, 165], sat_min: 0.35, val_min: 0.25}
-  red_band: {hue_deg: [340, 20], sat_min: 0.35, val_min: 0.25}   # wraps through 0
+  red_band: {hue_deg: [330, 20], sat_min: 0.35, val_min: 0.25}   # wraps through 0; 330 takes in a
+                                # red-green channel swap of a blue-tinted green (M07: (24, 196, 92) -> hue 330 to 336)
 
 components:                     # 3.7 granularity 3
   dilate_kernel_wh: [5, 3]      # 5 wide, 3 tall rectangle, one iteration

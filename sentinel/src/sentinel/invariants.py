@@ -29,9 +29,10 @@ Choices where the spec is ambiguous (each cites the section it reads):
   pre-existing lowering second, so a pre-existing violation is always one level below the same
   violation candidate-only (tier-1 S1 stays S1 when new, S2 when pre-existing). S3 is the floor.
 - Violation identity. A violation is keyed by (invariant id, subject), where the subject is the
-  build-stable name of what fired (component names, word anchor, label text, region id). The
-  pre-existing rule and the 3-frame rule match on this key; word boxes without an `anchor` fall
-  back to text and position, which is not stable across a layout shift.
+  build-stable name of what fired (component names, word anchor, label text, region id, grid
+  column and row ordinal). The pre-existing rule and the 3-frame rule match on this key; word
+  boxes without an `anchor` fall back to text and position, which is not stable across a layout
+  shift.
 - INV-02 viewports. 2.7 says both "parent not a viewport with a showing scrollbar" (Branch A) and
   "viewports excluded unless INV-06 fires" (controls). A child outside a viewport is excluded only
   when that viewport shows a scrollbar and INV-06 did not fire on it.
@@ -47,8 +48,8 @@ Choices where the spec is ambiguous (each cites the section it reads):
   base build without a reference (rule and label-prefix tests only). An A/A pair is checked both
   ways, each capture against the other, since any firing there is a false positive.
 - INV-04 needs a word at the same anchor on both builds (its "same anchor on both builds"
-  control); under Branch A it is suppressed when the base's displayed text already ended in an
-  ellipsis.
+  control); under Branch A on a frozen checkpoint outside rule regions it is suppressed when the
+  base's displayed text already ended in an ellipsis.
 - INV-05 Branch B matches a label against a run of words on one line, joined by single spaces,
   within one edit (Levenshtein distance at most 1).
 - INV-06. An allowed-scrollbar entry gives the size at and above which no scrollbar is expected;
@@ -732,17 +733,24 @@ class _Frame:
 
 
 def _inv01(f: _Frame) -> list[Violation]:
-    groups: dict[tuple[str, bool], list[UIComponent]] = defaultdict(list)
+    groups: dict[tuple[str | None, object], list[UIComponent]] = defaultdict(list)
     for c in f.model.components:
-        if c.parent is None or not c.showing:
+        if not c.showing:
             continue
         is_b = f.comp_is_b(c)
         if is_b and c.kind not in ("panel", "control"):
             continue
-        groups[(c.parent, is_b)].append(c)
+        if c.parent is not None:
+            groups[(c.parent, is_b)].append(c)
+        elif is_b:
+            # L-05, 2.7 INV-01 Branch B: no tree, so segmented panels and template-located controls
+            # need not name a parent; compare parentless panels pairwise and controls pairwise.
+            groups[(None, c.kind)].append(c)
     out = []
-    for members in groups.values():
+    for (parent, _), members in groups.items():
         for a, b in combinations(members, 2):
+            if parent is None and (a.bbox.contains(b.bbox) or b.bbox.contains(a.bbox)):
+                continue                                 # nesting, not an overlap, without a tree
             ox, oy = a.bbox.overlap(b.bbox)
             if ox < OVERLAP_MIN_PX or oy < OVERLAP_MIN_PX:
                 continue
@@ -854,12 +862,23 @@ def _inv04(f: _Frame) -> list[Violation]:
     out = []
     ref_by_name = {c.name: c for c in f.reference.components} if f.reference is not None else {}
     for c in f.a_components():
-        if not _ends_with_ellipsis(c.text) or not c.label or _ends_with_ellipsis(c.label):
+        if not _ends_with_ellipsis(c.text):
             continue
-        ref = ref_by_name.get(c.name)
-        if ref is not None and _ends_with_ellipsis(ref.text):
+        # L-04, 2.7 INV-04 controls and F46: inside a rule region, and on masked_live, the rule
+        # replaces the base comparison, as for Branch B words below.
+        region = f.rule_region(c.bbox)
+        if region is not None:
+            if region.admits_ellipsis(c.text):
+                continue
+            why = f"rule {region.id} admits no ellipsis"
+        elif f.rules.data_mode == "masked_live" or not c.label or _ends_with_ellipsis(c.label):
             continue
-        out.append(Violation("INV-04", c.name, (c.bbox,), f"displays {c.text!r}; accessible name {c.label!r}"))
+        else:
+            ref = ref_by_name.get(c.name)
+            if ref is not None and _ends_with_ellipsis(ref.text):
+                continue
+            why = f"accessible name {c.label!r}"
+        out.append(Violation("INV-04", c.name, (c.bbox,), f"displays {c.text!r}; {why}"))
     for w in f.b_words:
         if not _ends_with_ellipsis(w.text):
             continue
@@ -1062,8 +1081,14 @@ def _palette_class(color: tuple[int, int, int], config: CheckerConfig) -> str | 
 
 def _inv15(f: _Frame) -> list[Violation]:
     out = []
-    for c in f.model.cells:
-        if c.column not in f.rules.signed_columns or c.header or c.text is None or c.color is None:
+    # L-06, 2.7 Pre-existing: key a cell by column and row ordinal, which survive a layout shift.
+    data = [c for c in f.model.cells if not c.header]
+    row: dict[int, int] = {}
+    for col in dict.fromkeys(c.column for c in data):
+        in_col = sorted((i for i, c in enumerate(data) if c.column == col), key=lambda i: (data[i].bbox.y, data[i].bbox.x))
+        row.update((i, n) for n, i in enumerate(in_col))
+    for i, c in enumerate(data):
+        if c.column not in f.rules.signed_columns or c.text is None or c.color is None:
             continue
         value = _parse_signed(c.text)
         if value is None or value == 0:
@@ -1073,7 +1098,7 @@ def _inv15(f: _Frame) -> list[Violation]:
         cls = _palette_class(c.color, f.config)
         expected = "positive" if value > 0 else "negative"
         if cls is not None and cls != expected:
-            out.append(Violation("INV-15", f"{c.column}:{c.bbox.x},{c.bbox.y}", (c.bbox,),
+            out.append(Violation("INV-15", f"{c.column}:row{row[i]}", (c.bbox,),
                                  f"{c.text!r} in {c.column} is drawn {cls}; its sign is {expected}"))
     return out
 

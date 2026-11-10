@@ -35,12 +35,15 @@ Choices where the spec is ambiguous (each cites the section it reads):
   a verdict or R `unavailable` (the job gave up); for R `capped`, `done` when the item was queued
   when model calls stopped and `none` when the cap excluded it from the start (never queued).
 - Decision memory (3.11 input M, 9.7). Only active decisions count; an `intended` decision counts
-  only on its build pair or when the run's loaded manifest carries its entry or ticket. Matches
+  only on its build pair (read from the decision record and the match; whichever is set must equal
+  the run's pair) or when the run's loaded manifest carries its entry or ticket, and never on a
+  run without a manifest, where `intended` is disabled (4.3). Matches
   with different verdicts inherit nothing and are listed as conflicting. Otherwise the nearest
   by Hamming distance, then the newest, is inherited. A `confirmed_bug` match is not a row
   selector: the computed outcome stands, the decision is referenced (`decision_ref`) and a
   computed `collateral` takes reason `decision:<id>` (4.13). On rows 7 and 8 a matching decision
-  is a waiver: it is referenced and the outcome never changes. A rescued capture ignores M.
+  is a waiver: it is referenced and the outcome never changes. A rescued capture ignores M
+  entirely: no inheritance, no known-bug reference, no waiver (3.11 notes, 4.14).
 - Other applicable `needs_human` reasons (3.11 notes, F47) go in `detail` as "also: ..." in the
   fixed order of 3.11 on every row from 9 on. `uncalibrated`, `no_manifest` and `global_shift`
   apply only to an above-threshold diff.
@@ -334,12 +337,25 @@ def _in_scope(m: DecisionMatch, facts: Facts) -> bool:
     d = m.decision
     if d.verdict != "intended":
         return True
-    return ((m.build_pair_id is not None and m.build_pair_id == facts.build_pair_id)
+    # 9.7: a waiver (mark_intended on an invariant_violation or assertion_failed signature) applies to
+    # every run while it is active; its expiry is enforced by the store (L-DEC-07).
+    if d.signature.category in ("invariant_violation", "assertion_failed"):
+        return True
+    # L-02, 4.3 Missing manifest: the `intended` category is disabled for a no-manifest run, so an
+    # intended decision is not in scope there and the item falls through to rows 15 to 18.
+    if facts.manifest in ("no_manifest_ui", "no_manifest_nonui"):
+        return False
+    # L-01, F38: the pair the decision was made on is on the Decision record; a DecisionMatch may
+    # repeat it. Whichever is set must equal this run's pair.
+    pairs = {p for p in (m.build_pair_id, d.build_pair_id) if p is not None}
+    return (pairs == {facts.build_pair_id}
             or (d.manifest_entry_ref is not None and d.manifest_entry_ref in facts.manifest_entries)
             or (d.ticket is not None and d.ticket in facts.manifest_tickets))
 
 
 def _memory(facts: Facts) -> _Memory:
+    if facts.rescued:       # L-03, 3.11 notes rows 13 and 14: a rescued checkpoint ignores decision memory
+        return _Memory("none")
     live = [m for m in facts.decisions if m.decision.status == "active" and _in_scope(m, facts)]
     if not live:
         return _Memory("none")

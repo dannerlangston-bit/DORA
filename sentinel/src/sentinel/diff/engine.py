@@ -10,16 +10,20 @@ step 3) and components. A checkpoint the engine cannot diff ends in a `Terminal`
 refuses a pair before any pixel is read (3.3, 4.12), and `global_shift_prepass` is the run-level
 granularity-0 pass.
 
-Order of work (3.7, 5.8): pad to a common size (3.3); exact equality short-circuits to `zero`;
-locate landmarks; locate regions and evaluate the mask budget; refuse on a missing landmark;
+Order of work (3.7, 5.8): bring both captures to 3 channels (grayscale repeated, alpha dropped);
+pad to a common size (3.3); locate landmarks; locate regions and evaluate the mask budget; exact
+equality then short-circuits the pixel work to `zero`; refuse on a missing landmark;
 whole-window translation; per-region YIQ diff with anti-aliasing detection, per-region
 translation, SSIM and CIEDE2000; connected components over the whole changed map; thresholds;
 findings; heatmap.
 
 Choices where the spec is ambiguous (each reported to the coordinator):
 
-1. Hash equality short-circuits before landmarks and the mask budget (5.8 "exact hash equality
-   short-circuits to identical").
+1. Hash equality short-circuits the pixel work (5.8 "exact hash equality short-circuits to
+   identical"), but only after the landmarks are located and the mask budget is evaluated: a
+   redaction box over a money cell fills it the same way on both sides, so byte-equal captures can
+   still breach the budget, and `harness_error` comes before `identical` (3.8; 3.11 rows 2 and 10).
+   A missing landmark on byte-equal captures stays `zero` (5.8).
 2. The mask budget is evaluated before the missing-landmark refusal, on the panels whose landmarks
    were found, so `harness_error` keeps its precedence over `landmark_missing` (3.11 rows 2, 6).
 3. A translation counts (for the finding and for the threshold) only when the response, range and
@@ -51,6 +55,14 @@ Choices where the spec is ambiguous (each reported to the coordinator):
     it overrides 3.7.
 12. Money cells count any changed pixel as above threshold (3.11 note on row 11), although the 3.9
     table alone would give 4 px; their component and shift minimums are 1 as well.
+13. `system_masks` (the 16x16 parking rectangle of 3.5) are masks (3.2): they count toward the
+    panel share of the mask budget, and one over a money cell is `mask_budget_exceeded` (3.8).
+14. A region's edge tolerance is its own `floor_exception.edge_tolerance_px` (4.8, default 1; 0
+    turns it off); a region without a floor exception has none.
+15. A canary mutant is diffed with `DiffContext(synthetic=True)`: the result and its
+    `GlobalShiftSignal` carry `synthetic=True`, and the run-level passes (`global_shift_prepass`,
+    `calibration.aa_drift`) ignore it, so an injected global shift (M21, M23) never trips
+    `aa_drift_global` (10.3 Injection).
 """
 from __future__ import annotations
 
@@ -96,6 +108,7 @@ class DiffContext:
     run_id: str = "run-local"
     checkpoint_id: str | None = None
     tier: int | None = None
+    synthetic: bool = False             # a canary mutant (10.3): ignored by the run-level passes (choice 15)
 
 
 @dataclass(frozen=True)
@@ -191,6 +204,7 @@ class GlobalShiftSignal:
     changed_px: int
     text_edge_px: int
     text_edge_only: bool
+    synthetic: bool = False             # a canary mutant's signal: never counted by the pre-pass or A/A drift
 
 
 @dataclass
@@ -210,6 +224,7 @@ class DiffResult:
     budget: BudgetResult | None = None
     signal: GlobalShiftSignal | None = None
     changed_map: np.ndarray | None = None
+    synthetic: bool = False             # diffed with DiffContext(synthetic=True), a canary mutant (choice 15)
 
     def region(self, region_id: str) -> RegionMetrics:
         for r in self.regions:
@@ -256,10 +271,22 @@ def compare_fingerprints(base: Mapping[str, Any], candidate: Mapping[str, Any]) 
 # Template search (3.7 landmarks; also the settle rule's anchors, 3.5)
 # --------------------------------------------------------------------------------------------
 
+def _rgb(img: np.ndarray) -> np.ndarray:
+    """An H x W, H x W x 1, H x W x 3 or H x W x 4 image as H x W x 3: gray repeated, alpha dropped."""
+    if img.ndim == 2:
+        return np.repeat(img[:, :, None], 3, axis=2)
+    if img.ndim == 3 and img.shape[2] == 1:
+        return np.repeat(img, 3, axis=2)
+    if img.ndim == 3 and img.shape[2] in (3, 4):
+        return img[:, :, :3]
+    raise ValueError(f"an image is H x W (gray), H x W x 3 or H x W x 4; got shape {img.shape}")
+
+
 def match_template(image: np.ndarray, template: np.ndarray, search: Rect | None = None,
                    radius: int = 5) -> tuple[float, float, tuple[int, int] | None]:
     """`cv2.matchTemplate` with `TM_CCOEFF_NORMED` inside `search`: (best, second peak outside
     `radius` px of the best, best top-left in image coordinates)."""
+    image, template = _rgb(image), _rgb(template)       # e.g. a BGRA screen grab against an RGB template
     H, W = image.shape[:2]
     box = (search or Rect(0, 0, W, H)).intersect(Rect(0, 0, W, H))
     th, tw = template.shape[:2]
@@ -604,11 +631,11 @@ def _heatmap(base: np.ndarray, changed: np.ndarray, aa: np.ndarray, rects: Seque
 
 
 def _terminal_result(terminal: Terminal, findings: list[Finding], base: np.ndarray, params: Mapping[str, Any],
-                     landmarks: dict, budget: BudgetResult | None, source: str) -> DiffResult:
+                     landmarks: dict, budget: BudgetResult | None, source: str, synthetic: bool) -> DiffResult:
     blank = np.zeros(base.shape[:2], dtype=bool)
     return DiffResult(level=None, threshold_source=source, summary=DiffSummary(), findings=findings,
                       heatmap=_heatmap(base, blank, blank, [], [], params), landmarks=landmarks,
-                      terminal=terminal, budget=budget)
+                      terminal=terminal, budget=budget, synthetic=synthetic)
 
 
 def diff_pair(base: np.ndarray, candidate: np.ndarray, registry: RegionsFile | None = None, *,
@@ -620,11 +647,13 @@ def diff_pair(base: np.ndarray, candidate: np.ndarray, registry: RegionsFile | N
     `registry` is the effective Region Registry entry (see `regions.effective_registry`); None means
     no declared regions, so the whole window is `_rest`. `calibration` is the file for the run's
     fingerprint, or None when none exists (every region `uncalibrated`, 3.9 step 6).
+    Grayscale captures are repeated to 3 channels and an alpha channel is dropped.
     `redactions` are Capture's boxes (3.6, budgeted unless identity fields); `system_masks` are
     the other system-owned exclusions, such as `regions.park_rect` around the parking coordinate
-    (3.5), excluded on both sides and never budgeted. `panel_bounds[side][panel]` overrides the
-    mask-budget panel bounds.
+    (3.5), excluded on both sides and budgeted as masks (choice 13). `panel_bounds[side][panel]`
+    overrides the mask-budget panel bounds.
     """
+    base, candidate = _rgb(base), _rgb(candidate)
     p = params or load_params()
     ctx = context or DiffContext()
     reg = registry or RegionsFile(checkpoint_id=ctx.checkpoint_id or "")
@@ -646,32 +675,38 @@ def diff_pair(base: np.ndarray, candidate: np.ndarray, registry: RegionsFile | N
     thresholds[REST_ID] = _threshold(calibration, cid, REST_ID, None)
     thresholds[WHOLE_ID] = _threshold(calibration, cid, WHOLE_ID, None)
     any_calibrated = any(src == "calibrated" for _, src in thresholds.values())
+    identical = base.shape == candidate.shape and np.array_equal(base, candidate)
 
-    # 5.8: exact hash equality short-circuits (no pixel work; regions report zero metrics)
-    if base.shape == candidate.shape and np.array_equal(base, candidate):
-        return _identical(cid, reg, B, thresholds, findings, p)
-
-    # 3.7 landmarks, located in both images
-    matches = {lm.id: (locate_landmark(B, lm, p), locate_landmark(C, lm, p)) for lm in reg.landmarks}
+    # 3.7 landmarks, located in both images (once when the captures are byte-equal)
+    if identical:
+        matches = {lm.id: (m, m) for lm in reg.landmarks for m in [locate_landmark(B, lm, p)]}
+    else:
+        matches = {lm.id: (locate_landmark(B, lm, p), locate_landmark(C, lm, p)) for lm in reg.landmarks}
     pos_b = {k: m[0].pos for k, m in matches.items() if m[0].found}
     pos_c = {k: m[1].pos for k, m in matches.items() if m[1].found}
     loc_b, loc_c = locate(reg, pos_b), locate(reg, pos_c)
 
-    # 3.8 mask budget, before the landmark refusal (choice 2)
-    budget = mask_budget(reg, {"base": loc_b, "candidate": loc_c}, redactions, p["mask_budget"], panel_bounds)
+    # 3.8 mask budget, before the identical short-circuit (choice 1) and the landmark refusal (choice 2)
+    budget = mask_budget(reg, {"base": loc_b, "candidate": loc_c}, redactions, p["mask_budget"], panel_bounds,
+                         system_masks=system_masks)
     if budget.exceeded:
         detail = budget.detail()
         findings.append(_finding(ctx, "mask_budget_exceeded", f"mask budget exceeded: {detail}",
                                  evidence={"detail": detail}))
         return _terminal_result(Terminal("harness_error", "mask_budget_exceeded", detail=detail),
-                                findings, B, p, matches, budget, "calibrated" if any_calibrated else "uncalibrated")
+                                findings, B, p, matches, budget, "calibrated" if any_calibrated else "uncalibrated",
+                                ctx.synthetic)
+
+    # 5.8: exact hash equality short-circuits the pixel work (regions report zero metrics)
+    if identical:
+        return _identical(ctx, cid, reg, B, thresholds, findings, p, matches, loc_b, budget)
     for lm_id, (mb, mc) in matches.items():
         if not (mb.found and mc.found):
             side = "both" if not (mb.found or mc.found) else ("base" if not mb.found else "candidate")
             return _terminal_result(
                 Terminal("landmark_missing", f"landmark:{lm_id}", side=side,
                          detail=f"base score {mb.score:.3f}/{mb.second:.3f}, candidate score {mc.score:.3f}/{mc.second:.3f}"),
-                findings, B, p, matches, budget, "calibrated" if any_calibrated else "uncalibrated")
+                findings, B, p, matches, budget, "calibrated" if any_calibrated else "uncalibrated", ctx.synthetic)
 
     masks_b = [loc_b[r.id] for r in reg.regions if r.type == "mask"]
     masks_c = [loc_c[r.id] for r in reg.regions if r.type == "mask"]
@@ -692,7 +727,7 @@ def diff_pair(base: np.ndarray, candidate: np.ndarray, registry: RegionsFile | N
         Cc, vc = _crop(C, vC, rc, pad_rgb)
         excl_b = _local_mask(Bc.shape[:2], (rb.x, rb.y), masks_b + red)
         excl_c = _local_mask(Cc.shape[:2], (rc.x, rc.y), masks_c + red)
-        tol = int(p["pixel"]["edge_tolerance_px"]) if r.floor_exception is not None else 0
+        tol = int(r.floor_exception.edge_tolerance_px) if r.floor_exception is not None else 0   # choice 14
         pair = _compare(r.id, Bc, Cc, vb, vc, excl_b | excl_c, (rb.x, rb.y), (rc.x - rb.x, rc.y - rb.y), p, tol)
         n0 = int(pair.changed.sum())
         if n0 and min(rb.w, rb.h) >= tmin:
@@ -722,11 +757,10 @@ def diff_pair(base: np.ndarray, candidate: np.ndarray, registry: RegionsFile | N
                      findings, B, C, p)
 
 
-def _identical(cid: str, reg: RegionsFile, B: np.ndarray, thresholds: Mapping[str, tuple[RegionThreshold, str]],
-               findings: list[Finding], p: Mapping[str, Any]) -> DiffResult:
+def _identical(ctx: DiffContext, cid: str, reg: RegionsFile, B: np.ndarray,
+               thresholds: Mapping[str, tuple[RegionThreshold, str]], findings: list[Finding], p: Mapping[str, Any],
+               matches: dict, loc: Mapping[str, Rect], budget: BudgetResult) -> DiffResult:
     H, W = B.shape[:2]
-    matches = {lm.id: locate_landmark(B, lm, p) for lm in reg.landmarks}
-    loc = locate(reg, {k: m.pos for k, m in matches.items() if m.found})
     metrics = []
     for rid in [r.id for r in reg.regions if r.pixel_diffed] + [REST_ID]:
         th, src = thresholds[rid]
@@ -738,9 +772,9 @@ def _identical(cid: str, reg: RegionsFile, B: np.ndarray, thresholds: Mapping[st
     blank = np.zeros((H, W), dtype=bool)
     summary = DiffSummary(regions=[RegionDiff(m.region_id, 0.0, 1.0, False) for m in metrics])
     return DiffResult("zero", "calibrated" if any_calibrated else "uncalibrated", summary, findings,
-                      _heatmap(B, blank, blank, [], [], p), regions=metrics,
-                      landmarks={k: (m, m) for k, m in matches.items()},
-                      signal=GlobalShiftSignal(cid, "zero", False, 0, 0, True), changed_map=blank)
+                      _heatmap(B, blank, blank, [], [], p), regions=metrics, landmarks=matches, budget=budget,
+                      signal=GlobalShiftSignal(cid, "zero", False, 0, 0, True, ctx.synthetic), changed_map=blank,
+                      synthetic=ctx.synthetic)
 
 
 def _window_shift(B: np.ndarray, vB: np.ndarray, C: np.ndarray, vC: np.ndarray, excl_b_rects: list[Rect],
@@ -949,12 +983,13 @@ def _assemble(ctx: DiffContext, cid: str, reg: RegionsFile, pairs: list[_Pair], 
         regions=[RegionDiff(m.region_id, m.pixel_fraction, m.ssim, m.above_threshold) for m in metrics],
         components=[Component(c.area, c.bbox, c.region_id) for c in comps])
     signal = GlobalShiftSignal(cid, level, any(m.above_floor for m in metrics) or level_above,
-                               total_changed, int((changed & edge).sum()), all(c.text_edge for c in comps))
+                               total_changed, int((changed & edge).sum()), all(c.text_edge for c in comps),
+                               ctx.synthetic)
     rects = [m.base_rect for m in metrics[:-1]]
     return DiffResult(level=level, threshold_source=source, summary=summary, findings=findings,
                       heatmap=_heatmap(B, changed, aa, rects, comps, p), regions=metrics, components=comps,
                       landmarks=matches, window_shift=window_shift, budget=budget, signal=signal,
-                      changed_map=changed)
+                      changed_map=changed, synthetic=ctx.synthetic)
 
 
 def _text_edges(base_crop: np.ndarray, gp: Mapping[str, Any]) -> np.ndarray:
@@ -996,8 +1031,9 @@ def global_shift_prepass(signals: Sequence[GlobalShiftSignal], *, nightly: bool 
                          params: Mapping[str, Any] | None = None) -> GlobalShiftDecision:
     """Granularity 0 (3.7): once per run, after at least 20 pairs have been diffed. Raised when more
     than 2 percent of compared checkpoints are above floor and more than 70 percent of their changed
-    pixels are text-edge pixels."""
+    pixels are text-edge pixels. Synthetic signals (canary mutants, choice 15) are left out entirely."""
     gp = (params or load_params())["global_shift"]
+    signals = [s for s in signals if not s.synthetic]
     if len(signals) < int(gp["min_pairs"]):
         return GlobalShiftDecision(False, False, 0.0, 0.0)
     above = [s for s in signals if s.above_floor]

@@ -437,13 +437,16 @@ def _covered_area(bounds: Rect, rects: Sequence[Rect]) -> int:
 
 def mask_budget(regfile: RegionsFile, located: Mapping[str, Mapping[str, Rect]],
                 redactions: Sequence[RedactionBox], budgets: Mapping[str, float],
-                panel_bounds: Mapping[str, Mapping[str, Rect]] | None = None) -> BudgetResult:
+                panel_bounds: Mapping[str, Mapping[str, Rect]] | None = None, *,
+                system_masks: Sequence[Rect] = ()) -> BudgetResult:
     """Evaluate the mask budget per side against the located panel bounds (3.8, 4.8).
 
     `located[side][region_id]` are the absolute rects of that capture; `budgets` maps a panel class
     to its share (classes absent from it, such as `other`, have no budget). The share is the area
     of masks plus non-identity redaction boxes inside the panel's bounds over the bounds' area.
     Any mask or redaction box intersecting a money cell breaches the money cell's zero budget.
+    `system_masks` (the parking rectangle of 3.5, applied on both sides) are masks (3.2) and count
+    the same way on each side.
     """
     panels: list[PanelBudget] = []
     hits: list[MoneyCellHit] = []
@@ -451,6 +454,7 @@ def mask_budget(regfile: RegionsFile, located: Mapping[str, Mapping[str, Rect]],
     for side in SIDES:
         loc = located.get(side, {})
         masks = [(rid, rect) for rid, rect in loc.items() if by_id[rid].type == "mask"]
+        masks += [(f"system_mask@{r.x},{r.y}", r) for r in system_masks]
         cover = [rect for _, rect in masks] + [b.rect for b in redactions if not b.identity_field]
         for panel, budget in budgets.items():
             bounds = (panel_bounds or {}).get(side, {}).get(panel)

@@ -1379,6 +1379,9 @@ class _Linter:
                 break
             keys = [_s(st.get("key")).casefold()] if st.get("type") == "press" else \
                 [_s(x).casefold() for x in _l(st.get("keys"))] if st.get("type") == "key_chord" else []
+            # a type_fixture (or secret) step that commits with Enter presses Enter too (6.2)
+            if st.get("type") in ("type_fixture", "secret") and _s(st.get("commit")).casefold() == "enter":
+                keys.append("enter")
             if any(x in ENTER_KEYS for x in keys):
                 self.add("L-FLW-07", f, f"step {st.get('id')} presses Enter or Space while the order is staged", f"steps[{st.get('id')}]")
         if closed is None:

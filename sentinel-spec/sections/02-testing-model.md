@@ -480,14 +480,17 @@ function scope_pr(R, D, M, delta, S, E, Q, F, B):
      else: mark run no_manifest                      # case (b): non-UI PR; diffs will be needs_human(no_manifest)
   for s in static_surfaces - map_expanded - declared:
       emit dependency_map_gap(edge = (owning_primitive_or_unowned_root(s, changed), s)); propose map PR
-  for c in changed with no owning primitive and no owning surface:
-      emit dependency_map_gap(unowned_root = c)
-  census_surfaces = declared union map_expanded union static_surfaces union smoke_subset(R)
+  for c in changed with no owning primitive and no owning surface, and reverse_closure(S, {c}) reaching a surface:
+      emit dependency_map_gap(unowned_root = c)    # a UI-reaching class nobody owns; a backend class that reaches no surface is not a gap
+  change_surfaces = declared union map_expanded union static_surfaces
+  census_surfaces = change_surfaces union smoke_subset(R)
   census_items    = { (s, s.census.workspaces[0]) : s in census_surfaces }   # the canonical workspace only in PR runs
-  sweep_items     = { (s, host, step) : s in census_surfaces, s.resizable, s.tier == 1,
-                      host in s.hosts, step in ladder_S union splitters_short(s) }
-  flow_items      = { f in F : f.tier == 1 and (f.surfaces intersects census_surfaces
+  sweep_items     = { (s, host, step) : s in change_surfaces, s.resizable, s.tier == 1,
+                      host in s.hosts, step in ladder_S union splitters_short(s) }    # smoke adds census only (11.2 budget)
+  flow_items      = { f in F : f.tier == 1 and (f.surfaces intersects change_surfaces
                                                 or f.primitives intersects touched_prims) }
+  if run is no_manifest (case (b)):                # no UI scope, but a backend change can still move values
+     flow_items  = flow_items union { f in F : f.tier == 1, f.class == standard, f.surfaces intersects smoke_subset(R) }
   for s in R - census_surfaces: outcome(s) = not_run(scope)
   return order_and_cut(common_filters(census_items union sweep_items union flow_items, E, Q), B = 45 min, rigs)
 

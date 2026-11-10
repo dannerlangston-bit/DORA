@@ -110,9 +110,9 @@ def _number(fmt: str, text: str) -> Decimal:
     if (m["s1"] and m["s2"]) or (m["open"] and (m["s1"] or m["s2"])):
         raise FormatError("double sign")
     if m["cur"] and fmt not in ("money", "price"):
-        raise FormatError(f"currency symbol on a {fmt} field")
+        raise FormatError(f"{fmt} field with a currency symbol")
     if m["pct"] and fmt != "percent":
-        raise FormatError(f"percent sign on a {fmt} field")
+        raise FormatError(f"{fmt} field with a percent sign")
     num = m["num"]
     if fmt == "int" and "." in num:
         raise FormatError("decimal point on an integer field")

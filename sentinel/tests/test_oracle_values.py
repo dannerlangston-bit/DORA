@@ -22,7 +22,7 @@ def test_money_formats(text, value):
     ("N/A", "N/A"), ("--", "placeholder --"), ("", "empty"), ("--5.00", "double sign"), ("+-5.00", "double sign"),
     ("(-5.00)", "double sign"), ("-(5.00)", "double sign"), ("1,50,25.00", "misplaced separator"),
     ("15,02.00", "misplaced separator"), ("1.234,56", "misplaced separator"), ("1.2.3", "misplaced separator"),
-    ("($5.00", "unbalanced parentheses"), ("5.00%", "percent sign on a money field"),
+    ("($5.00", "unbalanced parentheses"), ("5.00%", "money field with a percent sign"),
 ])
 def test_r10_reasons(text, why):
     assert format_error("money", text) == why
@@ -41,7 +41,7 @@ def test_price_with_order_type_and_at_sign():
 def test_int_and_percent():
     assert parse("int", "1,000") == 1000 and parse("int", "-1") == -1 and parse("int", "+100") == 100
     assert format_error("int", "100.0") == "decimal point on an integer field"
-    assert format_error("int", "$100") == "currency symbol on a int field"
+    assert format_error("int", "$100") == "int field with a currency symbol"
     assert parse("percent", "+1.25%") == Decimal("1.25") and parse("percent", "(0.56%)") == Decimal("-0.56")
     assert parse("percent", "12.5") == Decimal("12.5")
 

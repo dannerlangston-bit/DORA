@@ -1,20 +1,23 @@
 """Round-2 review regressions for sentinel.orchestrator, sentinel.reviewer and sentinel.oracle (R2-01 to R2-18).
 
 Each test names its finding. The first test of every finding is the reviewer's failing test, moved here; the
-others pin the decisions taken while fixing it. Self-contained: the reviewer helpers are copied from
+others pin the decisions taken while fixing it. The `followup` tests at the end cover four items the
+integrator found in the same packages. Self-contained: the reviewer helpers are copied from
 test_reviewer.py, and nothing touches the network (the SDK client is only constructed)."""
 from __future__ import annotations
 
 import json
 import threading
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
 import pytest
+import yaml
 
-from sentinel.oracle.assertions import evaluate_assertions
-from sentinel.oracle.sources import GroundTruthApi, Reading, extract, problem
+from sentinel.oracle.assertions import evaluate_assertions, summarize
+from sentinel.oracle.sources import GroundTruthApi, GroundTruthReader, Reading, extract, problem
 from sentinel.oracle.tables import EvalContext, OracleConfigError, api_comparison
 from sentinel.oracle.values import digit_count, format_error, parse
 from sentinel.orchestrator.attestation import AttestationProfile, RowReads, attest
@@ -22,10 +25,12 @@ from sentinel.orchestrator.clock import ManualClock
 from sentinel.orchestrator.drill import DrillObservation, DrillRecord, Item5, expected_records, score_drill
 from sentinel.orchestrator.gateway import (VK_F1, VK_RETURN, VK_TAB, Action, Flag, SafetyContext, refusal,
                                            slow_half)
-from sentinel.orchestrator.killswitch import PROVEN_NO_SESSION, PROVEN_NONE, ProofInputs, post_run_proof
+from sentinel.orchestrator.explorer import match_deny
+from sentinel.orchestrator.killswitch import PROVEN_NO_SESSION, PROVEN_NONE, ProofInputs, post_run_proof, recovery_login
 from sentinel.orchestrator.machine import Orchestrator
-from sentinel.orchestrator.rig import ConfirmationCheck, HotkeyRow, OrderBook, OrderRow, SelectorRead, SettingRead
-from sentinel.orchestrator.simrig import (CONFIRM_POINT, DELETE_POINT, EMPTY, GOLDEN, MemorySink, SimScenario,
+from sentinel.orchestrator.rig import (ConfirmationCheck, HotkeyRow, LaunchObservation, OrderBook, OrderRow,
+                                       SelectorRead, SettingRead)
+from sentinel.orchestrator.simrig import (BUILD, CONFIRM_POINT, DELETE_POINT, EMPTY, GOLDEN, MemorySink, SimScenario,
                                           SimulatedRig, default_context)
 from sentinel.orchestrator.watchdog import hook_host_died
 from sentinel.reviewer import (BatchEntry, DependencyEdge, DiffMetrics, FlowContext, ManifestEntryRef, ModelResponse,
@@ -175,7 +180,6 @@ def test_r2_04_agent_drag_that_ends_on_order_geometry_is_refused_like_a_scripted
 
 
 def test_r2_04_order_geometry_is_denied_in_every_profile_and_the_deny_list_sees_the_end_target():
-    from sentinel.orchestrator.explorer import match_deny
     assert match_deny(title=None, labels=("chart",), target_kind="splitter", end_kind="order_bubble") == "opens_ticket"
     assert match_deny(title=None, labels=("divider",), target_kind="splitter", end_kind="detach_handle") is None
     click = Action("click", profile="agent", point=(5, 5), resolved_name="cell", target_kind="ladder_order_cell")
@@ -300,7 +304,6 @@ def test_r2_09_a_selector_that_shows_a_live_id_after_the_select_aborts_live_iden
 
 
 def test_r2_09_the_recovery_login_refuses_a_selected_account_outside_the_allowlist():
-    from sentinel.orchestrator.killswitch import recovery_login
     ctx = default_context()
     rig = SimulatedRig(SimScenario(selected=EMPTY), clock=ManualClock())
     assert recovery_login(rig, ctx.allowlist, rig.clock, EMPTY)
@@ -571,3 +574,71 @@ def test_r2_18_quantity_price_dates_and_the_digit_count_are_ascii_only():
     assert format_error("date", "١١/٠٦/٢٦") is not None
     assert format_error("money", "$15,025.00") is None and format_error("int", "100") is None
     assert digit_count("$１５,025.00") == 5
+
+
+# == integrator follow-ups (coordinator, round 2) ===========================================================
+
+def _read_back_assertion(aid: str) -> dict:
+    flow = Path(__file__).resolve().parents[1] / "config/example/flows/tier-1/flow.trade.active-trader.read-back.yaml"
+    doc = yaml.safe_load(flow.read_text())
+    return next(a for s in doc["steps"] if s.get("id") == "cp-positions" for a in s.get("expect", ()) if a["id"] == aid)
+
+
+def _one(assertion: dict, values: dict) -> Any:
+    (res,) = evaluate_assertions({"expect": [assertion]}, {"ocr": GroundTruthReader(values)}, {}, {},
+                                 context=EvalContext(symbol="AAPL"))
+    return res
+
+
+def test_followup_present_and_absent_with_a_format_judge_every_row_of_a_column():
+    """The example's `ps_qty` (present, format int) over the Position Statement's Qty column: every row is an
+    int value, so it passes; one row that is not makes it fail and the detail names that row."""
+    ps_qty = _read_back_assertion("ps_qty")
+    assert (ps_qty["kind"], ps_qty.get("format")) == ("present", "int")
+    assert _one(ps_qty, {"rgn.ps.qty": "100\n1\n7"}).status == "passed"
+    bad = _one(ps_qty, {"rgn.ps.qty": "100\nabc\n7"})
+    assert bad.status == "failed" and "'abc'" in bad.detail
+    assert _one(ps_qty, {"rgn.ps.qty": "100"}).status == "passed"
+    assert _one(ps_qty, {"rgn.ps.qty": ""}).status == "failed"                 # an empty region holds no value
+    absent = dict(ps_qty, id="no_qty", kind="absent")
+    assert _one(absent, {"rgn.ps.qty": "--\nN/A"}).status == "passed"
+    assert _one(absent, {"rgn.ps.qty": "--\n5"}).status == "failed"
+    assert _one(absent, {"rgn.ps.qty": ""}).status == "passed"
+
+
+def test_followup_a_rule_named_after_its_rule_id_has_no_doubled_prefix():
+    inputs = {"qty": "rgn.confirm.qty", "price": "rgn.confirm.price", "multiplier": 1, "total": "rgn.confirm.cost"}
+    values = {"rgn.confirm.qty": "100", "rgn.confirm.price": "150.00", "rgn.confirm.cost": "16,000.00"}
+    step = {"expect": [{"id": "R01", "kind": "rule", "rule_id": "R01", "tol": 0.01, "inputs": inputs},
+                       {"id": "cost_math", "kind": "rule", "rule_id": "R01", "tol": 0.01, "inputs": inputs}]}
+    results = evaluate_assertions(step, {"ocr": GroundTruthReader(values)}, {}, {}, context=EvalContext(symbol="AAPL"))
+    assert [r.status for r in results] == ["failed", "failed"]
+    detail = summarize(results).detail
+    assert "R01: R01:" not in detail and detail.startswith("R01: ") and "; cost_math: R01: " in detail
+
+
+def test_followup_the_simulated_rig_reports_the_build_it_launched():
+    rig = SimulatedRig(SimScenario(launches=[LaunchObservation(True, "2026.45.0")]), clock=ManualClock())
+    assert rig.read_title_build_id() is None                                   # nothing launched yet
+    rig.launch()
+    assert rig.read_title_build_id() == "2026.45.0"
+    assert rig.enumerate_windows()[0].title == "Main@thinkorswim [build 2026.45.0]"
+    rig.kill_process_tree()
+    assert rig.read_title_build_id() is None
+    rig.launch()                                                                # the scenario's clean relaunch
+    assert rig.read_title_build_id() == BUILD
+
+
+def test_followup_the_proof_line_is_the_6_6_text_form():
+    row = OrderRow("x1", "working", "WORKING", "AAPL", 1.0)
+    clean = OrderBook(net_liq=2500.0)
+    assert post_run_proof(ProofInputs(start=clean, end=clean)).line == "PROVEN: no orders sent"
+    assert post_run_proof(ProofInputs(None, None, session="never", tokens_issued=0)).line == PROVEN_NO_SESSION
+    assert post_run_proof(ProofInputs(start=None, end=clean)).line == "UNPROVEN: snapshot_missing"
+    sent = post_run_proof(ProofInputs(start=clean, end=OrderBook(working=(row,), net_liq=2500.0)))
+    assert sent.line == "UNPROVEN: undeclared_order_row (x1)"
+    failed = post_run_proof(ProofInputs(start=clean, end=OrderBook(working=(row,), net_liq=2500.0),
+                                        cancel_all="failed"))
+    assert failed.line == "UNPROVEN: cancel_all_failed (undeclared rows: x1)"
+    for p in (sent, failed):
+        assert p.line.startswith(("PROVEN: ", "UNPROVEN: "))                   # the Reporter's Safety row forms

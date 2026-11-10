@@ -105,6 +105,7 @@ class SimulatedRig(Rig):
         self.flag_aborts: list[str] = []          # profiles of agent or Explorer actions refused under the flag
         self.attested = False
         self.app_running = False
+        self.title_build_id: str | None = None    # the build in the main window's title, as last launched
         self.book = self.s.book
         self.calls: list[str] = []
         self._launch_i = 0
@@ -133,11 +134,13 @@ class SimulatedRig(Rig):
         self._launch_i += 1
         obs = self.s.launches[i] if i < len(self.s.launches) else LaunchObservation(True, BUILD, waited_s=40.0)
         self.app_running = obs.frame_found and obs.crash is None
+        self.title_build_id = obs.title_build_id
         self._watch()
         return obs
 
     def read_title_build_id(self) -> str | None:
-        return BUILD if self.app_running else None
+        """The build the running app's title shows: the one actually launched (None when no app runs)."""
+        return self.title_build_id if self.app_running else None
 
     def login(self) -> LoginObservation:
         self._log("login")
@@ -212,7 +215,8 @@ class SimulatedRig(Rig):
             self.gw.hook_alive_mono_ts = now
 
     def enumerate_windows(self) -> tuple[WindowInfo, ...]:
-        wins = [WindowInfo(1, 4100, "SunAwtFrame", f"Main@thinkorswim [build {BUILD}]")] if self.app_running else []
+        wins = [WindowInfo(1, 4100, "SunAwtFrame", f"Main@thinkorswim [build {self.title_build_id}]")] \
+            if self.app_running else []
         if self.dialog_open:
             wins.append(WindowInfo(2, 4100, "SunAwtDialog", "Order Confirmation"))
         return tuple(wins)

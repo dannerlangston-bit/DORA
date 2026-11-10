@@ -35,7 +35,9 @@ Choices (reported):
 5. 6.6 names four verdicts and none fits a clean read that finds an undeclared row; such a proof has the
    verdict `ORDERS SENT: undeclared rows` and lists the rows, and the run effect is `aborted_safety
    (reason: undeclared_order_row)`. With `Cancel All` failed as well the verdict is UNPROVEN
-   (`cancel_all_failed`) and the rows are still listed and still abort the run. The abort is decided at
+   (`cancel_all_failed`) and the rows are still listed and still abort the run. `Proof.line` writes the
+   text form of 6.6 (`PROVEN: ...`, `UNPROVEN: <reason>`), and for undeclared rows
+   `UNPROVEN: undeclared_order_row (<rows>)`, the run's abort reason naming the rows. The abort is decided at
    `teardown`, so unreached checkpoints carry `env_error (gate: teardown, reason: undeclared_order_row)`.
 6. Every proof records what `Cancel All` did (`Proof.cancel_all`: `not_needed`, `done` or `failed`).
    `cancel_new_working` is the one Cancel All and re-read loop of 6.6 step 5, used by the kill switch
@@ -183,8 +185,15 @@ class Proof:
 
     @property
     def line(self) -> str:
-        """The VERDICT line of the report section."""
-        return f"{self.verdict} ({self.reason})" if self.reason else self.verdict
+        """The VERDICT line in the text form of 6.6 and the Reporter's Safety row (9.x): `PROVEN: ...` or
+        `UNPROVEN: <reason>`. Undeclared rows (choice 5) read `UNPROVEN: undeclared_order_row (<rows>)`, the
+        run's abort reason naming the rows, since the Reporter knows only those two forms."""
+        rows = ", ".join(r.key for r in self.undeclared)
+        if self.verdict == ORDERS_SENT:
+            return f"{UNPROVEN}: undeclared_order_row ({rows})"
+        if self.verdict == UNPROVEN:
+            return f"{UNPROVEN}: {self.reason}" + (f" (undeclared rows: {rows})" if rows else "")
+        return self.verdict
 
 
 def _new_rows(start: OrderBook, end: OrderBook) -> dict[str, list[OrderRow]]:

@@ -1,0 +1,11 @@
+# The redaction list of 6.10, owned by the security contact: regions-file shape, every region a mask.
+# Identity fields (account number, account holder name) are redacted in Capture, excluded from the
+# mask budget and never diffed (4.8).
+schema_version: 1
+landmarks:
+  - {id: lm.order-confirmation-title, template: regions/landmarks/lm.order-confirmation-title.png}
+  - {id: lm.position-statement-header, template: regions/landmarks/lm.position-statement-header.png}
+regions:
+  - {id: rgn.redact.confirm-account-number, type: mask, landmark: lm.order-confirmation-title, rect: {dx: 24, dy: 24, w: 120, h: 16}, panel: order_confirmation, identity_field: true}
+  - {id: rgn.redact.confirm-account-holder, type: mask, landmark: lm.order-confirmation-title, rect: {dx: 150, dy: 24, w: 160, h: 16}, panel: order_confirmation, identity_field: true}
+  - {id: rgn.redact.ps-account-number, type: mask, landmark: lm.position-statement-header, rect: {dx: 300, dy: 0, w: 120, h: 18}, panel: account_info, identity_field: true}

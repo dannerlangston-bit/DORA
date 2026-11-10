@@ -1,0 +1,11 @@
+# Application Settings re-applied by the fixture reset flow (7.6); attestation items A3 to A6 (12.6).
+schema_version: 1
+id: profile.app-settings.sentinel-pinned
+kind: app_settings
+owner: tos-trade-ui
+settings:
+  order_confirmation: true
+  shift_click_send: false
+  active_trader_hotkeys: false
+  order_hotkeys: []
+  display_time_zone: America/New_York

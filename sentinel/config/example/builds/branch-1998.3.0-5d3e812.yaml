@@ -10,7 +10,7 @@ build:
   pipeline_run_id: "tos-desktop/pr-4812/3"
   artifact:
     uri: artifactory://tos-desktop/branch/5d3e812/thinkorswim-win64.zip
-    sha256: "@@HASH:branch-artifact@@"
+    sha256: "sha256:ce7086730ae1b8542c3da4bec24012d541216074248fe125f22fec5f59db9d36"
   install_method: artifact
   built_at: 2026-11-09T13:42:10-05:00
 build_pair:

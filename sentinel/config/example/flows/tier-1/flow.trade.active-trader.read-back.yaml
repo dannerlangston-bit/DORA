@@ -1,0 +1,62 @@
+# Reads the Active Trader workspace at rest: the docked ladder, the ladder in a Charts-tab Flexible
+# Grid cell and the Position Statement, each asserted on its money cells. No input reaches a ticket.
+schema_version: 2
+flow_id: flow.trade.active-trader.read-back
+title: Active Trader workspace read-back (ladder, grid ladder cell, Position Statement)
+class: standard
+tier: 1
+owner: tos-trade-ui
+persona: active_trader
+surface: trade.active-trader.ladder
+surfaces: [trade.active-trader.ladder, charts.flexible-grid.active-trader-cell, monitor.activity.position-statement]
+requires: [margin]
+workspace: ws.tier-a.active-trader
+fixture: fx.rig-01.paper
+data_mode: frozen
+agent_fallback: allowed
+budget: {max_duration_s: 120, max_steps: 20}
+normalize:
+  - {id: n1, type: press, key: escape}
+  - {id: n2, type: park_mouse}
+preconditions:
+  - {id: p1, type: precondition, check: paper_mode}
+  - {id: p2, type: precondition, check: workspace_loaded, expect: ws.tier-a.active-trader}
+  - {id: p3, type: precondition, check: no_modal}
+  - {id: p4, type: precondition, check: working_orders, expect: 0}
+steps:
+  - {id: r01, type: reset_input_state}
+  - {id: w-ladder, type: wait_for, anchor: {landmark: lm.ladder-header}, anti_anchors: [Loading, Reconnecting], timeout_ms: 8000}
+  - id: cp-ladder
+    type: checkpoint
+    checkpoint_id: flow/trade.active-trader.ladder/flow.trade.active-trader.read-back/cp-ladder
+    surface_id: trade.active-trader.ladder
+    target_window: {kind: main}
+    data_mode: frozen
+    regions: regions/flow/trade.active-trader.ladder/flow.trade.active-trader.read-back/cp-ladder.yaml
+    expect:
+      - {id: ladder_qty, kind: equals, region: rgn.ladder.qty, format: int, expected: 1}
+  - {id: w-cell, type: wait_for, anchor: {landmark: lm.atcell-header}, timeout_ms: 10000}
+  - id: cp-atcell
+    type: checkpoint
+    checkpoint_id: flow/charts.flexible-grid.active-trader-cell/flow.trade.active-trader.read-back/cp-atcell
+    surface_id: charts.flexible-grid.active-trader-cell
+    target_window: {kind: main}
+    data_mode: frozen
+    regions: regions/flow/charts.flexible-grid.active-trader-cell/flow.trade.active-trader.read-back/cp-atcell.yaml
+    expect:
+      - {id: atcell_qty, kind: equals, region: rgn.atcell.qty, format: int, expected: 1}
+  - {id: w-positions, type: wait_for, anchor: {landmark: lm.position-statement-header}, timeout_ms: 8000}
+  - id: cp-positions
+    type: checkpoint
+    checkpoint_id: flow/monitor.activity.position-statement/flow.trade.active-trader.read-back/cp-positions
+    surface_id: monitor.activity.position-statement
+    target_window: {kind: main}
+    data_mode: masked_live
+    regions: regions/flow/monitor.activity.position-statement/flow.trade.active-trader.read-back/cp-positions.yaml
+    expect:
+      - {id: ps_qty, kind: present, region: rgn.ps.qty, format: int}
+      - {id: pl_math, kind: rule, rule_id: R08, tol: 0.01,
+         inputs: {pl_open: rgn.ps.pl-open, mark: rgn.ps.mark, trade_price: rgn.ps.trade-price, qty: rgn.ps.qty, multiplier: 1}}
+teardown:
+  - {id: t1, type: teardown, action: working_orders_check, expect: 0}
+  - {id: t2, type: reset_input_state}

@@ -1,0 +1,54 @@
+# The behavioral canary flow of the mutant catalog (M26, M27, M28, M30; 4.11, 10.3). It fills the
+# stock ticket and never reaches Confirm and Send (L-MUT-04).
+schema_version: 2
+flow_id: flow.canary.ticket-stock
+title: Canary - fill the AAPL stock ticket and read it back
+class: canary
+tier: 1
+owner: sentinel-canaries
+persona: swing_trader
+surface: trade.order-entry.stock
+surfaces: [trade.order-entry.stock]
+requires: []
+workspace: ws.tier-a.swing-trader
+fixture: fx.rig-01.paper
+data_mode: frozen
+agent_fallback: disabled
+budget: {max_duration_s: 120, max_steps: 20}
+normalize:
+  - {id: n1, type: press, key: escape}
+  - {id: n2, type: park_mouse}
+preconditions:
+  - {id: p1, type: precondition, check: paper_mode}
+  - {id: p2, type: precondition, check: workspace_loaded, expect: ws.tier-a.swing-trader}
+  - {id: p3, type: precondition, check: no_modal}
+  - {id: p4, type: precondition, check: working_orders, expect: 0}
+steps:
+  - {id: c01, type: reset_input_state}
+  - {id: c02, type: type_fixture, target: trade.order-entry.stock.symbol-box, value_ref: fixture.symbols.aapl.symbol, commit: enter}
+  - {id: w-ticket, type: wait_for, anchor: {landmark: lm.order-entry-header}, anti_anchors: [Loading, Reconnecting], timeout_ms: 8000}
+  - id: cp-pre
+    type: checkpoint
+    checkpoint_id: flow/trade.order-entry.stock/flow.canary.ticket-stock/cp-pre
+    surface_id: trade.order-entry.stock
+    target_window: {kind: main}
+    data_mode: frozen
+    regions: default
+  - {id: c03, type: type_fixture, target: trade.order-entry.stock.qty-field, value: "100", commit: tab}
+  - {id: c04, type: type_fixture, target: trade.order-entry.stock.price-field, value_ref: fixture.prices.aapl_far_below.value, commit: tab}
+  - id: cp-ready
+    type: checkpoint
+    checkpoint_id: flow/trade.order-entry.stock/flow.canary.ticket-stock/cp-ready
+    surface_id: trade.order-entry.stock
+    target_window: {kind: main}
+    data_mode: frozen
+    regions: regions/flow/trade.order-entry.stock/flow.canary.ticket-stock/cp-ready.yaml
+    expect:
+      - {id: qty, kind: equals, region: rgn.order-entry.qty, format: int, expected: 100}
+      - {id: price, kind: equals, region: rgn.order-entry.price, format: price, value_ref: fixture.prices.aapl_far_below.value}
+      - {id: confirm_label, kind: equals, region: rgn.order-entry.confirm-button, expected: "Confirm and Send"}
+teardown:
+  - {id: t1, type: teardown, action: clear_ticket}
+  - {id: t2, type: assert, assertions: [{id: ticket_empty, kind: absent, region: rgn.order-entry.qty, pattern: "[0-9]"}]}
+  - {id: t3, type: teardown, action: working_orders_check, expect: 0}
+  - {id: t4, type: reset_input_state}

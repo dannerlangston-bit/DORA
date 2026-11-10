@@ -3,7 +3,7 @@ id: ws.tier-a.beginner
 tier: A
 persona: beginner
 file: corpus/workspaces/ws.tier-a.beginner/workspace.sentinel-beginner
-file_sha256: "@@FILESHA:corpus/workspaces/ws.tier-a.beginner/workspace.sentinel-beginner@@"
+file_sha256: "sha256:0d50a409c6f28af02211437284bb01950aeb4b813e15f693dbcce90df7779a06"
 display_config: {width: 1920, height: 1080, scale_percent: 100, theme: dark, font_size: medium}
 link_groups:
   - {color: red, symbol_ref: aapl}

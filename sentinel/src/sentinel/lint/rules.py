@@ -1079,7 +1079,8 @@ class _Linter:
             for i, lg in enumerate(map(_d, _l(w.get("link_groups")))):
                 ref = lg.get("symbol_ref")
                 for fx in sorted(x for x in used if x):
-                    syms = {_d(s).get("id") for s in _l(_d(_d(self.fixtures.get(fx)).data if fx in self.fixtures else {}).get("symbols"))}
+                    fdoc = self.fixtures.get(fx)
+                    syms = {_d(s).get("id") for s in _l(_d(fdoc.data if fdoc else None).get("symbols"))}
                     if ref not in syms:
                         self.add("L-WSP-07", f, f"symbol_ref {ref} is not a symbol of fixture {fx}", f"link_groups[{i}].symbol_ref")
                 if not used - {""}:

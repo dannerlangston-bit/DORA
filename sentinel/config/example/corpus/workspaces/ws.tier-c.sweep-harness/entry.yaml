@@ -2,7 +2,7 @@ schema_version: 1
 id: ws.tier-c.sweep-harness
 tier: C
 file: corpus/workspaces/ws.tier-c.sweep-harness/workspace.sentinel-sweep
-file_sha256: "@@FILESHA:corpus/workspaces/ws.tier-c.sweep-harness/workspace.sentinel-sweep@@"
+file_sha256: "sha256:acc3560481f54461b3bd8164a0c6c9793a3657842dd67fe2f5a13e888dc671b8"
 display_config: {width: 1920, height: 1080, scale_percent: 100, theme: dark, font_size: medium}
 link_groups:
   - {color: red, symbol_ref: aapl}

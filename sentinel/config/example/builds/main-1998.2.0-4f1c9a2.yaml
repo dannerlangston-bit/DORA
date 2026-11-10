@@ -7,7 +7,7 @@ build:
   pipeline_run_id: "tos-desktop/8790"
   artifact:
     uri: artifactory://tos-desktop/main/4f1c9a2/thinkorswim-win64.zip
-    sha256: "@@HASH:main-artifact@@"
+    sha256: "sha256:06f6828489eff8d0de6c4c982d3307ac72553ecd99c23b44f23d00a2d6d03b82"
   install_method: artifact
   built_at: 2026-11-08T21:10:00-05:00
 build_pair:

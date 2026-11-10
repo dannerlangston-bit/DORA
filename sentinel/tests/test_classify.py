@@ -380,6 +380,8 @@ def test_global_shift_replaces_rows_16_to_23():
     assert pending.review_state == "pending"                     # 4.13: allowed with global_shift
     for row in ("13", "14", "15"):
         assert classify(replace(ROW_FACTS[row], global_shift=True)).exception is None
+    late = apply_late_verdict(replace(ROW_FACTS["23"], global_shift=True), pending, answered("matches_manifest", 0.99))
+    assert (late.result.reason, late.result.review_state) == ("global_shift", "done")
 
 
 # --------------------------------------------------------------------------------------------

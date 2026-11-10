@@ -426,6 +426,7 @@ def test_inv11_allowlist():
     tooltip = UIComponent("tooltip", Rect(38, 12, 60, 20), "panel", parent="frame")
     rules = replace(RULES, allowlist=(("tooltip", "*"),))
     m = B(tooltip, words=[word("101.25", 10, 10, 50), word("Tip", 40, 15)])
+    assert ids(m) == ["INV-11"]
     assert ids(m, rules) == []
 
 
@@ -554,6 +555,15 @@ def test_pre_existing_is_reported_once_one_level_lower():
     assert by_id["INV-01"].pre_existing and by_id["INV-01"].severity == "S2"
     assert not by_id["INV-03"].pre_existing and by_id["INV-03"].severity == "S1"
     assert result.invariant_ids == ("INV-01", "INV-03")                                 # outcome stays on the candidate
+
+
+def test_candidate_clip_is_not_pre_existing_when_the_base_word_fills_its_cell():
+    """INV-03's base is the base build: the base is not judged against the candidate's text."""
+    cell = UIComponent("cell", Rect(100, 50, 60, 16), "cell", parent="frame")
+    base = B(cell, words=[WordBox("1,234.56", Rect(102, 52, 57, 12), 92, anchor="grid.r1.last")])
+    cand = B(cell, words=[WordBox("1,234.5", Rect(102, 52, 57, 12), 92, anchor="grid.r1.last")])
+    (r,) = compare(three(base), three(cand), RULES).reported
+    assert r.violation.invariant_id == "INV-03" and not r.pre_existing and r.severity == "S1"
 
 
 def test_base_only_and_no_base():

@@ -43,6 +43,9 @@ Choices where the spec is ambiguous (each cites the section it reads):
   declared-label prefix test and INV-04 does not fire, since neither a base nor a rule exists.
   A `text` rule admits an ellipsis when it has no pattern or its pattern matches the token;
   numeric rules admit none.
+- INV-03 and INV-04 on the base build. Their "base" is the base build, so `compare` checks the
+  base build without a reference (rule and label-prefix tests only). An A/A pair is checked both
+  ways, each capture against the other, since any firing there is a false positive.
 - INV-04 needs a word at the same anchor on both builds (its "same anchor on both builds"
   control); under Branch A it is suppressed when the base's displayed text already ended in an
   ellipsis.
@@ -120,7 +123,7 @@ ERODE_PX = 1                            # INV-11 Branch B
 ALIGN_TOLERANCE_PX = 2                  # INV-12
 MIN_GRID_ROWS = 3                       # INV-12
 MIN_FONT_PX = 9.0                       # INV-07 Branch A
-MIN_CAP_HEIGHT_PX = 7.0                 # INV-07 Branch B (12.1: 7 px cap height at 1920x1080, 100% DPI)
+MIN_CAP_HEIGHT_PX = 7.0                 # INV-07 Branch B (2.7: about 7 px cap height at the pinned font set)
 LABEL_TEMPLATE_FLOOR = 0.9              # INV-05 Branch B
 TEMPLATE_FLOOR = 0.92                   # INV-10 Branch B (3.7 default)
 PLACEHOLDERS: tuple[str, ...] = ("Loading", "Reconnecting", "--", "N/A", "NaN", "null", "Infinity")
@@ -1135,10 +1138,13 @@ def compare(base: Sequence[ScreenModel] | None, candidate: Sequence[ScreenModel]
             config: CheckerConfig = DEFAULT_CONFIG) -> Comparison:
     """Invariants on both builds (2.7): a violation on both is reported once as pre-existing at
     one severity level lower and still makes the candidate `invariant_violation`; candidate-only
-    violations get full severity. `base` is None when no base capture exists."""
-    base_capture = base[0] if base else None
-    cand = check_capture(candidate, rules, reference=base_capture, config=config)
-    base_result = check_capture(base, rules, reference=candidate[0], config=config) if base else None
+    violations get full severity. `base` is None when no base capture exists.
+
+    The "base" INV-03 and INV-04 compare against is the base build, so the candidate is checked
+    against the base capture and the base build is checked on its own (rule and label-prefix
+    tests only); otherwise a candidate-only clip would read as pre-existing."""
+    cand = check_capture(candidate, rules, reference=base[0] if base else None, config=config)
+    base_result = check_capture(base, rules, config=config) if base else None
     base_keys = base_result.keys if base_result is not None else frozenset()
     reported = tuple(Reported(v, effective_severity(v.invariant_id, tier=rules.tier, pre_existing=v.key in base_keys),
                               v.key in base_keys) for v in cand.violations)

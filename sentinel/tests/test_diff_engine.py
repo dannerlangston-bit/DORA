@@ -458,3 +458,39 @@ def test_fingerprints_must_match_except_build_id():
     assert "render_probe_hash" in t.detail
     assert fingerprint_id(_fp()["match"]) == fingerprint_id(_fp(build_id="other")["match"])
     assert fingerprint_id(_fp()["match"]) != fingerprint_id(_fp(data_epoch="E2")["match"])
+
+
+# -- component boxes in window and region coordinates (choice 16, 9.7) --------------------------
+
+def moved_panel_pair(origin, pl="+412.50", cid=CID):
+    """A positions panel at `origin` in an otherwise empty window, base and candidate (the candidate's
+    first P/L cell reads `pl`), with the panel's own landmark and region: one census checkpoint."""
+    def layout(text):
+        L = copy.deepcopy(LAYOUT)
+        panel = synth.node(L, "positions")
+        panel["rect"][:2] = list(origin)
+        synth.node(panel, "positions.grid")["rows"][0][3] = {"text": text, "color": "green"}
+        L["children"] = [panel]
+        return L
+    b, c = synth.render(layout("+12.50"), SIZE), synth.render(layout(pl), SIZE)
+    reg = RegionsFile(cid, [_landmark(b, "positions")],
+                      [_region("rgn.positions.panel", "positions", "positions", screen=b)])
+    return b, c, reg
+
+
+def test_components_carry_window_and_region_relative_boxes():
+    results = []
+    for origin in ((318, 6), (120, 190)):
+        b, c, reg = moved_panel_pair(origin)
+        res = diff_pair(b.image, c.image, reg, context=DiffContext(checkpoint_id=CID))
+        assert res.level == "above" and res.components
+        results.append(res)
+    (a, b) = ([c for c in r.components if c.region_id == "rgn.positions.panel"] for r in results)
+    assert [c.bbox_region for c in a] == [c.bbox_region for c in b]           # same place in the panel
+    assert a[0].bbox != b[0].bbox
+    lx, ly, _, _ = moved_panel_pair((318, 6))[0].get("positions").bbox
+    assert a[0].bbox_region == (a[0].bbox[0] - lx, a[0].bbox[1] - ly, a[0].bbox[2], a[0].bbox[3])
+    summary = results[0].summary.components[0]
+    assert (summary.bbox, summary.bbox_region) == (a[0].bbox, a[0].bbox_region)   # DiffSummary keeps both
+    rest = run(mutated(lambda L: synth.node(L, "main").__setitem__("title", "Main@thinkorswim [build 1998.3.1]")).image)
+    assert rest.components and all(c.bbox_region == c.bbox for c in rest.components if c.region_id == "_rest")

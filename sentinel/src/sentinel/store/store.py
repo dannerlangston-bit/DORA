@@ -28,12 +28,12 @@ Enforced here and, where SQL can say it, again by the schema:
   manifests carry its entry or ticket; a waiver applies to every run. Inheritance replaces only a computed
   collateral or needs_human (1.10).
 - a run is `complete` only with an outcome for every scoped checkpoint, no env_error, no not_comparable
-  (fingerprint_mismatch), no store-failure harness_error, no UNPROVEN post-run proof, no unimported shard, no
-  shard that ended worse than complete and every outcome-named artifact stored (1.10, 8.1, 8.2, 8.3, 8.9); no run
-  ends with a scoped checkpoint silent (L-OUT-07), or less severe than its worst shard (8.2). An outcome that
+  (fingerprint_mismatch), no store-failure harness_error, no UNPROVEN or ORDERS SENT post-run proof, no unimported
+  shard, no shard that ended worse than complete and every outcome-named artifact stored (1.10, 8.1, 8.2, 8.3, 8.9);
+  no run ends with a scoped checkpoint silent (L-OUT-07), or less severe than its worst shard (8.2). An outcome that
   names an artifact the store has no row for is refused at write (8.2); an artifact row needs bytes on disk that
-  hash to its name, and an image its redaction version (8.3, 8.4); a `decision:<id>` reason needs an active
-  decision with the outcome's verdict (4.13).
+  hash to its name, and an image its redaction version (8.3, 8.4); a `decision:<id>` reason needs an active decision
+  with the outcome's verdict (4.13).
 - every write batch is one `BEGIN IMMEDIATE` transaction, appended to `results.jsonl` before it commits (8.2).
 
 Choices where the spec is ambiguous or silent (reported to the coordinator):
@@ -43,7 +43,7 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   which 8.3 has no column for), and triggers for F65 (an env_error names a gate from taxonomy.yaml), for "nothing
   else is ever rewritten" (every outcome column the 8.3 triggers leave open, and deletion), for decision_ref
   set once, review_id only with the review transition, complete-needs-every-scoped-id, and complete-needs-no
-  fingerprint mismatch, UNPROVEN proof or worse shard (trg_run_complete_env).
+  fingerprint mismatch, UNPROVEN or ORDERS SENT proof or worse shard (trg_run_complete_env).
 - outcome_reasons seed: taxonomy.yaml has no owner_section or detail_means, so rows carry owner_section '4.13'
   (the reason vocabulary table the file is generated from; '1.10' for rows inherited through
   `reason_inheritance`, as 8.3's INSERT ... SELECT writes) and detail_means is the parameter placeholder
@@ -59,9 +59,21 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   clamped to 6 on a tier-1 checkpoint ("tier-1 checkpoint, so the override applies"; records.Decision defaults to
   8 and cannot say whether 8 was asked for) and to the region's calibrated tolerance at the run's config commit.
   noise_signature and request_mask get `expires_at` = decided_at + 30 days when none is given (8.3, 4.14).
-- Step outcomes become `step_events` rows with source orchestrator, action `step`, gate_decision none (records
-  has no gateway event), mode `agent` for an agent rung or fallback, and `finding:<ref>` in `reason`.
+- Step outcomes become `step_events` rows with source orchestrator, action `step`, mode `agent` for an agent rung
+  or fallback, and `finding:<ref>` in `reason`. The step's `gateway_event` (4.13) is stored as `gate_decision`,
+  `gate_reason` and `gate_class` (the code itself, 5.4.4), and `gate_decision` none when the step has none;
+  `step_outcomes` reads it back. `gateway_drops` counts the rows the hook dropped or the slow half refused (9.11).
 - Run counts exclude synthetic rows (canary mutants are not checkpoints of the run, 10.3).
+- `canary_results` (8.3) holds one row per mutant, safety canary, drill item or path-equivalence pair, which
+  `outcomes`, one record per (run, checkpoint), cannot. 8.3 gives the table no natural key; the store uses
+  (run_id, kind, mutant_id, checkpoint_id), since an `aa_control` entry binds one mutant id to several
+  checkpoints (10.3): a replayed row is a no-op and a different row for the same key an `ImportConflict`
+  (8.2). `created_at` is a write-time argument and not compared. Rows are `canary.CanaryResult`, whose
+  construction enforces the 8.3 CHECKs; the synthetic `harness_error` rows still go through `write_checkpoint`.
+- `post_run_proofs` (8.3) take `PostRunProof` rows through `write_proof`, one per shard, written once while the run
+  is open, and come back through `post_run_proofs`. `counts_json` holds the 6.6 table lines and, beside the counts
+  8.3 names, the undeclared and declared row keys, since an ORDERS SENT verdict lists every undeclared row (6.6)
+  and no other column can hold them.
 - A finished run is not re-ended with a different outcome (the 10.7 re-evaluation of a returning rig belongs
   to the import, which is not this module).
 - Timestamps are normalised to UTC ISO 8601 seconds on write (8.3).
@@ -81,13 +93,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from importlib import resources
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Sequence
 
 from ..records import (ACTION_VERDICT, DATA_MODES, PERSONAS, RUN_TYPES, CheckpointOutcome, Classification, Component,
                        Decision, DiffSummary, Finding, RegionDiff, RunOutcome, Signature, StepOutcome, now,
                        to_jsonable)
 from ..taxonomy import Taxonomy, TaxonomyError, checkpoint_parts, load
 from .artifacts import ArtifactStore, StoredArtifact, is_visual
+
+if TYPE_CHECKING:
+    from ..canary import CanaryResult
 
 SCHEMA_VERSION = 1
 DEFAULT_TOLERANCE = 8          # 4.14, 9.7: bits of 64
@@ -111,6 +126,10 @@ RUN_SEVERITY = ("complete", "complete_with_env_errors", "aborted_budget", "abort
 # 4.13 required fields: the verdict a `decision:<id>` reason names, by outcome.
 DECISION_REASON_VERDICT = {"noise": "noise", "intended": "intended", "collateral": "confirmed_bug"}
 LOCATOR_LEVELS = ("jab", "image", "ocr", "agent")
+GATEWAY_EVENT_KEYS = frozenset({"decision", "reason", "class"})   # 4.13 step_outcome.gateway_event
+# 8.3 post_run_proofs CHECKs (6.6): the five verdicts and what Cancel All did
+PROOF_VERDICTS = ("proven_no_sends", "proven_declared_sends", "proven_no_session", "unproven", "orders_sent")
+PROOF_CANCEL_ALL = ("not_needed", "performed_verified", "performed_unverified")
 NETWORK_FS = frozenset({"nfs", "nfs4", "cifs", "smb3", "smbfs", "afs", "ncpfs", "fuse.sshfs"})
 _PHASH_RE = re.compile(r"^[0-9a-f]{16}$")
 _DECISION_RE = re.compile(r"^dec-(\d+)$")
@@ -187,6 +206,40 @@ class RunPlan:
     pr_ref: str | None = None
     pr_author: str | None = None
     started_at: str = field(default_factory=now)
+
+
+@dataclass(frozen=True)
+class PostRunProof:
+    """One 8.3 `post_run_proofs` row: the ORDER SAFETY PROOF of one shard (6.6). `counts` is `counts_json`; it
+    names the undeclared rows an `orders_sent` verdict lists (`counts["undeclared"]`, 6.6)."""
+    shard_id: str
+    run_id: str
+    login_alias: str                       # the vault alias the store keys logins by (8.3); never printed
+    verdict: str
+    send_policy_ref: str
+    counts: dict
+    cancel_all: str
+    paper_mode_assertions: int
+    paper_mode_mismatches: int
+    gateway_events: int
+    gateway_drops: int
+    produced_at: str
+    reason: str | None = None
+    start_snapshot_sha256: str | None = None
+    end_snapshot_sha256: str | None = None
+    verified_by: str | None = None
+    verified_at: str | None = None
+
+    def __post_init__(self):
+        if self.verdict not in PROOF_VERDICTS:
+            raise StoreRefused(f"post-run proof verdict {self.verdict!r}; one of {PROOF_VERDICTS} (8.3)")
+        if self.cancel_all not in PROOF_CANCEL_ALL:
+            raise StoreRefused(f"post-run proof cancel_all {self.cancel_all!r}; one of {PROOF_CANCEL_ALL} (8.3)")
+        if (self.verdict == "unproven") != (self.reason is not None):
+            raise StoreRefused(f"post-run proof {self.verdict} with reason {self.reason!r}: a reason exactly when "
+                               "the verdict is unproven (6.6, 8.3)")
+        if self.verdict == "orders_sent" and not self.counts.get("undeclared"):
+            raise StoreRefused("an orders_sent proof names its undeclared rows (counts_json undeclared, 6.6)")
 
 
 @dataclass(frozen=True)
@@ -637,17 +690,45 @@ def apply_inheritance(outcome: CheckpointOutcome, lookup: DecisionLookup) -> Che
 # ---------------------------------------------------------------------------------------------------------------
 # record <-> row
 
+def _component(c: dict) -> Component:
+    """A stored diff component; one with a region-relative box comes back as the engine's `RegionComponent`."""
+    c = {**c, "bbox": tuple(c["bbox"])}
+    if "bbox_region" not in c:
+        return Component(**c)
+    from ..diff.engine import RegionComponent      # records.Component has no bbox_region field (engine choice 16)
+    return RegionComponent(**{**c, "bbox_region": tuple(c["bbox_region"])})
+
+
 def _outcome_from_dict(d: dict) -> CheckpointOutcome:
     d = dict(d)
     if "diff" in d:
         diff = dict(d["diff"])
         diff["shift"] = tuple(diff.get("shift", (0, 0)))
         diff["regions"] = [RegionDiff(**r) for r in diff.get("regions", [])]
-        diff["components"] = [Component(**{**c, "bbox": tuple(c["bbox"])}) for c in diff.get("components", [])]
+        diff["components"] = [_component(c) for c in diff.get("components", [])]
         d["diff"] = DiffSummary(**diff)
     if "classification" in d:
         d["classification"] = Classification(**d["classification"])
     return CheckpointOutcome(**d)
+
+
+def _gateway_columns(event: dict | None) -> dict:
+    """A step's 4.13 `gateway_event` as the 8.3 `step_events` columns; the schema's CHECKs refuse a decision, code
+    or class outside the closed lists, and a drop or refusal without its code."""
+    if event is None:
+        return {"gate_decision": "none", "gate_reason": None, "gate_class": None}
+    if "decision" not in event or set(event) - GATEWAY_EVENT_KEYS:
+        raise StoreRefused(f"gateway_event {event!r}: decision, and optionally reason and class (4.13)")
+    return {"gate_decision": event["decision"], "gate_reason": event.get("reason"), "gate_class": event.get("class")}
+
+
+def _gateway_event(row: sqlite3.Row) -> dict | None:
+    """The 4.13 `gateway_event` of a `step_events` row (reason and class only when set), None for gate_decision
+    none."""
+    if row["gate_decision"] == "none":
+        return None
+    event = {"decision": row["gate_decision"], "reason": row["gate_reason"], "class": row["gate_class"]}
+    return {k: v for k, v in event.items() if v is not None}
 
 
 def _revalidate(record):
@@ -1001,6 +1082,8 @@ class Store:
         if n := q("SELECT count(*) FROM post_run_proofs WHERE run_id = ? AND verdict = 'unproven' "
                   "AND verified_by IS NULL"):
             out.append(f"{n} UNPROVEN post-run proof(s)")                            # 1.10 per run, 6.6
+        if n := q("SELECT count(*) FROM post_run_proofs WHERE run_id = ? AND verdict = 'orders_sent'"):
+            out.append(f"{n} ORDERS SENT post-run proof(s)")                         # 6.6: aborted_safety
         if n := q("SELECT count(*) FROM shards WHERE run_id = ? AND state <> 'imported'"):
             out.append(f"{n} shard(s) not imported")
         if n := q("SELECT count(*) FROM shards WHERE run_id = ? AND shard_outcome <> 'complete'"):
@@ -1096,7 +1179,7 @@ class Store:
                 "wall_at": utc(s.recorded_at), "mono_ms": time.monotonic_ns() // 1_000_000,
                 "mode": "agent" if agent else "scripted", "action": "step",
                 "locator_level": s.locator_rung if s.locator_rung in LOCATOR_LEVELS else None,
-                "attempt": s.attempt, "step_outcome": s.status, "gate_decision": "none",
+                "attempt": s.attempt, "step_outcome": s.status, **_gateway_columns(s.gateway_event),
                 "reason": f"finding:{s.finding_ref}" if s.finding_ref else None, "duration_ms": s.duration_ms}
 
     def _finding_row(self, f: Finding, synthetic: bool) -> dict:
@@ -1249,6 +1332,77 @@ class Store:
             filled.append(cid)
         return filled
 
+    # -- canary results (8.3 canary_results, 10.3) ---------------------------------------------------------
+    _CANARY_KEY = ("run_id", "kind", "mutant_id", "checkpoint_id")
+    _CANARY_FIELDS = ("kind", "mutant_id", "catalog_version", "checkpoint_id", "defect_class", "money_cell", "seed",
+                      "base_sha256", "mutant_sha256", "produced_outcome", "produced_reason", "state", "absorbed_by",
+                      "class_rate", "class_floor", "reviewer_verdict", "reviewer_confidence", "mask_version",
+                      "threshold_version", "model_id", "prompt_hash")
+
+    def write_canary_results(self, run_id: str, results: Iterable[CanaryResult], *,
+                             created_at: str | None = None) -> None:
+        """Write a run's per-mutant canary rows in one batch (8.3 `canary_results`, 10.3 Scoring).
+
+        Each row is re-validated (`CanaryResult` enforces the 8.3 CHECKs; the generated schema refuses the rest).
+        Refuses an unknown or finished run. The same row again is a no-op; a different row for the same
+        (kind, mutant_id, checkpoint_id) is an ImportConflict (module docstring).
+        """
+        rows_in = [dataclasses.replace(r) for r in results]
+        self._running(run_id)
+        at = utc(created_at) or now()
+        where = " AND ".join(f"{k} = ?" for k in self._CANARY_KEY)
+        with self._batch("canary_results") as rows:
+            for r in rows_in:
+                values = {"run_id": run_id, **{f: getattr(r, f) for f in self._CANARY_FIELDS},
+                          "money_cell": int(r.money_cell), "expected_json": json.dumps(list(r.expected))}
+                old = self._one(f"SELECT * FROM canary_results WHERE {where}", [values[k] for k in self._CANARY_KEY])
+                if old is not None:
+                    if {k: old[k] for k in values} == values:
+                        continue
+                    raise ImportConflict(f"{r.mutant_id} on {r.checkpoint_id} in {run_id} already has a canary "
+                                         "result; rows are written once (8.2)")
+                self._insert(rows, "canary_results", {**values, "created_at": at})
+
+    def canary_results(self, run_id: str) -> list[CanaryResult]:
+        """The run's canary rows in the order they were written (8.3 `canary_results`)."""
+        from ..canary import CanaryResult
+        out = []
+        for r in self._conn.execute("SELECT * FROM canary_results WHERE run_id = ? ORDER BY canary_id", (run_id,)):
+            d = {f: r[f] for f in self._CANARY_FIELDS}
+            out.append(CanaryResult(**{**d, "money_cell": bool(r["money_cell"]),
+                                       "expected": json.loads(r["expected_json"])}))
+        return out
+
+    # -- post-run proofs -------------------------------------------------------------------------------------
+    _PROOF_COLUMNS = ("shard_id", "run_id", "login_alias", "verdict", "reason", "send_policy_ref", "cancel_all",
+                      "paper_mode_assertions", "paper_mode_mismatches", "gateway_events", "gateway_drops",
+                      "start_snapshot_sha256", "end_snapshot_sha256", "produced_at", "verified_by", "verified_at")
+
+    def write_proof(self, proof: PostRunProof) -> None:
+        """Write a shard's post-run proof (8.3 `post_run_proofs`, 6.6): one per shard, written once, before the run
+        ends. Refuses a shard not of the run, an unregistered login and a finished run; the same row again is a
+        no-op, a different row for the shard an ImportConflict (8.2)."""
+        p = dataclasses.replace(proof)                  # re-validates
+        self._running(p.run_id)
+        shard = self._one("SELECT run_id FROM shards WHERE shard_id = ?", (p.shard_id,))
+        if shard is None or shard["run_id"] != p.run_id:
+            raise StoreRefused(f"{p.shard_id} is not a shard of run {p.run_id} (8.3)")
+        values = {c: getattr(p, c) for c in self._PROOF_COLUMNS}
+        values.update(counts_json=_json(p.counts), produced_at=utc(p.produced_at), verified_at=utc(p.verified_at))
+        old = self._one("SELECT * FROM post_run_proofs WHERE shard_id = ?", (p.shard_id,))
+        if old is not None:
+            if {k: old[k] for k in values} == values:
+                return
+            raise ImportConflict(f"{p.shard_id} already has a post-run proof; one per shard, written once (8.2)")
+        with self._batch("post_run_proof") as rows:
+            self._insert(rows, "post_run_proofs", values)
+
+    def post_run_proofs(self, run_id: str) -> list[PostRunProof]:
+        """The run's post-run proofs, one per shard, in shard order (8.3 `post_run_proofs`)."""
+        return [PostRunProof(**{c: r[c] for c in self._PROOF_COLUMNS}, counts=json.loads(r["counts_json"]))
+                for r in self._conn.execute("SELECT * FROM post_run_proofs WHERE run_id = ? ORDER BY shard_id",
+                                            (run_id,))]
+
     # -- reading outcomes, steps, findings ------------------------------------------------------------------
     def _outcome(self, row: sqlite3.Row, record_json: str) -> CheckpointOutcome:
         d = json.loads(record_json)
@@ -1282,7 +1436,13 @@ class Store:
                             attempt=r["attempt"], locator_rung=r["locator_level"], duration_ms=r["duration_ms"] or 0,
                             finding_ref=(r["reason"][len("finding:"):] if (r["reason"] or "").startswith("finding:")
                                          else None),
+                            gateway_event=_gateway_event(r),
                             recorded_at=r["wall_at"]) for r in rows]
+
+    def gateway_drops(self, run_id: str) -> int:
+        """Gateway drops in a run: `step_events` rows the hook dropped or the slow half refused (9.11, 8.3)."""
+        return self._one("SELECT count(*) FROM step_events WHERE run_id = ? AND gate_decision IN ('dropped','refused')",
+                         (run_id,))[0]
 
     def _finding(self, r: sqlite3.Row) -> Finding:
         return Finding(finding_id=r["natural_key"], run_id=r["run_id"], kind=r["kind"], description=r["description"],

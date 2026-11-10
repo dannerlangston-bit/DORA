@@ -460,3 +460,13 @@ def test_malformed_values_do_not_crash(base, rel, path, bad, rule):
         cur = cur[p]
     cur[path[-1]] = bad
     assert rule in lint_repo(r, 1, TODAY).rules()
+
+
+def test_flw07_type_fixture_committing_with_enter_after_confirm_and_send(base):
+    """6.2, L-FLW-07: a type_fixture step that commits with Enter while the order is staged presses
+    Enter just as a `press: enter` step would."""
+    def fn(d):
+        i = next(k for k, st in enumerate(d["steps"]) if st.get("id") == "w-confirm")
+        d["steps"].insert(i + 1, {"id": "t-enter", "type": "type_fixture", "target": "trade.order-entry.stock.qty-field",
+                                  "fixture_ref": "fixture.order.qty", "commit": "enter"})
+    assert "L-FLW-07" in _apply(base, FLOW, fn)

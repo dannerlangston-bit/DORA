@@ -4,8 +4,9 @@
 checkpoint sequence of 5.17 with the rig replaced by `sim`:
 
 1. T+0:00. The config the run pins (the given directory plus the PR's manifest and build records,
-   4.3) is linted; any error ends the run `aborted_harness (reason: config_invalid)` with the abort
-   block in the PR comment. The build pair is read from the candidate's build record.
+   4.3) is linted; any error is preflight item G1 (12.7): the shard's Orchestrator stops at
+   `provisioned` and the run ends `aborted_harness (reason: config_invalid)` with the abort block in
+   the PR comment. The build pair is read from the candidate's build record.
 2. T+0:01 to 0:02. The manifest for the candidate is loaded (or not: the two no-manifest cases),
    the changed paths go through the static impact step and `scope.compute_scope` plans the run.
 3. Before any threshold is used (3.9, 1.6 Calibration run) an A/A calibration of the base build is
@@ -22,9 +23,11 @@ checkpoint sequence of 5.17 with the rig replaced by `sim`:
    (task A for declared surfaces, task B descriptions for `collateral`; never for invariants or
    assertions, never for a member that inherited a decision), up to the PR cap of 60 calls.
 7. Everything goes through `store.Store` (single writer) and `store.ArtifactStore` (content
-   addressed, redaction header set: synthetic screens carry no account data). The coverage matrix
-   (`coverage.build_matrix`) and the Reporter's PR comment, commit status and static HTML report
-   are rendered from what the store returns.
+   addressed, redaction header set: synthetic screens carry no account data), each shard's post-run
+   proof included (one 8.3 `post_run_proofs` row per shard, keyed by the rig's login alias). The coverage
+   matrix (`coverage.build_matrix`) and the Reporter's PR comment, commit status and static HTML report
+   are rendered from what the store returns: the proof line, what Cancel All did and the blocked login's
+   readable label (`orchestration.login_label`, never the vault alias) come from the stored proofs.
 
 `run_nightly` is the canary pass of a Nightly run (10.3): `canary.generate` mutates approved
 captures of the base build, every mutant goes through the same `evaluate` path as a PR checkpoint
@@ -32,33 +35,43 @@ with `synthetic: true`, behavioral canaries run their canary flow on the simulat
 `canary.score` gives the result rows, the detector state, the synthetic `harness_error` rows and
 the morning banner.
 
-Choices and workarounds (reported):
+The Orchestrator (5.2): every shard goes through `orchestrator.Orchestrator` on a simulated rig
+(`pipeline.orchestration`): provisioned, launched, authenticated, the paper-mode assertion against
+the example allowlist, settings attestation, workspace, fixture verification and the canary flow, then
+`running`, where the Executor (`_ShardWork`) re-reads the build id before each flow, writes a heartbeat
+at every step, sends each input-bearing flow step through the gateway (`Rig.send_input`, the drop
+ledger of 5.4.8), runs the Watchdog's hang detector, and captures the checkpoints of every shard in
+`running` in plan order; then each shard's teardown and post-run proof. A control result that stops
+a shard gives its unreached checkpoints the Orchestrator's exact outcome (1.10); the run outcome is the
+worst of the shards' (8.2). The A/A calibration runs once a shard reaches `running`, so a run whose
+shards all stop at a gate captures nothing. Every gateway drop or refusal is a `step_events` row in the store with
+its `gateway_event` (8.3 `gate_decision`, `gate_reason`, `gate_class`), and the Safety row counts those rows. Every
+control result's 9.10 route goes to `alerts.json`; the shards, their gates and proofs (`Proof.line`, 6.6), the
+gateway events and the actions the Orchestrator does not perform itself go to `orchestrator.json`.
 
-- WORKAROUND(scope): `scope.compute_scope` selects flows from the change-derived scope only (its
-  choice 1, which follows 1.6 and 1.11); 2.11's pseudocode selects tier-1 flows that touch the
-  census surfaces, smoke included. In the no-manifest, non-UI case (b) the change-derived scope is
-  empty, so no flow would run and the Order Confirmation money cells, where F41 says a backend side
-  effect shows, would never be captured. In case (b) only, this run adds the tier-1 flows of class
-  `standard` whose surfaces meet the smoke census, as the pseudocode does.
-- WORKAROUND(classify): `classify` builds a rule classification with the Reviewer's description
-  but drops the Reviewer's model id and prompt hash, so the report cannot tell a described
-  `collateral` from an undescribed one (9.2 Reviewer line, 9.3 item 2). The run copies them onto a
-  rule classification that carries a Reviewer description.
+The Oracle (2.8, `pipeline.assertions`): every flow checkpoint that declares assertions is evaluated
+on both builds; the candidate's verdict feeds `classify.Facts` (3.11 G and H) and the failed
+assertion's raw values of both builds go to `Finding.evidence.raw_values` and the finding text.
+
+Choices (reported):
+
 - The Nightly canary pass writes one synthetic outcome row per checkpoint at most: 8.3 keys
-  `outcomes` by (run, checkpoint), and the store has no API for `canary_results`, so the result rows
-  go to `canary-results.json` (and the artifact store) and only the synthetic `harness_error` rows
-  `canary.score` returns are written to `outcomes`.
-- No Oracle exists in the core, so no `assertion_failed` is produced; money cells are covered by
-  their zero-floor pixel diff, which 10.3 counts as detection when it lands on the mutated region.
+  `outcomes` by (run, checkpoint), so the per-mutant result rows go to `canary-results.json` (and the
+  artifact store) and only the synthetic `harness_error` rows `canary.score` returns are written to
+  `outcomes`. The Nightly pass runs without the Oracle: a mutant changes pixels, and the simulated
+  Oracle reads what synth drew, not pixels.
+- A Reviewer the run cannot reach for an item (`reviewer.ReviewerUnavailable`, the live adapter) gives
+  that item's classifier input R from the failed verdict (3.11 row 23); the run goes on.
 """
 from __future__ import annotations
 
 import dataclasses
+from collections import abc
 import hashlib
 import json
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
@@ -80,13 +93,34 @@ from ..lint import lint
 from ..records import PERSONAS, CheckpointOutcome, Decision, Finding, RunOutcome, Signature, StepOutcome
 from ..report import ReportContext, build_report, render_pr_comment, render_run_report
 from ..report.cluster import Member, cluster_members
+from ..report.model import proof_severity, worst_proof
 from ..scope import (DependencyIndex, Manifest, PlannedCheckpoint, Rig, ScopeConfigError, ScopePlan, classes_in,
                      compute_scope)
 from ..store import ArtifactStore, Store
 from ..store.artifacts import ManifestHeader, Redaction, StoredArtifact
-from ..store.store import RunPlan, ScopeEntry, ShardPlan
+from ..store.store import PostRunProof, RunPlan, ScopeEntry, ShardPlan
 from ..taxonomy import checkpoint_parts, load
+from ..oracle.assertions import AssertionResult, step_assertions
+from ..oracle.tables import OracleConfigError
+from ..orchestrator.budgets import SESSION_RELEASE_WAIT_S
+from ..orchestrator.clock import ManualClock
+from ..orchestrator.gates import check_authenticated, check_build_unchanged, check_launched
+from ..orchestrator.gateway import VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB, Action, DropLedger, drain, refusal
+from ..orchestrator.identity import judge_identity
+from ..orchestrator.killswitch import proof_line
+from ..orchestrator.machine import Orchestrator, RunContext, RunReport
+from ..orchestrator.results import ControlResult, Outcome, RunVerdict, worse
+from ..orchestrator.rig import CrashSignal
+from ..orchestrator.simrig import CONFIRM_POINT, DELETE_POINT, SimScenario, SimulatedRig, default_context
+from ..orchestrator.watchdog import (HANG_FLOOR_S, Heartbeat, HeartbeatUnwritable, HeartbeatWriter, app_failure,
+                                     edt_frozen, heartbeat_failed)
+from .assertions import FlowOracle, OracleCheck
 from .config import SentinelConfig, as_dict, materialize, parse_time, tree_sha256
+from ..reviewer.adapter import ModelReviewer, ReviewerUnavailable
+from ..reviewer.config import ReviewerConfig
+from ..reviewer.job import ReviewerJob
+from .live import CollectingReviewer, ItemBuilder
+from .orchestration import RigScript, ShardSink, alert_entry, login_alias, login_label, persisted_actions, shard_setup
 from .reviewer import ReviewerAdapter, ReviewRequest, SimulatedReviewer, change_types, to_review, validate
 from .sim import Capture, SimApp, SimBuild, observe
 
@@ -121,6 +155,7 @@ class Scenario:
     canary: Mapping[str, Any] | None = None                         # last Nightly's state for run health
     detector_banner: str | None = None
     history: tuple[dict, ...] = ()
+    rig: RigScript = RigScript()                                    # what the simulated rig does (pipeline.orchestration)
 
 
 @dataclass
@@ -144,6 +179,8 @@ class Evaluated:
     answer: dict | None = None
     review: Review | None = None
     settle_ms: int | None = None
+    oracle: OracleCheck | None = None              # the candidate's assertion results (flow checkpoints)
+    oracle_base: OracleCheck | None = None         # the same assertions on the base build
 
     @property
     def category(self) -> str:
@@ -174,7 +211,9 @@ class RunResult:
     lint_errors: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     canary: Any = None
-    extra_flows: list[str] = field(default_factory=list)
+    alerts: list[dict] = field(default_factory=list)
+    shards: list[dict] = field(default_factory=list)
+    proof: str | None = None
 
     def counts(self) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -371,13 +410,26 @@ def _region_choice(ev_reg: RegionsFile, res: DiffResult | None, comparison: inv.
     return None, None
 
 
+def _located(reg: RegionsFile, res: DiffResult | None, side: int) -> dict[str, tuple[int, int]]:
+    """Where each landmark sits on one side's capture: the Diff Engine's match, else where it was cut."""
+    if res is not None and res.landmarks:
+        return {k: m[side].pos for k, m in res.landmarks.items() if m[side].found}
+    return {lm.id: lm.expected for lm in reg.landmarks if lm.expected is not None}
+
+
+def _event_id(run: _Run, cp: PlannedCheckpoint) -> str:
+    """The Watchdog event id a harness fault at this checkpoint carries (4.13)."""
+    return "wd-" + hashlib.sha256(f"{run.run_id}|{cp.checkpoint_id}".encode()).hexdigest()[:8]
+
+
 def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Capture, *, x: str,
              primitive: str | None, entry_ref: str | None, recapture: Callable[[], Capture],
              recapturable: bool = True, store: Store | None = None, synthetic: bool = False,
-             absent_reason: str | None = None, injected: bool = False) -> Evaluated:
+             absent_reason: str | None = None, injected: bool = False, oracle: FlowOracle | None = None) -> Evaluated:
     """5.17 from capture to classification for one checkpoint; PR checkpoints and canary mutants alike.
     An `injected` candidate (a canary mutant, 10.3 Injection) is already a settled capture: the settle
-    loop, a capture-time gate, does not run on it."""
+    loop, a capture-time gate, does not run on it. With `oracle`, a flow checkpoint's assertions are
+    evaluated on both builds (module docstring)."""
     reg = run.registry(cp, base if base is not None else cand)
     rules = run.surface_rules(cp)
     park = _park(cand)
@@ -403,8 +455,7 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
             if t.outcome == "landmark_missing":
                 facts = Facts(landmark=Condition(t.reason, side=t.side, detail=t.detail), **fkw)
             else:
-                event = "wd-" + hashlib.sha256(f"{run.run_id}|{cp.checkpoint_id}".encode()).hexdigest()[:8]
-                facts = Facts(harness=HarnessFailure(t.reason, event), **fkw)
+                facts = Facts(harness=HarnessFailure(t.reason, _event_id(run, cp)), **fkw)
         else:
             inv_ids, inv_stab, inv_cause = (), None, None
             stab, cause = None, None
@@ -442,14 +493,30 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
             facts = Facts(diff=res.level, stability=stab, stability_cause=cause, threshold_source=res.threshold_source,
                           fix_list_item=fix, invariant_ids=inv_ids, invariant_stability=inv_stab,
                           invariant_stability_cause=inv_cause, bounds_unreadable=comparison.unreadable, **fkw)
+    checks: tuple[OracleCheck | None, OracleCheck | None] = (None, None)
+    if oracle is not None and cp.test_kind == "flow" and s_c.settled and facts.landmark is None and facts.harness is None:
+        try:
+            c_chk = oracle.check(cp.flow_id or "", cp.step_id or "", cp.data_mode, cand, reg, _located(reg, res, 1),
+                                 "candidate")
+            b_chk = oracle.check(cp.flow_id or "", cp.step_id or "", cp.data_mode, base, reg, _located(reg, res, 0),
+                                 "base") if base is not None and c_chk is not None else None
+        except OracleConfigError:              # a flow the lint accepted that the Oracle cannot evaluate: harness
+            c_chk = b_chk = None
+            facts = dataclasses.replace(facts, harness=HarnessFailure("exception:OracleConfigError", _event_id(run, cp)))
+        if c_chk is not None:
+            facts = dataclasses.replace(facts, **c_chk.verdict.facts_fields(harness_event_id=_event_id(run, cp)))
+            checks = (c_chk, b_chk)
     classified = classify(facts)
     ev = Evaluated(cp, base, cand, reg, facts, classified, res, comparison, recaptures=recaps,
-                   settle_ms=s_c.time_to_settle_ms)
+                   settle_ms=s_c.time_to_settle_ms, oracle=checks[0], oracle_base=checks[1])
     ev.facts_category = classified.outcome
     cand_lm = {k: m[1].pos for k, m in (res.landmarks.items() if res else []) if m[1].found}
     h, w = cand.screen.image.shape[:2]
     if classified.outcome in LISTED and classified.outcome != "harness_error":
         region, box = _region_choice(reg, res, comparison, cand_lm, (w, h))
+        asserted = _asserted_region(ev, cand_lm) if classified.outcome == "assertion_failed" else None
+        if asserted is not None:
+            region, box = asserted
         if region is None and comparison is not None and comparison.fired:
             region, box = "_window", (0, 0, w, h)
         if region is not None and box is not None:
@@ -476,6 +543,27 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
     return ev
 
 
+def _asserted_region(ev: Evaluated, cand_lm: Mapping[str, tuple[int, int]]) -> tuple[str, tuple] | None:
+    """The signature region of an `assertion_failed` checkpoint (9.7): the region the failed assertion read;
+    for a rule, the operand region the diff saw move, else its last operand (R01's total)."""
+    if ev.oracle is None:
+        return None
+    failed = ev.oracle.failed()
+    if not failed:
+        return None
+    fields = [e.field for e in failed[0].operands.values()]
+    moved = {m.region_id for m in (ev.diff.regions if ev.diff is not None else ()) if m.above_threshold}
+    rid = next((f for f in fields if f in moved), fields[-1] if fields else None)
+    try:
+        r = ev.registry.region(rid) if rid else None
+    except KeyError:
+        r = None
+    if r is None or r.landmark not in cand_lm:
+        return None
+    lx, ly = cand_lm[r.landmark]
+    return r.id, (r.rect.x + lx, r.rect.y + ly, r.rect.w, r.rect.h)
+
+
 def _as_settled(cap: Capture) -> SettleResult:
     """An injected capture is a settled capture already (10.3 Injection)."""
     return SettleResult(True, cap.screen.image, 0, 750, None, None, None, 750)
@@ -485,11 +573,6 @@ def _with_review(ev: Evaluated, review: Review) -> None:
     ev.review = review
     ev.facts = dataclasses.replace(ev.facts, review=review)
     c = classify(ev.facts)
-    cls = c.classification
-    if cls is not None and cls.by == "rule" and cls.description and not cls.model_id:
-        # WORKAROUND(classify): keep the describing Reviewer call's model id and prompt hash (module docstring)
-        c = dataclasses.replace(c, classification=dataclasses.replace(cls, model_id=review.model_id,
-                                                                       prompt_hash=review.prompt_hash))
     ev.classified = c
     if not (c.reason or "").startswith("decision:"):
         ev.facts_category = c.outcome     # the verdict decided the category; a decision would not have
@@ -553,6 +636,37 @@ def _violation_text(ev: Evaluated) -> tuple[str, dict]:
                 details = details.replace(k, noun.replace("the ", ""))
             parts.append(f"{inv_id} {SHORT[inv_id]}: {details}{pre}.")
     return " ".join(parts), ev_notes
+
+
+def _base_result(ev: Evaluated, assertion_id: str) -> AssertionResult | None:
+    if ev.oracle_base is None:
+        return None
+    return next((r for r in ev.oracle_base.verdict.results if r.assertion_id == assertion_id), None)
+
+
+def _raw_values(ev: Evaluated) -> dict[str, str]:
+    """`Finding.evidence.raw_values` (4.13): the first failed assertion's expected, read and source, and what
+    every source read on the candidate and on the base build (`AssertionResult.raw_values`)."""
+    first = ev.oracle.failed()[0]
+    return first.raw_values(_base_result(ev, first.assertion_id))
+
+
+def _assertion_text(ev: Evaluated) -> str:
+    """An `assertion_failed` finding: the Oracle's expected and extracted values (4.13 detail), then the raw
+    reads of the failed assertion's regions on both builds, so a reader sees what each build drew."""
+    first = ev.oracle.failed()[0]
+    base = _base_result(ev, first.assertion_id)
+
+    def reads(r: AssertionResult | None) -> str:
+        if r is None:
+            return "not read"
+        return ", ".join(f"{e.field} '{e.text}' ({e.source or 'no source'})" for e in r.operands.values()) or "nothing"
+    others = [r.assertion_id for r in ev.oracle.failed()[1:]]
+    text = (f"Assertion {first.assertion_id} failed: {first.detail}. Raw values, candidate: {reads(first)}; "
+            f"base: {reads(base)}" + (f" (base {base.status})" if base is not None else "") + ".")
+    if others:
+        text += f" Also failed: {', '.join(others)}."
+    return text
 
 
 def _ocr_in(model: inv.ScreenModel, box: tuple[int, int, int, int]) -> str:
@@ -682,10 +796,17 @@ class _Writer:
             elif c.outcome == "landmark_missing":
                 desc = f"Landmark not found ({c.reason}, side {c.side}): {c.detail}"
                 evidence["side"] = c.side
+            elif c.outcome == "assertion_failed" and ev.oracle is not None and ev.oracle.failed():
+                desc = _assertion_text(ev)
+            elif c.outcome == "needs_human" and c.reason == "oracle_unreadable" and ev.oracle is not None:
+                desc = (f"The Oracle could not read {', '.join(ev.oracle.verdict.unreadable)} on any source "
+                        f"(2.8.1): {c.detail or 'no read above its confidence floor'}.")
             elif c.classification is not None and c.classification.description:
                 desc = c.classification.description
             else:
                 desc = _metrics_text(ev) or (c.detail or c.outcome)
+            if ev.oracle is not None and ev.oracle.failed():
+                evidence["raw_values"] = _raw_values(ev)
             if ev.answer is not None:
                 evidence["reviewer"] = {"verdict": ev.answer["verdict"], "change_types": change_types(ev.answer)}
             if ev.related:
@@ -708,28 +829,7 @@ class _Writer:
 
 
 # ------------------------------------------------------------------------------------------------
-# Scope workaround, coverage and run-health inputs
-
-
-def _case_b_flows(cfg: SentinelConfig, plan: ScopePlan) -> list[PlannedCheckpoint]:
-    """WORKAROUND(scope): in case (b), 2.11's flow rule over the smoke census (module docstring)."""
-    if plan.manifest_state != "no_manifest_nonui" or plan.scope_surfaces:
-        return []
-    have = set(plan.planned_ids)
-    out = []
-    for f in sorted(cfg.flows, key=lambda f: f.flow_id):
-        if f.tier != 1 or f.flow_class != "standard" or not set(f.surfaces) & plan.census_surfaces:
-            continue
-        if not f.requires <= cfg.entitlements:
-            continue
-        persona = f.persona
-        for fc in f.checkpoints:
-            if fc.checkpoint_id in have:
-                continue
-            tier = cfg.registry[fc.surface_id].tier if fc.surface_id in cfg.registry else f.tier
-            out.append(PlannedCheckpoint(fc.checkpoint_id, fc.surface_id, "flow", tier, f.workspace, persona,
-                                         fc.data_mode, flow_id=f.flow_id, step_id=fc.step_id))
-    return out
+# Coverage and run-health inputs
 
 
 def coverage_summary(cfg: SentinelConfig, plan: ScopePlan, outcomes: Sequence[CheckpointOutcome], run_id: str) -> dict:
@@ -781,7 +881,7 @@ def coverage_summary(cfg: SentinelConfig, plan: ScopePlan, outcomes: Sequence[Ch
 
 def _register(store: Store, cfg: SentinelConfig, builds: Iterable[str]) -> None:
     for i, rig in enumerate(RIGS, 1):
-        store.register_rig(rig, login_alias=f"vault://sentinel/rigs/{rig}/tos-login", owner="asmith",
+        store.register_rig(rig, login_alias=login_alias(rig), owner="asmith",
                            snapshot_id=f"snap-{rig}-2026-11-01", allowlist_entry=i)
     for bid in builds:
         doc = cfg.builds.get(bid)
@@ -811,34 +911,511 @@ def _status_json(status) -> dict:
 
 
 # ------------------------------------------------------------------------------------------------
+# The Orchestrator and the Executor (5.2, 5.4, 10.2): one shard through the gate machine
+
+
+FLOW_INPUT_STEPS = ("click_named", "press", "type_fixture")
+NAMED_KEYS = {"enter": VK_RETURN, "return": VK_RETURN, "space": VK_SPACE, "tab": VK_TAB, "escape": VK_ESCAPE}
+GUARDED_KEYS = ("enter", "return", "space")
+MAX_WAIT_S = 15.0                        # 3.5: the settle loop's maximum wait, the hang detector's max_wait_s
+STEP_S = 2.0                             # simulated seconds per Executor step (heartbeats, token expiry)
+
+
+def _units(cps: Sequence[PlannedCheckpoint]) -> list[list[PlannedCheckpoint]]:
+    """The shard's work in order: a flow's checkpoints, a sweep ladder or splitter series of one surface and
+    host, or one census checkpoint. A unit is what `rest_of_flow` and `resume_next_flow` mean (10.2)."""
+    def key(cp: PlannedCheckpoint) -> tuple:
+        if cp.test_kind == "flow":
+            return ("flow", cp.flow_id)
+        if cp.test_kind in ("sweep", "split"):
+            return (cp.test_kind, cp.surface_id, _host(cp))
+        return ("census", cp.checkpoint_id)
+    out: list[list[PlannedCheckpoint]] = []
+    for cp in cps:
+        if out and key(out[-1][0]) == key(cp):
+            out[-1].append(cp)
+        else:
+            out.append([cp])
+    return out
+
+
+@dataclass
+class _Shard:
+    """One shard's moving parts while the Orchestrator runs it."""
+
+    shard_id: str
+    rig_id: str
+    cps: list[PlannedCheckpoint]
+    orch: Orchestrator
+    rig: SimulatedRig
+    sink: ShardSink
+    clock: ManualClock
+    ctx: RunContext
+    order_stage: bool = False
+    noted: set[int] = field(default_factory=set)
+
+
+class _ShardWork:
+    """The Executor's side of every shard of one run (module docstring): build re-read, heartbeats, gateway
+    input, captures, the Watchdog's hang detector, the subset outcomes control results return."""
+
+    def __init__(self, run: _Run, cfg: SentinelConfig, scenario: Scenario, out: Path, oracle: FlowOracle | None,
+                 store: Store, planned: Sequence[PlannedCheckpoint], plan: ScopePlan | None, today: date):
+        self.run, self.cfg, self.scenario, self.out, self.oracle = run, cfg, scenario, out, oracle
+        self.store, self.planned, self.plan, self.today = store, list(planned), plan, today
+        self.script: RigScript = scenario.rig
+        self.ledger = DropLedger()                         # 5.4.8 counts per flow and per run, across shards
+        self.evals: list[Evaluated] = []
+        self.bare: dict[str, tuple[PlannedCheckpoint, Outcome]] = {}   # outcomes a control result decided
+        self.findings: list[Finding] = []
+        self.steps: list[tuple[StepOutcome, str]] = []
+        self.alerts: list[dict] = []
+        self.actions: list[dict] = []
+        self.summaries: list[dict] = []
+        self.reports: list[tuple[_Shard, RunReport]] = []
+        self.calibrated = False
+        self.frozen: set[str] = set()
+
+    # -- the shards -------------------------------------------------------------------------------------
+    def run_shards(self, specs: Sequence[tuple[str, int, str, list[PlannedCheckpoint]]]) -> None:
+        """Every shard through its Orchestrator, as parallel shards on their rigs would run (module docstring):
+        each shard's gates in rig order, then every shard that reached `running` captures its checkpoints in
+        plan order across the shards, then each shard tears down and proves."""
+        self._specs = list(specs)
+        self._running: list[_Shard] = []
+        self._chain(0)
+        self.reports.sort(key=lambda sr: sr[0].ctx.shard)
+        self.summaries.sort(key=lambda d: d["shard_id"])
+
+    def _chain(self, k: int) -> None:
+        """Shard k's Orchestrator, whose `running` hands over to shard k+1's; the last one runs the captures."""
+        if k == len(self._specs):
+            self._capture_all()
+            return
+        shard_id, shard_no, rig_id, cps = self._specs[k]
+        sc = self.scenario
+        clock = ManualClock(start=self.run.now.astimezone(timezone.utc), mono=1000.0 + 10_000 * shard_no)
+        ctx, sim = shard_setup(self.cfg, run_id=sc.run_id, run_type="pr", shard_id=shard_id, shard_no=shard_no,
+                               build_id=sc.candidate.build_id, workspace_id=cps[0].workspace_id, script=self.script)
+        rig = SimulatedRig(sim, clock=clock)
+        sink = ShardSink([cp.checkpoint_id for cp in cps])
+        hb = HeartbeatWriter(self.out / "heartbeat" / f"shard-{shard_no}.json", clock)
+        orch = Orchestrator(rig, ctx, sink, clock=clock, ledger=self.ledger, heartbeat=hb,
+                            watchdog_status=lambda: (1.0, True))
+        st = _Shard(shard_id, rig_id, list(cps), orch, rig, sink, clock, ctx)
+        entered: list[bool] = []
+
+        def work(o: Orchestrator) -> None:
+            entered.append(True)
+            for r in list(o.results):                   # gate results may name parts of the scope
+                self._subsets(st, r)
+            self._running.append(st)
+            self._chain(k + 1)
+
+        report = orch.run(work)
+        if not entered:                                  # stopped at a gate; the other shards still run
+            self._chain(k + 1)
+        for r in report.results:
+            self._note(st, r)
+        for cid, o in sink.filled.items():
+            self.bare.setdefault(cid, (next(cp for cp in cps if cp.checkpoint_id == cid), o))
+        self.reports.append((st, report))
+        self.summaries.append({
+            "shard_id": shard_id, "rig": rig_id, "simulated_rig_identity": ctx.allowlist.rig,
+            "checkpoints": len(cps), "verdict": report.verdict.status, "reason": report.verdict.reason,
+            "last_gate": report.last_gate, "proof": report.proof.line,
+            "kill_switch": [name for name, _ in report.kill_switch.steps] if report.kill_switch else None,
+            "gates": [{"control": r.control, "gate": r.gate, "passed": r.passed, "detail": r.detail}
+                      for r in report.results],
+            "unreached_filled": sorted(sink.filled)})
+
+    def _note(self, st: _Shard, r: ControlResult, checkpoint: PlannedCheckpoint | None = None,
+              flow_id: str | None = None) -> None:
+        """Record a control result once: its 9.10 route, the actions to persist and its findings."""
+        if id(r) in st.noted:
+            return
+        st.noted.add(id(r))
+        sc = self.scenario
+        a = alert_entry(sc.run_id, st.shard_id, r)
+        if a is not None:
+            self.alerts.append(a)
+        self.actions += persisted_actions(sc.run_id, st.shard_id, st.rig_id, r, flow_id)
+        for spec in r.findings:
+            n = len(self.findings) + 1
+            extra: dict[str, Any] = {"created_at": _ts(self.today, sc.clock, 900)}
+            if checkpoint is not None:
+                extra.update(checkpoint_id=checkpoint.checkpoint_id, step_id=checkpoint.step_id)
+            self.findings.append(spec.to_finding(f"fnd-{sc.run_id}-orc-{n:03d}", sc.run_id, **extra))
+
+    # -- outcomes a control result decides ----------------------------------------------------------
+    def _todo(self, st: _Shard) -> list[PlannedCheckpoint]:
+        return [cp for cp in st.cps if cp.checkpoint_id not in st.sink.done and cp.checkpoint_id not in st.sink.filled]
+
+    def _select(self, st: _Shard, selector: str, current: PlannedCheckpoint | None,
+                rest: Sequence[PlannedCheckpoint]) -> list[PlannedCheckpoint]:
+        """The shard checkpoints a `SubsetOutcome` selector names (results.SubsetOutcome)."""
+        todo = self._todo(st)
+        if selector in ("all", "shard"):
+            return todo
+        if selector == "frozen":
+            return [cp for cp in todo if cp.data_mode == "frozen"]
+        if selector in ("api_within", "ocr_assertion"):
+            def has(cp: PlannedCheckpoint) -> bool:
+                exp = step_assertions(self.cfg.flow_step(cp.flow_id or "", cp.step_id or "")) if cp.flow_id else []
+                if selector == "api_within":
+                    return any(a.get("kind") == "api_within" for a in exp)
+                return any(a.get("source", "ocr") == "ocr" and a.get("kind") != "api_within" for a in exp)
+            return [cp for cp in todo if has(cp)]
+        if selector == "in_progress":
+            return [current] if current is not None else []
+        if selector == "rest_of_flow":
+            return [cp for cp in rest if cp in todo]
+        if selector == "first_unreached":
+            return todo[:1]
+        return []        # account_state, probe:<Pn>, explorer_stage, drill, ...: no checkpoint of a PR shard's scope
+
+    def _subsets(self, st: _Shard, r: ControlResult, current: PlannedCheckpoint | None = None,
+                 rest: Sequence[PlannedCheckpoint] = ()) -> None:
+        for sub in r.outcomes:
+            for cp in self._select(st, sub.selector, current, rest):
+                self.bare[cp.checkpoint_id] = (cp, sub.outcome)
+                st.sink.done.add(cp.checkpoint_id)
+
+    # -- running --------------------------------------------------------------------------------------
+    def _capture_all(self) -> None:
+        """The Executor's work of every shard in `running`, unit by unit in plan order (3.10's re-run budget is
+        then spent in the plan's tier order, as the run budget of max(30, 10 percent) is shared by the run)."""
+        if not self._running:
+            return
+        if not self.calibrated:                         # the Calibration run of 1.6, before any threshold
+            self.run.calibrate(self.planned, self.out)
+            self.calibrated = True
+        index = {cp.checkpoint_id: i for i, cp in enumerate(self.planned)}
+        units = sorted(((st, u) for st in self._running for u in _units(st.cps)),
+                       key=lambda su: min(index[cp.checkpoint_id] for cp in su[1]))
+        for st, unit in units:
+            orch = st.orch
+            if orch.stop is not None or not [cp for cp in unit if cp in self._todo(st)]:
+                continue
+            r = orch.apply(check_build_unchanged(st.rig.read_title_build_id(), st.ctx.expected_build))
+            self._note(st, r)
+            if not r.passed:
+                continue
+            if unit[0].test_kind == "flow":
+                self._flow(st, unit)
+            else:
+                for i, cp in enumerate(unit):
+                    self._heartbeat(st, None, None, cp)
+                    if not self._capture(st, cp, unit[i + 1:]) or orch.stop is not None:
+                        break
+
+    def _heartbeat(self, st: _Shard, flow_id: str | None, step_id: str | None, cp: PlannedCheckpoint | None) -> None:
+        """10.2: a heartbeat at every step start; a write failing twice ends the run (watchdog.heartbeat_failed)."""
+        st.clock.advance(STEP_S)
+        hb = st.orch.heartbeat
+        if hb is None:
+            return
+        try:
+            hb.write(Heartbeat(self.scenario.run_id, st.ctx.shard, st.ctx.attempt, "running", st.clock.now().isoformat(),
+                               st.clock.monotonic(), flow_id=flow_id, step_id=step_id,
+                               checkpoint_id=cp.checkpoint_id if cp else None, max_wait_s=MAX_WAIT_S))
+        except HeartbeatUnwritable as e:
+            self._note(st, st.orch.apply(heartbeat_failed(e)))
+
+    def _flow(self, st: _Shard, unit: Sequence[PlannedCheckpoint]) -> None:
+        """One flow: its steps in order, input steps through the gateway, its checkpoints captured, then its
+        teardown input (5.4.3, 4.7). Preconditions and normalize steps send no input here."""
+        flow_id = unit[0].flow_id or ""
+        doc = self.cfg.flow_docs.get(flow_id, {})
+        want = {cp.step_id: cp for cp in unit}
+        cps = list(unit)
+        for step in doc.get("steps") or ():
+            if st.orch.stop is not None:
+                return
+            sid = str(step.get("id"))
+            cp = want.get(sid) if step.get("type") == "checkpoint" else None
+            self._heartbeat(st, flow_id, sid, cp)
+            if cp is not None:
+                if cp in self._todo(st) and not self._capture(st, cp, cps[cps.index(cp) + 1:]):
+                    return
+            elif step.get("type") in FLOW_INPUT_STEPS and not self._input(st, flow_id, step, doc):
+                return
+            if self.script.enter_after == (flow_id, sid):     # the scenario's scripted Enter on the open dialog
+                if not self._send(st, Action("press", keys=(VK_RETURN,), declared_guarded=True,
+                                             flow_class=str(doc.get("class", "standard"))),
+                                  flow_id, f"{sid}+enter"):
+                    return
+        for step in doc.get("teardown") or ():
+            if st.orch.stop is not None:
+                return
+            self._heartbeat(st, flow_id, str(step.get("id")), None)
+            if step.get("action") == "close_dialog" and st.rig.dialog_open:
+                # the Order Confirmation's dismiss allowlist (6.2): Delete closes the dialog, Send never
+                self._send(st, Action("click", point=DELETE_POINT, resolved_name="Delete", under_point_text="Delete",
+                                      teardown_action="close_dialog", flow_class=str(doc.get("class"))),
+                           flow_id, str(step.get("id")))
+                st.order_stage = st.rig.dialog_open
+
+    def _label(self, target: str) -> str:
+        """A step target's control text from the Surface Registry (`<surface>.<control id>`)."""
+        for sid in sorted(self.cfg.surfaces, key=len, reverse=True):
+            if target.startswith(sid + "."):
+                cid = target[len(sid) + 1:]
+                for c in self.cfg.surfaces[sid].get("controls") or ():
+                    if str(c.get("id")) == cid:
+                        return str(c.get("ocr_text") or cid)
+                return cid
+        return target
+
+    def _input(self, st: _Shard, flow_id: str, step: Mapping[str, Any], doc: Mapping[str, Any]) -> bool:
+        """One input-bearing flow step as the gateway's `Action` (5.4.3 stages 1 to 3 resolved here)."""
+        kind, cls = step.get("type"), str(doc.get("class", "standard"))
+        if kind == "click_named":
+            label = self._label(str(step.get("target", "")))
+            stage = step.get("order_stage") is True
+            ok = self._send(st, Action("click", point=CONFIRM_POINT if label.casefold() == "confirm and send" else (40, 40),
+                                       resolved_name=label, under_point_text=label, order_stage_step=stage,
+                                       flow_class=cls), flow_id, str(step.get("id")))
+            st.order_stage = st.order_stage or (stage and st.rig.dialog_open)
+            return ok
+        key = str(step.get("key") if kind == "press" else step.get("commit") or "").casefold()
+        if key not in NAMED_KEYS:
+            return True
+        return self._send(st, Action(kind if kind == "press" else "type_fixture", keys=(NAMED_KEYS[key],),
+                                     declared_guarded=key in GUARDED_KEYS, flow_class=cls), flow_id, str(step.get("id")))
+
+    def _send(self, st: _Shard, action: Action, flow_id: str, step_id: str) -> bool:
+        """`Rig.send_input` and the drop ledger of 5.4.8: a refusal or a hook drop is a step event, and the
+        ledger's result may end the flow or the run (an attempted send is `aborted_safety`)."""
+        res = st.rig.send_input(action)
+        drops = [refusal(res.refused)] if res.refused is not None else []
+        drops += [drain(d, e) for e, d in zip(res.events, res.decisions) if not d.allowed]
+        for drop in drops:
+            r = st.orch.apply(self.ledger.record(drop, unit=flow_id, order_stage=st.order_stage))
+            self._note(st, r, flow_id=flow_id)
+            self.steps.append((StepOutcome(self.scenario.run_id, flow_id, step_id, r.step or "blocked_by_gateway",
+                                           shard_id=st.shard_id, gateway_event={"decision": drop.decision,
+                                                                                "reason": drop.reason,
+                                                                                "class": drop.gate_class},
+                                           recorded_at=_ts(self.today, self.scenario.clock, 600)), st.shard_id))
+        return not drops and st.orch.stop is None
+
+    def _capture(self, st: _Shard, cp: PlannedCheckpoint, rest: Sequence[PlannedCheckpoint]) -> bool:
+        """Capture and evaluate one checkpoint; False when the unit ends here (an app failure, 10.2)."""
+        cid = cp.checkpoint_id
+        if self.script.freeze_at == cid and cid not in self.frozen:
+            return self._freeze(st, cp, rest)
+        live = cp.data_mode == "masked_live"
+        base_cap = self.run.capture(cp, "base", tick=1 if live else 0)
+        cand_cap = self.run.capture(cp, "candidate", tick=2 if live else 0)
+        att = self.plan.attribution.get(cp.surface_id)
+        ticks = iter(range(3, 9))
+        ev = evaluate(self.run, cp, base_cap, cand_cap, x=self.plan.x_input(cp.surface_id),
+                      primitive=att.primitive if att else None, entry_ref=att.entry_id if att else None,
+                      recapture=lambda: self.run.capture(cp, "candidate", tick=next(ticks)),
+                      recapturable=_recapturable(self.cfg, cp), store=self.store, oracle=self.oracle)
+        self.evals.append(ev)
+        st.sink.done.add(cid)
+        return True
+
+    def _freeze(self, st: _Shard, cp: PlannedCheckpoint, rest: Sequence[PlannedCheckpoint]) -> bool:
+        """The app's EDT freezes while `cp` is captured: the screenshot-staleness detector fires after
+        max(2 x max wait, 60 s), `app_failure` decides, and the Executor kills, relaunches and logs in again
+        before the next unit (10.2 sampling 5, F62)."""
+        self.frozen.add(cp.checkpoint_id)
+        since = st.clock.monotonic()
+        st.clock.advance(max(2 * MAX_WAIT_S, HANG_FLOOR_S))
+        if not edt_frozen(now=st.clock.monotonic(), expect_change_since=since, last_hash_change=since - STEP_S,
+                          max_wait_s=MAX_WAIT_S, anti_anchor=False, capture_suspended=False):
+            raise RuntimeError("the hang detector did not fire on a frozen screen")
+        r = st.orch.apply(app_failure(CrashSignal("hang", "screenshot_staleness"), st.orch.budgets, phase="running"))
+        self._note(st, r, checkpoint=cp, flow_id=cp.flow_id)
+        self._subsets(st, r, cp, rest)
+        if st.orch.stop is not None:
+            return False
+        if r.has("kill_tree"):
+            st.rig.kill_process_tree()
+            st.order_stage = False
+        if r.has("wait_session_release"):
+            st.clock.sleep(SESSION_RELEASE_WAIT_S)
+        if r.has("relaunch"):
+            self._relaunch(st)
+        return False
+
+    def _relaunch(self, st: _Shard) -> None:
+        """Re-enter at `launched` after an app failure (10.2): launch, log in, assert paper mode again."""
+        orch, ctx, rig = st.orch, st.ctx, st.rig
+        for check in (lambda: check_launched(rig.launch(), expected_build=ctx.expected_build, first_launch=False,
+                                             budgets=orch.budgets),
+                      lambda: check_authenticated(rig.login()),
+                      lambda: judge_identity([rig.read_account_selector()], ctx.allowlist)):
+            r = orch.apply(check())
+            self._note(st, r)
+            if not r.passed or orch.stop is not None:
+                return
+
+    # -- after every shard ----------------------------------------------------------------------------
+    def bare_outcome(self, cp: PlannedCheckpoint, o: Outcome) -> CheckpointOutcome:
+        sc = self.scenario
+        return CheckpointOutcome(
+            run_id=sc.run_id, checkpoint_id=cp.checkpoint_id, outcome=o.outcome, reason=o.reason, detail=o.detail,
+            gate=o.gate, workspace_id=cp.workspace_id, persona=cp.persona, data_mode=cp.data_mode,
+            surface_id=cp.surface_id, test_kind=cp.test_kind, tier=cp.tier, flow_id=cp.flow_id, step_id=cp.step_id,
+            size_step=dict(cp.size_step) if cp.size_step else None, flow_class=_flow_class(self.cfg, cp),
+            fingerprint_id=self.run.fp_id, data_epoch_id=self.run.epoch, recorded_at=_ts(self.today, sc.clock, 900))
+
+    def stop(self) -> tuple[_Shard, ControlResult] | None:
+        """The shard and result that ended the run (an `aborted_*` run outcome), if one did."""
+        for st, rep in self.reports:
+            if rep.verdict.aborted and st.orch.stop is not None:
+                return st, st.orch.stop
+        return None
+
+    def verdict(self) -> RunVerdict:
+        """8.2: the run outcome is the worst of the shards'."""
+        v: RunVerdict | None = None
+        for _, rep in self.reports:
+            v = worse(v, rep.verdict)
+        return v or RunVerdict("complete")
+
+    def write_proofs(self) -> None:
+        """One 8.3 `post_run_proofs` row per shard proof (6.6), through the store, keyed by the shard's login alias;
+        `proofs` reads them back for the report. A shard's gateway drops are its step events the hook dropped or the
+        slow half refused (the rows `write_steps` stores, 9.11); its events are every one the gateway decided."""
+        sc = self.scenario
+        for st, rep in self.reports:
+            p, log = rep.proof, st.rig.gateway_log()
+            pm = [r for r in rep.results if r.control == "paper_mode"]
+            drops = sum(1 for s, sid in self.steps
+                        if sid == st.shard_id and (s.gateway_event or {}).get("decision") in ("dropped", "refused"))
+            self.store.write_proof(PostRunProof(
+                shard_id=st.shard_id, run_id=sc.run_id, login_alias=login_alias(st.rig_id), verdict=p.verdict_code,
+                reason=p.reason, send_policy_ref=self.cfg.send_policy_ref, counts=p.counts,
+                cancel_all=p.cancel_all_code, paper_mode_assertions=sum(1 for r in pm if r.passed),
+                paper_mode_mismatches=sum(1 for r in pm if r.run_status == "aborted_safety"),
+                gateway_events=log.allowed + log.drops + log.refusals, gateway_drops=drops,
+                start_snapshot_sha256=p.start_sha256, end_snapshot_sha256=p.end_sha256,
+                produced_at=st.clock.now().isoformat()))
+
+    def proofs(self) -> list[tuple[_Shard, PostRunProof, str]]:
+        """Each shard's stored proof (8.3 `post_run_proofs`) with its 6.6 VERDICT line, in shard order."""
+        by = {st.shard_id: st for st, _ in self.reports}
+        return [(by[p.shard_id], p, proof_line(p.verdict, p.reason, p.counts.get("undeclared", ()), p.cancel_all))
+                for p in self.store.post_run_proofs(self.scenario.run_id)]
+
+    def proof(self) -> str:
+        """The run's proof line (6.6) for run health and the abort block, from the stored proofs: the most severe of
+        the shards' (ORDERS SENT, then UNPROVEN, then PROVEN; 8.2), the stopping shard's among equals."""
+        stored = self.proofs()
+        lines = [line for _, _, line in stored]
+        stop = self.stop()
+        if stop is not None:
+            lines.insert(0, next(line for st, _, line in stored if st is stop[0]))
+        return worst_proof(lines) if lines else "UNPROVEN: no shard ran"
+
+    def safety(self) -> dict:
+        """Run health's safety facts (9.11), from what the shards' controls returned and the stored proofs (6.6):
+        what Cancel All did, the run's proof and the readable label of each login the worst proof blocks (never the
+        vault alias). The gateway drops are the run's stored `step_events` rows the hook dropped or the slow half
+        refused (9.11), so it runs after `write_steps` and `write_proofs`."""
+        results = [r for _, rep in self.reports for r in rep.results]
+        att = [r for r in results if r.gate == "settings_attested" and r.control == "attestation"]
+        stored = self.proofs()
+        did = {p.cancel_all for _, p, _ in stored}                     # what Cancel All did per shard (6.6)
+        cancel = ("failed" if "performed_unverified" in did else "verified" if "performed_verified" in did
+                  else "not needed")
+        proof = self.proof()
+        worst = proof_severity(proof) if stored else None
+        logins = [login_label(st.rig_id) for st, _, line in stored if proof_severity(line) == worst]
+        return {"attestation": ("passed" if att and all(r.passed for r in att) else
+                                "not reached" if not att else "failed"),
+                "paper_mode_asserted": sum(1 for r in results if r.control == "paper_mode" and r.passed),
+                "gateway_drops": self.store.gateway_drops(self.scenario.run_id), "cancel_all": cancel,
+                "proof": proof, "login": logins[0] if len(logins) == 1 else logins}
+
+    def write(self, extra: Mapping[str, Any] | None = None) -> None:
+        """`alerts.json` and `orchestrator.json` in the scenario output (appended to by every run there)."""
+        _append_json(self.out / "alerts.json", self.alerts)
+        _append_json(self.out / "orchestrator.json", [{
+            "run_id": self.scenario.run_id, "shards": self.summaries, "persisted_actions": self.actions,
+            "gateway_events": [s.to_dict() for s, _ in self.steps], **dict(extra or {})}])
+
+
+class _EvalIndex(abc.Mapping):
+    """The run's evaluated checkpoints by checkpoint id, as the shards produce them (for `ItemBuilder`)."""
+
+    def __init__(self, work: _ShardWork):
+        self.work = work
+
+    def __getitem__(self, cid: str) -> Evaluated:
+        return next(ev for ev in self.work.evals if ev.cp.checkpoint_id == cid)
+
+    def __iter__(self):
+        return (ev.cp.checkpoint_id for ev in self.work.evals)
+
+    def __len__(self) -> int:
+        return len(self.work.evals)
+
+
+def _append_json(path: Path, entries: Sequence[Any]) -> None:
+    old = json.loads(path.read_text()) if path.exists() else []
+    path.write_text(json.dumps(old + list(entries), indent=1, sort_keys=True, default=str) + "\n")
+
+
+# ------------------------------------------------------------------------------------------------
 # run_pipeline
 
 
 def _abort_config(store: Store, scenario: Scenario, cfg_root: Path, errors: list[str], rule_ids: list[str],
                   out_dir: Path, today: date, started: str) -> RunResult:
-    """1.7 T+0:00: a lint failure ends the run aborted_harness (reason: config_invalid)."""
+    """1.7 T+0:00 and preflight G1 (12.7): config lint failed, so the shard's Orchestrator fails G1 at
+    `provisioned` and the run ends `aborted_harness (reason: config_invalid)` before any product action."""
     store.begin_run(_run_plan(scenario.run_id, scenario.run_type, cfg_root, (), (), started, None, scenario.pr,
                               scenario.author))
-    store.fill_unreached(scenario.run_id, "harness_error", "config_invalid")   # 1.10: none was scoped yet
-    run = store.end_run(RunOutcome(scenario.run_id, scenario.run_type, "aborted_harness", "provisioned",
-                                   reason="config_invalid", started_at=started, ended_at=_ts(today, scenario.clock, 60)))
-    ctx = ReportContext(pr=scenario.pr or 0, candidate_build=scenario.candidate.build_id,
-                        base_build=scenario.base.build_id,
-                        abort={"rule_ids": rule_ids, "requeued": "not re-queued: a config fix is needed first"})
-    comment = render_pr_comment(run, [], [], [], {}, {}, None, ctx)
-    report = build_report(run, [], [], [], {}, {}, None, ctx)
+    sink = ShardSink(())                                 # 1.10: none was scoped yet
+    clock = ManualClock(start=parse_time(started).astimezone(timezone.utc))
+    ctx = default_context(scenario.run_id, scenario.run_type, expected_build=scenario.candidate.build_id)
+    report = Orchestrator(SimulatedRig(SimScenario(preflight_failures={"G1": None}), clock=clock), ctx, sink,
+                          clock=clock).run()
+    store.fill_unreached(scenario.run_id, "harness_error", "config_invalid")
+    run = store.end_run(RunOutcome(scenario.run_id, scenario.run_type, report.verdict.status, report.last_gate,
+                                   reason=report.verdict.reason, started_at=started,
+                                   ended_at=_ts(today, scenario.clock, 60)))
+    alerts = [a for r in report.results if (a := alert_entry(scenario.run_id, ctx.shard_id, r)) is not None]
+    _append_json(out_dir / "alerts.json", alerts)
+    shard = {"shard_id": ctx.shard_id, "rig": "none (stopped at provisioned)", "verdict": report.verdict.status,
+             "reason": report.verdict.reason, "last_gate": report.last_gate, "proof": report.proof.line,
+             "gates": [{"control": r.control, "gate": r.gate, "passed": r.passed, "detail": r.detail}
+                       for r in report.results]}
+    _append_json(out_dir / "orchestrator.json", [{"run_id": scenario.run_id, "shards": [shard], "persisted_actions": [],
+                                                  "gateway_events": [], "lint_errors": errors}])
+    ctx_r = ReportContext(pr=scenario.pr or 0, candidate_build=scenario.candidate.build_id,
+                          base_build=scenario.base.build_id,
+                          abort={"rule_ids": rule_ids,
+                                 "not_requeued": "the same config would fail again; fix it first"})
+    health = {"wall_clock": _mmss(60), "budget": "45:00", "shards": 1,
+              "safety": {"attestation": "not reached", "paper_mode_asserted": 0, "gateway_drops": 0,
+                         "cancel_all": "not needed", "proof": report.proof.line},
+              "integrations": {"pr_comment": {"state": "posted", "time": "(simulated: written to pr-comment.md)"},
+                               "jira_queued": 0, "slack": {"queued": 0}}}
+    comment = render_pr_comment(run, [], [], [], {}, health, None, ctx_r)
+    rep = build_report(run, [], [], [], {}, health, None, ctx_r)
     (out_dir / "pr-comment.md").write_text(comment, encoding="utf-8")
-    (out_dir / "commit-status.json").write_text(json.dumps(_status_json(report.status), indent=2) + "\n")
-    render_run_report(run, [], [], [], {}, {}, None, ctx, out_dir / "report.html")
+    (out_dir / "commit-status.json").write_text(json.dumps(_status_json(rep.status), indent=2) + "\n")
+    render_run_report(run, [], [], [], {}, health, None, ctx_r, out_dir / "report.html")
     return RunResult(scenario.run_id, scenario.run_type, run.status, run.reason, out_dir, comment=comment,
-                     commit_status=_status_json(report.status), lint_errors=errors)
+                     commit_status=_status_json(rep.status), lint_errors=errors, alerts=alerts, shards=[shard],
+                     proof=report.proof.line)
 
 
 def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path, today: date = DEFAULT_TODAY,
-                 reviewer: ReviewerAdapter | None = None) -> RunResult:
-    """One simulated PR run from webhook to PR comment (module docstring). Writes into `out_dir`:
+                 reviewer: ReviewerAdapter | None = None, live: ReviewerJob | None = None) -> RunResult:
+    """One simulated PR run from webhook to PR comment (module docstring). The Reviewer is `reviewer`, else
+    with `live` (a `reviewer.ReviewerJob`, `pipeline.live.live_job`) the real adapter `ModelReviewer`, else
+    the offline `SimulatedReviewer`. Writes into `out_dir`:
     `config/<run_id>/`, `sentinel.db` (shared by every run of the directory), `artifacts/`,
-    `calibration/`, `pr-comment.md`, `commit-status.json`, `report.html`, `reviewer-calls.json`."""
+    `calibration/`, `heartbeat/`, `pr-comment.md`, `commit-status.json`, `report.html`,
+    `reviewer-calls.json`, and appends to `alerts.json` and `orchestrator.json`."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     started = _ts(today, scenario.clock)
@@ -851,6 +1428,10 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
             rules = sorted({v.rule for v in report_lint.errors})
             return _abort_config(store, scenario, cfg_root, errs, rules, out, today, started)
         cfg = SentinelConfig.load(cfg_root)
+        try:
+            oracle = FlowOracle.load(cfg, now)
+        except OracleConfigError as exc:
+            return _abort_config(store, scenario, cfg_root, [str(exc)], [], out, today, started)
         cand_doc = cfg.builds.get(scenario.candidate.build_id, {})
         pair = cand_doc.get("build_pair") or {}
         base_id = pair.get("base", scenario.base.build_id)
@@ -864,14 +1445,10 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                                  rigs=[Rig(r, "fp") for r in RIGS], candidate_build_id=scenario.candidate.build_id)
         except ScopeConfigError as exc:
             return _abort_config(store, scenario, cfg_root, [str(exc)], ["L-SRF-10"], out, today, started)
-        extra = _case_b_flows(cfg, plan)
-        planned = list(plan.planned) + extra
+        planned = list(plan.planned)
         rig_of = {cp.checkpoint_id: it.rigs[0] for it in plan.items for cp in it.checkpoints}
-        for cp in extra:
-            rig_of[cp.checkpoint_id] = RIGS[0]
         run = _Run(cfg, scenario.run_id, "pr", scenario.base, scenario.candidate, now, manifest, plan, plan.x_input)
         run.budget = RerunBudget(len(planned), run.params)
-        run.calibrate(planned, out)
         # 3.3: fingerprint equality on every field but build id, before any capture
         mismatch = compare_fingerprints({"match": dict(run.fp_match, build_id=base_id)},
                                         {"match": dict(run.fp_match, build_id=scenario.candidate.build_id)})
@@ -894,20 +1471,18 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         mtext = (cfg.root / "manifests" / f"{scenario.candidate.build_id}.yaml")
         store.begin_run(_run_plan(scenario.run_id, "pr", cfg.root, scope_entries, shards, started,
                                   mtext.read_text() if mtext.exists() else None, scenario.pr, scenario.author))
+        work = _ShardWork(run, cfg, scenario, out, oracle, store, planned, plan, today)
         rev = reviewer or SimulatedReviewer()
-        # -- 5.17 per checkpoint
-        evals: list[Evaluated] = []
-        for k, cp in enumerate(planned):
-            live = cp.data_mode == "masked_live"
-            base_cap = run.capture(cp, "base", tick=1 if live else 0)
-            cand_cap = run.capture(cp, "candidate", tick=2 if live else 0)
-            att = plan.attribution.get(cp.surface_id)
-            ticks = iter(range(3, 9))
-            ev = evaluate(run, cp, base_cap, cand_cap, x=plan.x_input(cp.surface_id),
-                          primitive=att.primitive if att else None, entry_ref=att.entry_id if att else None,
-                          recapture=lambda cp=cp: run.capture(cp, "candidate", tick=next(ticks)),
-                          recapturable=_recapturable(cfg, cp), store=store)
-            evals.append(ev)
+        items = ItemBuilder(scenario.run_id, arts, REDACTION, _EvalIndex(work), manifest=manifest, epoch=run.epoch,
+                            flow_docs=cfg.flow_docs, pad=(live.config if live else ReviewerConfig()).crop.pad_px)
+        if reviewer is None and live is not None:          # 3.12: the real Reviewer; crops from the artifact store
+            rev = ModelReviewer(live, items)
+        if isinstance(rev, CollectingReviewer):
+            rev.item_for = items
+        # -- 5.2: every shard through the Orchestrator; 5.17 per checkpoint inside `running`
+        work.run_shards([(shard_of[r], i, r, [cp for cp in planned if rig_of[cp.checkpoint_id] == r])
+                         for i, r in enumerate(used, 1)])
+        evals = work.evals
         shift = global_shift_prepass([ev.diff.signal for ev in evals if ev.diff is not None and ev.diff.signal is not None],
                                      params=run.params)
         if shift.raised:                       # 3.7 granularity 0: one needs_human (global_shift) cluster
@@ -934,31 +1509,61 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                                      recorded_at=_ts(today, scenario.clock, 600))]
             store.write_checkpoint(o, findings=fs, artifacts=stored, shard_id=shard_of[rig_of[ev.cp.checkpoint_id]],
                                    steps=steps)
+        by_cp = {}
+        for f in work.findings:
+            by_cp.setdefault(f.checkpoint_id, []).append(f)
+        for cid, (cp, oc) in sorted(work.bare.items()):
+            store.write_checkpoint(work.bare_outcome(cp, oc), findings=by_cp.pop(cid, []),
+                                   shard_id=shard_of[rig_of[cid]])
+        for fs in by_cp.values():
+            for f in fs:
+                store.write_finding(f)
+        for s, sid in work.steps:                         # each with its gateway_event (8.3 gate_* columns)
+            store.write_steps([s], shard_id=sid, side="candidate")
         for c in plan.cuts:
             if c.checkpoint is not None:
                 store.write_checkpoint(dataclasses.replace(c.outcome(scenario.run_id), recorded_at=started))
-        for sid in shards:
-            store.end_shard(sid.shard_id, "complete")
-            store.mark_shard_imported(sid.shard_id)
+        verdict = work.verdict()
+        stop = work.stop()
+        reported = {st.shard_id: rep for st, rep in work.reports}
+        work.write_proofs()                               # 8.3 post_run_proofs, one per shard (6.6)
+        for sp in shards:
+            v = reported[sp.shard_id].verdict
+            store.end_shard(sp.shard_id, v.status, v.reason)
+            store.mark_shard_imported(sp.shard_id)
         arts.write_manifest(ManifestHeader(config_commit=tree_sha256(cfg.root)[:12], harness_commit="sentinel-core-0.1.0",
                                            run_id=scenario.run_id, created_at=started))
         wall = GATES_S + max(sum(it.rig_cost_s for it in plan.items if r in it.rigs) for r in used) + \
             8 * sum(ev.recaptures for ev in evals) + TEARDOWN_S
-        blockers = store.complete_blockers(scenario.run_id)
-        status = "complete" if not blockers else "complete_with_env_errors"
-        runrec = store.end_run(RunOutcome(scenario.run_id, "pr", status, "reported", started_at=started,
+        status, reason = verdict.status, verdict.reason
+        if status == "complete" and store.complete_blockers(scenario.run_id):
+            status, reason = "complete_with_env_errors", None
+        last_gate = stop[1].gate if stop is not None and stop[1].gate else "reported"
+        runrec = store.end_run(RunOutcome(scenario.run_id, "pr", status, last_gate, reason=reason, started_at=started,
                                           ended_at=_ts(today, scenario.clock, int(wall))))
-        result = _report(store, cfg, plan, run, scenario, runrec, manifest, mdoc, out, today, wall, len(used))
+        abort = {}
+        if stop is not None and runrec.status == "aborted_safety":
+            st, r = stop
+            stopped = [s.rig_id for s, rep in work.reports if rep.verdict.status == "aborted_safety"]
+            abort = {"trigger": r.run_reason, "gate": r.gate, "proof": work.proof(), "incident": r.incident or "unknown",
+                     "rig": stopped or [st.rig_id]}                    # every rig the abort disabled (6.6 step 6)
+        result = _report(store, cfg, plan, run, scenario, runrec, manifest, mdoc, out, today, wall, len(work.reports),
+                         safety=work.safety(), abort=abort)
         result.reviewer_calls = calls
         n_pairs = sum(1 for ev in evals if ev.diff is not None and ev.diff.signal is not None)
         result.notes.append(
             f"global-shift pre-pass (3.7) over {n_pairs} diffed pairs: "
             + ("not evaluated (it needs at least 20 pairs)" if not shift.evaluated else
                f"{'raised' if shift.raised else 'not raised'} ({shift.fraction_above_floor:.1%} of pairs above floor, "
-               f"{shift.text_edge_share:.1%} of their changed pixels on text edges; it is raised above 2 percent "
-               f"and 70 percent)"))
+               f"{shift.text_edge_share:.1%} of their changed pixels on text edges; it is raised only when more than "
+               "2 percent of pairs are above floor and more than 70 percent of their changed pixels are on text "
+               "edges)"))
         result.disabled_invariants = run.disabled
-        result.extra_flows = sorted({cp.flow_id for cp in extra if cp.flow_id})
+        lines = {st.shard_id: line for st, _, line in work.proofs()}  # each shard's proof as the store holds it
+        for summary in work.summaries:
+            summary["proof"] = lines[summary["shard_id"]]
+        result.alerts, result.shards, result.proof = work.alerts, work.summaries, work.proof()
+        work.write()
         (out / "reviewer-calls.json").write_text(json.dumps(calls, indent=1, sort_keys=True, default=str) + "\n")
         return result
 
@@ -1017,11 +1622,19 @@ def _review_pass(run: _Run, evals: list[Evaluated], rev: ReviewerAdapter, cap: i
             observations=tuple(obs), crop=rep.crop or (0, 0, 1, 1), entry=entry,
             edge={"primitive": att.primitive, "entry_id": att.entry_id} if att and task == "describe_collateral" else None,
             sizes=sizes, ladder=any(d.kind == "order_strip" for d in rep.cand.screen.components))
-        answer = rev.review(req)
-        problems = validate(answer, req)
-        if problems:                      # 3.13: re-sent once, then unavailable (row 23)
+        try:
             answer = rev.review(req)
             problems = validate(answer, req)
+            if problems:                  # 3.13: re-sent once, then unavailable (row 23)
+                answer = rev.review(req)
+                problems = validate(answer, req)
+        except ReviewerUnavailable as exc:       # the live adapter gave up on the item (3.11 row 23)
+            for ev in evs:
+                _with_review(ev, exc.review())
+            calls.append({"task": task, "checkpoints": list(req.checkpoint_ids), "request_sha256": req.sha256,
+                          "model_id": rev.model_id, "prompt_hash": rev.prompt_hash, "answer": None,
+                          "unavailable": f"{exc.verdict.state}: {exc.verdict.cause}"})
+            continue
         if problems:
             for ev in evs:
                 _with_review(ev, Review("unavailable", cause="reviewer_schema_violation"))
@@ -1041,8 +1654,10 @@ def _area(ev: Evaluated) -> tuple:
 
 
 def _report(store: Store, cfg: SentinelConfig, plan: ScopePlan, run: _Run, scenario: Scenario, runrec: RunOutcome,
-            manifest: Manifest | None, mdoc: dict | None, out: Path, today: date, wall: float, shards: int) -> RunResult:
-    """Read the run back from the store and render the PR comment, commit status and report (9.2, 9.5)."""
+            manifest: Manifest | None, mdoc: dict | None, out: Path, today: date, wall: float, shards: int, *,
+            safety: dict, abort: dict) -> RunResult:
+    """Read the run back from the store and render the PR comment, commit status and report (9.2, 9.5).
+    `safety` is run health's safety row from the shards' control results; `abort` the abort block's facts."""
     outcomes = store.outcomes(scenario.run_id)
     findings = store.findings(scenario.run_id)
     steps = store.step_outcomes(scenario.run_id)
@@ -1053,8 +1668,7 @@ def _report(store: Store, cfg: SentinelConfig, plan: ScopePlan, run: _Run, scena
         "wall_clock": _mmss(wall), "budget": "45:00", "shards": shards,
         "fingerprint": {"candidate": run.fp_id[7:13], "base": run.fp_id[7:13]},
         "reviewer": {"cost_usd": 0.0},
-        "safety": {"attestation": "passed (simulated rig)", "paper_mode_asserted": shards, "gateway_drops": 0,
-                   "cancel_all": "not needed", "proof": "PROVEN: no orders sent (simulated rig, nothing to send)"},
+        "safety": safety,
         "integrations": {"pr_comment": {"state": "posted", "time": "(simulated: written to pr-comment.md)"},
                          "jira_queued": 0, "slack": {"queued": 0}},
     }
@@ -1062,7 +1676,7 @@ def _report(store: Store, cfg: SentinelConfig, plan: ScopePlan, run: _Run, scena
         health["canary"] = dict(scenario.canary)
     ctx = ReportContext(pr=scenario.pr or 0, candidate_build=scenario.candidate.build_id,
                         base_build=scenario.base.build_id, detector_banner=scenario.detector_banner,
-                        history=scenario.history,
+                        history=scenario.history, abort=abort,
                         provenance={"harness_commit": "sentinel-core-0.1.0 (simulated run)",
                                     "config_commit": tree_sha256(cfg.root)[:12],
                                     "vm_image_id": "none: synthetic screens from sentinel.synth"})
@@ -1128,8 +1742,9 @@ NOT_SIMULATED = {
     "M07": "color_swap expects INV-15; the registry declares no signed P/L column and palette for the synthetic app",
     "M10": "clipped_label needs OCR to read the cropped header word; the synthetic OCR reads drawn text, not pixels",
     "M11": "clipped_label (ellipsis) needs OCR of the pixels, as M10",
-    "M13": "missing_row expects an Oracle assertion (R08); the core has no Oracle",
-    "M15": "placeholder lands on a rule region, asserted by the Oracle, which the core lacks",
+    "M13": "missing_row expects an Oracle assertion (R08); the simulated Oracle reads what synth drew, not a mutant's "
+           "pixels, so the Nightly pass runs without it",
+    "M15": "placeholder lands on a rule region asserted by the Oracle, which reads drawn text, not a mutant's pixels",
     "M16": "font_height needs OCR cap heights from the pixels",
     "M17": "scrollbar needs a template match of the drawn thumb",
     "M19": "redaction is proven by the redaction stage and the egress log, which the simulation has no rig for",
@@ -1207,6 +1822,14 @@ def _static_capture(cid: str, img: np.ndarray, model: inv.ScreenModel, template:
     return Capture(cid, "candidate", frames, screen, model, template.info)
 
 
+def _end_nightly_shard(store: Store, work: _ShardWork, st: _Shard, report: RunReport) -> None:
+    """The Nightly run's one shard at teardown: its post-run proof (8.3 `post_run_proofs`, 6.6), its outcome and
+    the import mark (8.2)."""
+    work.write_proofs()
+    store.end_shard(st.shard_id, report.verdict.status, report.verdict.reason)
+    store.mark_shard_imported(st.shard_id)
+
+
 def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str | Path, today: date = DEFAULT_TODAY,
                 history: Mapping[str, Sequence[float]] | None = None) -> RunResult:
     """The canary pass of one Nightly run (module docstring). Writes `canary-results.json`,
@@ -1232,55 +1855,94 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         bound = sorted({e.checkpoint_id for e in entries} | {str(e.params.get("donor_checkpoint")) for e in entries
                                                               if e.params.get("donor_checkpoint")})
         cps = {cid: planned_for(cfg, cid) for cid in bound}
-        run.budget = RerunBudget(len(cps), run.params)
-        run.calibrate(list(cps.values()), out)
-        approved: dict[str, Capture] = {cid: run.capture(cp, "base") for cid, cp in cps.items()}
-        boxes: dict[str, dict[str, tuple[int, int, int, int]]] = {}
-        for cid, cp in cps.items():
-            reg = run.registry(cp, approved[cid])
-            lm = {l.id: l.expected for l in reg.landmarks}
-            boxes[cid] = {r.id: (r.rect.x + lm[r.landmark][0], r.rect.y + lm[r.landmark][1], r.rect.w, r.rect.h)
-                          for r in reg.regions if lm.get(r.landmark) is not None}
-        gen = cn.generate(entries, {cid: c.screen.image for cid, c in approved.items()}, boxes)
-        results: list[cn.MutantResult] = []
-        produced: dict[str, CheckpointOutcome] = {}
-        writer = _Writer(run, ArtifactStore(out / "artifacts", f"runs/{scenario.run_id}"), today, scenario.clock)
-        rows_meta = []
-        arts_by_sha: dict[str, StoredArtifact] = {}
-        for m in gen.mutants:
-            cp = cps[m.checkpoint_id]
-            if m.failed or m.image is None:
-                results.append(cn.MutantResult(m))
-                continue
-            base_cap = approved[m.checkpoint_id]
-            model = _mutant_model(base_cap.model, m, boxes[m.checkpoint_id])
-            image = m.image
-            if m.defect_class == "window_offscreen":
-                image = base_cap.screen.image    # Capture grabs the window by its DWM bounds (5.7): same pixels
-            mutant_cap = _static_capture(m.checkpoint_id, image, model, base_cap)
-            ev = evaluate(run, cp, base_cap, mutant_cap, x="undeclared", primitive=None, entry_ref=None,
-                          recapture=lambda c=mutant_cap: c, recapturable=_recapturable(cfg, cp), synthetic=True,
-                          injected=True)
-            rec, _, stored = writer.records(ev, synthetic=True, tag=m.mutant_id)
-            arts_by_sha.update({a.sha256: a for a in stored})
-            step_status = None
-            if m.defect_class == "gateway":
-                step_status = "blocked_by_gateway"       # the simulated gateway refuses the unmatched Send template
-            absorbed = None
-            if ev.classified.outcome in ("identical", "noise"):
-                masks = [f"mask {r.mask_ref} (region {r.id})" for r in ev.registry.regions if r.type == "mask"]
-                absorbed = ", ".join(masks) if masks else None
-            results.append(cn.MutantResult(m, rec, absorbed_by=absorbed, step_status=step_status))
-            produced[m.key] = rec
-            rows_meta.append((m, ev))
-        report = cn.score(results, history=history or {}, since=f"{today.isoformat()} {scenario.clock[:5]} ET",
-                          context=cn.RowContext(scenario.run_id, "ws.tier-a.swing-trader", "swing_trader", "frozen"))
+        work = _ShardWork(run, cfg, Scenario(scenario.name, scenario.run_id, scenario.build, scenario.build,
+                                             run_type="nightly", clock=scenario.clock), out, None, store, (), None,
+                          today)
+        clock = ManualClock(start=now.astimezone(timezone.utc))
+        ctx, sim = shard_setup(cfg, run_id=scenario.run_id, run_type="nightly", shard_id=f"{scenario.run_id}/1",
+                               shard_no=1, build_id=scenario.build.build_id, workspace_id="ws.tier-a.swing-trader",
+                               script=RigScript())
+        orch = Orchestrator(SimulatedRig(sim, clock=clock), ctx, ShardSink(()),
+                            clock=clock, heartbeat=HeartbeatWriter(out / "heartbeat" / f"{scenario.run_id}.json", clock),
+                            watchdog_status=lambda: (1.0, True))
+        done: dict[str, Any] = {}
+
+        def canary_pass(_: Orchestrator) -> None:
+            """The Nightly run's work in `running` (5.2): the canary pass of 10.3."""
+            run.budget = RerunBudget(len(cps), run.params)
+            run.calibrate(list(cps.values()), out)
+            approved: dict[str, Capture] = {cid: run.capture(cp, "base") for cid, cp in cps.items()}
+            boxes: dict[str, dict[str, tuple[int, int, int, int]]] = {}
+            for cid, cp in cps.items():
+                reg = run.registry(cp, approved[cid])
+                lm = {l.id: l.expected for l in reg.landmarks}
+                boxes[cid] = {r.id: (r.rect.x + lm[r.landmark][0], r.rect.y + lm[r.landmark][1], r.rect.w, r.rect.h)
+                              for r in reg.regions if lm.get(r.landmark) is not None}
+            gen = cn.generate(entries, {cid: c.screen.image for cid, c in approved.items()}, boxes)
+            results: list[cn.MutantResult] = []
+            produced: dict[str, CheckpointOutcome] = {}
+            writer = _Writer(run, ArtifactStore(out / "artifacts", f"runs/{scenario.run_id}"), today, scenario.clock)
+            rows_meta = []
+            arts_by_sha: dict[str, StoredArtifact] = {}
+            for m in gen.mutants:
+                cp = cps[m.checkpoint_id]
+                if m.failed or m.image is None:
+                    results.append(cn.MutantResult(m))
+                    continue
+                base_cap = approved[m.checkpoint_id]
+                model = _mutant_model(base_cap.model, m, boxes[m.checkpoint_id])
+                image = m.image
+                if m.defect_class == "window_offscreen":
+                    image = base_cap.screen.image    # Capture grabs the window by its DWM bounds (5.7): same pixels
+                mutant_cap = _static_capture(m.checkpoint_id, image, model, base_cap)
+                ev = evaluate(run, cp, base_cap, mutant_cap, x="undeclared", primitive=None, entry_ref=None,
+                              recapture=lambda c=mutant_cap: c, recapturable=_recapturable(cfg, cp), synthetic=True,
+                              injected=True)
+                rec, _, stored = writer.records(ev, synthetic=True, tag=m.mutant_id)
+                arts_by_sha.update({a.sha256: a for a in stored})
+                step_status = None
+                if m.defect_class == "gateway":
+                    step_status = "blocked_by_gateway"       # the simulated gateway refuses the unmatched Send template
+                absorbed = None
+                if ev.classified.outcome in ("identical", "noise"):
+                    masks = [f"mask {r.mask_ref} (region {r.id})" for r in ev.registry.regions if r.type == "mask"]
+                    absorbed = ", ".join(masks) if masks else None
+                results.append(cn.MutantResult(m, rec, absorbed_by=absorbed, step_status=step_status))
+                produced[m.key] = rec
+                rows_meta.append((m, ev))
+            report = cn.score(results, history=history or {}, since=f"{today.isoformat()} {scenario.clock[:5]} ET",
+                              context=cn.RowContext(scenario.run_id, "ws.tier-a.swing-trader", "swing_trader", "frozen"))
+            done.update(report=report, rows_meta=rows_meta, produced=produced, writer=writer, arts_by_sha=arts_by_sha)
+
+        shard = orch.run(canary_pass)
+        st = _Shard(ctx.shard_id, cfg.fixture.get("rig", "rig-01"), [], orch, orch.rig, orch.sink, clock, ctx)
+        work.reports.append((st, shard))
+        shard_plan = (ShardPlan(ctx.shard_id, st.rig_id, scope_count=0),)
+        for r in shard.results:
+            work._note(st, r)
+        work.summaries.append({"shard_id": ctx.shard_id, "rig": st.rig_id, "verdict": shard.verdict.status,
+                               "reason": shard.verdict.reason, "last_gate": shard.last_gate,
+                               "proof": shard.proof.line,
+                               "gates": [{"control": r.control, "gate": r.gate, "passed": r.passed, "detail": r.detail}
+                                         for r in shard.results]})
+        work.write()
+        if "report" not in done:                 # a gate stopped the Nightly run before the canary pass
+            _register(store, cfg, [scenario.build.build_id])
+            store.begin_run(_run_plan(scenario.run_id, "nightly", cfg.root, (), shard_plan, started, None, None, None))
+            _end_nightly_shard(store, work, st, shard)
+            runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", shard.verdict.status, shard.last_gate,
+                                              reason=shard.verdict.reason, started_at=started,
+                                              ended_at=_ts(today, scenario.clock, 600)))
+            return RunResult(scenario.run_id, "nightly", runrec.status, runrec.reason, out, alerts=work.alerts,
+                             shards=work.summaries, proof=shard.proof.line)
+        report, rows_meta = done["report"], done["rows_meta"]
+        produced, writer, arts_by_sha = done["produced"], done["writer"], done["arts_by_sha"]
         # -- store: identity, the run, synthetic rows (one per checkpoint at most, run docstring)
         _register(store, cfg, [scenario.build.build_id])
         store.register_checkpoints([ScopeEntry(cp.checkpoint_id, cp.workspace_id, cp.persona, cp.tier, cp.data_mode,
                                                flow_class=_flow_class(cfg, cp)) for cp in cps.values()],
                                    config_commit=tree_sha256(cfg.root)[:12])
-        store.begin_run(_run_plan(scenario.run_id, "nightly", cfg.root, (), (), started, None, None, None))
+        store.begin_run(_run_plan(scenario.run_id, "nightly", cfg.root, (), shard_plan, started, None, None, None))
         written: set[str] = set()
         for row in report.outcome_rows:
             if row.checkpoint_id in written:
@@ -1297,7 +1959,9 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                     f"{r.absorbed_by or 'not recorded'}", scenario.run_id, checkpoint_id=r.checkpoint_id, tier=1,
                     evidence={"raw_values": {"state": r.state, "money_cell": str(r.money_cell)}},
                     created_at=_ts(today, scenario.clock, 1800)))
-        runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", "complete", "reported", started_at=started,
+        _end_nightly_shard(store, work, st, shard)
+        runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", shard.verdict.status, "reported",
+                                          reason=shard.verdict.reason, started_at=started,
                                           ended_at=_ts(today, scenario.clock, 2 * 3600)))
         money = [r for r in report.results if r.money_cell and r.state != "generation_failed"]
         other = [r for r in report.results if not r.money_cell and r.state != "generation_failed"]
@@ -1326,7 +1990,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         render_run_report(runrec, outcomes, store.findings(scenario.run_id), [], {}, health, None, ctx,
                           out / f"nightly-report-{scenario.run_id}.html")
         res = RunResult(scenario.run_id, "nightly", runrec.status, runrec.reason, out, outcomes,
-                        store.findings(scenario.run_id))
+                        store.findings(scenario.run_id), alerts=work.alerts, shards=work.summaries,
+                        proof=shard.proof.line)
         res.canary = {"report": report, "health": canary_health, "produced": produced, "evals": rows_meta,
                       "simulated": sorted(wanted)}
         return res

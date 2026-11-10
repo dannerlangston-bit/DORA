@@ -56,7 +56,8 @@ steps:
     expect:
       - {id: ps_qty, kind: present, region: rgn.ps.qty, format: int}
       - {id: pl_math, kind: rule, rule_id: R08, tol: 0.01,
-         inputs: {pl_open: rgn.ps.pl-open, mark: rgn.ps.mark, trade_price: rgn.ps.trade-price, qty: rgn.ps.qty, multiplier: 1}}
+         inputs: {pl_open: rgn.ps.pl-open, mark: rgn.ps.mark, trade_price: rgn.ps.trade-price, qty: rgn.ps.qty,
+                 multiplier: rgn.ps.instrument}}         # per-row multiplier from the symbol (2.8.3): stock, /MES, options, forex
 teardown:
   - {id: t1, type: teardown, action: working_orders_check, expect: 0}
   - {id: t2, type: reset_input_state}

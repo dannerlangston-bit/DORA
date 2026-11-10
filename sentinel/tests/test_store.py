@@ -246,6 +246,55 @@ def test_round_trip_of_records(store):
     assert tuple(row) == ("locator", "s07\nrung jab missed", 50.0)
 
 
+def test_a_steps_gateway_event_is_stored_in_the_gate_columns_and_read_back(tmp_path):
+    """4.13 step_outcome.gateway_event as 8.3 step_events gate_decision, gate_reason and gate_class (5.4.4)."""
+    flow = "flow.trade.order-ticket.stock.limit"
+    with Store(tmp_path / "run.db") as s:
+        s.register_rig("rig-a1", login_alias="paper-01", owner="qa", snapshot_id="snap-1", allowlist_entry=1)
+        s.begin_run(plan(shards=(ShardPlan(f"{RUN}/1", "rig-a1"),)))
+        refused = StepOutcome(RUN, flow, "s07+enter", "blocked_by_gateway",
+                              gateway_event={"decision": "refused", "reason": "guarded_key_refused", "class": "safety"})
+        dropped = StepOutcome(RUN, flow, "s06", "blocked_by_gateway",
+                              gateway_event={"decision": "dropped", "reason": "token_expired", "class": "integrity"})
+        emitted = StepOutcome(RUN, flow, "s05", "passed", gateway_event={"decision": "emitted", "class": "allowed"})
+        plain = StepOutcome(RUN, flow, "s04", "passed")
+        s.write_steps([refused, dropped, emitted, plain], shard_id=f"{RUN}/1", side="candidate")
+        rows = s.conn.execute("SELECT step_id, gate_decision, gate_reason, gate_class FROM step_events ORDER BY seq")
+        assert [tuple(r) for r in rows] == [("s07+enter", "refused", "guarded_key_refused", "safety"),
+                                            ("s06", "dropped", "token_expired", "integrity"),
+                                            ("s05", "emitted", None, "allowed"), ("s04", "none", None, None)]
+        assert s.step_outcomes(RUN) == [refused, dropped, emitted, plain]
+        assert s.gateway_drops(RUN) == 2                          # 9.11: dropped or refused rows
+        for bad in ({"decision": "refused"},                                       # a refusal names its code
+                    {"decision": "refused", "reason": "blocked", "class": "safety"},   # a coarse class, not a code
+                    {"decision": "refused", "reason": "no_token", "class": "fatal"},
+                    {"reason": "no_token"}, {"decision": "dropped", "reason": "no_token", "code": "x"}):
+            with pytest.raises(StoreRefused):
+                s.write_steps([StepOutcome(RUN, flow, "s08", "blocked_by_gateway", gateway_event=bad)],
+                              shard_id=f"{RUN}/1", side="candidate")
+        assert s.gateway_drops(RUN) == 2
+
+
+def test_an_orders_sent_proof_blocks_complete(tmp_path):
+    """6.6: ORDERS SENT (8.3 verdict orders_sent) makes the run aborted_safety; the store never lets it be complete."""
+    with Store(tmp_path / "run.db") as s:
+        s.register_rig("rig-a1", login_alias="paper-01", owner="qa", snapshot_id="snap-1", allowlist_entry=1)
+        s.begin_run(plan(shards=(ShardPlan(f"{RUN}/1", "rig-a1"),)))
+        s.conn.execute("INSERT INTO post_run_proofs (shard_id, run_id, login_alias, verdict, reason, send_policy_ref, "
+                       "counts_json, cancel_all, paper_mode_assertions, paper_mode_mismatches, gateway_events, "
+                       "gateway_drops, produced_at, verified_by) VALUES (?, ?, 'paper-01', 'orders_sent', NULL, "
+                       "'dec-1', '{}', 'performed_verified', 1, 0, 0, 0, '2026-11-09T00:00:00+00:00', 'jdoe')",
+                       (f"{RUN}/1", RUN))
+        finish_all(s)
+        s.end_shard(f"{RUN}/1", "complete")
+        s.mark_shard_imported(f"{RUN}/1")
+        assert s.complete_blockers(RUN) == ["1 ORDERS SENT post-run proof(s)"]
+        with pytest.raises(RunNotComplete, match="ORDERS SENT"):
+            s.end_run(RunOutcome(RUN, "pr", "complete", "reported"))
+        with pytest.raises(sqlite3.IntegrityError, match="orders-sent"):
+            s.conn.execute("UPDATE runs SET lifecycle = 'finished', outcome = 'complete' WHERE run_id = ?", (RUN,))
+
+
 def test_steps_and_findings_need_a_shard_and_round_trip(tmp_path):
     with Store(tmp_path / "run.db") as s:
         s.register_rig("rig-a1", login_alias="paper-01", owner="qa", snapshot_id="snap-1", allowlist_entry=1)
@@ -512,3 +561,46 @@ def test_decision_constraints_from_8_3(tmp_path):
             s.record_decision(bad, run_id=RUN)
         with pytest.raises(StoreRefused, match="dec-"):
             s.record_decision(dataclasses.replace(bad, decision_id="D7"), run_id=RUN)
+
+
+# -- canary results (8.3 canary_results, 10.3) ---------------------------------------------------------------------
+
+def test_canary_results_hold_one_row_per_mutant(tmp_path):
+    from sentinel.canary import CanaryResult
+
+    night = "run-n1"
+    rows = [
+        CanaryResult("M01", "cat-v3", CENSUS, "erased_control", False, 11, ["collateral"], "detected",
+                     base_sha256="a" * 64, mutant_sha256="b" * 64, produced_outcome="collateral"),
+        CanaryResult("M04", "cat-v3", CENSUS, "swapped_digit", True, 12, ["collateral", "assertion_failed"],
+                     "detector_blind", produced_outcome="identical", absorbed_by="msk-7"),   # same checkpoint as M01
+        CanaryResult("M25", "cat-v3", SWEEP, "aa_control", False, 13, ["identical"], "detected",
+                     produced_outcome="identical"),
+        CanaryResult("M25", "cat-v3", FLOW, "aa_control", False, 13, ["identical"], "detector_degraded",
+                     produced_outcome="noise", class_rate=0.5, class_floor=0.9, model_id="claude-x",
+                     prompt_hash="c" * 64),                                                   # one id, two checkpoints
+    ]
+    with Store(tmp_path / "run.db") as s:
+        s.begin_run(dataclasses.replace(plan(night), run_type="nightly"))
+        s.write_canary_results(night, rows, created_at="2026-11-10T03:12:00-05:00")
+        assert s.canary_results(night) == rows
+        assert [r[0] for r in s.conn.execute("SELECT DISTINCT created_at FROM canary_results")] == [
+            "2026-11-10T08:12:00+00:00"]
+        s.write_canary_results(night, rows[:2])                       # replay: a no-op (8.2)
+        assert len(s.canary_results(night)) == 4
+        with pytest.raises(ImportConflict):
+            s.write_canary_results(night, [dataclasses.replace(rows[0], state="missed", produced_outcome="identical")])
+        bad = dataclasses.replace(rows[2])
+        bad.state = "detector_blind"                                  # mutable; a non-money row is never blind (8.3)
+        with pytest.raises(TaxonomyError):
+            s.write_canary_results(night, [bad])
+        with pytest.raises(StoreRefused, match="unknown run"):
+            s.write_canary_results("run-x", rows)
+        # the money-cell miss still writes its synthetic harness_error row to outcomes, beside its canary row
+        s.write_checkpoint(out(CENSUS, "harness_error", run_id=night, reason="detector_blind", synthetic=True))
+        assert s.get_outcome(night, CENSUS).reason == "detector_blind"
+        assert s.run_counts(night)["harness_error"] == 0               # synthetic rows are not the run's counts
+        assert len(s.canary_results(night)) == 4
+    lines = [json.loads(x) for x in (tmp_path / "results.jsonl").read_text().splitlines()]
+    assert [x["batch"] for x in lines] == ["run_begin", "canary_results", "checkpoint"]
+    assert {r["table"] for r in lines[1]["rows"]} == {"canary_results"} and len(lines[1]["rows"]) == 4

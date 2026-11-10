@@ -1,10 +1,11 @@
 """`sentinel demo`: simulated end-to-end Sentinel runs a tester can read (see `sentinel.pipeline`).
 
-    sentinel demo <scenario> --out DIR [--today YYYY-MM-DD] [--config DIR]
+    sentinel demo <scenario> --out DIR [--today YYYY-MM-DD] [--config DIR] [--reviewer simulated|live]
     sentinel demo all --out DIR
 
 Scenarios (each writes `DIR/<scenario>/`: pr-comment.md, report.html, commit-status.json,
-sentinel.db, artifacts/, summary.txt, plus the config each run used and its calibration):
+sentinel.db, artifacts/, summary.txt, alerts.json, orchestrator.json, plus the config each run used
+and its calibration):
 
 - `flexgrid-ladder`: the worked example of 1.11 (PR 4812).
 - `clean-pr`: a declared change that only touches its declared surface.
@@ -13,24 +14,43 @@ sentinel.db, artifacts/, summary.txt, plus the config each run used and its cali
 - `nightly-canary`: two Nightly canary passes, the second blind on a money cell, then a PR run
   under the detector-blind banner (10.3).
 - `decision-inheritance`: PR 4812 run twice with human decisions recorded in between (9.7).
+- `wrong-number`: the Order Confirmation cost is not quantity times price on an otherwise identical
+  dialog; the Oracle's R01 fails (`assertion_failed (assertion: cost_math)`).
+- `paper-mode-mismatch`: the account selector reads a live-format account id; the paper-mode gate
+  aborts the run (`aborted_safety (reason: live_identity)`) before any capture.
+- `attempted-send`: the Executor presses Enter on the open Order Confirmation; the gateway blocks it,
+  the run is `aborted_safety (reason: attempted_send)` and the proof shows no order went out.
+- `app-crash`: the app freezes during a sweep step; `assertion_failed (assertion: app_alive)`, the rest
+  of the ladder `not_run (reason: app_crash)`, a relaunch, and the run goes on.
+- `config-invalid`: the run date is past the first mask's expiry; preflight G1 (config lint) fails and
+  the run is `aborted_harness (reason: config_invalid)`.
 
-The thinkorswim app is simulated (`sentinel.synth` screens); the Reviewer is an offline simulated
-stand-in. Everything else is the real core.
+`sentinel demo all` runs every scenario, prints one line each and writes `DIR/index.html`, a page that
+links each scenario's report, PR comment, summary and alerts with what to check.
+
+The thinkorswim app is simulated (`sentinel.synth` screens) and so is the rig the Orchestrator drives
+(`orchestrator.SimulatedRig`); the Reviewer is an offline simulated stand-in unless `--reviewer live`
+is given with `ANTHROPIC_API_KEY` set. Everything else is the real core, the Oracle and the Orchestrator
+included.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
+import html
 import shutil
 import sys
 from dataclasses import replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable, Mapping
 
 import cv2
 
+import yaml
+
 from . import synth
+from .pipeline.orchestration import RigScript
 from .pipeline.reviewer import SIMULATED_MODEL_ID
 from .pipeline.run import (DEFAULT_TODAY, NOT_SIMULATED, NightlyScenario, RunResult, Scenario, record_decisions,
                            run_nightly, run_pipeline)
@@ -38,7 +58,13 @@ from .pipeline.sim import SimBuild
 from .store import Store
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "example"
-SCENARIOS = ("flexgrid-ladder", "clean-pr", "backend-only", "ui-no-manifest", "nightly-canary", "decision-inheritance")
+SCENARIOS = ("flexgrid-ladder", "clean-pr", "backend-only", "ui-no-manifest", "nightly-canary", "decision-inheritance",
+             "wrong-number", "paper-mode-mismatch", "attempted-send", "app-crash", "config-invalid")
+AT = "charts.flexible-grid.active-trader-cell"
+LADDER = "trade.active-trader.ladder"
+STOCK_FLOW = "flow.trade.order-ticket.stock.limit"
+LIVE_ACCOUNT = "12345678SCHW"                    # the live account id format of 6.13 item 5: eight digits, then SCHW
+FREEZE_AT = f"sweep/{AT}/flexgrid/640x480"
 BASE_ID = "main-1998.3.0-2c91ae4"
 GRID_SRC = "desktop/ui/grid/src/main/java/com/tos/desktop/ui/grid"
 GRID_INDEX = {
@@ -51,11 +77,14 @@ GRID_INDEX = {
     "com.tos.desktop.trade.activetrader.ActiveTraderPanel": ("com.tos.desktop.ui.grid.FlexibleGridCell",),
 }
 SIMULATION_NOTE = (
-    "This is a SIMULATED run. thinkorswim is replaced by synthetic screens drawn by sentinel.synth, and the "
-    f"AI Reviewer by an offline stand-in ({SIMULATED_MODEL_ID}) that never calls a model. Everything else is "
-    "the real Sentinel core: config lint, scope, settle, the Diff Engine with A/A calibration, the Invariant "
-    "Checker, classification, decisions, the SQLite store, coverage, canaries and the Reporter. The rig facts "
-    "in Run health (gates, attestation, safety proof, wall clock) are simulated, not measured.")
+    "This is a SIMULATED run. thinkorswim is replaced by synthetic screens drawn by sentinel.synth, the Windows "
+    "rig by the Orchestrator's simulated rig, and the AI Reviewer by an offline stand-in "
+    f"({SIMULATED_MODEL_ID}) that never calls a model. Everything else is the real Sentinel core: config lint, "
+    "scope, the Orchestrator's gate machine and safety controls (paper-mode assertion, attestation, the input "
+    "gateway, the Watchdog's decisions, the kill switch and the post-run proof), settle, the Diff Engine with A/A "
+    "calibration, the Invariant Checker, the Oracle, classification, decisions, the SQLite store, coverage, "
+    "canaries and the Reporter. What the rig observes (selector text, settings rows, the order book) and the wall "
+    "clock are simulated, not measured; the Oracle reads the text synth drew, where the rig would run OCR.")
 
 
 def _commit(prefix: str) -> str:
@@ -209,6 +238,87 @@ def ui_no_manifest_scenario(today: date) -> Scenario:
                     depends_on={})
 
 
+def _backend_pr(sha7: str, pr: int, branch: str, path: str) -> tuple[str, dict[str, str], tuple[str, ...]]:
+    """A PR that changes one backend resource and carries no manifest (the no-manifest case (b) of 4.3)."""
+    return f"branch-1998.3.0-{sha7}", dict([_main_build(), _branch_build(sha7, pr, branch)]), (path,)
+
+
+def wrong_number_scenario(today: date) -> Scenario:
+    """PR 4851: a pricing resource change transposes two digits of the Order Confirmation cost."""
+    cand, overlay, paths = _backend_pr("e5a1c07", 4851, "fix/TOS-48351-cost-format",
+                                       "desktop/trade/pricing/src/main/resources/pricing/cost-format.properties")
+    return Scenario("wrong-number", f"run-{today.isoformat()}-pr-4851-01",
+                    SimBuild(cand, frozenset({"confirm-cost-transposed"})), SimBuild(BASE_ID), pr=4851, author="pchen",
+                    overlay=overlay, changed_paths=paths, depends_on={})
+
+
+def paper_mode_scenario(today: date) -> Scenario:
+    """PR 4823 (the chart header change) on a rig whose account selector shows a live-format account id."""
+    sc = clean_scenario(today)
+    return replace(sc, name="paper-mode-mismatch", rig=RigScript(selector_text=LIVE_ACCOUNT))
+
+
+def attempted_send_scenario(today: date) -> Scenario:
+    """PR 4853: a backend change with no visible effect; the stock ticket flow's Executor presses Enter on the
+    open Order Confirmation dialog."""
+    cand, overlay, paths = _backend_pr("f2b9d44", 4853, "chore/TOS-48353-ticket-timeouts",
+                                       "desktop/trade/orders/src/main/resources/orders/ticket-timeouts.properties")
+    return Scenario("attempted-send", f"run-{today.isoformat()}-pr-4853-01", SimBuild(cand), SimBuild(BASE_ID),
+                    pr=4853, author="okafor", overlay=overlay, changed_paths=paths, depends_on={},
+                    rig=RigScript(enter_after=(STOCK_FLOW, "open-confirm")))
+
+
+def app_crash_scenario(today: date) -> Scenario:
+    """PR 4854: the Active Trader cell's host class changes (declared, no visible change); the app freezes
+    during the Ladder S sweep."""
+    sha7 = "a7c3e19"
+    cand = f"branch-1998.3.0-{sha7}"
+    overlay = dict([_main_build(), _branch_build(sha7, 4854, "fix/TOS-48354-active-trader-cell-quantity")])
+    overlay[f"manifests/{cand}.yaml"] = f"""schema_version: 1
+manifest_id: mf-{cand}
+candidate: {cand}
+base: {BASE_ID}
+source: manual
+author: jdoe
+entries:
+  - entry_id: tos-48354-1
+    tickets: [TOS-48354]
+    summary: The Active Trader cell keeps its quantity when the cell is resized
+    declared_surfaces: [{AT}]
+    touched_primitives: []
+    changed_paths:
+      - "desktop/charts/src/main/java/**/cell/ActiveTraderCellHost.java"
+    expected_visual: >
+      No visible change at rest; the quantity field keeps its value after a resize.
+    feature_flags: []
+    must_be_observed: false
+"""
+    return Scenario("app-crash", f"run-{today.isoformat()}-pr-4854-01", SimBuild(cand), SimBuild(BASE_ID), pr=4854,
+                    author="jdoe", overlay=overlay,
+                    changed_paths=("desktop/charts/src/main/java/com/tos/desktop/charts/grid/cell/ActiveTraderCellHost.java",),
+                    depends_on={}, rig=RigScript(freeze_at=FREEZE_AT))
+
+
+def mask_expiry(config_dir: Path) -> date:
+    """The earliest `expires_at` of the config's masks: the first day after it, the config no longer lints."""
+    dates = []
+    for p in sorted((config_dir / "masks").rglob("*.yaml")):
+        doc = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        if doc.get("expires_at"):
+            dates.append(datetime.fromisoformat(str(doc["expires_at"])).date())
+    if not dates:
+        raise ValueError(f"{config_dir} has no mask with an expiry")
+    return min(dates)
+
+
+# The single-PR-run scenarios by name, for `sentinel review` (the Reviewer items of one run)
+PR_SCENARIOS: dict[str, Callable[[date], Scenario]] = {
+    "flexgrid-ladder": lambda d: flexgrid_scenario(d), "clean-pr": lambda d: clean_scenario(d),
+    "backend-only": backend_scenario, "ui-no-manifest": ui_no_manifest_scenario, "wrong-number": wrong_number_scenario,
+    "paper-mode-mismatch": paper_mode_scenario, "attempted-send": attempted_send_scenario,
+    "app-crash": app_crash_scenario,
+}
+
 S07 = "regions/flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07.yaml"
 S07_MASK = "masks/flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07/msk.confirm.clock-01.yaml"
 
@@ -279,7 +389,11 @@ def _run_block(r: RunResult) -> list[str]:
     for f in r.findings:
         kinds[f.kind] = kinds.get(f.kind, 0) + 1
     if kinds:
-        lines.append("Findings stored: " + ", ".join(f"{n} {k}" for k, n in sorted(kinds.items())) + ".")
+        decided = sum(1 for f in r.findings if f.decision_ref)
+        lines.append("Findings stored: " + ", ".join(f"{n} {k}" for k, n in sorted(kinds.items()))
+                     + (f"; {decided} of them carry an earlier human decision (the PR comment's 'Suppressed by "
+                        "decision' table; a finding keeps its kind, the decision sets the outcome)" if decided else "")
+                     + ".")
     if r.reviewer_calls:
         tasks: dict[str, int] = {}
         for c in r.reviewer_calls:
@@ -297,23 +411,31 @@ def _run_block(r: RunResult) -> list[str]:
     return lines
 
 
+INDEX_FILES = ("report.html", "pr-comment.md", "summary.txt", "alerts.json")
 FILES = """Files in this folder:
   pr-comment.md       the PR comment Sentinel would post (9.2), exactly as rendered
   report.html         the static run report (9.5); open it in a browser, crops are embedded at 1:1
   commit-status.json  the sentinel/pr-run commit status (9.2)
-  sentinel.db         the SQLite store (8.3): runs, outcomes, findings, decisions, artifacts index
+  sentinel.db         the SQLite store (8.3): runs, outcomes, findings, decisions, step events (with each
+                      gateway block and its reason code), artifacts index
   artifacts/          content-addressed crops and heatmaps (8.4) with manifest.json
   calibration/        the A/A calibration file of the run's fingerprint (3.9)
   config/<run id>/    the exact config each run linted and used (the example plus the PR's files)
   reviewer-calls.json every simulated Reviewer request and answer (3.13 shape)
+  alerts.json         every 9.10 alert route the Orchestrator's controls returned, per run and shard
+  orchestrator.json   per run: each shard's gates, verdict, last gate, proof and kill switch steps, the
+                      actions the Orchestrator does not perform itself (quarantine records, blocked logins,
+                      a disabled rig, maintenance tasks) and the gateway's step events
+  heartbeat/          the last heartbeat each shard wrote (10.2)
   results.jsonl       the store's append-only ledger of every write batch (8.2)
   nightly-canary only: canary-results-<run>.json (10.3 result rows), morning-report.txt (the banner),
                       nightly-report*.html (the Nightly runs' reports)"""
 
 
-def _write_summary(out: Path, title: str, story: list[str], results: list[RunResult], extra: list[str] = ()) -> None:
+def _write_summary(out: Path, title: str, story: list[str], results: list[RunResult], extra: list[str] = (),
+                   *, abort_expected: bool = False) -> None:
     lines = [title, "=" * len(title), "", SIMULATION_NOTE, "", "What this scenario shows", "-" * 24]
-    if any(r.reason == "config_invalid" for r in results):
+    if not abort_expected and any(r.reason == "config_invalid" for r in results):
         lines += ["NOTE: a run below stopped at T+0:00 because config lint failed (1.7): it ended",
                   "aborted_harness (reason: config_invalid) and its PR comment carries the abort block. With the",
                   "default --today 2026-11-10 the example config lints clean; a later date expires its mask and the",
@@ -331,16 +453,15 @@ def _count(r: RunResult, surface: str | None = None, outcome: str | None = None,
                and (outcome is None or o.outcome == outcome) and (kind is None or o.test_kind == kind))
 
 
-AT = "charts.flexible-grid.active-trader-cell"
-LADDER = "trade.active-trader.ladder"
 
 
 # ------------------------------------------------------------------------------------------------
 # Scenarios
 
 
-def demo_flexgrid_ladder(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE) -> list[RunResult]:
-    r = run_pipeline(config, flexgrid_scenario(today), out, today)
+def demo_flexgrid_ladder(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                        ) -> list[RunResult]:
+    r = run_pipeline(config, flexgrid_scenario(today), out, today, **_rev(reviewer))
     inv_at = _count(r, AT, "invariant_violation", "sweep")
     exhausted = sum(1 for o in r.outcomes if o.stability_cause == "budget")
     sweep_at = _count(r, AT, kind="sweep")
@@ -374,12 +495,13 @@ def demo_flexgrid_ladder(out: Path, today: date = DEFAULT_TODAY, config: Path = 
         "- Item wording and invariant ids follow from the synthetic screens (INV-01 with INV-02 and INV-10 here;",
         "  9.3 has INV-01 and INV-03 from real OCR).",
     ]
-    _write_summary(out, "Scenario flexgrid-ladder: the 1.11 worked example", story, [r])
+    _write_summary(out, "Scenario flexgrid-ladder: the 1.11 worked example", story, [r], _safety_lines(r))
     return [r]
 
 
-def demo_clean_pr(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE) -> list[RunResult]:
-    r = run_pipeline(config, clean_scenario(today), out, today)
+def demo_clean_pr(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                 ) -> list[RunResult]:
+    r = run_pipeline(config, clean_scenario(today), out, today, **_rev(reviewer))
     story = [
         "PR 4823 adds the aggregation period to the chart cell header ('AAPL' becomes 'AAPL  1D') and declares",
         "exactly that surface in its manifest. Only the chart cell's own code changed, so the scope is the chart",
@@ -390,32 +512,39 @@ def demo_clean_pr(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE
         "- The smoke census checkpoints are pixel-identical to base: identical.",
         "- Nothing is unexpected, so the sentinel/pr-run check is success.",
     ]
-    _write_summary(out, "Scenario clean-pr: a declared change and nothing else", story, [r])
+    _write_summary(out, "Scenario clean-pr: a declared change and nothing else", story, [r], _safety_lines(r))
     return [r]
 
 
-def demo_backend_only(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE) -> list[RunResult]:
-    r = run_pipeline(config, backend_scenario(today), out, today)
+def demo_backend_only(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                     ) -> list[RunResult]:
+    r = run_pipeline(config, backend_scenario(today), out, today, **_rev(reviewer))
     story = [
         "PR 4830 changes a margin rules file in the backend (no Java UI class, no manifest). The static impact step",
         "finds no UI dependents, so this is the no-manifest case (b) of 4.3 and F5: no manifest_missing finding,",
         "'intended' is disabled, and any diff above threshold needs a human (needs_human, reason no_manifest).",
         "",
         "The change moves the Buying Power Effect on the Order Confirmation dialog from -15,025.00 to -15,032.51.",
-        "Buying Power Effect is a money cell (F41): it is always pixel-diffed with a zero floor, so the one-glyph",
-        "change is above threshold and the checkpoint ends needs_human (reason: no_manifest) instead of slipping",
-        "through. The dialog checkpoint s07 is recapturable: false in its flow, so its stability is 'unknown'.",
+        "Two independent checks see it:",
+        "- Buying Power Effect is a money cell (F41): it is always pixel-diffed with a zero floor, so the one-glyph",
+        "  change is above threshold. On its own that gives needs_human (reason: no_manifest).",
+        "- The Oracle reads the dialog and evaluates the flow's assertions. R02 (2.8.3) wants the buying power",
+        "  effect of a stock order on the margin account within 50 to 100 percent of the notional, and -15,032.51",
+        "  is 100.05 percent of 15,025.00 (\"bracket check\": the margin formula is not pinned yet). An assertion",
+        "  outranks every comparison outcome (3.11), so s07 ends assertion_failed (assertion: R02), with both",
+        "  builds' reads in the finding and the pixel diff kept on the record.",
+        "The dialog checkpoint s07 is recapturable: false in its flow, so its stability is 'unknown'.",
         "",
-        "Simulation note (a reported workaround): the scope module selects flows only from the change-derived scope;",
-        "in case (b) that scope is empty, so no flow would reach the dialog. Following the 2.11 pseudocode, this run",
-        f"adds the tier-1 flows that touch the smoke census: {', '.join(r.extra_flows) or 'none'}.",
+        "Case (b) still runs the smoke flows (2.11): the scope adds the tier-1 standard flows that touch the smoke",
+        "census, so the stock ticket flow reaches the dialog although the change-derived scope is empty.",
     ]
-    _write_summary(out, "Scenario backend-only: a money-cell diff with no manifest", story, [r])
+    _write_summary(out, "Scenario backend-only: a money-cell change with no manifest", story, [r], _safety_lines(r))
     return [r]
 
 
-def demo_ui_no_manifest(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE) -> list[RunResult]:
-    r = run_pipeline(config, ui_no_manifest_scenario(today), out, today)
+def demo_ui_no_manifest(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                       ) -> list[RunResult]:
+    r = run_pipeline(config, ui_no_manifest_scenario(today), out, today, **_rev(reviewer))
     story = [
         "PR 4835 changes how the Level II cell prints sizes ('2200' becomes '22x100') and carries no manifest.",
         "The changed class sits under the Level II cell's roots, so the static impact step finds a UI dependent:",
@@ -424,12 +553,13 @@ def demo_ui_no_manifest(out: Path, today: date = DEFAULT_TODAY, config: Path = E
         "The Level II cell is tier 2, so the check stays success (tier 2 and 3 never block, 9.2), but the comment",
         "lists the collateral and the missing manifest.",
     ]
-    _write_summary(out, "Scenario ui-no-manifest: a UI change without a manifest", story, [r])
+    _write_summary(out, "Scenario ui-no-manifest: a UI change without a manifest", story, [r], _safety_lines(r))
     return [r]
 
 
-def demo_decision_inheritance(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE) -> list[RunResult]:
-    r1 = run_pipeline(config, flexgrid_scenario(today), out, today)
+def demo_decision_inheritance(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                             ) -> list[RunResult]:
+    r1 = run_pipeline(config, flexgrid_scenario(today), out, today, **_rev(reviewer))
     with Store(out / "sentinel.db") as store:
         at = f"{today.isoformat()}T11:20:00-05:00"
         bugs = record_decisions(store, r1, lambda o: o.outcome == "invariant_violation", action="confirm_bug",
@@ -443,12 +573,12 @@ def demo_decision_inheritance(out: Path, today: date = DEFAULT_TODAY, config: Pa
             reason="The 6 px shift is the declared header change on surfaces the entry did not declare")
     cand2 = "branch-1998.3.0-9c4f1e7"
     sc2 = flexgrid_scenario(today, seq=2, sha7="9c4f1e7")
-    r2 = run_pipeline(config, sc2, out, today)
+    r2 = run_pipeline(config, sc2, out, today, **_rev(reviewer))
     story = [
         "PR 4812 runs twice. After the first run a human acts on the PR comment, as 1.11 'What happens next' says:",
         f"- confirm bug on the overlap (ticket TOS-48391): {_plural(len(bugs), 'decision')}, one per member signature;",
-        f"- mark intended with ticket TOS-48120 on the tier-1 collateral, proposed by the author and confirmed by",
-        f"  the triage rotation (the two-person rule for tier 1 and 2, 9.6):",
+        "- mark intended with ticket TOS-48120 on the tier-1 collateral, proposed by the author and confirmed by",
+        "  the triage rotation (the two-person rule for tier 1 and 2, 9.6):",
         f"  {_plural(len(intended), 'decision')}.",
         f"The developer then pushes a new commit ({cand2}) that does not touch the UI, so the screens are the same.",
         "",
@@ -467,7 +597,8 @@ def demo_decision_inheritance(out: Path, today: date = DEFAULT_TODAY, config: Pa
     return [r1, r2]
 
 
-def demo_nightly_canary(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE) -> list[RunResult]:
+def demo_nightly_canary(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                       ) -> list[RunResult]:
     yesterday = today - timedelta(days=1)
     main = SimBuild(BASE_ID)
     overlay = dict([_main_build()])
@@ -482,7 +613,8 @@ def demo_nightly_canary(out: Path, today: date = DEFAULT_TODAY, config: Path = E
     rep = n2.canary["report"]
     pr = run_pipeline(config, replace(clean_scenario(today, seq=1, clock="10:31:00"),
                                       overlay=dict(clean_scenario(today).overlay, **blind_overlay(Path(config))),
-                                      canary=n2.canary["health"], detector_banner=rep.banner), out, today)
+                                      canary=n2.canary["health"], detector_banner=rep.banner), out, today,
+                      **_rev(reviewer))
     (out / "morning-report.txt").write_text((rep.banner or "Detector state ok.") + "\n", encoding="utf-8")
     shutil.copyfile(out / f"nightly-report-{n2.run_id}.html", out / "nightly-report.html")
     s1, s2 = n1.canary["health"], n2.canary["health"]
@@ -515,40 +647,280 @@ def demo_nightly_canary(out: Path, today: date = DEFAULT_TODAY, config: Path = E
     return [n1, n2, pr]
 
 
+def _safety_lines(r: RunResult) -> list[str]:
+    """The Orchestrator's side of a run, for summary.txt: each shard's verdict, last gate and proof, the alerts."""
+    lines = [f"Orchestrator: {len(r.shards)} shard(s) through the gate machine of 5.2 (see orchestrator.json):"]
+    for sh in r.shards:
+        lines.append(f"  - {sh['shard_id']} on {sh['rig']}: {sh['verdict']}" + (f" ({sh['reason']})" if sh["reason"] else "")
+                     + f", last gate {sh['last_gate']}, proof {sh['proof']}")
+    if r.alerts:
+        seen: dict[str, int] = {}
+        for a in r.alerts:
+            key = (f"{a['priority']} {a['rule']}" + (f" incident {a['incident']}" if a["incident"] else "")
+                   + f" paging {', '.join(a['paged']) or 'nobody'}")
+            seen[key] = seen.get(key, 0) + 1
+        lines.append("Alerts routed by 9.10 (see alerts.json): " + "; ".join(
+            k + (f" (x{n}, one per shard)" if n > 1 else "") for k, n in seen.items()) + ".")
+    else:
+        lines.append("Alerts routed by 9.10: none (alerts.json is empty).")
+    return lines
+
+
+def demo_wrong_number(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                      ) -> list[RunResult]:
+    r = run_pipeline(config, wrong_number_scenario(today), out, today, **_rev(reviewer))
+    story = [
+        "PR 4851 changes a pricing format resource (no UI code, no manifest). The build transposes two digits of the",
+        "Order Confirmation cost: 15,205.00 for 100 shares at 150.25. Every other pixel of the dialog is the base's.",
+        "",
+        "The Oracle reads the dialog's regions (OCR on the rig; here the text synth drew) and evaluates the flow's",
+        "assertions on both builds. cost_math is rule R01 (quantity x price x multiplier = cost): it holds on the",
+        "base and fails on the candidate, so s07 ends assertion_failed (assertion: cost_math), whatever the pixel",
+        "diff says (an assertion outranks every comparison outcome, 3.11). The finding's text and its raw_values",
+        "carry what each build read, so the PR comment shows 15,205.00 next to the base's 15,025.00.",
+        "R02 (the buying power bracket) still passes: -15,025.00 lies within 50 to 100 percent of 15,205.00.",
+    ]
+    _write_summary(out, "Scenario wrong-number: the Oracle catches a cost that is not quantity times price", story, [r],
+                   _safety_lines(r))
+    return [r]
+
+
+def demo_paper_mode_mismatch(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                             ) -> list[RunResult]:
+    r = run_pipeline(config, paper_mode_scenario(today), out, today, **_rev(reviewer))
+    story = [
+        f"PR 4823's run starts on a rig whose account selector reads {LIVE_ACCOUNT}: the live account id format",
+        "(eight digits, then SCHW), not an entry of gateway/allowlist.yaml. The paper-mode assertion of 6.4 runs at",
+        "the paper_mode_asserted gate, before settings are read and long before anything is captured.",
+        "",
+        "- The gate fails with aborted_safety (reason: live_identity): the hook goes to deny-all, the process tree",
+        "  is killed, the login is blocked and the 9.10 safety route pages the harness on-call at P1 (incident S1).",
+        "- The kill switch of 6.6 runs: a recovery login, the Monitor read and the proof. The run had no order",
+        "  snapshot yet (it stopped before one was taken), so the proof is UNPROVEN (snapshot_missing): with",
+        "  nothing to compare against it cannot show that no order was sent. UNPROVEN pages a second time",
+        "  (safety:unproven_proof) and keeps the login blocked until a human checks the account by hand.",
+        "- Every shard's rig shows the same selector (the example config has one rig identity), so every shard",
+        "  stops at that gate. Nothing was captured: no calibration, no crops, no diff. Every scoped checkpoint is",
+        "  env_error with the aborting gate and reason (gate paper_mode_asserted, reason live_identity).",
+        "- The PR comment carries the abort block (trigger, gate, proof, incident) instead of Unexpected and",
+        "  Intended; the check is error.",
+    ]
+    _write_summary(out, "Scenario paper-mode-mismatch: a live account id stops the run before any capture", story, [r],
+                   _safety_lines(r))
+    return [r]
+
+
+def demo_attempted_send(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                        ) -> list[RunResult]:
+    r = run_pipeline(config, attempted_send_scenario(today), out, today, **_rev(reviewer))
+    story = [
+        "PR 4853 changes a backend timeout (no visible effect, no manifest), so the smoke flows run. In the stock",
+        "ticket flow the scripted step open-confirm clicks Confirm and Send as an attested order-stage step and the",
+        "Order Confirmation dialog opens. The scenario then makes the Executor press Enter on the dialog: the one",
+        "key that would send the order (a step `config lint` refuses in a flow file, L-FLW-07; here it comes from",
+        "the Executor, as a mis-resolved or rescued step would).",
+        "",
+        "- The gateway blocks it: its slow half refuses the key before any input token is written (reason code",
+        "  guarded_key_refused: Enter while a ticket or dialog is open). Nothing reaches the app; the simulated rig",
+        "  sent 0 orders.",
+        "- One attempted send on a scripted flow is enough (5.4.8 rule 1): aborted_safety (reason: attempted_send),",
+        "  the flow is quarantined and the kill switch runs on that shard's rig. Its proof compares the Monitor's",
+        "  order grids with the snapshot taken at run start: PROVEN: no orders sent.",
+        "- On that shard, s07 and every checkpoint not yet captured are env_error (gate running, reason",
+        "  attempted_send); the checkpoints captured before the abort keep their outcomes. The other shard runs on",
+        "  its own rig and finishes normally; the run takes the worst shard's result (8.2).",
+        "- The blocked step is stored as blocked_by_gateway with the gateway's decision (refused), reason code",
+        "  (guarded_key_refused) and class (safety); run health counts it as 1 gateway drop.",
+    ]
+    _write_summary(out, "Scenario attempted-send: the gateway blocks an Enter on the Order Confirmation", story, [r],
+                   _safety_lines(r))
+    return [r]
+
+
+def demo_app_crash(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                   ) -> list[RunResult]:
+    r = run_pipeline(config, app_crash_scenario(today), out, today, **_rev(reviewer))
+    story = [
+        "PR 4854 declares the Active Trader cell (a host class changed; no visible change), so its Ladder S sweep of",
+        f"12 steps runs. At step {FREEZE_AT.rsplit('/', 1)[1]} the app's UI thread freezes: the window stops changing.",
+        "",
+        "- The Watchdog's screenshot-staleness detector fires after max(2 x 15 s, 60 s) (10.2 sampling 5) and",
+        "  app_failure decides: assertion_failed (assertion: app_alive) on that step, with an app_crash finding,",
+        "  and not_run (reason: app_crash) for the rest of the ladder (7 steps).",
+        "- The Executor kills the process tree, waits for the session release, relaunches (one of 3 relaunches",
+        "  per shard), logs in and asserts paper mode again, then resumes with the next unit of work: the census",
+        "  checkpoints after the ladder are captured and compared as usual.",
+        "- The run ends complete; the check fails on the tier-1 app_alive item.",
+        "- Coverage: the table counts surface-and-persona cells (2.12) and the ladder's cell shows its worst outcome,",
+        "  the app_alive failure, so its not_run column reads 0 app_crash; the line under the table counts the",
+        "  checkpoints: \"Checkpoints not run: 7 app_crash (sweep steps after the crash)\".",
+    ]
+    _write_summary(out, "Scenario app-crash: a frozen app mid-sweep, a relaunch, and the run goes on", story, [r],
+                   _safety_lines(r))
+    return [r]
+
+
+def demo_config_invalid(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                        ) -> list[RunResult]:
+    day = mask_expiry(Path(config)) + timedelta(days=1)
+    r = run_pipeline(config, clean_scenario(day), out, day, **_rev(reviewer))
+    story = [
+        f"PR 4823's run on {day.isoformat()}, the day after the example config's first mask expires (--today past",
+        "the mask expiry). Config lint is preflight item G1 (12.7): with an expired mask it fails (L-MSK-02), the",
+        "Orchestrator stops at the provisioned gate and the run ends aborted_harness (reason: config_invalid)",
+        "before any product action: no launch, no login, nothing captured, no scope.",
+        "",
+        "- The PR comment carries the abort block with the failing lint rules; the check is error.",
+        "- aborted_harness pages the harness on-call at P1 (9.10); see alerts.json.",
+        "- The post-run proof is PROVEN: no session established: the app was never started, so nothing could",
+        "  have been sent, and no login is blocked.",
+    ]
+    _write_summary(out, "Scenario config-invalid: an expired mask stops the run at preflight", story, [r],
+                   _safety_lines(r), abort_expected=True)
+    return [r]
+
+
 DEMOS: dict[str, Callable[..., list[RunResult]]] = {
     "flexgrid-ladder": demo_flexgrid_ladder, "clean-pr": demo_clean_pr, "backend-only": demo_backend_only,
     "ui-no-manifest": demo_ui_no_manifest, "nightly-canary": demo_nightly_canary,
-    "decision-inheritance": demo_decision_inheritance,
+    "decision-inheritance": demo_decision_inheritance, "wrong-number": demo_wrong_number,
+    "paper-mode-mismatch": demo_paper_mode_mismatch, "attempted-send": demo_attempted_send,
+    "app-crash": demo_app_crash, "config-invalid": demo_config_invalid,
+}
+
+# One sentence per scenario for out/index.html: what it demonstrates, and what a tester should check.
+INDEX = {
+    "flexgrid-ladder": ("The 1.11 worked example: a Flexible Grid chrome change makes the Active Trader ladder "
+                        "overlap its order strip at height 360.",
+                        "the comment lists invariant_violation (INV-01) for the four 360 px steps first, then the "
+                        "collateral and the intended chart cells, and the check is failure."),
+    "clean-pr": ("A declared change that touches only its declared surface.",
+                 "Unexpected is 0, Intended lists the chart cell, and the check is success."),
+    "backend-only": ("A backend margin change with no manifest moves the Buying Power Effect, a money cell.",
+                     "s07 is assertion_failed (assertion: R02) with both builds' reads, the pixel diff is still above "
+                     "threshold on the zero-floor money cell, and the comment says no manifest and no UI code touched."),
+    "ui-no-manifest": ("A UI change with no manifest (4.3 case a).",
+                       "the Level II cell is collateral (manifest_missing) and the manifest_missing finding is listed."),
+    "nightly-canary": ("Two Nightly canary passes, the second blind on a money cell, then a PR run under the banner.",
+                       "the morning banner names M04 and the mask that absorbed it, and the PR comment starts with "
+                       "DETECTOR BLIND."),
+    "decision-inheritance": ("Human decisions recorded after one run are inherited by the next (9.7).",
+                             "the second run's comment shows 26 suppressed by decision and the check turns success."),
+    "wrong-number": ("The Oracle catches an Order Confirmation cost that is not quantity times price on an otherwise "
+                     "pixel-identical dialog.",
+                     "s07 is assertion_failed (assertion: cost_math) and the comment shows the candidate's 15,205.00 "
+                     "next to the base's 15,025.00."),
+    "paper-mode-mismatch": ("A live-format account id in the selector stops the run at the paper-mode gate (6.4).",
+                            "the run is aborted_safety (live_identity), nothing was captured, every checkpoint is "
+                            "env_error (paper_mode_asserted, live_identity), the comment has the abort block and "
+                            "alerts.json has a P1 S1 safety page."),
+    "attempted-send": ("The gateway blocks a scripted Enter on the open Order Confirmation dialog (6.2).",
+                       "the run is aborted_safety (attempted_send), the step is blocked_by_gateway, the proof reads "
+                       "PROVEN: no orders sent and the flow has a quarantine record in orchestrator.json."),
+    "app-crash": ("The app freezes during a sweep step; the Watchdog decides, the Executor relaunches and the run goes "
+                  "on (10.2).",
+                  "that step is assertion_failed (assertion: app_alive) with an app_crash finding, the rest of the "
+                  "ladder is not_run (app_crash), counted under the Coverage table as \"Checkpoints not run: 7 "
+                  "app_crash\", and the census checkpoints after it were still compared."),
+    "config-invalid": ("An expired mask fails config lint at preflight G1 and the run ends before any product action.",
+                       "the run is aborted_harness (config_invalid), the comment's abort block names L-MSK-02 and "
+                       "alerts.json has the P1 aborted_harness page."),
 }
 
 
-def run_demo(name: str, out_root: str | Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE) -> list[RunResult]:
-    """Run one scenario into `out_root/<name>/`, replacing what a previous run left there."""
+def _rev(reviewer: Any) -> dict:
+    """`run_pipeline` keyword arguments for the Reviewer: none (the simulated one) or a live job."""
+    return {} if reviewer is None else {"live": reviewer()}
+
+
+def run_demo(name: str, out_root: str | Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE,
+             reviewer: Callable[[], Any] | None = None) -> list[RunResult]:
+    """Run one scenario into `out_root/<name>/`, replacing what a previous run left there. `reviewer` makes
+    the live Reviewer's job for a run (`pipeline.live.live_job`); None keeps the offline simulated one."""
     if name not in DEMOS:
         raise KeyError(f"unknown scenario {name!r}; one of {', '.join(SCENARIOS)} or all")
     out = Path(out_root) / name
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
-    return DEMOS[name](out, today, Path(config))
+    return DEMOS[name](out, today, Path(config), reviewer)
+
+
+def _line(name: str, last: RunResult, out: Path) -> str:
+    return (f"{name}: {last.status}" + (f" ({last.reason})" if last.reason else "") +
+            (f", check {last.commit_status.get('state')}" if last.commit_status else "") + f" -> {out}/summary.txt")
+
+
+def write_index(out_root: str | Path, results: Mapping[str, list[RunResult]]) -> Path:
+    """`out/index.html`: one self-contained page linking each scenario's report, comment, summary and alerts,
+    with what each scenario demonstrates and what a tester should check."""
+    rows = []
+    for name in SCENARIOS:
+        if name not in results:
+            continue
+        last = results[name][-1]
+        what, check = INDEX[name]
+        state = (last.commit_status or {}).get("state", "n/a")
+        links = " ".join(f'<a href="{html.escape(name)}/{f}">{f}</a>' for f in INDEX_FILES)
+        rows.append(f"<tr><td><b>{html.escape(name)}</b><br><code>{html.escape(last.status)}"
+                    f"{html.escape(f' ({last.reason})' if last.reason else '')}</code>, check {html.escape(state)}</td>"
+                    f"<td>{html.escape(what)} Check that {html.escape(check)}</td><td>{links}</td></tr>")
+    page = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentinel demo scenarios</title>
+<style>
+:root {{ --bg: #ffffff; --fg: #1b1f24; --muted: #57606a; --line: #d0d7de; --link: #0b62c4; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg: #0f1216; --fg: #e6edf3; --muted: #9aa5b1; --line: #30363d;
+  --link: #6cb6ff; }} }}
+body {{ background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, sans-serif; margin: 0 auto;
+  max-width: 1100px; padding: 24px 16px; }}
+table {{ border-collapse: collapse; width: 100%; }} td {{ border-top: 1px solid var(--line); padding: 10px 8px;
+  vertical-align: top; }} td:last-child {{ white-space: nowrap; }} a {{ color: var(--link); margin-right: 8px; }}
+p {{ color: var(--muted); }} code {{ font-size: 13px; }}
+@media (max-width: 700px) {{ td {{ display: block; border: 0; padding: 4px 0; }} tr {{ display: block;
+  border-top: 1px solid var(--line); padding: 8px 0; }} td:last-child {{ white-space: normal; }} }}
+</style></head><body>
+<h1>Sentinel demo scenarios</h1>
+<p>{html.escape(SIMULATION_NOTE)}</p>
+<table>
+{chr(10).join(rows)}
+</table></body></html>
+"""
+    path = Path(out_root) / "index.html"
+    path.write_text(page, encoding="utf-8")
+    return path
 
 
 def main(argv: list[str] | None = None) -> int:
-    """`sentinel demo <scenario|all> --out DIR [--today YYYY-MM-DD] [--config DIR]`."""
+    """`sentinel demo <scenario|all> --out DIR [--today YYYY-MM-DD] [--config DIR] [--reviewer simulated|live]`."""
     p = argparse.ArgumentParser(prog="sentinel demo", description=__doc__.split("\n\n")[0])
     p.add_argument("scenario", choices=SCENARIOS + ("all",))
     p.add_argument("--out", default="out", help="output root; each scenario writes <out>/<scenario>/")
     p.add_argument("--today", type=date.fromisoformat, default=DEFAULT_TODAY,
                    help="date for expiries and run ids (default 2026-11-10, which the example config assumes)")
     p.add_argument("--config", default=str(EXAMPLE), help="sentinel-config directory (default config/example)")
+    p.add_argument("--reviewer", choices=("simulated", "live"), default="simulated",
+                   help="simulated (default, offline) or live: the Claude adapter, only with ANTHROPIC_API_KEY set")
+    p.add_argument("--reviewer-config", help="a YAML file whose `reviewer:` block sets the live Reviewer (3.15)")
     a = p.parse_args(argv)
+    factory = None
+    if a.reviewer == "live":
+        from .pipeline.live import live_job, load_reviewer_config
+        from .reviewer import NetworkNotAllowed
+        settings = load_reviewer_config(a.reviewer_config)
+        try:
+            live_job(config=settings)                   # refuses before any client exists without a key
+        except NetworkNotAllowed as exc:
+            print(f"sentinel demo: --reviewer live: {exc}", file=sys.stderr)
+            return 2
+        factory = lambda: live_job(config=settings)     # noqa: E731 - one job per run
     names = SCENARIOS if a.scenario == "all" else (a.scenario,)
+    done: dict[str, list[RunResult]] = {}
     for name in names:
-        results = run_demo(name, a.out, a.today, Path(a.config))
-        last = results[-1]
-        print(f"{name}: {last.status}" + (f" ({last.reason})" if last.reason else "") +
-              (f", check {last.commit_status.get('state')}" if last.commit_status else "") +
-              f" -> {Path(a.out) / name}/summary.txt")
+        done[name] = run_demo(name, a.out, a.today, Path(a.config), factory)
+        print(_line(name, done[name][-1], Path(a.out) / name))
+    if a.scenario == "all":
+        print(f"index: {write_index(a.out, done)}")
     return 0
 
 

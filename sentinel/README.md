@@ -9,7 +9,7 @@ This folder holds everything that does not need Windows or thinkorswim. The Wind
 ```
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e '.[test]'
-pytest                                        # about 650 tests, under a minute
+pytest                                        # about 1250 tests, about two minutes
 sentinel lint config/example --today 2026-11-10
 sentinel taxonomy --check
 ```

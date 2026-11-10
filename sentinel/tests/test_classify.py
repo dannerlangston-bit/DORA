@@ -491,6 +491,22 @@ def test_collateral_is_decided_by_declaration_alone():
         assert removed_declared.outcome in ("intended", "needs_human")
 
 
+def test_rule_classification_keeps_the_describing_reviewer_call():
+    """A collateral by rule that the Reviewer described keeps the call's model id and prompt hash (9.2, 9.3)."""
+    review = answered("does_not_match_manifest", 0.97, model_id="claude-x", prompt_hash="ab" * 32,
+                      description="ladder overlaps strip", region_pointer="rgn.ladder.viewport")
+    for row in ("16", "17", "18"):
+        c = classify(replace(ROW_FACTS[row], review=review))
+        assert (c.outcome, c.classification.by) == (EXPECTED[row][0], "rule")
+        assert c.classification == Classification(c.classification.category, "rule", model_id="claude-x",
+                                                  prompt_hash="ab" * 32, description="ladder overlaps strip",
+                                                  region_pointer="rgn.ladder.viewport")
+    undescribed = classify(ROW_FACTS["16"])
+    assert undescribed.classification == Classification("collateral", "rule")   # no call: no provenance
+    pending = classify(replace(ROW_FACTS["16"], review=Review("pending", model_id="claude-x")))
+    assert pending.classification.model_id is None
+
+
 # --------------------------------------------------------------------------------------------
 # End to end: the worked example through the checker, the re-capture and the table
 

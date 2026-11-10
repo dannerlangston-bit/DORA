@@ -30,6 +30,9 @@ Census captures. A census checkpoint captures the surface's host cell or panel a
 workspace gives it, not the whole 1920x1080 window: the synthetic workspace has nothing else to
 show, and a smaller image keeps the demo fast.
 
+`region_values(screen, regions, located)` is what the Oracle's readers would read in each region: the
+text synth drew there (the ground truth `oracle.GroundTruthReader` serves, `pipeline.assertions`).
+
 `observe(base, candidate)` lists what the synthetic build drew differently (the change notes the
 simulated Reviewer reads in place of looking at crops); `describe_observations` words them.
 """
@@ -57,6 +60,8 @@ PANEL_KINDS = frozenset({"panel", "grid_cell", "cell_header", "order_strip", "la
                          "titlebar", "grid_header"})
 CONTROL_KINDS = frozenset({"button", "checkbox"})
 WORD_KINDS = frozenset({"label", "text", "cell", "header_cell", "price_cell"})
+READ_KINDS = frozenset({"label", "text", "cell", "price_cell"})    # what the Oracle reads in a region
+ROW_TOLERANCE = 4                                # px: texts whose centres are this close share a row
 OCR_CONFIDENCE = 92.0
 TEMPLATE_SCORE = 0.97
 STUDY_RGB = (255, 200, 0)                        # the SMA line, the color M24 erases (RGB)
@@ -67,7 +72,7 @@ class VisualChange:
     """One visual change a simulated build can carry, and the ticket it implements."""
 
     change_id: str
-    ticket: str
+    ticket: str | None                          # None: a defect no ticket asked for
     summary: str
     surfaces: frozenset[str]
 
@@ -93,6 +98,10 @@ VISUAL_CHANGES: dict[str, VisualChange] = {c.change_id: c for c in (
     VisualChange("bp-effect-house-surcharge", "TOS-48330",
                  "Backend margin table adds a 0.05 percent house surcharge to the buying power effect",
                  frozenset({"dialog.order-confirmation"})),
+    VisualChange("confirm-cost-transposed", None,
+                 "A pricing refactor transposes two digits of the Order Confirmation cost (15,205.00 for "
+                 "100 x 150.25); every other pixel of the dialog is the base's",
+                 frozenset({"dialog.order-confirmation"})),
 )}
 
 
@@ -114,7 +123,8 @@ class SimBuild:
 
     def tickets_for(self, surface_id: str) -> frozenset[str]:
         """Tickets of the changes this build carries that touch `surface_id`."""
-        return frozenset(VISUAL_CHANGES[c].ticket for c in self.changes if surface_id in VISUAL_CHANGES[c].surfaces)
+        return frozenset(t for c in self.changes if surface_id in VISUAL_CHANGES[c].surfaces
+                         and (t := VISUAL_CHANGES[c].ticket) is not None)
 
 
 @dataclass
@@ -323,13 +333,14 @@ def _order_confirmation(build: SimBuild, clock: str) -> tuple[dict, ScreenInfo]:
     lm = _landmark_pos(dialog, size, "dialog.title.label")
     o = (0, 24)
     bp = "-15,032.51" if build.has("bp-effect-house-surcharge") else "-15,025.00"
+    cost = "15,205.00" if build.has("confirm-cost-transposed") else "15,025.00"
     kids = dialog["children"]
     kids.append({"type": "text", "name": "confirm.kind", "text": "Limit order, good for the day", "color": "dim",
                  "rect": _at(lm, o, 24, 24, 300, 18)})
     for name, (dx, w), text, color in (("side", (24, 60), "BUY", "green"), ("qty", (90, 48), "100", "text"),
-                                       ("symbol", (144, 110), "AAPL", "text"), ("price", (260, 90), "150.25 LMT", "text")):
+                                       ("symbol", (144, 110), "AAPL", "text"), ("price", (260, 90), "150.25", "text")):
         kids.append({"type": "text", "name": f"confirm.{name}", "text": text, "color": color, "rect": _at(lm, o, dx, 48, w, 20)})
-    for name, dy, caption, value in (("cost", 96, "Cost", "15,025.00"), ("bp", 120, "Buying power effect", bp),
+    for name, dy, caption, value in (("cost", 96, "Cost", cost), ("bp", 120, "Buying power effect", bp),
                                      ("maxloss", 144, "Max loss", "15,025.00")):
         kids.append({"type": "text", "name": f"confirm.{name}.caption", "text": caption, "color": "dim",
                      "rect": _at(lm, o, 24, dy, 200, 20)})
@@ -357,9 +368,9 @@ def _position_statement(tick: int, clock: bool) -> tuple[dict, ScreenInfo]:
     o = (11, 30)
     rows = []
     for k, (sym, qty, avg, mult, mark0) in enumerate(POSITIONS):
-        mark = mark0 * (1 + 0.0004 * (((tick * 7 + k * 3) % 11) - 5))
-        pl = (mark - avg) * qty * mult
-        dec = 4 if mark < 2 else 2
+        dec = 4 if mark0 < 2 else 2
+        mark = round(mark0 * (1 + 0.0004 * (((tick * 7 + k * 3) % 11) - 5)), dec)
+        pl = (mark - avg) * qty * mult            # from the displayed mark, so R08 holds on every row
         rows.append([f"{qty:,}" if qty > 0 else str(qty), f"{avg:,.{dec}f}", f"{mark:,.{dec}f}",
                      {"text": f"{pl:+,.2f}", "color": "green" if pl >= 0 else "red"}, sym])
     panel["children"].append({"type": "grid", "name": "ps.grid", "rect": _at(lm, o, 0, 24, 474, 18 + 16 * 7),
@@ -487,6 +498,36 @@ def screen_model(screen: synth.Screen, controls: Mapping[str, str] | None = None
     main = inv.Window("main", inv.Rect(0, 0, W, H), "main")
     return inv.ScreenModel("B", (W, H), tuple(ui), tuple(words), windows=(main,), virtual_screen=VIRTUAL_SCREEN,
                            pinned_frame_rect=main.rect)
+
+
+def region_values(screen: synth.Screen, regfile: RegionsFile,
+                  located: Mapping[str, tuple[int, int]]) -> dict[str, str | None]:
+    """What the Oracle's readers would read in each region of a capture (2.8.1; `pipeline.assertions`):
+    the text synth drew whose box centre lies in the region, rows top to bottom joined by newlines and the
+    words of a row left to right. A caption drawn inside a value region (`*.caption`, the Order
+    Confirmation's "Cost" left of its value) is left out, as the field's OCR whitelist drops it (5.10).
+    `located` maps a landmark id to its top-left on this capture; a region whose landmark was not found
+    cannot be read at all (None)."""
+    texts = [d for d in screen.components if d.kind in READ_KINDS and d.text and not d.name.endswith(".caption")]
+    out: dict[str, str | None] = {}
+    for r in regfile.regions:
+        pos = located.get(r.landmark)
+        if pos is None:
+            out[r.id] = None
+            continue
+        x, y = r.rect.x + pos[0], r.rect.y + pos[1]
+        inside = [d for d in texts if x <= d.bbox[0] + d.bbox[2] / 2 < x + r.rect.w
+                  and y <= d.bbox[1] + d.bbox[3] / 2 < y + r.rect.h]
+        rows: list[list[synth.Drawn]] = []
+        for d in sorted(inside, key=lambda d: (d.bbox[1] + d.bbox[3] / 2, d.bbox[0])):
+            cy = d.bbox[1] + d.bbox[3] / 2
+            if rows and abs(cy - (rows[-1][0].bbox[1] + rows[-1][0].bbox[3] / 2)) <= ROW_TOLERANCE:
+                rows[-1].append(d)
+            else:
+                rows.append([d])
+        out[r.id] = "\n".join(" ".join((d.text or "").strip() for d in sorted(row, key=lambda d: d.bbox[0]))
+                               for row in rows)
+    return out
 
 
 # ------------------------------------------------------------------------------------------------

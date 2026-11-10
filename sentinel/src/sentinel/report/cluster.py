@@ -4,13 +4,17 @@
   cluster per run whatever their sizes (one cluster per checkpoint kind, so a sweep and a
   split of one surface stay apart: "findings of one run cluster by checkpoint kind").
 - Census and flow checkpoints form one cluster when category, primitive and region are equal,
-  the pHash values are within Hamming 6 and the largest diff component boxes are equal within
-  4 px. Clustering is transitive (single linkage), so the result does not depend on input order.
+  the pHash values are within Hamming 6 and the largest diff component boxes, relative to the
+  region's anchored bounds, are equal within 4 px. Clustering is transitive (single linkage), so
+  the result does not depend on input order.
 - Every `needs_human (reason: global_shift)` checkpoint joins one cluster (9.2 banner, 3.7).
 
 Choices where 9.7 is silent (reported to the coordinator):
-- Component boxes are compared as recorded on `Component.bbox`; the Diff Engine is assumed to
-  store them relative to the region's anchored bounds, as 9.7 requires for this comparison.
+- Component boxes are compared by `bbox_region`, the box the Diff Engine records relative to the
+  owning region's anchored bounds (engine choice 16), so the same defect in a panel that sits at
+  another window position still clusters. When either largest component lacks it (a record
+  written before the engine kept it) both are compared by their window `bbox`, never one
+  coordinate frame against the other.
 - A member without a pHash, or without a box when the other has one, clusters with nobody.
 - The representative member (whose crops, finding links and actions the item shows) is the
   lower median of the unsuppressed members, ordered by step area (sweep), fraction (split) or
@@ -22,7 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..records import CheckpointOutcome, Decision, Finding
+from ..records import CheckpointOutcome, Component, Decision, Finding
 from ..taxonomy import checkpoint_parts
 
 PHASH_TOLERANCE = 6     # 9.7: cross-checkpoint clustering
@@ -79,14 +83,15 @@ class Member:
     def reason_code(self) -> str | None:
         return self.outcome.reason.partition(":")[0] if self.outcome.reason else None
 
-    def largest_box(self) -> tuple[int, int, int, int] | None:
+    def largest_component(self) -> Component | None:
+        """The largest diff component in the member's region (ties: the lower region-relative box)."""
         diff = self.outcome.diff
         if not diff or not diff.components:
             return None
         comps = [c for c in diff.components if self.region is None or c.region_id in (None, self.region)]
         if not comps:
             return None
-        return tuple(max(comps, key=lambda c: (c.area, c.bbox)).bbox)
+        return max(comps, key=lambda c: (c.area, tuple(_region_box(c) or c.bbox)))
 
 
 @dataclass
@@ -148,17 +153,26 @@ def hamming(a: str, b: str) -> int:
     return bin(int(a, 16) ^ int(b, 16)).count("1")
 
 
-def _boxes_match(a: tuple | None, b: tuple | None) -> bool:
+def _region_box(c: Component) -> tuple[int, int, int, int] | None:
+    """The box relative to the region's anchored bounds, when the engine recorded one (engine choice 16)."""
+    box = getattr(c, "bbox_region", None)
+    return None if box is None else tuple(box)
+
+
+def _boxes_match(a: Component | None, b: Component | None) -> bool:
+    """9.7: the largest components' boxes equal within 4 px, in one coordinate frame (module docstring)."""
     if a is None or b is None:
         return a is None and b is None
-    return all(abs(x - y) <= BOX_TOLERANCE_PX for x, y in zip(a, b))
+    ra, rb = _region_box(a), _region_box(b)
+    ba, bb = (ra, rb) if ra is not None and rb is not None else (a.bbox, b.bbox)
+    return all(abs(x - y) <= BOX_TOLERANCE_PX for x, y in zip(ba, bb))
 
 
 def _census_match(a: Member, b: Member) -> bool:
     pa, pb = a.finding.phash if a.finding else None, b.finding.phash if b.finding else None
     if not pa or not pb or hamming(pa, pb) > PHASH_TOLERANCE:
         return False
-    return _boxes_match(a.largest_box(), b.largest_box())
+    return _boxes_match(a.largest_component(), b.largest_component())
 
 
 def _category_key(m: Member) -> tuple:

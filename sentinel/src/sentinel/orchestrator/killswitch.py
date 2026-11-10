@@ -1,0 +1,434 @@
+"""Kill switch, recovery and the post-run proof (6.6).
+
+Triggers (`TripWires`, evaluated by the Orchestrator at every step and flow boundary and by the
+Watchdog on its 2 s sample): the file flag and the named pipe; a new Working or Filled row against
+the run-start snapshot; an order-submitted or order-rejected window (`order_event`); an Order
+Confirmation dialog open more than 30 s with no owning step in a scripted flow or agent rescue; ten
+gateway drops or refusals; an attempted send on a scripted flow or agent rescue; a paper-mode or
+attestation mismatch at any read; a dead Orchestrator heartbeat while the ticket flag is set.
+
+`kill_switch` is the decision (run `aborted_safety`, every unreached checkpoint `env_error (gate:
+<aborting gate>, reason: <abort reason>)`, the running flow quarantined, the 9.10 safety page) and
+`execute_kill_switch` drives the Watchdog-owned sequence on a `Rig`: deny-all, kill the tree, a fresh
+scripted login with A1 and A2, Working read, `Cancel All` when a row is new, re-read until clean or
+60 s, the Monitor reads, the proof, and the snapshot revert.
+
+`post_run_proof` gives one of the five verdicts: `PROVEN: no orders sent`, `PROVEN: only declared
+sends` (gated branch), `PROVEN: no session established`, `UNPROVEN` with `recovery_login_failed`,
+`monitor_unreadable`, `cancel_all_failed`, `snapshot_missing` or `session_unavailable`, or `ORDERS SENT`
+when a clean read finds an undeclared new Working, Filled or Canceled row, the most severe. `proof_result`
+turns it into the run effect: ORDERS SENT is `aborted_safety (reason: undeclared_order_row)` after the fact
+(S1), with the login blocked and the rig disabled; UNPROVEN is `complete_with_env_errors (reason:
+unproven_proof)` unless the run is already `aborted_safety`, blocks the next run on the login, and a second
+UNPROVEN in a row on one login disables the rig and files a `harness_error` finding against the proof flow.
+
+Choices (reported):
+
+1. The abort reason of a kill-switch run is the trigger's own code where 4.13 has one
+   (`attempted_send`, `live_identity`, `paper_mode_mismatch`, `attestation_mismatch`) and `kill_switch`
+   for the human channels, a new row, an `order_event` window, the 30-second dialog, ten drops and a dead
+   Orchestrator with the flag set; unreached checkpoints carry that same reason (1.10, 12.2).
+2. A changed Position Statement row count or a Net Liq drift beyond 0.50 (the sample's tolerance) with
+   no new order row to explain it means the Monitor reads do not agree: UNPROVEN `monitor_unreadable`.
+3. The no-session rule is applied literally: the login never authenticated and the gateway issued no
+   token in the run. A login that typed credentials issued secret tokens, so it takes the normal path.
+4. `Cancel All` re-reads Working every 5 s until it shows no new row or 60 s pass.
+5. Undeclared rows found by a clean read are ORDERS SENT whatever `Cancel All` did, so `Cancel All` failing
+   on undeclared rows reads `ORDERS SENT: ...; Cancel All failed`; UNPROVEN `cancel_all_failed` is left for
+   a Cancel All that failed with no undeclared row (declared sends of the gated branch left Working, or a
+   teardown Cancel All not verified). When no undeclared row is Working, `Cancel All` was not
+   needed and the line says so (`Cancel All not needed`; 6.6 writes the form with `verified` and `failed`).
+   The abort is decided at `teardown`, so unreached checkpoints carry `env_error (gate: teardown, reason:
+   undeclared_order_row)`.
+6. Every proof records what `Cancel All` did (`Proof.cancel_all`: `not_needed`, `done` or `failed`).
+   `cancel_new_working` is the one Cancel All and re-read loop of 6.6 step 5, used by the kill switch
+   sequence and by the recovery proof of machine.py.
+7. An undeclared row found by the teardown proof is one incident and gets one page (6.6 step 4, 9.10 safety
+   routing): the page is sent after the kill switch sequence, never at the teardown read, so it carries the
+   sequence's proof and what `Cancel All` finally did (`teardown_incident`). The teardown read's line ("Cancel All
+   not needed": it clicked nothing) is not paged.
+8. Every proof carries the sha256 of the start and end Monitor reads it compared (`book_sha256`, 8.3
+   `post_run_proofs.start_snapshot_sha256` and `end_snapshot_sha256`), None for a read it did not have; and its
+   8.3 row form (`verdict_code`, `cancel_all_code`, `counts`), from which `proof_line` gives the 6.6 text back.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field, replace
+
+from . import alerts
+from .clock import Clock
+from .identity import READ_GAP_S, Allowlist, judge_identity
+from .results import ControlResult, FindingSpec, RunVerdict, safety_abort_outcome
+from .rig import OrderBook, OrderRow, Rig
+
+DIALOG_OPEN_MAX_S = 30.0
+CANCEL_REREAD_S = 60.0
+CANCEL_POLL_S = 5.0
+NET_LIQ_TOLERANCE = 0.50
+GRIDS = ("working", "filled", "canceled")
+
+PROVEN_NONE = "PROVEN: no orders sent"
+PROVEN_DECLARED = "PROVEN: only declared sends"
+PROVEN_NO_SESSION = "PROVEN: no session established"
+UNPROVEN = "UNPROVEN"
+ORDERS_SENT = "ORDERS SENT: undeclared rows"      # the fifth verdict, the most severe (6.6, choice 5)
+# what Cancel All did, as the ORDERS SENT line prints it (6.6)
+CANCEL_ALL_TEXT = {"done": "verified", "failed": "failed", "not_needed": "not needed"}
+# the 8.3 `post_run_proofs` codes of a proof's verdict and of what Cancel All did (choice 8)
+VERDICT_CODES = {PROVEN_NONE: "proven_no_sends", PROVEN_DECLARED: "proven_declared_sends",
+                 PROVEN_NO_SESSION: "proven_no_session", UNPROVEN: "unproven", ORDERS_SENT: "orders_sent"}
+CANCEL_ALL_CODES = {"not_needed": "not_needed", "done": "performed_verified", "failed": "performed_unverified"}
+UNPROVEN_REASONS = ("recovery_login_failed", "monitor_unreadable", "cancel_all_failed", "snapshot_missing",
+                    "session_unavailable")
+# 4.13 aborted_safety codes a trigger keeps as the run reason (choice 1)
+OWN_REASON = {"attempted_send": "attempted_send", "live_identity": "live_identity",
+              "paper_mode_mismatch": "paper_mode_mismatch", "attestation_mismatch": "attestation_mismatch"}
+
+
+@dataclass(frozen=True)
+class TripWires:
+    """One evaluation of the automatic and human triggers (6.6 Triggers)."""
+
+    file_flag: bool = False
+    named_pipe: bool = False
+    new_working_or_filled: bool = False
+    order_event_window: bool = False
+    dialog_open_s: float = 0.0
+    dialog_owned: bool = False                  # an owning step in a scripted flow or an agent rescue
+    explorer_session: bool = False              # the 30 s rule never applies to an Explorer session (6.8)
+    gateway_drops: int = 0
+    attempted_send: bool = False                # on a scripted flow or an agent rescue
+    identity_mismatch: str | None = None        # live_identity | paper_mode_mismatch
+    attestation_mismatch: bool = False
+    orchestrator_dead: bool = False
+    flag_set: bool = False
+
+
+def check_tripwires(w: TripWires, *, drop_limit: int = 10) -> str | None:
+    """The first trigger that fires, as a trigger name, or None (6.6 Triggers, in the spec's order)."""
+    if w.file_flag:
+        return "file_flag"
+    if w.named_pipe:
+        return "named_pipe"
+    if w.new_working_or_filled:
+        return "new_order_row"
+    if w.order_event_window:
+        return "order_event_window"
+    if w.dialog_open_s > DIALOG_OPEN_MAX_S and not w.dialog_owned and not w.explorer_session:
+        return "dialog_open_30s"
+    if w.gateway_drops >= drop_limit:
+        return "ten_drops"
+    if w.attempted_send:
+        return "attempted_send"
+    if w.identity_mismatch:
+        return w.identity_mismatch
+    if w.attestation_mismatch:
+        return "attestation_mismatch"
+    if w.orchestrator_dead and w.flag_set:
+        return "orchestrator_dead_flag_set"
+    return None
+
+
+def kill_switch(trigger: str, *, gate: str, running_flow: str | None = None) -> ControlResult:
+    """The decision of the 6.6 sequence for `trigger` at the aborting `gate` (steps 1 to 4 and 6)."""
+    reason = OWN_REASON.get(trigger, "kill_switch")
+    run, un = safety_abort_outcome(gate, reason, detail=f"trigger {trigger}")
+    acts = ["deny_all", "kill_tree", "recovery_login", "revert_snapshot", "disable_rig"]
+    if running_flow:
+        acts.insert(1, "quarantine_flow")
+    if trigger == "live_identity":
+        acts.append("block_login")
+    return ControlResult("kill_switch", False, gate, run=run, unreached=un, alert=alerts.safety_abort(),
+                         actions=tuple(acts), incident="S1" if trigger in ("new_order_row", "live_identity") else None,
+                         detail=f"kill switch: {trigger}" + (f"; flow {running_flow} quarantined" if running_flow else ""))
+
+
+# -- the post-run proof -----------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class ProofInputs:
+    """What the proof reads (6.6). `session` is `established`, `never` (the login never authenticated) or
+    `kicked` (`session_kicked`, 7.7); `cancel_all` is `not_needed`, `done` or `failed` (not located, or rows
+    left after 60 s)."""
+
+    start: OrderBook | None
+    end: OrderBook | None
+    session: str = "established"
+    tokens_issued: int = 1
+    recovery_login_ok: bool | None = None       # None: no recovery login was needed
+    kicked_login_ok: bool | None = None         # the one fresh login after session_release_wait (kicked only)
+    cancel_all: str = "not_needed"
+    declared_sends: frozenset[str] = frozenset()
+    net_liq_tolerance: float = NET_LIQ_TOLERANCE
+
+
+@dataclass(frozen=True)
+class ProofRow:
+    """One line of the proof table: start, end, new, expected and the line's verdict."""
+
+    name: str
+    start: float | None
+    end: float | None
+    new: int
+    expected: int
+    verdict: str
+
+
+@dataclass(frozen=True)
+class Proof:
+    """The ORDER SAFETY PROOF section's verdict, reason, undeclared rows and table (6.6)."""
+
+    verdict: str
+    reason: str | None = None
+    undeclared: tuple[OrderRow, ...] = ()
+    declared: tuple[OrderRow, ...] = ()
+    rows: tuple[ProofRow, ...] = ()
+    cancel_all: str = "not_needed"              # what Cancel All did before the final read (choice 6)
+    start_sha256: str | None = None             # the Monitor reads the proof compared (choice 8)
+    end_sha256: str | None = None
+
+    def __post_init__(self):
+        if self.verdict not in (PROVEN_NONE, PROVEN_DECLARED, PROVEN_NO_SESSION, UNPROVEN, ORDERS_SENT):
+            raise ValueError(f"proof verdict {self.verdict!r}")
+        if self.cancel_all not in ("not_needed", "done", "failed"):
+            raise ValueError(f"cancel_all {self.cancel_all!r}")
+        if (self.verdict == UNPROVEN) != (self.reason is not None) or (self.reason and self.reason not in UNPROVEN_REASONS):
+            raise ValueError(f"proof reason {self.reason!r} with {self.verdict}")
+        if (self.verdict == ORDERS_SENT) != bool(self.undeclared):
+            raise ValueError(f"{self.verdict} with {len(self.undeclared)} undeclared row(s): ORDERS SENT exactly when "
+                             "a row is undeclared (6.6)")
+
+    @property
+    def proven(self) -> bool:
+        return self.verdict.startswith("PROVEN")
+
+    @property
+    def line(self) -> str:
+        """The VERDICT line in the text form of 6.6, as the Reporter's Safety row and abort block print it (9.2):
+        `PROVEN: ...`, `UNPROVEN: <reason>`, or `ORDERS SENT: undeclared rows (<rows>); Cancel All <verified|failed>`
+        (`Cancel All not needed` when no undeclared row was Working, choice 5)."""
+        return proof_line(self.verdict_code, self.reason, [r.key for r in self.undeclared], self.cancel_all_code)
+
+    @property
+    def verdict_code(self) -> str:
+        """The 8.3 `post_run_proofs.verdict` of this proof."""
+        return VERDICT_CODES[self.verdict]
+
+    @property
+    def cancel_all_code(self) -> str:
+        """The 8.3 `post_run_proofs.cancel_all` of this proof."""
+        return CANCEL_ALL_CODES[self.cancel_all]
+
+    @property
+    def counts(self) -> dict:
+        """The 8.3 `post_run_proofs.counts_json` of this proof: per table line (working, filled and canceled
+        orders, position statement rows: start, end, new, expected; net liq: start, end, drift) and its verdict,
+        and the undeclared and declared row keys the ORDERS SENT and declared-sends lines name (choice 8)."""
+        rows: dict[str, dict] = {}
+        for r in self.rows:
+            if r.name == "net liq":
+                drift = None if r.start is None or r.end is None else round(abs(r.end - r.start), 2)
+                rows[r.name] = {"start": r.start, "end": r.end, "drift": drift, "verdict": r.verdict}
+            else:
+                rows[r.name] = {"start": r.start, "end": r.end, "new": r.new, "expected": r.expected,
+                                "verdict": r.verdict}
+        return {"rows": rows, "undeclared": [r.key for r in self.undeclared],
+                "declared": [r.key for r in self.declared]}
+
+
+def proof_line(verdict_code: str, reason: str | None, undeclared: Sequence[str], cancel_all_code: str) -> str:
+    """The 6.6 VERDICT line of a proof from its 8.3 row (verdict and cancel_all codes, the reason and the undeclared
+    row keys of counts_json), so a proof read back from the store prints as `Proof.line` does (choice 8)."""
+    verdict = next(v for v, c in VERDICT_CODES.items() if c == verdict_code)
+    if verdict == ORDERS_SENT:
+        cancel = next(k for k, c in CANCEL_ALL_CODES.items() if c == cancel_all_code)
+        return f"{ORDERS_SENT} ({', '.join(undeclared)}); Cancel All {CANCEL_ALL_TEXT[cancel]}"
+    if verdict == UNPROVEN:
+        return f"{UNPROVEN}: {reason}"
+    return verdict
+
+
+def book_sha256(book: OrderBook | None) -> str | None:
+    """The sha256 of a Monitor read in canonical JSON form (8.3 `start_snapshot_sha256`, choice 8); None for none."""
+    if book is None:
+        return None
+    return hashlib.sha256(json.dumps(asdict(book), sort_keys=True).encode()).hexdigest()
+
+
+def _new_rows(start: OrderBook, end: OrderBook) -> dict[str, list[OrderRow]]:
+    out = {}
+    for g in GRIDS:
+        before = {r.key for r in start.rows(g)}
+        out[g] = [r for r in end.rows(g) if r.key not in before]
+    return out
+
+
+def post_run_proof(p: ProofInputs) -> Proof:
+    """The proof verdict from the inputs (6.6 Post-run proof, Runs without a usable session), with what
+    Cancel All did recorded on it."""
+    return replace(_proof(p), cancel_all=p.cancel_all, start_sha256=book_sha256(p.start), end_sha256=book_sha256(p.end))
+
+
+def _proof(p: ProofInputs) -> Proof:
+    if p.session == "never" and p.tokens_issued == 0:
+        return Proof(PROVEN_NO_SESSION)
+    if p.session == "kicked" and not p.kicked_login_ok:
+        return Proof(UNPROVEN, "session_unavailable")
+    if p.recovery_login_ok is False:
+        return Proof(UNPROVEN, "recovery_login_failed")
+    if p.start is None:
+        return Proof(UNPROVEN, "snapshot_missing")
+    if p.end is None or not (p.end.readable and p.end.copy_all_agrees and p.start.readable
+                             and p.start.copy_all_agrees):
+        return Proof(UNPROVEN, "monitor_unreadable")         # either Monitor read failed its cross-check (6.6)
+    new = _new_rows(p.start, p.end)
+    declared = tuple(r for g in ("working", "canceled") for r in new[g] if r.key in p.declared_sends)
+    undeclared = tuple(r for g in GRIDS for r in new[g] if r.key not in p.declared_sends or g == "filled")
+    rows = [ProofRow(f"{g} orders", len(p.start.rows(g)), len(p.end.rows(g)), len(new[g]),
+                     sum(1 for r in new[g] if r.key in p.declared_sends and g != "filled"),
+                     "ok" if all(r.key in p.declared_sends and g != "filled" for r in new[g]) else "UNDECLARED")
+            for g in GRIDS]
+    pos_change = p.end.position_rows - p.start.position_rows
+    rows.append(ProofRow("position statement rows", p.start.position_rows, p.end.position_rows, max(pos_change, 0), 0,
+                         "ok" if pos_change == 0 else "changed"))
+    drift = None if p.start.net_liq is None or p.end.net_liq is None else abs(p.end.net_liq - p.start.net_liq)
+    rows.append(ProofRow("net liq", p.start.net_liq, p.end.net_liq, 0, 0,
+                         "ok" if drift is not None and drift <= p.net_liq_tolerance else "drift"))
+    if undeclared:                                       # a clean read: an order was sent (choice 5)
+        return Proof(ORDERS_SENT, None, undeclared, declared, tuple(rows))
+    if p.cancel_all == "failed":                         # with no undeclared row (choice 5)
+        return Proof(UNPROVEN, "cancel_all_failed", (), declared, tuple(rows))
+    if pos_change != 0 or drift is None or drift > p.net_liq_tolerance:
+        return Proof(UNPROVEN, "monitor_unreadable", (), declared, tuple(rows))
+    return Proof(PROVEN_DECLARED if declared else PROVEN_NONE, None, (), declared, tuple(rows))
+
+
+def proof_result(proof: Proof, *, run_so_far: RunVerdict | None = None, unproven_streak: int = 0) -> ControlResult:
+    """The run effect of a proof (6.6): ORDERS SENT (undeclared rows), UNPROVEN, or a passing proof.
+
+    `unproven_streak` counts the UNPROVEN results on this login just before this one.
+    """
+    ev = {"verdict": proof.line, "undeclared": [r.key for r in proof.undeclared], "cancel_all": proof.cancel_all}
+    if proof.verdict == ORDERS_SENT:
+        acts = ("block_login", "disable_rig")
+        run, un = safety_abort_outcome("teardown", "undeclared_order_row")
+        return ControlResult("proof", False, "teardown", run=run, unreached=un,
+                             alert=alerts.safety_abort().plus(paged=("login_owner",)), actions=acts, incident="S1",
+                             detail=proof.line, evidence=ev)
+    if not proof.proven:
+        keep = run_so_far is not None and run_so_far.status == "aborted_safety"
+        twice = unproven_streak + 1 >= 2
+        return ControlResult(
+            "proof", False, "teardown", run=None if keep else RunVerdict("complete_with_env_errors", "unproven_proof"),
+            alert=alerts.unproven_proof(), actions=("block_login",) + (("disable_rig",) if twice else ()),
+            findings=(FindingSpec("harness_error", "two UNPROVEN proofs in a row on one login: the proof reader is "
+                                  "suspect", detail="proof flow"),) if twice else (),
+            detail=proof.line, evidence=ev)
+    return ControlResult("proof", True, "teardown", detail=proof.line, evidence=ev)
+
+
+# -- the sequence on a rig --------------------------------------------------------------------------------
+@dataclass
+class KillSwitchReport:
+    """What `execute_kill_switch` did: the decision, the proof and each step with its monotonic time."""
+
+    result: ControlResult
+    proof: Proof
+    proof_effect: ControlResult
+    steps: list[tuple[str, float]] = field(default_factory=list)
+
+
+def recovery_login(rig: Rig, allowlist: Allowlist, clock: Clock, fixture_account: str | None) -> bool:
+    """A fresh scripted login with A1 and A2 (6.6 step 5): relaunch, LOGIN, an allowlisted selector, the fixture
+    account selected. True when the session is usable for the proof."""
+    rig.launch()
+    o = rig.login()
+    if o.auth_error or o.challenge or o.session_kicked or o.live_selected or not o.vault_lease \
+            or o.main_window_s is None or not o.post_login_anchor:
+        return False
+    reads = [rig.read_account_selector()]
+    try:
+        verdict = judge_identity(reads, allowlist)
+    except ValueError:
+        clock.sleep(READ_GAP_S)
+        reads.append(rig.read_account_selector())
+        verdict = judge_identity(reads, allowlist)
+    if not verdict.passed:
+        return False
+    if fixture_account is not None and reads[-1].text != fixture_account:
+        rig.select_account(fixture_account)
+        after = rig.read_account_selector().text
+        return after == fixture_account and after in allowlist      # A1 holds for the selected account too (6.4)
+    return True
+
+
+def cancel_new_working(rig: Rig, start: OrderBook | None, end: OrderBook, *, clock: Clock,
+                       declared_sends: Sequence[str] = (),
+                       steps: list[tuple[str, float]] | None = None) -> tuple[str, OrderBook]:
+    """6.6 step 5: when a fresh read of Working shows a row not in the start snapshot, click `Cancel All` and
+    re-read every 5 s until no new undeclared row is Working or 60 s pass (choice 4). Returns what Cancel All
+    did (`not_needed`, `done`, `failed`) and the last read."""
+    if start is None or not end.readable or not _new_rows(start, end)["working"]:
+        return "not_needed", end
+    res = rig.cancel_all()
+    if steps is not None:
+        steps.append(("cancel_all", clock.monotonic()))
+    deadline = clock.monotonic() + CANCEL_REREAD_S
+    cancel = "done" if res.located and res.clicked else "failed"
+    while cancel == "done":
+        end = rig.read_orders()
+        if not [r for r in _new_rows(start, end)["working"] if r.key not in declared_sends]:
+            break
+        if clock.monotonic() >= deadline:
+            cancel = "failed"
+            break
+        clock.sleep(CANCEL_POLL_S)
+    return cancel, end
+
+
+def execute_kill_switch(rig: Rig, decision: ControlResult, *, clock: Clock, allowlist: Allowlist,
+                        start: OrderBook | None, fixture_account: str | None = None,
+                        declared_sends: Sequence[str] = (), run_so_far: RunVerdict | None = None,
+                        unproven_streak: int = 0) -> KillSwitchReport:
+    """Drive steps 1, 3, 5 and 6 of the 6.6 sequence on `rig` after `kill_switch` decided (steps 2 and 4 are
+    the decision's unreached outcome and alert, written by the caller)."""
+    steps: list[tuple[str, float]] = []
+    rig.set_hook_state(armed=False, deny_all=True)
+    steps.append(("deny_all", clock.monotonic()))
+    rig.kill_process_tree()
+    steps.append(("kill_tree", clock.monotonic()))
+    cancel = "not_needed"
+    end: OrderBook | None = None
+    login_ok = recovery_login(rig, allowlist, clock, fixture_account)
+    steps.append(("recovery_login", clock.monotonic()))
+    if login_ok:
+        cancel, end = cancel_new_working(rig, start, rig.read_orders(), clock=clock, declared_sends=declared_sends,
+                                         steps=steps)
+    proof = post_run_proof(ProofInputs(start=start, end=end, recovery_login_ok=login_ok, cancel_all=cancel,
+                                       declared_sends=frozenset(declared_sends)))
+    steps.append(("proof", clock.monotonic()))
+    rig.revert_snapshot()
+    steps.append(("revert_snapshot", clock.monotonic()))
+    return KillSwitchReport(decision, proof, proof_result(proof, run_so_far=run_so_far or decision.run,
+                                                          unproven_streak=unproven_streak), steps)
+
+
+def teardown_incident(found: Proof, decision: ControlResult, ks: KillSwitchReport) -> ControlResult:
+    """The one control result, so the one 9.10 page, of an undeclared row found by the teardown proof (6.6, 9.10).
+
+    `found` is the teardown read's ORDERS SENT proof, `decision` its `proof_result` (the `aborted_safety` that ran
+    the kill switch sequence) and `ks` what the sequence did. The incident pages once, after the sequence, with what
+    `Cancel All` finally did (choice 7): the sequence's own result when its proof is ORDERS SENT; otherwise (the
+    recovery login failed, or the fresh Monitor read was unreadable) the decision's safety page, run outcome and
+    unreached outcome, with the sequence's actions and findings added and both reads named in the detail.
+    """
+    final = ks.proof_effect
+    if ks.proof.verdict == ORDERS_SENT:
+        return final
+    rows = ", ".join(r.key for r in found.undeclared)
+    return replace(decision, actions=tuple(dict.fromkeys(decision.actions + final.actions)),
+                   findings=decision.findings + final.findings,
+                   detail=f"{ORDERS_SENT} ({rows}) at teardown; after the kill switch sequence: {ks.proof.line}",
+                   evidence={**final.evidence, "teardown_undeclared": [r.key for r in found.undeclared]})

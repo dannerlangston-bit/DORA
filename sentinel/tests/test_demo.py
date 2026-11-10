@@ -109,15 +109,20 @@ def test_backend_only_money_cell_diff_needs_a_human(runs):
     text = assert_outputs(out)
     outs, finds, counts = stored(out, r.run_id)
     assert_legal(outs)
-    (s07,) = [o for o in outs if o.checkpoint_id == S07]
-    assert (s07.outcome, s07.reason) == ("needs_human", "no_manifest")
+    (s07,) = [o for o in outs if o.checkpoint_id == S07]           # case (b): the scope plans the smoke flows
+    # The Oracle's R02 bracket (2.8.3: 50 to 100 percent of notional on margin) catches the 0.05 percent surcharge;
+    # an assertion outranks the comparison rows, which alone would give needs_human (no_manifest) (3.11 row 8).
+    assert (s07.outcome, s07.reason, s07.assertion_ids) == ("assertion_failed", "assertion:R02", ["R02"])
     assert (s07.stability, s07.stability_cause) == ("unknown", "not_recapturable")
     assert any(rd.region_id == "rgn.confirm.bp-effect" and rd.above_threshold for rd in s07.diff.regions)
-    assert counts["needs_human"] == 1 and counts["collateral"] == 0 and counts["intended"] == 0
-    assert not [f for f in finds if f.kind == "manifest_missing"]
-    assert "flow.trade.order-ticket.stock.limit" in r.extra_flows
+    assert counts["assertion_failed"] == 1 and counts["needs_human"] == 0 and counts["collateral"] == 0
+    assert counts["intended"] == 0 and not [f for f in finds if f.kind == "manifest_missing"]
     assert "No manifest and no UI code touched" in text and "needs_human (reason: no_manifest)" in text
-    assert "-15,032.51" in [f for f in finds if f.checkpoint_id == S07][0].description
+    (f07,) = [f for f in finds if f.checkpoint_id == S07]
+    assert "-15,032.51" in f07.description and f07.region_id == "rgn.confirm.bp-effect"
+    raw = f07.evidence["raw_values"]
+    assert raw["candidate.rgn.confirm.bp-effect.ocr"].startswith("'-15,032.51'")
+    assert raw["base.rgn.confirm.bp-effect.ocr"].startswith("'-15,025.00'") and raw["label"] == "bracket check"
 
 
 def test_ui_change_without_a_manifest_is_collateral(runs):
@@ -152,6 +157,10 @@ def test_nightly_canary_goes_blind_on_a_money_cell(runs):
     assert body["detector_state"] == "detector_blind" and body["not_simulated"]
     detected = {r.mutant_id for r in n1.canary["report"].results if r.state == "detected"}
     assert {"M01", "M02", "M03", "M04", "M05", "M12", "M26", "M28"} <= detected
+    runs_ = json.loads((out / "orchestrator.json").read_text())       # every run went through the gate machine
+    assert [r["run_id"] for r in runs_] == [n1.run_id, n2.run_id, pr.run_id]
+    assert all(s["verdict"] == "complete" and s["proof"] == "PROVEN: no orders sent" for r in runs_ for s in r["shards"])
+    assert n1.shards[0]["gates"][3]["control"] == "paper_mode" and json.loads((out / "alerts.json").read_text()) == []
 
 
 def test_decision_inheritance_suppresses_and_inherits(runs):
@@ -171,6 +180,10 @@ def test_decision_inheritance_suppresses_and_inherits(runs):
     assert "mark_intended (intended)" in text and r2.commit_status["state"] == "success"
     assert r1.commit_status["state"] == "failure"
     assert {f.decision_ref for f in stored(out, r1.run_id)[1] if f.decision_ref}   # the first run's findings carry them
+    # the summary explains why the second run still stores 20 collateral findings with only 2 collateral outcomes
+    second = (out / "summary.txt").read_text().split(f"Run {r2.run_id}", 1)[1]
+    assert "Findings stored: 20 collateral, 4 intended, 8 invariant_violation" in second
+    assert "; 26 of them carry an earlier human decision (the PR comment's 'Suppressed by decision' table" in second
 
 
 def test_same_scenario_twice_gives_identical_outcomes_and_comment(tmp_path, runs):

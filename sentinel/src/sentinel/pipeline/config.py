@@ -69,6 +69,7 @@ class SentinelConfig:
     quarantine: frozenset[str]
     send_policy: str
     fixture: dict = field(default_factory=dict)
+    send_policy_ref: str = "OPEN"                 # the risk owner decision of policy/send_policy.yaml (6.6, 8.3)
 
     @classmethod
     def load(cls, root: str | Path) -> "SentinelConfig":
@@ -95,7 +96,7 @@ class SentinelConfig:
             entitlements=frozenset("margin" if k == "margin" else k for k in kinds if k),
             quarantine=frozenset(x for x in q if x),
             send_policy="no_sends" if not ((send.data or {}).get("enabled") if send else False) else "gated",
-            fixture=fixture)
+            fixture=fixture, send_policy_ref=str((send.data or {}).get("decision") or "OPEN") if send else "OPEN")
 
     # -- helpers ---------------------------------------------------------------------------
     def regions_doc(self, checkpoint_id: str, surface_id: str, kind: str, host: str | None) -> dict | None:

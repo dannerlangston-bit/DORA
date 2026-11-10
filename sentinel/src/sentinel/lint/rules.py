@@ -495,8 +495,8 @@ _SCHEMA_OF: dict[str, tuple[str, str]] = {      # doc kind -> (schema name, rule
     "ladders": ("ladders", "L-SRF-03"), "workspace": ("workspace", "L-WSP-00"),
     "flow": ("flow", "L-FLW-00"), "renames": ("renames", "L-FLW-03"), "regions": ("regions", "L-RGN-00"),
     "redaction": ("redaction", "L-MSK-03"), "mask": ("mask", "L-MSK-00"), "fixture": ("fixture", "L-FIX-00"),
-    "allowlist": ("allowlist", "L-FIX-00"), "profile": ("profile", "L-FIX-05"),
-    "configs_allowed": ("configs-allowed", "L-WSP-05"), "send_policy": ("send-policy", "L-FLW-08"),
+    "allowlist": ("allowlist", "L-FIX-00"), "margin_rules": ("margin-rules", "L-FIX-00"),
+    "profile": ("profile", "L-FIX-05"), "configs_allowed": ("configs-allowed", "L-WSP-05"), "send_policy": ("send-policy", "L-FLW-08"),
     "explorer_budget": ("explorer-budget", "L-XREF-14"), "branches": ("branches", "L-XREF-15"),
     "quarantine": ("quarantine", "L-XREF-11"),
 }
@@ -1379,6 +1379,9 @@ class _Linter:
                 break
             keys = [_s(st.get("key")).casefold()] if st.get("type") == "press" else \
                 [_s(x).casefold() for x in _l(st.get("keys"))] if st.get("type") == "key_chord" else []
+            # a type_fixture (or secret) step that commits with Enter presses Enter too (6.2)
+            if st.get("type") in ("type_fixture", "secret") and _s(st.get("commit")).casefold() == "enter":
+                keys.append("enter")
             if any(x in ENTER_KEYS for x in keys):
                 self.add("L-FLW-07", f, f"step {st.get('id')} presses Enter or Space while the order is staged", f"steps[{st.get('id')}]")
         if closed is None:

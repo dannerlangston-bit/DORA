@@ -155,16 +155,34 @@ def test_plan_order_and_ids_follow_2_11_and_the_4_1_grammar(inputs):
 # -- the no-manifest cases (4.3, 2.11, F5) ---------------------------------------------------
 
 def test_backend_only_pr_without_manifest_is_case_b(inputs):
-    plan = pr(inputs, manifest=None, changed_classes={"com.tos.desktop.net.Codec"})
+    flows = inputs["flows"] + [
+        replace(inputs["flows"][0], flow_id="flow.trade.fixture-reset", flow_class="fixture_reset"),   # not standard
+        replace(inputs["flows"][0], flow_id="flow.trade.tier2-ticket", tier=2),                        # not tier 1
+    ]
+    plan = pr(inputs, manifest=None, changed_classes={"com.tos.desktop.net.Codec"}, flows=flows)
     assert plan.manifest_state == "no_manifest_nonui" and not plan.intended_enabled
     assert plan.x_input(CHART) == "no_manifest_nonui"
     assert "manifest_missing" not in [f.kind for f in plan.findings]
-    gaps = [f.evidence["raw_values"] for f in plan.findings if f.kind == "dependency_map_gap"]
-    assert gaps == [{"reason": "unowned_root", "unowned_root": "com.tos.desktop.net.Codec"}]
+    # Codec reaches QuoteClient and no surface: a backend class is not an unowned-root gap (2.11)
+    assert "dependency_map_gap" not in [f.kind for f in plan.findings]
     assert plan.scope_surfaces == frozenset()
     smoke = {s.id for s in inputs["registry"] if s.smoke}
-    assert {cp.surface_id for cp in plan.planned} == smoke   # the smoke census alone: no sweep, no flow
-    assert {cp.test_kind for cp in plan.planned} == {"census"}
+    assert {cp.surface_id for cp in plan.planned} == smoke   # the smoke census plus flows on smoke surfaces
+    assert {cp.test_kind for cp in plan.planned} == {"census", "flow"}   # no sweep: smoke adds census only
+    # case (b): the tier-1 standard flows whose surfaces meet the smoke subset still run (2.11)
+    assert {cp.flow_id for cp in plan.planned if cp.test_kind == "flow"} == {
+        "flow.trade.active-trader.ticket", "flow.trade.order-ticket.futures.single-leg"}
+    assert all(it.protected for it in plan.items if it.kind == "flow")   # on smoke surfaces: never budget-cut
+
+
+def test_case_b_flows_need_a_smoke_surface_and_pass_the_common_filters(inputs):
+    plan = pr(inputs, manifest=None, changed_classes={"com.tos.desktop.net.Codec"}, entitlements=("margin",))
+    assert {cp.flow_id for cp in plan.planned if cp.test_kind == "flow"} == {"flow.trade.active-trader.ticket"}
+    ent = {c.checkpoint.flow_id for c in plan.cuts if c.reason == "entitlement" and c.checkpoint.flow_id}
+    assert ent == {"flow.trade.order-ticket.futures.single-leg"}          # requires futures (common_filters)
+    off_smoke = replace(inputs["flows"][0], flow_id="flow.analyze.risk", surfaces=("analyze.risk-profile",))
+    plan = pr(inputs, manifest=None, changed_classes={"com.tos.desktop.net.Codec"}, flows=[off_smoke])
+    assert [cp for cp in plan.planned if cp.test_kind == "flow"] == []
 
 
 def test_ui_pr_without_manifest_is_case_a(inputs):
@@ -206,7 +224,7 @@ def test_static_impact_edge_missing_from_the_map_is_a_dependency_map_gap(inputs)
                                    "com.tos.desktop.ui.grid.CellContentAdapter -> "
                                    "com.tos.desktop.charts.flexgrid.level2cell.Level2CellView")
     assert gaps[0].primitive == "FlexibleGrid" and gaps[0].tier == 2
-    assert raws[1:] == [{"reason": "unowned_root", "unowned_root": "com.tos.desktop.util.Strings"}]
+    assert raws[1:] == []                         # util.Strings is unowned but reaches no surface: no gap (2.11)
     assert L2_CELL in plan.scope_surfaces and ids(plan, L2_CELL, "census")    # still looked at
     assert plan.proposed_edges == [Edge("FlexibleGrid", L2_CELL, "static_analysis", 1.0, True, CANDIDATE, raws[0]["evidence"])]
 

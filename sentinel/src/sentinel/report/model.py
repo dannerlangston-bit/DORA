@@ -17,7 +17,9 @@ Inputs beyond the records, and where each comes from:
   `wall_clock`, `budget`, `shards`, `fingerprint` {candidate, base}, `reviewer` {cost_usd, tier,
   top_tier_usd}, `canary` {money_detected, money_total, other_detected, other_total,
   detector_state, date}, `safety` {attestation, paper_mode_asserted, gateway_drops, cancel_all,
-  proof, login}, `integrations` {pr_comment {state, time}, jira_queued, slack {queued, to, posts}},
+  proof (a 6.6 verdict in one of the `PROOF_FORMS`), login (a label or a list of labels)},
+  `integrations` {pr_comment {state, time},
+  jira_queued, slack {queued, to, posts}},
   optional `env_errors` [{gate, shard, screenshot}], `shard_rerun_queued`, `steps` (counts).
   Counts that outcome rows determine (env and harness errors, not settled, re-runs, Reviewer
   calls, layout shift) are computed here, never read from `health`.
@@ -50,6 +52,17 @@ Choices where 9.2 is silent (reported to the coordinator):
   per surface" (9.3 says "per cell" for its Flexible Grid cells; no record carries that noun).
 - Comparable scope for the coverage percent is in-scope cells minus `not_run (entitlement)`
   minus not-compared (blocked) cells (2.12: blocked cells are not in the coverage percent).
+- The Coverage table keeps the 2.12 surface-and-persona cells; beneath it one line counts the run's `not_run`
+  checkpoints per reason ("Checkpoints not run: 7 app_crash (sweep steps after the crash)", `not_run_line`), so
+  checkpoints that a cell's worse outcome hides from the table are still shown; no line when none is not_run.
+- A run that stopped before scope (no coverage tiers and no scope facts) prints "Scope not computed" in place
+  of an empty Coverage table, and an unread fingerprint prints "not read". An `aborted_safety` that disabled
+  several rigs names them all; an `aborted_harness` that re-queuing cannot fix prints "Not re-queued: {why}"
+  (abort key `not_requeued`). ORDERS SENT, the most severe proof verdict (6.6), adds the blocked login and
+  disabled rig to the Safety row and the abort block (`ORDERS_SENT_NOTE`).
+- `safety.login` is the readable label of the login the worst proof blocks, or a list of them when several
+  shards' proofs block theirs ("logins A and B"); a `vault://` reference handed in place of a label is never
+  printed (`login_phrase`, 6.9).
 - `aborted_safety` and `aborted_harness` replace Unexpected and Intended with the abort block
   and keep Suppressed, Coverage and Run health; `pool_saturated` and `dead_man` comments carry
   only the header and the abort text; a secret leak carries only the header, result, check and
@@ -80,6 +93,19 @@ FINDING_ONLY = {"dependency_map_gap": MAP_GAP, "manifest_missing": MANIFEST_MISS
 NOT_RUN_ORDER = ("scope", "budget", "entitlement", "quarantine", "step_failed", "base_step_failed",
                  "app_crash", "model_unavailable")
 NOT_COMPARED = ("env_error", "not_settled", "not_comparable", "landmark_missing", "not_run")
+# 1.10 not_run reasons, as the checkpoint line under the Coverage table says which checkpoints they are (9.2)
+NOT_RUN_WHICH = {
+    "scope": "outside the run's scope",
+    "budget": "cut by the budget",
+    "entitlement": "the login is not entitled to",
+    "quarantine": "in quarantine",
+    "step_failed": "after a failed step",
+    "base_step_failed": "the base build could not reach",
+    "app_crash": "after the crash",
+    "model_unavailable": "skipped while the model was unavailable",
+}
+CHECKPOINT_NOUNS = {"sweep": "sweep step", "split": "splitter step", "flow": "flow checkpoint",
+                    "census": "census checkpoint"}
 
 # 2.7 Layout invariants, "Statement" column.
 INVARIANT_STATEMENTS = {
@@ -122,6 +148,47 @@ class ReportInputError(ValueError):
     """The inputs cannot be rendered faithfully (unknown mode, vocabulary or shape)."""
 
 
+# 6.6: the post-run proof verdict forms the Reporter prints (`Proof.line`), least to most severe. ORDERS SENT means
+# a clean read found an undeclared order row: an order was sent (the run is aborted_safety, S1).
+PROOF_FORMS = ("PROVEN: ", "UNPROVEN: ", "ORDERS SENT: ")
+PROVEN_PROOF, UNPROVEN_PROOF, ORDERS_SENT_PROOF = range(3)
+ORDERS_SENT_NOTE = ("an order reached the account: {login} blocked and {rig} disabled until a human verifies "
+                    "the account and the incident closes")
+# what a login prints as when the Reporter is handed its vault reference (4.9 `login_ref`), which it never prints
+VAULT_LOGIN = "(vault reference not printed)"
+
+
+def login_phrase(login: str | list[str] | tuple[str, ...] | None) -> str:
+    """9.2's "login {alias}" for the login or logins a proof blocks: `login rig-01 paper login`, or `logins A and B`
+    for several. Each is the readable label the run gives (6.4); a `vault://` reference is never printed (6.9,
+    4.9 L-FIX-04) and reads as `VAULT_LOGIN`."""
+    names = [login] if isinstance(login, str) or login is None else list(login)
+    shown = list(dict.fromkeys(VAULT_LOGIN if "vault://" in (n or "") else (n or "unknown") for n in names))
+    return ("login " if len(shown) <= 1 else "logins ") + (words_and(shown) or "unknown")
+
+
+def orders_sent_note(login: str | list[str] | tuple[str, ...] | None) -> str:
+    """`ORDERS_SENT_NOTE` for the login or logins a proof blocks (`login_phrase`)."""
+    several = not (isinstance(login, str) or login is None) and len(set(login)) > 1
+    return ORDERS_SENT_NOTE.format(login=login_phrase(login), rig="rigs" if several else "rig")
+
+
+def proof_severity(proof: str) -> int:
+    """How severe a post-run proof verdict is: `PROVEN_PROOF`, `UNPROVEN_PROOF` or `ORDERS_SENT_PROOF`, the most
+    severe (6.6). Any other text is refused."""
+    for severity, form in enumerate(PROOF_FORMS):
+        if proof.startswith(form):
+            return severity
+    raise ReportInputError(f"post-run proof verdict {proof!r} (6.6)")
+
+
+def worst_proof(proofs: list[str]) -> str:
+    """The most severe of several proof verdicts (one per shard), the first of equals; 6.6, 8.2."""
+    if not proofs:
+        raise ReportInputError("no post-run proof verdict (6.6)")
+    return max(proofs, key=proof_severity)
+
+
 @dataclass(frozen=True)
 class ReportContext:
     """Run-level facts 9.2 prints that no outcome record holds."""
@@ -134,7 +201,7 @@ class ReportContext:
     base_reused_from: str | None = None          # merge run whose frozen base captures were reused (3.1)
     detector_banner: str | None = None           # 10.3 banner text, verbatim
     reviewer_disabled: dict | None = None        # {"since": date, "gate": eval gate name} (10.4)
-    abort: dict = field(default_factory=dict)    # abort block facts, see `_abort_block`
+    abort: dict = field(default_factory=dict)    # abort block facts, see `_abort`
     history: tuple[dict, ...] = ()               # earlier runs: {run_id, candidate, result, counts, reported}
     marker_recreated: bool = False               # 9.1: the marker comment was missing; a new one was made
     report_late: bool = False                    # 9.1: posted after the PR run's budget deadline
@@ -239,6 +306,7 @@ class RunReport:
     coverage_rows: list[tuple[str, ...]]
     coverage_cells: list[dict]               # 2.12 matrix cells from the summary, when it carries them
     scope_line: Line
+    not_run_line: Line | None                # 9.2: every not_run reason among the run's checkpoints, counted
     health_rows: list[tuple[str, Line]]
     history: tuple[dict, ...]
     outcomes: list[CheckpointOutcome]
@@ -402,6 +470,8 @@ class _Prose:
         else:
             text = self.b.description(cl) or (rep.finding.description if rep.finding else "") or ""
         rng = self.range_summary(cl, rep, group)
+        if text and rng and not text.endswith((".", "!", "?")):
+            text += "."                                   # a record's description may lack the full stop
         return (T(" ".join(x for x in (text, rng) if x)),)
 
     def range_summary(self, cl: Cluster, rep: Member, group: int) -> str:
@@ -1010,7 +1080,32 @@ def coverage_rows(coverage: dict) -> list[tuple[str, ...]]:
     return rows
 
 
+def not_run_line(outcomes: list[CheckpointOutcome]) -> Line | None:
+    """9.2's line under the Coverage table: the checkpoint count of every `not_run` reason in the run, in 1.10 order,
+    each with which checkpoints they are ("Checkpoints not run: 7 app_crash (sweep steps after the crash)"). The
+    table counts surface-and-persona cells (2.12), where a cell takes its worst outcome, so not_run checkpoints
+    inside a cell that also holds a worse outcome show only here. None when no checkpoint is not_run."""
+    by: dict[str, list[CheckpointOutcome]] = {}
+    for o in outcomes:
+        if o.outcome == "not_run" and o.reason:
+            code = o.reason.split(":", 1)[0]                # step_failed:<step> counts under step_failed
+            if code not in NOT_RUN_ORDER:
+                raise ReportInputError(f"not_run reason {code!r} is not in 1.10")
+            by.setdefault(code, []).append(o)
+    if not by:
+        return None
+    parts = []
+    for code in sorted(by, key=NOT_RUN_ORDER.index):
+        kinds = {checkpoint_parts(o.checkpoint_id)["kind"] for o in by[code]}
+        noun = CHECKPOINT_NOUNS.get(kinds.pop(), "checkpoint") if len(kinds) == 1 else "checkpoint"
+        n = len(by[code])
+        parts.append(f"{n} {code} ({noun if n == 1 else noun + 's'} {NOT_RUN_WHICH[code]})")
+    return (T("Checkpoints not run: " + ", ".join(parts)),)
+
+
 def scope_line(b: _Builder) -> Line:
+    if not b.coverage.get("tiers") and not b.coverage.get("scope"):
+        return (T(f"Scope not computed: the run stopped at {b.run.last_gate} before it planned any checkpoint."),)
     s = b.coverage.get("scope", {})
     n_decl = int(s.get("declared_surfaces", len(b.declared)))
     edges = int(s.get("edges", 0))
@@ -1117,14 +1212,16 @@ def _canary_row(c: dict) -> Line:
 
 def _safety_row(s: dict) -> Line:
     proof = s.get("proof", "unknown")
-    if not (proof.startswith("PROVEN: ") or proof.startswith("UNPROVEN: ")):
-        raise ReportInputError(f"post-run proof verdict {proof!r} (6.6)")
+    severity = proof_severity(proof)
     text = (f"attestation {s.get('attestation', 'unknown')}, paper mode asserted "
             f"{plural(int(s.get('paper_mode_asserted', 0)), 'time')}, "
             f"gateway {plural(int(s.get('gateway_drops', 0)), 'drop')}, "
             f"Cancel All {s.get('cancel_all', 'unknown')}, proof {proof}")
-    if proof.startswith("UNPROVEN"):
-        text += f"; next run on login {s.get('login', 'unknown')} blocked until a human verifies the account"
+    login = s.get("login", "unknown")
+    if severity == ORDERS_SENT_PROOF:
+        text += "; " + orders_sent_note(login)
+    elif severity == UNPROVEN_PROOF:
+        text += f"; next run on {login_phrase(login)} blocked until a human verifies the account"
     return (T(text),)
 
 
@@ -1175,7 +1272,9 @@ def health_rows(b: _Builder, items: list[Item], intended_clusters: list[Cluster]
     fp = h.get("fingerprint", {})
     cand, base = fp.get("candidate", "unknown"), fp.get("base", "unknown")
     fp_text = f"candidate {cand} = base {base}" if cand == base else f"candidate {cand} != base {base}"
-    if cand == base and b.ctx.candidate_build != b.ctx.base_build:
+    if "unknown" in (cand, base):
+        fp_text = "not read"
+    elif cand == base and b.ctx.candidate_build != b.ctx.base_build:
         fp_text += " (build id differs, as expected)"
     if b.ctx.base_reused_from:
         fp_text += f"; base captures reused from {b.ctx.base_reused_from}"
@@ -1263,9 +1362,17 @@ def _abort(b: _Builder, members: list[Member]) -> tuple[str | None, str | None, 
         img = b.urls.image("screenshot", a.get("screenshot"))
         if img is not None:
             lines.append((T("Last screenshot: "), Link("screenshot", img.url)))
-        proof = a.get("proof") or b.health.get("safety", {}).get("proof", "unknown")
-        lines += [(T(f"Post-run proof: {proof}"),), (T(f"Incident: {a.get('incident', 'unknown')}"),),
-                  (T(f"No run starts on rig {a.get('rig', 'unknown')} until the incident closes."),)]
+        safety = b.health.get("safety", {})
+        proof = a.get("proof") or safety.get("proof", "unknown")
+        lines.append((T(f"Post-run proof: {proof}"),))
+        if proof != "unknown" and proof_severity(proof) == ORDERS_SENT_PROOF:
+            note = orders_sent_note(a.get("login") or safety.get("login", "unknown"))
+            lines.append((T(note[0].upper() + note[1:] + "."),))
+        rigs = a.get("rig", "unknown")
+        rigs = [rigs] if isinstance(rigs, str) else list(rigs)
+        lines += [(T(f"Incident: {a.get('incident', 'unknown')}"),),
+                  (T(f"No run starts on {'rig' if len(rigs) == 1 else 'rigs'} {words_and(rigs)} until the incident "
+                     "closes."),)]
         listed = [m for m in members if not m.suppressed]
         if listed:
             lines.append((T(f"{plural(len(listed), 'finding')} recorded before the abort, collapsed on the "),
@@ -1288,7 +1395,10 @@ def _abort(b: _Builder, members: list[Member]) -> tuple[str | None, str | None, 
         img = b.urls.image("screenshot", a.get("screenshot"))
         if img is not None:
             lines.append((T("Screenshot: "), Link("screenshot", img.url)))
-        lines.append((T(f"Re-queued once: {a.get('requeued') or 'already re-queued'}"),))
+        if a.get("not_requeued"):                        # re-queuing cannot help, e.g. a config that fails lint
+            lines.append((T(f"Not re-queued: {a['not_requeued']}"),))
+        else:
+            lines.append((T(f"Re-queued once: {a.get('requeued') or 'already re-queued'}"),))
         return special, "Abort", lines
     return None, None, []
 
@@ -1371,6 +1481,7 @@ def build_report(run: RunOutcome, outcomes: list[CheckpointOutcome], findings: l
         reconciliation=b.reconciliation(), needs_baseline_line=nb_line,
         suppressed=b.suppressed_rows(clusters), coverage_rows=coverage_rows(b.coverage),
         coverage_cells=list(b.coverage.get("cells", [])), scope_line=scope_line(b),
+        not_run_line=not_run_line(b.outcomes),
         health_rows=health_rows(b, items, intended_clusters), history=tuple(context.history), outcomes=b.outcomes)
 
 

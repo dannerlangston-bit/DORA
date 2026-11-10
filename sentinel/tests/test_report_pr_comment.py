@@ -7,8 +7,9 @@ from dataclasses import replace
 import pytest
 
 from sentinel.records import Classification, CheckpointOutcome, Finding, RunOutcome
-from sentinel.report import ReportContext, comment_marker, render_pr_comment
-from sentinel.report.model import ReportInputError
+from sentinel.report import ReportContext, build_report, comment_marker, render_pr_comment, render_run_report_html
+from sentinel.report.model import (ORDERS_SENT_PROOF, PROVEN_PROOF, UNPROVEN_PROOF, ReportInputError, proof_severity,
+                                   worst_proof)
 from sentinel.report.pr_comment import ZWSP
 
 from test_report_sample import AT, RUN_ID, render, sample
@@ -106,6 +107,48 @@ def test_no_session_established_blocks_nothing():
     assert "proof PROVEN: no session established |" in text and "blocked until" not in text
 
 
+ORDERS_SENT_LINE = "ORDERS SENT: undeclared rows (sim-order-1); Cancel All verified"
+
+
+def test_orders_sent_is_accepted_and_rendered_as_the_most_severe_proof():
+    s = sample()
+    s["run"] = _run("aborted_safety", "undeclared_order_row", "teardown")
+    s["context"] = _ctx(abort={"trigger": "undeclared_order_row", "gate": "teardown", "incident": "S1",
+                               "rig": "rig-2", "proof": ORDERS_SENT_LINE})
+    s["health"]["safety"].update(proof=ORDERS_SENT_LINE, cancel_all="verified", login="paper-07")
+    text = render_pr_comment(**s)
+    assert "Result: **aborted_safety (reason: undeclared_order_row)**" in text
+    block = text.split("**Abort**\n", 1)[1].split("\n\n", 1)[0].splitlines()
+    assert block[:5] == [
+        "- Trigger: undeclared_order_row",
+        "- Gate: teardown",
+        f"- Post-run proof: {ORDERS_SENT_LINE}",
+        "- An order reached the account: login paper-07 blocked and rig disabled until a human verifies the account "
+        "and the incident closes.",
+        "- Incident: S1",
+    ]
+    assert (f"Cancel All verified, proof {ORDERS_SENT_LINE}; an order reached the account: login paper-07 blocked "
+            "and rig disabled until a human verifies the account and the incident closes |") in text
+    assert "Check `sentinel/pr-run`: error (informational). aborted_safety: incident S1" in text
+
+
+def test_proof_severity_orders_the_five_verdicts_and_refuses_anything_else():
+    assert [proof_severity(p) for p in ("PROVEN: no orders sent", "PROVEN: only declared sends",
+                                        "PROVEN: no session established", "UNPROVEN: monitor_unreadable",
+                                        ORDERS_SENT_LINE)] == [PROVEN_PROOF] * 3 + [UNPROVEN_PROOF, ORDERS_SENT_PROOF]
+    assert worst_proof(["PROVEN: no orders sent", "UNPROVEN: snapshot_missing", ORDERS_SENT_LINE,
+                        "UNPROVEN: monitor_unreadable"]) == ORDERS_SENT_LINE
+    assert worst_proof(["PROVEN: no orders sent", "UNPROVEN: snapshot_missing", "UNPROVEN: monitor_unreadable"]) \
+        == "UNPROVEN: snapshot_missing"                          # the first of equals
+    for bad in ("orders sent: x1", "PROVEN", "unknown"):
+        with pytest.raises(ReportInputError, match="post-run proof verdict"):
+            proof_severity(bad)
+    s = sample()
+    s["health"]["safety"]["proof"] = "ORDERS SENT x1"
+    with pytest.raises(ReportInputError, match="post-run proof verdict"):
+        render_pr_comment(**s)
+
+
 def test_aborted_budget_shows_what_ran_and_the_unfinished_scope():
     s = sample()
     s["run"] = _run("aborted_budget", "wall_clock", "running")
@@ -178,6 +221,31 @@ def test_aborted_harness_names_reason_gate_and_requeue():
     assert "error (informational). aborted_harness: config_invalid" in text
     s["context"] = _ctx(abort={})
     assert "- Re-queued once: already re-queued" in render_pr_comment(**s)
+
+
+def test_a_config_abort_before_scope_says_what_was_not_done_instead_of_empty_tables():
+    s = sample()
+    s["run"] = _run("aborted_harness", "config_invalid", "provisioned")
+    s["outcomes"], s["findings"], s["coverage"] = [], [], {}
+    s["health"] = {"wall_clock": "1:00", "safety": s["health"]["safety"]}
+    s["context"] = _ctx(abort={"rule_ids": ["L-MSK-02"], "not_requeued": "the same config would fail again"},
+                        base_reused_from=None)
+    text = render_pr_comment(**s)
+    assert "- Not re-queued: the same config would fail again" in text and "Re-queued once" not in text
+    coverage = text.split("**Coverage**\n", 1)[1].split("\n\n", 1)[0]
+    assert coverage == "Scope not computed: the run stopped at provisioned before it planned any checkpoint."
+    assert "| Fingerprint | not read |" in text and "unknown = base" not in text
+    page = render_run_report_html(build_report(**s))
+    section = page.split('<section id="coverage">', 1)[1].split("</section>", 1)[0]
+    assert "Scope not computed" in section and "<table" not in section
+
+
+def test_an_abort_on_several_rigs_names_every_rig():
+    s = sample()
+    s["run"] = _run("aborted_safety", "live_identity", "paper_mode_asserted")
+    s["context"] = _ctx(abort={"trigger": "live_identity", "gate": "paper_mode_asserted", "incident": "S1",
+                               "rig": ["rig-01", "rig-02", "rig-03"]})
+    assert "- No run starts on rigs rig-01, rig-02 and rig-03 until the incident closes." in render_pr_comment(**s)
 
 
 def test_aborted_harness_preflight_reason():

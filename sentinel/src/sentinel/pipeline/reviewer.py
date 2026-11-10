@@ -37,7 +37,7 @@ SIMULATED_MODEL_ID = "simulated-reviewer-offline"
 SIMULATED_PROMPT_HASH = "sim-1"
 SCHEMA_VERSION = "reviewer-1"
 TASKS = ("manifest_match", "describe_collateral", "manifest_visibility")
-VERDICTS = tuple(load().list("reviewer_verdicts")) + ("not_applicable",)
+VERDICTS = tuple(load().list("reviewer_verdicts"))          # 3.13 verdict enum; task C answers not_applicable
 CHANGE_TYPES = ("overlap", "missing_element", "added_element", "clipped_text", "shifted", "resized", "text_change",
                 "color_change", "color_semantic_flip", "other")
 # 3.12 task B: "the closest defect class"; a defect that hides or breaks content outranks a move.

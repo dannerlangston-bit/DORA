@@ -285,7 +285,7 @@ class _Painter:
         strip = (x, y, w, strip_h)
         self.fill(strip, THEME["panel"])
         self.record(f"{name}.strip", "order_strip", strip, parent)
-        by, bh = y + 4, strip_h - 8
+        by, bh = y + 4, strip_h - 6
         parts = [("qty", (x + 6, by, 48, bh), "1", "default"), ("buy", (x + 60, by, 80, bh), "BUY MKT", "buy"),
                  ("sell", (x + 146, by, 80, bh), "SELL MKT", "sell")]
         for key, rect, label, style in parts:

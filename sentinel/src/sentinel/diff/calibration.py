@@ -313,12 +313,12 @@ class CalibrationFile:
                 fl = c.floors[rid]
                 regions[rid] = {
                     "thresholds": {"component_area_min": th.component_area_min, "changed_px_min": th.changed_px_min,
-                                   "delta_e_min": round(th.delta_e_min, 6), "shift_px_min": th.shift_px_min},
-                    "floors": {"changed_px": fl.changed_px, "pixel_fraction": fl.pixel_fraction,
+                                   "delta_e_min": float(th.delta_e_min), "shift_px_min": th.shift_px_min},
+                    "floors": {"changed_px": fl.changed_px, "pixel_fraction": float(fl.pixel_fraction),
                                "components": fl.components, "component_area": fl.component_area,
                                "largest_bbox": list(fl.largest_bbox) if fl.largest_bbox else None,
-                               "delta_e": round(fl.delta_e, 6), "shift_px": fl.shift_px,
-                               "ssim_min": round(fl.ssim_min, 6), "ssim_block_min": round(fl.ssim_block_min, 6)},
+                               "delta_e": float(fl.delta_e), "shift_px": fl.shift_px,
+                               "ssim_min": float(fl.ssim_min), "ssim_block_min": float(fl.ssim_block_min)},
                 }
             fixes = [{"region_id": f.region_id, "cause": f.cause, "outcome": f.outcome, "reason": f.reason,
                       "floor_exception": _exception_dict(f.floor_exception)} for f in c.fix_list]

@@ -7,6 +7,7 @@ from sentinel.records import (Classification, CheckpointOutcome, Component, Deci
                               RegionDiff, Signature, StepOutcome)
 from sentinel.report import build_report, render_pr_comment
 from sentinel.report.cluster import Member, cluster_members, hamming
+from sentinel.report.inline import plain
 from sentinel.report.model import COLLATERAL
 
 from test_report_sample import AT, ENTRY, RUN_ID, sample
@@ -185,30 +186,31 @@ def test_unexpected_ranking_follows_tier_then_kind_order_then_confidence_then_no
     add("base-failed", "not_run", reason="base_step_failed")
     add("invariant", "invariant_violation", reason="INV-01", invariant_ids=["INV-01"])
     add("crash", "assertion_failed", reason="assertion:app_alive", detail="jvm_crash")
-    text = render_pr_comment(**s)
-    order = [h.split("] ", 1)[1].split("**")[0] for h in _item_headers(text)]
+    report = build_report(**s)
+    order = [plain(i.header).split("] ", 1)[1] for i in report.unexpected]
     expected = [
-        "assertion_failed (assertion: app_alive) on `charts.crash`",
-        "invariant_violation (comparison not_run, reason: base_step_failed) on `charts.base-failed`",
-        "invariant_violation on `charts.invariant`",
-        "assertion_failed (assertion: qty-equals) on `charts.assertion`",
-        "collateral on `charts.collateral-new`",       # novel before seen-before, same tier and kind
-        "collateral on `charts.collateral-old`",
-        "needs_human (reason: uncalibrated) on `charts.uncalibrated`",
-        "needs_human (reason: reviewer_no_match) on `charts.declared`",
-        "landmark_missing (reason: landmark:hdr) on `charts.landmark-cand`",
-        "unregistered_surface (reason: probe:P3) on `charts.unregistered`",
-        "needs_human (reason: reviewer_uncertain) on `charts.uncertain-high`",   # confidence descending
-        "needs_human (reason: reviewer_uncertain) on `charts.uncertain-low`",
-        "needs_baseline (reason: new_surface) on `charts.undeclared-new`",
-        "step failed on `trade.ticket`, flow `flow.trade.ticket` step `s03`",
-        "step passed_via_agent_fallback on `trade.ticket`, flow `flow.trade.ticket` step `s04`",
+        "assertion_failed (assertion: app_alive) on charts.crash",
+        "invariant_violation (comparison not_run, reason: base_step_failed) on charts.base-failed",
+        "invariant_violation on charts.invariant",
+        "assertion_failed (assertion: qty-equals) on charts.assertion",
+        "collateral on charts.collateral-new",       # uncalibrated ranks with collateral (9.2);
+        "needs_human (reason: uncalibrated) on charts.uncalibrated",   # novel before seen-before
+        "collateral on charts.collateral-old",
+        "needs_human (reason: reviewer_no_match) on charts.declared",
+        "landmark_missing (reason: landmark:hdr) on charts.landmark-cand",
+        "unregistered_surface (reason: probe:P3) on charts.unregistered",
+        "needs_human (reason: reviewer_uncertain) on charts.uncertain-high",   # confidence descending
+        "needs_human (reason: reviewer_uncertain) on charts.uncertain-low",
+        "needs_baseline (reason: new_surface) on charts.undeclared-new",
+        "step failed on trade.ticket, flow flow.trade.ticket step s03",
+        "step passed_via_agent_fallback on trade.ticket, flow flow.trade.ticket step s04",
         "dependency_map_gap",
         "manifest_missing",
         "unknown_popup",
-        "invariant_violation on `charts.t2-invariant`",   # tier 2 after every tier-1 kind
+        "invariant_violation on charts.t2-invariant",   # tier 2 after every tier-1 kind
     ]
     assert [o.split(", checkpoint")[0] for o in order] == expected
+    text = render_pr_comment(**s)
     assert "charts.landmark-both" not in text.split("**Intended")[0]   # both sides: not compared, not Unexpected
     assert "1 checkpoints `needs_baseline` on declared new surfaces" in text
     assert "Check `sentinel/pr-run`: failure (informational). 12 tier-1 findings have no decision" in text

@@ -452,3 +452,575 @@ class CheckpointDef:
     tier: Any
     file: str
     flow: str | None = None
+
+
+# -- the linter ------------------------------------------------------------------------------------
+
+_SCHEMA_OF: dict[str, tuple[str, str]] = {      # doc kind -> (schema name, rule id for its failures)
+    "build": ("build", "L-BLD-00"), "manifest": ("manifest", "L-MAN-00"),
+    "dependency_map": ("dependency-map", "L-DEP-00"), "surface": ("surface", "L-SRF-00"),
+    "ladders": ("ladders", "L-SRF-03"), "workspace": ("workspace", "L-WSP-00"),
+    "flow": ("flow", "L-FLW-00"), "renames": ("renames", "L-FLW-03"), "regions": ("regions", "L-RGN-00"),
+    "redaction": ("redaction", "L-MSK-03"), "mask": ("mask", "L-MSK-00"), "fixture": ("fixture", "L-FIX-00"),
+    "allowlist": ("allowlist", "L-FIX-00"), "profile": ("profile", "L-FIX-05"),
+    "configs_allowed": ("configs-allowed", "L-WSP-05"), "send_policy": ("send-policy", "L-FLW-08"),
+    "explorer_budget": ("explorer-budget", "L-XREF-14"), "branches": ("branches", "L-XREF-15"),
+    "quarantine": ("quarantine", "L-XREF-11"),
+}
+_CATALOGS = {"popups": ("popup", "L-POP-00", "popups"), "mutants": ("mutant", "L-MUT-00", "mutants")}
+
+
+class _Linter:
+    """One lint pass over a loaded repository; `run()` returns the violations."""
+
+    def __init__(self, repo: Repo, phase: int, today: date, flow_p50_s: dict[str, float] | None):
+        self.r = repo
+        self.phase = phase
+        self.today = today
+        self.now = datetime.combine(today, time(0), tzinfo=timezone.utc)
+        self.p50 = flow_p50_s or {}
+        self.tax = load_taxonomy()
+        self.out: list[Violation] = []
+        self._index()
+
+    # -- reporting -------------------------------------------------------------------------------
+
+    def add(self, rule: str, file: str, message: str, path: str = "", severity: str | None = None) -> None:
+        self.out.append(Violation(file, rule, severity or RULES[rule].severity, path, message))
+
+    def _phase_sev(self, until_phase: int) -> str:
+        return "warn" if self.phase < until_phase else "error"
+
+    # -- index -----------------------------------------------------------------------------------
+
+    def _index(self) -> None:
+        r = self.r
+        self.surfaces: dict[str, dict] = {}
+        self.surface_file: dict[str, str] = {}
+        self.controls: dict[str, tuple[str, dict]] = {}
+        for doc in r.of("surface"):
+            sid = _d(doc.data).get("id")
+            if isinstance(sid, str) and sid not in self.surfaces:
+                self.surfaces[sid] = doc.data
+                self.surface_file[sid] = doc.rel
+                for c in _l(doc.data.get("controls")):
+                    if isinstance(_d(c).get("id"), str):
+                        self.controls.setdefault(f"{sid}.{c['id']}", (sid, c))
+        dm = r.one("dependency_map")
+        self.depmap_file = dm.rel if dm else "registry/dependency-map.yaml"
+        self.depmap = _d(dm.data) if dm else {}
+        self.primitives = {p["id"]: p for p in map(_d, _l(self.depmap.get("primitives"))) if isinstance(p.get("id"), str)}
+        self.edges = [_d(e) for e in _l(self.depmap.get("edges"))]
+        self.workspaces: dict[str, tuple[str, dict]] = {}
+        for doc in r.of("workspace"):
+            wid = _d(doc.data).get("id")
+            if isinstance(wid, str):
+                self.workspaces.setdefault(wid, (doc.rel, doc.data))
+        self.flows: dict[str, Doc] = {}
+        for doc in r.of("flow"):
+            fid = _d(doc.data).get("flow_id")
+            if isinstance(fid, str):
+                self.flows.setdefault(fid, doc)
+        self.fixtures = {d.data["fixture_id"]: d for d in r.of("fixture") if isinstance(_d(d.data).get("fixture_id"), str)}
+        self.profiles = {d.data["id"]: d.data for d in r.of("profile") if isinstance(_d(d.data).get("id"), str)}
+        self.builds: dict[str, dict] = {}
+        self.pairs: list[tuple[str, dict]] = []
+        for doc in r.of("build"):
+            b, p = _d(doc.data).get("build"), _d(doc.data).get("build_pair")
+            if isinstance(b, dict) and isinstance(b.get("build_id"), str):
+                self.builds.setdefault(b["build_id"], b)
+            if isinstance(p, dict):
+                self.pairs.append((doc.rel, p))
+        self.regions: dict[str, Doc] = {d.rel[len("regions/"):-len(".yaml")]: d for d in r.of("regions")}
+        self.masks: dict[tuple[str, str], Doc] = {}
+        for doc in r.of("mask"):
+            m = _d(doc.data)
+            self.masks.setdefault((_s(m.get("checkpoint_id")), _s(m.get("mask_id"))), doc)
+        b = r.one("branches")
+        self.branches = _d(b.data) if b else {}
+        sp = r.one("send_policy")
+        self.send_policy = _d(sp.data) if sp else {}
+        eb = r.one("explorer_budget")
+        self.explorer_budget = _d(eb.data) if eb else {}
+        rn = r.one("renames")
+        self.renames = [_d(x) for x in _l(_d(rn.data).get("renames"))] if rn else []
+        self.renames_file = rn.rel if rn else "flows/RENAMES.yaml"
+        self.retired = {x.get("old") for x in self.renames if x.get("new") == "retired"}
+        red = r.one("redaction")
+        self.redaction = [_d(x) for x in _l(_d(red.data).get("regions"))] if red else []
+        self.ladder_sizes = self._ladder_sizes()
+        self.defined: dict[str, CheckpointDef] = {}
+        self._define_checkpoints()
+
+    def _ladder_sizes(self) -> list[tuple[int, int]]:
+        doc = self.r.one("ladders")
+        sizes: list[tuple[int, int]] = []
+        for lad in map(_d, _l(_d(doc.data).get("ladders")) if doc else []):
+            for st in map(_d, _l(lad.get("steps"))):
+                w, h = st.get("w"), st.get("h")
+                if isinstance(w, int) and isinstance(h, int) and (w, h) not in sizes:
+                    sizes.append((w, h))
+        if not doc:
+            sizes = list(dict.fromkeys(LADDER_S + LADDER_F_GRID + ((240, 160),)))
+        return sizes
+
+    def _define_checkpoints(self) -> None:
+        for sid, s in self.surfaces.items():
+            file, mode, tier = self.surface_file[sid], s.get("data_mode"), s.get("tier")
+            census = _d(s.get("census"))
+            if census.get("enabled", True):
+                dims = [(k, _l(v)) for k, v in _d(census.get("dimensions")).items()]
+                combos = list(itertools.product(*[[f"{k}={v}" for v in vals] for k, vals in dims])) if dims else [()]
+                for ws in _l(census.get("workspaces")):
+                    for combo in combos:
+                        cid = f"census/{sid}/{ws}" + (f"/{','.join(combo)}" if combo else "")
+                        self.defined.setdefault(cid, CheckpointDef(cid, "census", sid, mode, tier, file))
+            if s.get("resizable") is True:
+                for host in _l(s.get("hosts")):
+                    for w, h in self.ladder_sizes:
+                        cid = f"sweep/{sid}/{host}/{w}x{h}"
+                        self.defined.setdefault(cid, CheckpointDef(cid, "sweep", sid, mode, tier, file))
+            for sp in map(_d, _l(s.get("splitters"))):
+                fractions = [f for f in (_l(sp.get("fractions")) or SPLIT_FULL) if _num(f) is not None]
+                for f in fractions:
+                    if f in (0.0, 1.0) and not sp.get("collapsible"):
+                        continue
+                    cid = f"split/{sid}/{sp.get('id')}/{float(f):.2f}"
+                    self.defined.setdefault(cid, CheckpointDef(cid, "split", sid, mode, tier, file))
+        for fid, doc in self.flows.items():
+            for st in self._seq(doc.data):
+                if st.get("type") == "checkpoint" and isinstance(st.get("checkpoint_id"), str):
+                    sid = _s(st.get("surface_id"))
+                    tier = st.get("tier", _d(self.surfaces.get(sid)).get("tier"))
+                    cid = st["checkpoint_id"]
+                    self.defined.setdefault(cid, CheckpointDef(cid, "flow", sid, _s(st.get("data_mode")), tier, doc.rel, fid))
+
+    @staticmethod
+    def _seq(flow: Any) -> list[dict]:
+        """Steps then teardown: the order a flow runs in after its preconditions."""
+        f = _d(flow)
+        return [_d(x) for x in _l(f.get("steps")) + _l(f.get("teardown"))]
+
+    @staticmethod
+    def _all_steps(flow: Any) -> list[tuple[str, dict]]:
+        f = _d(flow)
+        return [(sec, _d(x)) for sec in ("normalize", "preconditions", "steps", "teardown") for x in _l(f.get(sec))]
+
+    def region_map(self, cid: str) -> dict[str, dict]:
+        """Region id -> region of the regions file of a checkpoint (empty when there is none)."""
+        doc = self.regions.get(cid)
+        return {x["id"]: x for x in map(_d, _l(_d(doc.data).get("regions") if doc else [])) if isinstance(x.get("id"), str)}
+
+    def expand(self, spec: Any) -> set[str]:
+        """Registry ids an edge's surface names: an id, a `<prefix>.*` glob or `*` (4.4)."""
+        if spec == "*":
+            return set(self.surfaces)
+        if isinstance(spec, str) and spec.endswith(".*"):
+            return {s for s in self.surfaces if s.startswith(spec[:-1])}
+        return {spec} if spec in self.surfaces else set()
+
+    def rungs(self, target: str) -> int:
+        """How many locator rungs a target has: the template, plus JAB (branch A only), plus OCR text."""
+        ctl = self.controls.get(target)
+        if not ctl:
+            return 0
+        c = ctl[1]
+        return (1 if c.get("template") else 0) + (1 if c.get("jab") and self.branches.get("jab") == "A" else 0) \
+            + (1 if c.get("ocr_text") else 0)
+
+    def png(self, rel: Any) -> tuple[str | None, int, int, int]:
+        """(error, width, height, bytes) of a repository PNG."""
+        if not isinstance(rel, str) or not self.r.exists(rel):
+            return (f"{rel} does not exist", 0, 0, 0)
+        p = self.r.path(rel)
+        try:
+            with Image.open(p) as im:
+                fmt, (w, h) = im.format, im.size
+        except (OSError, ValueError) as exc:
+            return (f"{rel} is not an image: {exc}", 0, 0, 0)
+        if fmt != "PNG":
+            return (f"{rel} is {fmt}, not PNG", w, h, 0)
+        return (None, w, h, p.stat().st_size)
+
+    def hosted(self) -> set[str]:
+        """The derived hosted-surface list of the tier A workspaces (choice 4)."""
+        out: set[str] = set()
+        for _rel, w in self.workspaces.values():
+            if w.get("tier") == "A":
+                out |= {x for x in _l(w.get("gadgets_present")) if isinstance(x, str)}
+                out |= {_d(p).get("surface") for p in _l(w.get("active_trader_panels")) if isinstance(_d(p).get("surface"), str)}
+        grew = True
+        while grew:
+            more = {sid for sid, s in self.surfaces.items() if s.get("parent") in out} - out
+            out |= more
+            grew = bool(more)
+        return out
+
+    def order_surface(self, sid: str) -> bool:
+        return "OrderTicketCore" in _l(_d(self.surfaces.get(sid)).get("primitives"))
+
+    # -- run -------------------------------------------------------------------------------------
+
+    def run(self) -> list[Violation]:
+        for check in (self.check_schemas, self.check_builds, self.check_manifests, self.check_depmap,
+                      self.check_surfaces, self.check_ladders, self.check_workspaces, self.check_flows,
+                      self.check_renames, self.check_regions, self.check_masks, self.check_fixtures,
+                      self.check_popups, self.check_mutants, self.check_fingerprint_schema, self.check_xref):
+            check()
+        return sorted(set(self.out))
+
+    # -- schemas (4.1) ---------------------------------------------------------------------------
+
+    def check_schemas(self) -> None:
+        for doc in self.r.docs.values():
+            if doc.kind in _CATALOGS:
+                name, rule, key = _CATALOGS[doc.kind]
+                if doc.error:
+                    self.add(rule, doc.rel, doc.error)
+                    continue
+                items = doc.data if isinstance(doc.data, list) else _d(doc.data).get(key)
+                if not isinstance(items, list):
+                    self.add(rule, doc.rel, f"must be a list of {name} entries (4.10, 4.11)")
+                    continue
+                for i, item in enumerate(items):
+                    for loc, msg in schemas.validate(name, item):
+                        self.add(rule, doc.rel, msg, f"[{i}]" + (f".{loc}" if loc else ""))
+                continue
+            if doc.kind not in _SCHEMA_OF:
+                continue
+            name, rule = _SCHEMA_OF[doc.kind]
+            if doc.error:
+                self.add(rule, doc.rel, doc.error)
+                continue
+            for loc, msg in schemas.validate(name, doc.data):
+                self.add(rule, doc.rel, msg, loc)
+
+    # -- 4.2 builds ------------------------------------------------------------------------------
+
+    def check_builds(self) -> None:
+        seen: dict[str, str] = {}
+        for doc in self.r.of("build"):
+            b = _d(_d(doc.data).get("build"))
+            if not b:
+                continue
+            bid, ch, sha = b.get("build_id"), b.get("channel"), _s(b.get("commit_sha"))
+            if bid in seen:
+                self.add("L-BLD-01", doc.rel, f"build_id {bid} also defined in {seen[bid]}", "build.build_id")
+            seen.setdefault(bid, doc.rel)
+            want = f"{ch}-{b.get('version_string')}-{sha[:7]}"
+            if bid != want:
+                self.add("L-BLD-01", doc.rel, f"build_id {bid} must be {want}", "build.build_id")
+            method = b.get("install_method")
+            if method == "artifact" and not _d(b.get("artifact")).get("sha256"):
+                self.add("L-BLD-02", doc.rel, "install_method artifact requires artifact.sha256", "build.artifact")
+            if method == "snapshot" and not b.get("snapshot_id"):
+                self.add("L-BLD-02", doc.rel, "install_method snapshot requires snapshot_id", "build.snapshot_id")
+            for f in ("branch", "merge_base_sha"):
+                if ch == "branch" and not b.get(f):
+                    self.add("L-BLD-03", doc.rel, f"branch builds carry {f}", f"build.{f}")
+                if ch != "branch" and f in b:
+                    self.add("L-BLD-03", doc.rel, f"{ch} builds do not carry {f}", f"build.{f}")
+            if ("released_at" in b) != (ch == "released"):
+                self.add("L-BLD-06", doc.rel, "released_at is present if and only if channel is released", "build.released_at")
+        table = {
+            "pr": ("merge_base_main", "branch", "main"), "merge": ("previous_main", "main", "main"),
+            "rc": ("last_released", "rc", "released"), "nightly": ("same_build", None, None),
+            "calibration": ("same_build", None, None),
+        }
+        for rel, p in self.pairs:
+            cand, base, rule, rt = p.get("candidate"), p.get("base"), p.get("base_rule"), p.get("run_type")
+            if rt in table:
+                want_rule, want_c, want_b = table[rt]
+                if rule != want_rule:
+                    self.add("L-BLD-04", rel, f"run_type {rt} requires base_rule {want_rule}, not {rule}", "build_pair.base_rule")
+                cc = _d(self.builds.get(cand)).get("channel", _channel(cand))
+                bc = _d(self.builds.get(base)).get("channel", _channel(base))
+                if want_c and cc != want_c:
+                    self.add("L-BLD-04", rel, f"run_type {rt} requires a {want_c} candidate, not {cc}", "build_pair.candidate")
+                if want_b and bc != want_b:
+                    self.add("L-BLD-04", rel, f"run_type {rt} requires a {want_b} base, not {bc}", "build_pair.base")
+                if rt == "pr":
+                    mb = _s(_d(self.builds.get(cand)).get("merge_base_sha"))
+                    base_sha = _s(_d(self.builds.get(base)).get("commit_sha"))
+                    if not mb:
+                        self.add("L-BLD-04", rel, f"candidate {cand} has no merge_base_sha in builds/", "build_pair.candidate")
+                    elif (base_sha and base_sha != mb) or (not base_sha and not mb.startswith(_short_sha(base))):
+                        self.add("L-BLD-04", rel, f"base {base} is not the candidate's merge base {mb[:7]}", "build_pair.base")
+                if rt == "rc" and not p.get("lineage_baseline_set"):
+                    self.add("L-BLD-04", rel, "rc pairs carry lineage_baseline_set", "build_pair.lineage_baseline_set")
+            if cand == base and rule != "same_build":
+                self.add("L-BLD-05", rel, f"candidate equals base ({cand}) without base_rule same_build", "build_pair")
+
+    # -- 4.3 manifests ---------------------------------------------------------------------------
+
+    def check_manifests(self) -> None:
+        for doc in self.r.of("manifest"):
+            m = _d(doc.data)
+            entries = _l(m.get("entries"))
+            if not entries and not m.get("empty_reason"):
+                self.add("L-MAN-06", doc.rel, "entries is empty and empty_reason is missing", "entries")
+            cand = _s(m.get("candidate"))
+            if (m.get("source") == "union" or _d(self.builds.get(cand)).get("channel", _channel(cand)) in ("main", "rc")) \
+                    and not m.get("approved_by"):
+                self.add("L-MAN-06", doc.rel, "merge and rc manifests carry approved_by", "approved_by")
+            for i, e in enumerate(map(_d, entries)):
+                at = f"entries[{i}]"
+                for s in _l(e.get("declared_surfaces")):
+                    if s not in self.surfaces:
+                        self.add("L-MAN-01", doc.rel, f"declared surface {s} is not in the Surface Registry", f"{at}.declared_surfaces")
+                for p in _l(e.get("touched_primitives")):
+                    if p not in self.primitives:
+                        self.add("L-MAN-02", doc.rel, f"touched primitive {p} is not in the dependency map", f"{at}.touched_primitives")
+                ev, summary = _s(e.get("expected_visual")).strip(), _s(e.get("summary")).strip()
+                if len(ev) < 20 or ev == summary:
+                    self.add("L-MAN-03", doc.rel, "expected_visual needs at least 20 characters and must differ from summary", f"{at}.expected_visual")
+                if "mock_image" in e:
+                    err, w, h, size = self.png(e.get("mock_image"))
+                    if err or w > 1920 or h > 1080 or size > 5 * 1024 * 1024:
+                        self.add("L-MAN-04", doc.rel, err or f"mock is {w}x{h}, {size} bytes; at most 1920x1080 and 5 MB", f"{at}.mock_image")
+                tickets = _l(e.get("tickets"))
+                if not tickets:
+                    self.add("L-MAN-05", doc.rel, "an entry carries at least one ticket", f"{at}.tickets")
+                for t in tickets:
+                    if not (isinstance(t, str) and JIRA.match(t)):
+                        self.add("L-MAN-05", doc.rel, f"ticket {t!r} does not match ^[A-Z][A-Z0-9]+-[0-9]+$", f"{at}.tickets")
+                names = [_d(f).get("name") for f in _l(e.get("feature_flags"))]
+                for n in names:
+                    if not (isinstance(n, str) and FLAG.match(n)):
+                        self.add("L-MAN-08", doc.rel, f"feature flag name {n!r} does not match ^[a-z0-9_.]+$", f"{at}.feature_flags")
+                for n in sorted({n for n in names if isinstance(n, str) and names.count(n) > 1}):
+                    self.add("L-MAN-08", doc.rel, f"feature flag {n} appears twice", f"{at}.feature_flags")
+                touched = set(_l(e.get("touched_primitives")))
+                if not _l(e.get("changed_paths")):
+                    for s in _l(e.get("declared_surfaces")):
+                        if s in self.surfaces and not any(ed.get("primitive") in touched and s in self.expand(ed.get("surface")) for ed in self.edges):
+                            self.add("L-MAN-07", doc.rel, f"declared surface {s} consumes no touched primitive and changed_paths is empty", f"{at}.declared_surfaces")
+
+    # -- 4.4 dependency map ----------------------------------------------------------------------
+
+    def check_depmap(self) -> None:
+        f = self.depmap_file
+        if not self.r.one("dependency_map"):
+            self.add("L-DEP-00", f, "registry/dependency-map.yaml is missing")
+            return
+        seen: set[str] = set()
+        for i, p in enumerate(map(_d, _l(self.depmap.get("primitives")))):
+            pid, at = p.get("id"), f"primitives[{i}]"
+            if pid in seen:
+                self.add("L-DEP-01", f, f"primitive id {pid} is not unique", f"{at}.id")
+            seen.add(pid)
+            if not (isinstance(pid, str) and PASCAL.match(pid)):
+                self.add("L-DEP-01", f, f"primitive id {pid!r} is not PascalCase", f"{at}.id")
+            pkgs = _l(p.get("source_packages"))
+            if not pkgs:
+                self.add("L-DEP-01", f, "a primitive has at least one source_packages entry", f"{at}.source_packages")
+            for g in pkgs:
+                if isinstance(g, str) and g.startswith("TBD."):
+                    self.add("L-DEP-01", f, f"{g} is the unfilled 12.9 placeholder; fill it from the Phase 0 jar listing (11.8)",
+                             f"{at}.source_packages", self._phase_sev(1))
+        pairs: set[tuple[Any, Any]] = set()
+        for i, e in enumerate(self.edges):
+            at, prim, surf = f"edges[{i}]", e.get("primitive"), e.get("surface")
+            p = self.primitives.get(prim)
+            if p is None:
+                self.add("L-DEP-02", f, f"edge primitive {prim} is not in primitives", f"{at}.primitive")
+            if surf == "*":
+                if p is not None and not p.get("global"):
+                    self.add("L-DEP-02", f, f'surface "*" is allowed only for global primitives, not {prim}', f"{at}.surface")
+            elif isinstance(surf, str) and surf.endswith(".*"):
+                if not self.expand(surf):
+                    self.add("L-DEP-02", f, f"glob {surf} matches no registry id", f"{at}.surface")
+            elif surf not in self.surfaces:
+                self.add("L-DEP-02", f, f"surface {surf} is not in the Surface Registry", f"{at}.surface")
+            src, conf = e.get("source"), _num(e.get("confidence"))
+            if src == "declared" and conf != 1.0:
+                self.add("L-DEP-03", f, "declared edges have confidence 1.0", f"{at}.confidence")
+            if src == "static_analysis":
+                if not e.get("evidence"):
+                    self.add("L-DEP-03", f, "static_analysis edges carry evidence", f"{at}.evidence")
+                if conf is None or not 0 < conf <= 1:
+                    self.add("L-DEP-03", f, "static_analysis confidence is in (0, 1]", f"{at}.confidence")
+                if conf == 1.0 and not e.get("confirmed_from_source"):
+                    self.add("L-DEP-03", f, "confidence 1.0 on a static_analysis edge requires confirmed_from_source", f"{at}.confidence")
+            if e.get("confirmed_from_source") and not e.get("confirmed_build"):
+                self.add("L-DEP-03", f, "confirmed_from_source requires confirmed_build", f"{at}.confirmed_build")
+            key = (prim, surf)
+            if key in pairs:
+                self.add("L-DEP-04", f, f"duplicate edge {prim} -> {surf}", at)
+            pairs.add(key)
+            lv = _ts(e.get("last_verified"))
+            if lv and self.now - lv > timedelta(days=90):
+                self.add("L-DEP-07", f, f"last_verified {e.get('last_verified')} is older than 90 days", f"{at}.last_verified")
+        for sid, s in self.surfaces.items():
+            for prim in _l(s.get("primitives")):
+                if prim in self.primitives and not any(e.get("primitive") == prim and sid in self.expand(e.get("surface")) for e in self.edges):
+                    self.add("L-DEP-05", f, f"{sid} lists {prim} but no edge {prim} -> {sid} exists")
+            if not any(sid in self.expand(e.get("surface")) for e in self.edges):
+                self.add("L-DEP-06", f, f"surface {sid} has no incoming edge")
+        for i, e in enumerate(self.edges):
+            prim, surf = e.get("primitive"), e.get("surface")
+            if surf == "*" or _d(self.primitives.get(prim)).get("global"):
+                continue
+            for sid in sorted(self.expand(surf)):
+                if prim not in _l(self.surfaces[sid].get("primitives")):
+                    self.add("L-DEP-05", f, f"edge {prim} -> {surf} but {sid} does not list {prim}", f"edges[{i}]")
+        ladder = "trade.active-trader.ladder"
+        if not any(e.get("primitive") == "FlexibleGrid" and (e.get("surface") == ladder or
+                   (isinstance(e.get("surface"), str) and e["surface"].endswith(".*") and ladder.startswith(e["surface"][:-1])))
+                   for e in self.edges):
+            self.add("L-DEP-08", f, "the edge FlexibleGrid -> trade.active-trader.ladder is missing (Phase 1 exit scenario)")
+
+    # -- 4.5 surfaces ----------------------------------------------------------------------------
+
+    def check_surfaces(self) -> None:
+        seen: dict[str, str] = {}
+        smoke = []
+        hosted = self.hosted()
+        jab_a = self.branches.get("jab") == "A"
+        for doc in self.r.of("surface"):
+            s, f = _d(doc.data), doc.rel
+            sid = s.get("id")
+            if not (isinstance(sid, str) and is_slug(sid)):
+                self.add("L-SRF-01", f, f"id {sid!r} is not a dotted, hyphenated slug", "id")
+                continue
+            if sid in seen:
+                self.add("L-SRF-01", f, f"id {sid} is also defined in {seen[sid]}", "id")
+                continue
+            seen[sid] = f
+            if Path(f).name != f"{sid}.yaml":
+                self.add("L-SRF-01", f, f"file name must be {sid}.yaml", "id")
+            if s.get("smoke") is True:
+                smoke.append(sid)
+            landmarks = [_d(x) for x in _l(s.get("landmarks"))]
+            controls = [_d(x) for x in _l(s.get("controls"))]
+            if s.get("tier") == 1:
+                missing = [what for what, ok in (
+                    ("owner", bool(s.get("owner"))), ("smoke: true", s.get("smoke") is True),
+                    ("a must_see landmark", any(x.get("must_see") is True for x in landmarks)),
+                    ("anti_anchors", bool(_l(s.get("anti_anchors")))), ("labels", bool(_l(s.get("labels")))),
+                    ("a required control", any(c.get("required") is True for c in controls))) if not ok]
+                if missing:
+                    self.add("L-SRF-02", f, "tier 1 requires " + ", ".join(missing))
+            hosts = _l(s.get("hosts"))
+            splitters = [_d(x) for x in _l(s.get("splitters"))]
+            if s.get("resizable") is True:
+                if not hosts:
+                    self.add("L-SRF-03", f, "resizable surfaces list their hosts", "hosts")
+                if s.get("enumerable_by") != "P8" and not splitters:
+                    self.add("L-SRF-03", f, "resizable is set only from probe P8 or a declared splitter", "resizable")
+            if "size_ladder" in s:
+                if s.get("size_ladder") not in self.ladder_ids():
+                    self.add("L-SRF-03", f, f"size_ladder {s.get('size_ladder')} is not in registry/ladders.yaml", "size_ladder")
+                if not s.get("ladder_reason"):
+                    self.add("L-SRF-03", f, "size_ladder requires ladder_reason", "ladder_reason")
+            tw = _d(s.get("target_window"))
+            needs = s.get("kind") == "dialog" or tw.get("kind") in ("dialog", "detached", "popup")
+            if needs and not tw.get("title_regex"):
+                self.add("L-SRF-04", f, "dialog, detached and popup windows require target_window.title_regex", "target_window")
+            if tw.get("kind") == "main" and "title_regex" in tw:
+                self.add("L-SRF-04", f, "a main target window has no title_regex", "target_window.title_regex")
+            if isinstance(tw.get("title_regex"), str):
+                try:
+                    re.compile(tw["title_regex"])
+                except re.error as exc:
+                    self.add("L-SRF-04", f, f"title_regex does not compile: {exc}", "target_window.title_regex")
+            path = [_d(x) for x in _l(s.get("path"))]
+            must_see = {x.get("id") for x in landmarks if x.get("must_see") is True}
+            last = path[-1] if path else {}
+            if last.get("type") != "wait_for" or _d(last.get("anchor")).get("landmark") not in must_see:
+                self.add("L-SRF-05", f, "path ends with a wait_for on a must_see landmark of this surface", "path")
+            for i, st in enumerate(path):
+                for k in TARGET_FIELDS:
+                    t = st.get(k)
+                    if isinstance(t, str) and self.rungs(t) < 2:
+                        why = "does not resolve to a registry control" if t not in self.controls else "resolves on fewer than two rungs"
+                        self.add("L-SRF-05", f, f"path target {t} {why}", f"path[{i}].{k}")
+            templates = [(f"landmarks[{i}].template", x.get("template")) for i, x in enumerate(landmarks)]
+            templates += [(f"controls[{i}].template", x.get("template")) for i, x in enumerate(controls)]
+            templates += [(f"splitters[{i}].template", x.get("template")) for i, x in enumerate(splitters)]
+            for loc, t in templates:
+                err, w, h, _ = self.png(t)
+                if err or not (16 <= w <= 400 and 16 <= h <= 400):
+                    self.add("L-SRF-06", f, err or f"template {t} is {w}x{h}; templates are 16x16 to 400x400", loc)
+            for p in _l(s.get("primitives")):
+                if p not in self.primitives:
+                    self.add("L-SRF-07", f, f"primitive {p} is not in the dependency map", "primitives")
+            if not _l(s.get("roots")):
+                self.add("L-SRF-07", f, "roots is empty", "roots")
+            ids = [c.get("id") for c in controls]
+            for c in sorted({x for x in ids if ids.count(x) > 1}, key=str):
+                self.add("L-SRF-09", f, f"control id {c} is not unique", "controls")
+            for i, c in enumerate(controls):
+                if "jab" in c and not jab_a:
+                    self.add("L-SRF-09", f, "jab fields need phase0/branches.yaml jab: A", f"controls[{i}].jab")
+            census = _d(s.get("census"))
+            if census.get("enabled", True):
+                if not _l(census.get("workspaces")):
+                    self.add("L-SRF-10", f, "census.workspaces is empty while the census is enabled", "census.workspaces")
+                for w in _l(census.get("workspaces")):
+                    if w not in self.workspaces:
+                        self.add("L-SRF-10", f, f"census workspace {w} is not in the corpus", "census.workspaces")
+            for k, vals in _d(census.get("dimensions")).items():
+                for v in _l(vals):
+                    if not is_slug(str(v)):
+                        self.add("L-SRF-10", f, f"dimension value {v!r} of {k} is not a slug", f"census.dimensions.{k}")
+            parent = s.get("parent")
+            if parent is not None:
+                if parent not in self.surfaces:
+                    self.add("L-SRF-11", f, f"parent {parent} is not in the registry", "parent")
+                else:
+                    chain, cur = {sid}, parent
+                    while cur in self.surfaces and cur not in chain:
+                        chain.add(cur)
+                        cur = self.surfaces[cur].get("parent")
+                    if cur in chain:
+                        self.add("L-SRF-11", f, f"parent chain of {sid} has a cycle at {cur}", "parent")
+            for i, x in enumerate(map(_d, _l(s.get("invariant_exceptions")))):
+                exp = _ts(x.get("expires_at"))
+                if not (x.get("owner") and x.get("reason")) or exp is None or exp <= self.now:
+                    self.add("L-SRF-11", f, "an invariant exception carries owner, reason and a future expires_at",
+                             f"invariant_exceptions[{i}]")
+            for i, sp in enumerate(splitters):
+                if sp.get("host") not in hosts:
+                    self.add("L-SRF-13", f, f"splitter host {sp.get('host')} is not in hosts", f"splitters[{i}].host")
+                for fr in _l(sp.get("fractions")):
+                    if fr not in SPLIT_FULL:
+                        self.add("L-SRF-13", f, f"fraction {fr} is not in the 2.5.2 set", f"splitters[{i}].fractions")
+                    elif fr in (0.0, 1.0) and not sp.get("collapsible"):
+                        self.add("L-SRF-13", f, f"fraction {fr} needs collapsible: true", f"splitters[{i}].fractions")
+            if sid not in hosted:
+                self.add("L-SRF-14", f, f"{sid} is hosted by no tier A workspace (gadgets_present or a hosted parent)")
+            if s.get("data_mode") == "masked_live":
+                bare = [c for c in self.defined.values() if c.surface == sid and c.kind != "flow" and not self._has_rule_or_mask(c.cid)]
+                for c in bare:
+                    self.add("L-SRF-08", f, f"masked_live checkpoint {c.cid} has no rule or mask region", "data_mode")
+        if len(smoke) > 40:
+            self.add("L-SRF-15", "registry/surfaces", f"{len(smoke)} surfaces carry smoke: true; the cap is 40")
+
+    def _has_rule_or_mask(self, cid: str) -> bool:
+        return any(x.get("type") in ("rule", "mask") for x in self.region_map(cid).values())
+
+    def ladder_ids(self) -> set[str]:
+        doc = self.r.one("ladders")
+        return {_d(x).get("id") for x in _l(_d(doc.data).get("ladders"))} if doc else set()
+
+    def check_ladders(self) -> None:
+        doc = self.r.one("ladders")
+        if not doc:
+            self.add("L-SRF-03", "registry/ladders.yaml", "registry/ladders.yaml is missing (2.5.2 ladders S and F)")
+            return
+        data = _d(doc.data)
+        by_name = {_d(x).get("name"): _d(x) for x in _l(data.get("ladders"))}
+        want = {"S": [(w, h, "grid") for w, h in LADDER_S],
+                "F": [(w, h, "grid") for w, h in LADDER_F_GRID] + [(w, h, "corner") for w, h in LADDER_F_CORNERS]
+                + [(w, h, "ascending") for w, h in LADDER_F_ASCENDING]}
+        for name, steps in want.items():
+            lad = by_name.get(name)
+            got = [(_d(x).get("w"), _d(x).get("h"), _d(x).get("part", "grid")) for x in _l(_d(lad).get("steps"))]
+            if lad is None or got != steps:
+                self.add("L-SRF-03", doc.rel, f"ladder {name} differs from 2.5.2 (steps, part and order)", "ladders")
+        if _d(by_name.get("F")).get("corpus_sizes") is not True:
+            self.add("L-SRF-03", doc.rel, "ladder F includes the corpus sizes (2.5.2)", "ladders")
+        sets = _d(data.get("splitter_sets"))
+        if tuple(_l(sets.get("full"))) != SPLIT_FULL or tuple(_l(sets.get("short"))) != SPLIT_SHORT:
+            self.add("L-SRF-03", doc.rel, "splitter_sets differ from 2.5.2 (full 0.00..1.00, short 0.15, 0.50, 0.85)", "splitter_sets")

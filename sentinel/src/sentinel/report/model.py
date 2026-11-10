@@ -264,25 +264,22 @@ def _decision_id(o: CheckpointOutcome, f: Finding | None) -> str | None:
     return None
 
 
-def _group(outcome: str, reason: str | None, side: str | None, declared: bool,
-           finding_kind: str | None) -> int | None:
+def _group(category: str, reason: str | None, side: str | None, declared: bool) -> int | None:
+    """The 9.2 kind order of a member, None when the category is not listed in Unexpected."""
     code = reason.partition(":")[0] if reason else None
-    if outcome == "assertion_failed":
+    if category == "assertion_failed":
         return APP_ALIVE if reason == "assertion:app_alive" else ASSERTION
-    if outcome == "invariant_violation":
+    if category == "invariant_violation":
         return INVARIANT
-    if outcome == "not_run" and reason == "base_step_failed":
-        # 9.2: the candidate capture was still checked (3.1)
-        return {"invariant_violation": INVARIANT, "assertion_failed": ASSERTION}.get(finding_kind or "")
-    if outcome == "collateral":
+    if category == "collateral":
         return COLLATERAL
-    if outcome == "needs_human":
+    if category == "needs_human":
         return {"uncalibrated": COLLATERAL, "reviewer_no_match": NO_MATCH}.get(code or "", NEEDS_HUMAN)
-    if outcome == "landmark_missing":
+    if category == "landmark_missing":
         return LANDMARK if side in (None, "candidate") else None
-    if outcome == "unregistered_surface":
+    if category == "unregistered_surface":
         return UNREGISTERED
-    if outcome == "needs_baseline":
+    if category == "needs_baseline":
         return None if declared else NEEDS_BASELINE
     return None
 
@@ -315,21 +312,17 @@ def _member(o: CheckpointOutcome, fs: list[Finding], decisions: dict[str, Decisi
     f = _primary_finding(o, fs)
     did = _decision_id(o, f)
     dec = decisions.get(did) if did else None
-    category = o.outcome
+    kind = f.kind if f else None
+    category, reason = o.outcome, o.reason
     if did and o.outcome in ("noise", "intended"):
         # the decision changed the outcome; the cluster key is the computed category (9.7)
         category = (dec.signature.category if dec else None) or (f.category if f else None) or o.outcome
-    reason = o.reason if not did else None
-    if o.outcome == "not_run" and f is not None and f.kind in ("invariant_violation", "assertion_failed"):
-        category = f.kind
-        group = _group(o.outcome, o.reason, o.side, o.surface_id in declared, f.kind)
-    elif category != o.outcome:
-        group = _group(category, reason, o.side, o.surface_id in declared, f.kind if f else None)
-    else:
-        group = _group(o.outcome, o.reason, o.side, o.surface_id in declared, f.kind if f else None)
+        reason = None
+    elif o.outcome == "not_run" and o.reason == "base_step_failed" and kind in ("invariant_violation",
+                                                                                "assertion_failed"):
+        category = kind   # 9.2: the candidate capture was still checked (3.1)
     side = (f.evidence.get("side") if f else None) or o.side
-    if o.outcome == "landmark_missing" and side not in (None, "candidate"):
-        group = None
+    group = _group(category, reason, side, o.surface_id in declared)
     return Member(o, f, category, group, _region(o, f), did, dec)
 
 

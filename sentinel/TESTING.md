@@ -46,7 +46,7 @@ The scenarios, and what each one should show:
 | `clean-pr` | A declared change that touches only what it declared. | Nothing unexpected, the declared chart cell under Intended, the check passes. |
 | `backend-only` | A backend pricing change with no manifest moves the Buying Power Effect on the Order Confirmation. | The number check (rule R02) fails on that cell and the comment shows both builds' values. |
 | `ui-no-manifest` | A UI change the developer did not declare. | A "manifest missing" finding and the moved cell listed as unexpected. |
-| `wrong-number` | The Order Confirmation shows a cost that is not quantity times price, while every pixel matches. | A failed number check (`cost_math`) with both builds' values, even though the screenshots are identical. |
+| `wrong-number` | The Order Confirmation shows a cost that is not quantity times price. Two digits are swapped; nothing else on the dialog changes. | A failed number check (`cost_math`) showing both builds' values. A screen comparison alone would only say the cost cell changed; the number check says the value is wrong. |
 | `nightly-canary` | The nightly self-test plants known defects. Night 2 has a wrongly placed mask over a money field. | Night 1 all caught. Night 2 says the detector is blind, names the mask, and the next PR comment carries a DETECTOR BLIND banner. |
 | `decision-inheritance` | A tester confirms some findings as bugs and marks others intended, then the next build runs. | Those findings move to "Suppressed by decision" and the check passes. Nothing gets lost. |
 | `paper-mode-mismatch` | The login lands on a live-looking account. | The run stops before capturing anything, every checkpoint says why, and an S1 page goes out. |

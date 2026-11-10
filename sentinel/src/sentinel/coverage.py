@@ -21,12 +21,10 @@ Choices where the spec is ambiguous (each is reported to the coordinator):
 4. Blocked cells (`not_run (blocked:<outcome>)`) stay in the coverage denominator, which drops only
    `not_run (entitlement)` and `not_run (scope)` cells (2.12, 9.11); they are also counted apart
    for run health. Synthetic rows and synthetic (canary) outcome records count nowhere in percent.
-5. The quarantine ceiling is measured in checkpoints as 10.5, 3.10, 9.10 and the 1.5 metric state
-   (2.12 says cells, under which quarantined checkpoints inside a covered cell would vanish): distinct
-   tier-1 checkpoint ids `not_run (quarantine)`, from outcome records or quarantine cuts, over every
-   tier-1 checkpoint id of a registered row in the records and cuts, less those `not_run
-   (entitlement)` or `not_run (scope)`; strictly above 2 percent is red. The cell count stays
-   available for display (`quarantine_cells`).
+5. The quarantine ceiling is counted in checkpoints (2.12, 10.5, 1.5): distinct tier-1 checkpoint
+   ids `not_run (quarantine)`, from outcome records or quarantine cuts, over every tier-1 checkpoint
+   id of a registered row in the records and cuts, less those `not_run (entitlement)` or `not_run
+   (scope)`; strictly above 2 percent is red. The cell share is for display (`quarantine_cells`).
 6. Manifest coverage: an entry's covering checkpoints are every outcome on its declared surfaces;
    "a diff above the noise floor" is an outcome `intended`, `collateral` or `needs_human`, or a
    region diff above threshold. A `needs_human` for `oracle_unreadable`, `bounds_unreadable` or

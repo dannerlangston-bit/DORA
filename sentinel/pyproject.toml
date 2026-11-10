@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sentinel"
+version = "0.1.0"
+description = "Platform-independent core of the Sentinel thinkorswim UI regression system (see ../sentinel-spec)"
+requires-python = ">=3.11"
+dependencies = ["numpy", "opencv-python-headless", "scikit-image", "pyyaml", "jsonschema", "pillow"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+sentinel = "sentinel.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+sentinel = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

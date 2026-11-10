@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import sentinel.orchestrator.attestation as A
 from sentinel.orchestrator import alerts
 from sentinel.orchestrator.attestation import AttestationProfile, RowReads, attest
 from sentinel.orchestrator.clock import ManualClock
@@ -18,7 +19,7 @@ from sentinel.orchestrator.killswitch import (ORDERS_SENT, PROVEN_DECLARED, PROV
                                               UNPROVEN, ProofInputs, TripWires, check_tripwires, execute_kill_switch,
                                               kill_switch, post_run_proof, proof_result)
 from sentinel.orchestrator.results import RunVerdict
-from sentinel.orchestrator.rig import (ConfirmationCheck, HotkeyRow, NotificationsRead, OrderBook, OrderRow,
+from sentinel.orchestrator.rig import (ConfirmationCheck, HotkeyRow, NotificationsRead, OrderBook, OrderRow, Rig,
                                        SelectorRead, SettingRead)
 from sentinel.orchestrator.simrig import EMPTY, GOLDEN, SimScenario, SimulatedRig, default_settings
 
@@ -179,8 +180,6 @@ def test_a11_missing_evidence_is_aborted_harness_and_profile_drift_is_env_error(
 
 
 def test_attestation_reads_and_never_repairs():
-    import sentinel.orchestrator.attestation as A
-    from sentinel.orchestrator.rig import Rig
     assert not [n for n in dir(Rig) if n.startswith(("set_setting", "write_setting", "repair"))]
     assert "repair" not in [n for n in dir(A) if not n.startswith("_")]
 

@@ -43,7 +43,6 @@ from .watchdog import app_failure, dead_man_finalize
 
 GATES = ("provisioned", "launched", "authenticated", "paper_mode_asserted", "settings_attested", "workspace_loaded",
          "fixture_verified", "canary_flow_passed", "running", "teardown", "reported")
-PRE_RUNNING = GATES[:8]
 PREFLIGHT_ITEMS = tuple([f"R{i}" for i in range(1, 8)] + [f"B{i}" for i in range(1, 4)]
                         + [f"H{i}" for i in range(1, 11)] + [f"N{i}" for i in range(1, 8)]
                         + [f"G{i}" for i in range(1, 6)])

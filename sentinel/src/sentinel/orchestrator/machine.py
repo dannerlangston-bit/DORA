@@ -24,7 +24,11 @@ through it; the no-session rule counts the tokens issued outside `class: login` 
 (`GatewayLog.tokens_issued`), since before authentication there is no session in which anything could
 be pressed (F43 names an authentication failure as a no-session case although its credentials were typed). A session
 kicked at the `authenticated` gate leaves no run-start snapshot, so its proof after the fresh login is
-UNPROVEN (`snapshot_missing`): the normal proof has nothing to diff against.
+UNPROVEN (`snapshot_missing`): the normal proof has nothing to diff against. A session that authenticated but
+whose identity was never asserted (the paper-mode gate stopped the run before any session token) is not a
+usable session (6.6 "Runs without a usable session"): with no session token issued its proof is `PROVEN: no
+session established`, so an unreadable selector stays the P2, non-incident outcome 6.4 describes; an
+`aborted_safety` at that gate still runs the full kill switch sequence.
 """
 from __future__ import annotations
 
@@ -38,7 +42,7 @@ from .clock import Clock, SystemClock
 from .gateway import Chord, DropLedger
 from .gates import (AccountExpectation, WorkspaceExpectation, check_authenticated, check_canary_flow, check_fixture,
                     check_launched, check_provisioned, check_teardown, check_workspace, decide_run_outcome)
-from .identity import Allowlist, judge_fixture_account, judge_identity, readable as selector_readable
+from .identity import READ_GAP_S, Allowlist, judge_fixture_account, judge_identity, readable as selector_readable
 from .killswitch import (KillSwitchReport, Proof, ProofInputs, execute_kill_switch, post_run_proof, proof_result,
                          recovery_login)
 from .alerts import AlertRoute
@@ -155,7 +159,8 @@ class Orchestrator:
 
     # -- the gate sequence --------------------------------------------------------------------------------
     def run(self, work: Callable[["Orchestrator"], None] | None = None) -> RunReport:
-        """Run the shard; `work` runs the shard's work items while the state is `running`."""
+        """Run the shard. `work` runs the shard's work items while the state is `running`, reports every control
+        result through `apply` and returns as soon as `stop` is set (a result that set a run outcome)."""
         if self._gates() and self._gate("running"):
             if work is not None:
                 work(self)
@@ -223,7 +228,7 @@ class Orchestrator:
         reads = [rig.read_account_selector()]
         if not selector_readable(reads[0]):
             rig.set_hook_state(armed=True, deny_all=True)          # nothing is pressed while identity is unknown
-            self.clock.sleep(1.0)
+            self.clock.sleep(READ_GAP_S)
             reads.append(rig.read_account_selector())
         r = self.apply(judge_identity(reads, ctx.allowlist,
                                       unreadable_streak=ctx.history.identity_unreadable_streak))
@@ -256,7 +261,7 @@ class Orchestrator:
         rc = ctx.run_type == "rc"
         a10 = rig.read_notifications() if rc and all_match else None
         evidence = {"A1": self._a1, "A2": self._a2, **{i: reads[i].last.screenshot_sha256 for i in SAFETY_ROWS},
-                    "A9": a9.screenshot_sha256 if a9 else None, "A10": "notifications" if a10 else None}
+                    "A9": a9.screenshot_sha256 if a9 else None, "A10": a10.screenshot_sha256 if a10 else None}
         res = attest(reads, ctx.profile, a9=a9, a10=a10, rc_run=rc, evidence=evidence,
                      previous_unreadable=ctx.history.attestation_unreadable_last_run)
         self.apply(res.result)
@@ -273,12 +278,16 @@ class Orchestrator:
             report.filled = write_unreached(self.sink, ctx.run_id, stop)
         streak = ctx.history.unproven_streak
         so_far = stop.run if stop else None
-        if stop is not None and (stop.run_status == "aborted_safety" or stop.has("kill_switch")):
+        kill_switch_path = stop is not None and (stop.run_status == "aborted_safety" or stop.has("kill_switch"))
+        if stop is not None and stop.has("kill_tree") and not kill_switch_path:
+            rig.kill_process_tree()
+        if kill_switch_path:
             ks = execute_kill_switch(rig, stop, clock=self.clock, allowlist=ctx.allowlist, start=self.start_book,
                                      fixture_account=ctx.fixture_account, run_so_far=so_far, unproven_streak=streak)
             report.kill_switch, report.proof = ks, ks.proof
             self.apply(ks.proof_effect)
-        elif self.session == "never":
+        elif self.session == "never" or (self.session == "established" and self.start_book is None
+                                         and rig.gateway_log().tokens_issued == 0):
             tokens = rig.gateway_log().tokens_issued
             proof = post_run_proof(ProofInputs(start=None, end=None, session="never", tokens_issued=tokens))
             report.proof = proof
@@ -305,7 +314,6 @@ class Orchestrator:
     def _recovery_proof(self, *, kicked: bool) -> Proof:
         """6.6 step 5 (and the kicked-session rule): a fresh scripted login with A1 and A2, then the proof."""
         rig, ctx = self.rig, self.ctx
-        rig.kill_process_tree()
         attempts = 2 if kicked else 1
         ok = False
         for _ in range(attempts):

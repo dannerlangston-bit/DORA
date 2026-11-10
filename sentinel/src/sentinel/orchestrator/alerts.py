@@ -100,11 +100,6 @@ def aborted_harness() -> AlertRoute:
     return AlertRoute("aborted_harness", P1, ("harness_on_call",), (ON_CALL_CHANNEL,))
 
 
-def report_withheld() -> AlertRoute:
-    """A plaintext secret found by the post-run scan (6.9): P1 to the security contact and system owner."""
-    return AlertRoute("report_withheld", P1, ("security_contact", "system_owner"), (ON_CALL_CHANNEL,))
-
-
 def aborted_budget(reason: str) -> AlertRoute:
     """`aborted_budget`: posted to the on-call channel (10.2); `rate_cap` also tells the system owner (6.4)."""
     extra = ("system_owner",) if reason == "rate_cap" else ()

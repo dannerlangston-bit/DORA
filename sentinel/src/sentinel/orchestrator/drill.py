@@ -21,9 +21,9 @@ Two failure cases, by the rows:
 
 Choices (reported): the `<item>` parameter is `item1` to `item5`, or the precondition's name
 (`hook_open`, `attestation`, `injector`, `account`) for a failed precondition; with several failed items
-the first names the reason and the rest go in `detail`. The gateway attempt of item 2 is refused
-`order_geometry` (deny geometry outside an order-stage step; gateway.py choice 2). The slow half's
-refusal of items 1, 3 and 4 uses the hook code of the same rule.
+the first names the reason and the rest go in `detail`. The gateway attempts are refused with the slow-half codes of 4.13
+(gateway.py choice 1): `guarded_key_refused` for the keys and chords of items 1 and 3, `deny_profile` for
+the ladder cell of item 2 (deny geometry outside an order-stage step) and `shift_click_dialog` for item 4.
 """
 from __future__ import annotations
 
@@ -56,12 +56,12 @@ def expected_records(chords: Sequence[Chord]) -> Counter[DrillRecord]:
     """The declared drop and refusal set of items 1 to 4 (6.5), with the default order chords for item 3."""
     exp: Counter[DrillRecord] = Counter()
     for reason in ("blocked_key_dialog", "blocked_key_dialog", "blocked_chord_dialog"):    # Enter, Space, Ctrl+Enter
-        exp[DrillRecord(1, "gateway", "refused", reason)] += 1
+        exp[DrillRecord(1, "gateway", "refused", "guarded_key_refused")] += 1
         exp[DrillRecord(1, "raw", "dropped", reason)] += 1
-    exp[DrillRecord(2, "gateway", "refused", "order_geometry")] += 1
+    exp[DrillRecord(2, "gateway", "refused", "deny_profile")] += 1
     exp[DrillRecord(2, "raw", "dropped", "no_token")] += 1
     for _ in chords:
-        exp[DrillRecord(3, "gateway", "refused", "blocked_chord_dialog")] += 1
+        exp[DrillRecord(3, "gateway", "refused", "guarded_key_refused")] += 1
         exp[DrillRecord(3, "raw", "dropped", "blocked_chord_dialog")] += 1
     for _ in ("ticket buy button", "ladder cell"):
         exp[DrillRecord(4, "gateway", "refused", "shift_click_dialog")] += 1
@@ -171,5 +171,5 @@ def score_drill(obs: DrillObservation, chords: Sequence[Chord]) -> DrillResult:
     return DrillResult(ControlResult(
         "fire_drill", False, "running", checkpoint=Outcome("harness_error", f"drill_failed:{failed[0]}",
                                                            detail="; ".join(notes) or None),
-        outcomes=(), alert=alerts.drill_failure(), actions=tuple(acts), incident="S2",
+        alert=alerts.drill_failure(), actions=tuple(acts), incident="S2",
         detail="fire drill failed: " + ", ".join(failed) + "; the Nightly run stays complete"), tuple(failed))

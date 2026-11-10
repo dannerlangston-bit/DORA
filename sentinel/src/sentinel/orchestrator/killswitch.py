@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 
 from . import alerts
 from .clock import Clock
-from .identity import Allowlist, judge_identity
+from .identity import READ_GAP_S, Allowlist, judge_identity
 from .results import ControlResult, FindingSpec, RunVerdict, safety_abort_outcome
 from .rig import OrderBook, OrderRow, Rig
 
@@ -270,7 +270,7 @@ def recovery_login(rig: Rig, allowlist: Allowlist, clock: Clock, fixture_account
     try:
         verdict = judge_identity(reads, allowlist)
     except ValueError:
-        clock.sleep(1.0)
+        clock.sleep(READ_GAP_S)
         reads.append(rig.read_account_selector())
         verdict = judge_identity(reads, allowlist)
     if not verdict.passed:

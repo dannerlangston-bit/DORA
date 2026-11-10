@@ -19,22 +19,28 @@ and the low-level hooks, live behind `Rig.send_input` (rig.py); the real hook ho
 
 Choices where the spec is ambiguous (reported):
 
-1. Reason codes of slow-half refusals. 5.4.4 names the hook's codes only; the slow half stores its
-   refusal under the hook code of the same rule where one exists (`blocked_key_dialog`,
-   `blocked_chord_dialog`, `shift_click_dialog`, `deny_rect`, `dialog_not_ok`) and otherwise under:
-   `never_tokenize` (a send label, 5.4.3), `unknown_dialog_label`, `deny_profile` (a hit on the active
-   profile's own list that is not a send label: Cancel All outside `cancel_all`, Working Orders cancel
-   or replace outside `paper_send_ok`, Application Settings and the Explorer deny list),
-   `order_geometry` (a ladder order cell or order bubble outside an order-stage step, 5.4.10),
-   `guarded_key_undeclared` (Enter or Space not declared by the step, 5.4.7), `confirm_and_send_gated`
-   (`Confirm and Send` from a scripted step that is not an order-stage step, or before attestation or a
-   current paper-mode assertion, 5.4.3), `ambiguous_name` and `hook_host_dead` (5.4.2).
-2. Attempted sends are exactly the reasons 5.4.8 rule 1 and 6.2 list: `deny_rect`,
-   `blocked_key_dialog`, `blocked_chord_dialog`, `shift_click_dialog`, `dialog_not_ok` and a
-   never-tokenize hit on a send label. `order_geometry` is not in that list (5.4.3 names the causes of
-   an attempted send and ladder geometry outside an order stage is not one), so it is a counted
-   non-send refusal; inside an order stage the ladder's order columns are deny rectangles and a click
-   there is `deny_rect`, an attempted send.
+1. Reason codes. Every refusal and drop carries one code of the closed list of 4.13 `gateway_event.reason`
+   and the 8.3 `step_events.gate_reason` CHECK (`GATEWAY_REASONS`). The slow half uses `never_tokenize` (a
+   send label), `dialog_allowlist` (a click in an order dialog that is not on the dismiss allowlist),
+   `deny_profile` (a hit on the active profile's own list: Cancel All outside `cancel_all`, Working Orders
+   cancel or replace outside `paper_send_ok`, Application Settings and the Explorer deny list for agent and
+   Explorer, `drag_named` on anything but splitters and detach handles, keys outside the agent toolset, a
+   ladder order cell or order bubble outside an order-stage step (5.4.10), and `Confirm and Send` from a
+   scripted step that is not an order-stage step or before attestation and a current paper-mode
+   assertion), `guarded_key_refused` (a guarded key: Enter, Space, an F-key or a blocked chord under the
+   flag; Enter or Space not declared by the step outside it), `shift_click_dialog` and `deny_rect` (the
+   flag re-check's click rules, named as the hook names them) and `hook_host_dead`. An ambiguous
+   resolution has no code in that list although 5.4.8 counts it; it is refused `deny_profile` with the
+   detail "ambiguous name" (reported as a taxonomy gap).
+2. Whether a refusal is an attempted send follows 5.4.3 stage 4 and is carried as a flag, since a code can
+   cover both cases: a never-tokenize hit on a send label, a guarded key requested under the flag, a
+   Shift+click or deny-rectangle click under the flag, and a non-allowlisted dialog click whose label is
+   send-like or lies in a deny rectangle. A `dialog_allowlist` refusal on a label that is neither is the
+   unknown dialog label. Hook drops are attempted sends by code (`deny_rect`, `blocked_key_dialog`,
+   `blocked_chord_dialog`, `shift_click_dialog`, `dialog_not_ok`; 5.4.8 rule 1). Ladder or bubble
+   geometry outside an order stage is not among 5.4.3's causes, so it is a counted non-send refusal;
+   inside an order stage the ladder's order columns are deny rectangles and a click there is an attempted
+   send.
 3. `deny_all` and `not_armed` drops (the kill switch has fired, or the hook is between runs) are
    safety-class codes that count toward no threshold: they are the effect of a trip, not a new one.
 4. Rule 2's "any mouse event while Shift is held" is applied to button downs, as the 5.4.4 table
@@ -100,17 +106,21 @@ DISMISS_ALLOWLIST = frozenset({"Delete", "Edit"})      # pinned in Phase 0 (6.2)
 HOOK_SAFETY = frozenset({"deny_all", "not_armed", "deny_rect", "shift_click_dialog", "dialog_not_ok",
                          "blocked_key_dialog", "blocked_chord_dialog", "foreign_input", "untokened_injected"})
 HOOK_INTEGRITY = frozenset({"token_expired", "token_mismatch_coords", "move_outside_allow"})
-# 5.4.8 rule 1 and 6.2: an attempted send
-ATTEMPTED_SEND = frozenset({"deny_rect", "blocked_key_dialog", "blocked_chord_dialog", "shift_click_dialog",
-                            "dialog_not_ok", "never_tokenize"})
+# 5.4.8 rule 1 and 6.2: a hook drop with one of these codes is an attempted send
+HOOK_ATTEMPTED_SEND = frozenset({"deny_rect", "blocked_key_dialog", "blocked_chord_dialog", "shift_click_dialog",
+                                 "dialog_not_ok"})
 # 5.4.8 rule 2: a gateway_integrity finding and an on-call alert
 INTEGRITY_FINDING = frozenset({"untokened_injected", "foreign_input"})
 # choice 3: the effect of a trip, never a new count
 UNCOUNTED = frozenset({"deny_all", "not_armed"})
-SLOW_REFUSALS = frozenset({"never_tokenize", "dialog_not_ok", "unknown_dialog_label", "deny_profile",
-                           "order_geometry", "blocked_key_dialog", "blocked_chord_dialog", "shift_click_dialog",
-                           "deny_rect", "guarded_key_undeclared", "confirm_and_send_gated", "ambiguous_name",
-                           "hook_host_dead"})
+# 4.13 gateway_event.reason and the 8.3 gate_reason CHECK: the closed list of hook and slow-half codes
+GATEWAY_REASONS = frozenset({"no_token", "token_mismatch_coords", "token_expired", "deny_rect", "shift_click_dialog",
+                             "dialog_not_ok", "blocked_key_dialog", "blocked_chord_dialog", "move_outside_allow",
+                             "deny_all", "not_armed", "foreign_input", "untokened_injected", "never_tokenize",
+                             "dialog_allowlist", "deny_profile", "guarded_key_refused", "hook_host_dead",
+                             "hook_reinstalled"})
+SLOW_REFUSALS = frozenset({"never_tokenize", "dialog_allowlist", "deny_profile", "guarded_key_refused",
+                           "shift_click_dialog", "deny_rect", "hook_host_dead"})
 PROFILES = ("scripted", "agent", "explorer")
 MODES = PROFILES + ("system",)
 
@@ -527,21 +537,23 @@ class SlowDecision:
     reason: str | None = None
     dialog_ok: bool = False
     detail: str | None = None
+    attempted_send: bool = False
+    unknown_dialog: bool = False
 
-    @property
-    def attempted_send(self) -> bool:
-        return self.refused and self.reason in ATTEMPTED_SEND
+    def __post_init__(self):
+        if self.refused and self.reason not in SLOW_REFUSALS:
+            raise ValueError(f"not a slow-half refusal code: {self.reason!r}")
 
     @property
     def gate_class(self) -> str | None:
         """8.3 `gate_class` of a refusal (choice 6)."""
         if not self.refused:
             return None
-        return "safety" if self.reason in ATTEMPTED_SEND | {"unknown_dialog_label"} else "integrity"
+        return "safety" if self.attempted_send or self.unknown_dialog else "integrity"
 
 
-def _refuse(reason: str, detail: str | None = None) -> SlowDecision:
-    return SlowDecision(True, reason, detail=detail)
+def _refuse(reason: str, detail: str | None = None, *, send: bool = False, unknown: bool = False) -> SlowDecision:
+    return SlowDecision(True, reason, detail=detail, attempted_send=send, unknown_dialog=unknown)
 
 
 def _in_deny_rect(point: tuple[int, int] | None, rects: tuple[DenyRect, ...]) -> DenyRect | None:
@@ -555,7 +567,7 @@ def slow_half(a: Action, ctx: SafetyContext) -> SlowDecision:
     if not ctx.hook_alive:
         return _refuse("hook_host_dead")
     if a.ambiguous:
-        return _refuse("ambiguous_name")
+        return _refuse("deny_profile", "ambiguous name")
     labels = a.labels
     lowered = {s.lower() for s in labels}
     confirm = CONFIRM_AND_SEND in lowered
@@ -563,14 +575,14 @@ def slow_half(a: Action, ctx: SafetyContext) -> SlowDecision:
     # never-tokenize (exact list anywhere; the send-like regex outside the Order Confirmation dialog)
     if pointer:
         if any(NEVER_TOKENIZE_RE.match(s) for s in labels):
-            return _refuse("never_tokenize", f"label {labels}")
+            return _refuse("never_tokenize", f"label {labels}", send=True)
         if confirm:
             if a.profile != "scripted":
-                return _refuse("never_tokenize", "Confirm and Send under profile " + a.profile)
+                return _refuse("never_tokenize", "Confirm and Send under profile " + a.profile, send=True)
             if not (a.order_stage_step and ctx.attestation_passed and ctx.paper_assertion_current):
-                return _refuse("confirm_and_send_gated")
+                return _refuse("deny_profile", "Confirm and Send outside an attested order-stage step")
         elif not ctx.order_dialog_present and any(SEND_LIKE_RE.search(s) for s in labels):
-            return _refuse("never_tokenize", f"send-like label {labels}")
+            return _refuse("never_tokenize", f"send-like label {labels}", send=True)
         if a.profile == "scripted":
             if "cancel all" in lowered and a.teardown_action != "cancel_all":
                 return _refuse("deny_profile", "Cancel All outside the cancel_all teardown action")
@@ -584,9 +596,9 @@ def slow_half(a: Action, ctx: SafetyContext) -> SlowDecision:
         if labels and all(s in ctx.dismiss_allowlist for s in labels) and len(labels) == 2:
             dialog_ok = True
         elif any(SEND_LIKE_RE.search(s) for s in labels) or _in_deny_rect(a.point, ctx.deny_rects):
-            return _refuse("dialog_not_ok", f"non-allowlisted click in the order dialog on {labels}")
+            return _refuse("dialog_allowlist", f"send-like click in the order dialog on {labels}", send=True)
         else:
-            return _refuse("unknown_dialog_label", f"label {labels} is neither allowlisted nor send-like")
+            return _refuse("dialog_allowlist", f"label {labels} is neither allowlisted nor send-like", unknown=True)
     # deny profile
     if a.profile in ("agent", "explorer"):
         if ctx.deny_list_hit:
@@ -599,23 +611,21 @@ def slow_half(a: Action, ctx: SafetyContext) -> SlowDecision:
             return _refuse("deny_profile", "key outside the agent toolset")
     elif pointer and (a.target_kind in ("ladder_order_cell", "order_bubble")
                       or a.end_kind in ("ladder_order_cell", "order_bubble")) and not a.order_stage_step:
-        return _refuse("order_geometry", f"{a.target_kind or a.end_kind} outside an order-stage step")
+        return _refuse("deny_profile", f"{a.target_kind or a.end_kind} outside an order-stage step")
     # flag re-check from the fresh enumeration
     if ctx.flag != Flag.CLEAR:
-        if a.keys:
-            if a.mods & CHORD_MODS or any(Chord(a.mods, k) in ctx.chords for k in a.keys):
-                return _refuse("blocked_chord_dialog")
-            if any(k in BLOCKED_VK for k in a.keys):
-                return _refuse("blocked_key_dialog")
+        if a.keys and (a.mods & CHORD_MODS or any(Chord(a.mods, k) in ctx.chords or k in BLOCKED_VK
+                                                   for k in a.keys)):
+            return _refuse("guarded_key_refused", "guarded key or blocked chord under the flag", send=True)
         if pointer:
             if "shift" in a.mods:
-                return _refuse("shift_click_dialog")
+                return _refuse("shift_click_dialog", send=True)
             hit = _in_deny_rect(a.point, ctx.deny_rects)
             if hit is not None:
-                return _refuse("deny_rect", f"point in the deny rectangle of {hit.label!r}")
+                return _refuse("deny_rect", f"point in the deny rectangle of {hit.label!r}", send=True)
             dialog_ok = dialog_ok or not ctx.order_dialog_present
     elif any(k in GUARDED_VK for k in a.keys) and not (a.profile == "scripted" and a.declared_guarded):
-        return _refuse("guarded_key_undeclared")
+        return _refuse("guarded_key_refused", "Enter or Space not declared by the step")
     return SlowDecision(False, dialog_ok=dialog_ok)
 
 
@@ -630,8 +640,12 @@ class GatewayDrop:
     mode: str = "scripted"
     tag: str | None = None        # `drill` inside the drill's declared raw-injection phase (6.5)
     own_token: bool = False       # the step's own token was dropped (5.4.3 stage 7)
+    send: bool | None = None      # a refusal's attempted-send flag; None: decided by the hook code
+    unknown_dialog: bool = False  # a `dialog_allowlist` refusal on a label neither allowlisted nor send-like
 
     def __post_init__(self):
+        if self.reason not in GATEWAY_REASONS:
+            raise ValueError(f"gateway reason {self.reason!r} is not a 4.13 code")
         if self.mode not in MODES:
             raise ValueError(f"mode {self.mode!r}")
         if self.decision not in ("dropped", "refused"):
@@ -639,7 +653,7 @@ class GatewayDrop:
 
     @property
     def attempted_send(self) -> bool:
-        return self.reason in ATTEMPTED_SEND
+        return self.send if self.send is not None else self.reason in HOOK_ATTEMPTED_SEND
 
 
 def drain(d: HookDecision, e: InputEvent, *, mode: str = "scripted", drill_phase: bool = False) -> GatewayDrop:
@@ -664,7 +678,8 @@ def refusal(s: SlowDecision, *, mode: str = "scripted") -> GatewayDrop:
     """A slow-half refusal as a `gateway_drop` step event (decision `refused`)."""
     if not s.refused or s.reason is None:
         raise ValueError("not a refusal")
-    return GatewayDrop(s.reason, "refused", s.gate_class or "integrity", mode)
+    return GatewayDrop(s.reason, "refused", s.gate_class or "integrity", mode, send=s.attempted_send,
+                       unknown_dialog=s.unknown_dialog)
 
 
 class DropLedger:
@@ -695,7 +710,7 @@ class DropLedger:
             return ControlResult("gateway", False, "running", step="blocked_by_gateway", step_reason=drop.reason,
                                  detail="not counted (choice 3); hook_host_dead goes to the Watchdog (10.2)",
                                  evidence=ev)
-        if drop.reason == "unknown_dialog_label":
+        if drop.unknown_dialog:
             if order_stage:
                 run, un = safety_abort_outcome("running", "unknown_dialog_in_order_stage")
                 return ControlResult("gateway", False, "running", run=run, unreached=un, alert=alerts.safety_abort(),

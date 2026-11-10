@@ -6,8 +6,8 @@ import pytest
 from sentinel.orchestrator import alerts
 from sentinel.orchestrator.gateway import (VK_ESCAPE, VK_F1, VK_RETURN, VK_SPACE, VK_TAB, Action, Chord, DenyRect,
                                            DropLedger, Flag, FlagWatcher, GatewayDrop, GatewayError, GatewayState,
-                                           InputEvent, Rect, SafetyContext, agent_flag_abort, drain, hook_decide,
-                                           refusal, slow_half)
+                                           GATEWAY_REASONS, InputEvent, Rect, SafetyContext, SlowDecision,
+                                           agent_flag_abort, drain, hook_decide, refusal, slow_half)
 from sentinel.orchestrator.simrig import CONFIRM_POINT, DELETE_POINT, SEND_RECT, SimulatedRig
 
 T = 100.0
@@ -209,24 +209,25 @@ def click(label: str | None, under: str | None = None, **kw) -> Action:
                   under_point_text=under if under is not None else label, **kw)
 
 
-@pytest.mark.parametrize("a,reason", [
-    (click("Send"), "never_tokenize"),
-    (click("Order Entry", "Auto Send"), "never_tokenize"),
-    (click("Blast All"), "never_tokenize"),
-    (click("Auto-hide"), "never_tokenize"),                        # send-like outside the dialog
-    (click("Cancel All"), "deny_profile"),
-    (click("Cancel", target_kind="working_order_action"), "deny_profile"),
-    (click("Confirm and Send"), "confirm_and_send_gated"),
-    (click("Confirm and Send", profile="agent"), "never_tokenize"),
-    (click("Application Settings", profile="agent", target_kind="application_settings"), "deny_profile"),
-    (click("Buy", target_kind="ladder_order_cell"), "order_geometry"),
-    (Action("press", keys=(VK_RETURN,)), "guarded_key_undeclared"),
-    (Action("press", profile="agent", keys=(VK_RETURN,)), "deny_profile"),
-    (click("Splitter", ambiguous=True), "ambiguous_name"),
+@pytest.mark.parametrize("a,reason,send", [
+    (click("Send"), "never_tokenize", True),
+    (click("Order Entry", "Auto Send"), "never_tokenize", True),
+    (click("Blast All"), "never_tokenize", True),
+    (click("Auto-hide"), "never_tokenize", True),                  # send-like outside the dialog
+    (click("Cancel All"), "deny_profile", False),
+    (click("Cancel", target_kind="working_order_action"), "deny_profile", False),
+    (click("Confirm and Send"), "deny_profile", False),
+    (click("Confirm and Send", profile="agent"), "never_tokenize", True),
+    (click("Application Settings", profile="agent", target_kind="application_settings"), "deny_profile", False),
+    (click("Buy", target_kind="ladder_order_cell"), "deny_profile", False),
+    (Action("press", keys=(VK_RETURN,)), "guarded_key_refused", False),
+    (Action("press", profile="agent", keys=(VK_RETURN,)), "deny_profile", False),
+    (click("Splitter", ambiguous=True), "deny_profile", False),
 ])
-def test_slow_half_refusals(a, reason):
+def test_slow_half_refusals_use_4_13_codes(a, reason, send):
     s = slow_half(a, SafetyContext())
-    assert s.refused and s.reason == reason
+    assert s.refused and s.reason == reason and s.attempted_send is send
+    assert refusal(s).reason in GATEWAY_REASONS
 
 
 def test_slow_half_allows_cancel_all_only_to_the_teardown_action_and_declared_enter():
@@ -239,7 +240,7 @@ def test_slow_half_allows_cancel_all_only_to_the_teardown_action_and_declared_en
 
 def test_confirm_and_send_needs_order_stage_attestation_and_paper_assertion():
     a = click("Confirm and Send", order_stage_step=True)
-    assert slow_half(a, SafetyContext(attestation_passed=True)).reason == "confirm_and_send_gated"
+    assert slow_half(a, SafetyContext(attestation_passed=True)).reason == "deny_profile"
     ok = slow_half(a, SafetyContext(flag=Flag.SET, attestation_passed=True, paper_assertion_current=True))
     assert not ok.refused and ok.dialog_ok                         # the sticky flag is already set; no dialog yet
 
@@ -248,23 +249,26 @@ def test_dialog_allowlist_inverts_inside_the_order_dialog():
     ctx = SafetyContext(flag=Flag.SET, order_dialog_present=True, deny_rects=(SEND,))
     ok = slow_half(click("Delete", point=DELETE_POINT), ctx)
     assert not ok.refused and ok.dialog_ok
-    assert slow_half(click("Delete", "Del ete"), ctx).reason == "unknown_dialog_label"      # both labels must match
+    both = slow_half(click("Delete", "Del ete"), ctx)                                     # both labels must match
+    assert both.reason == "dialog_allowlist" and both.unknown_dialog
     s = slow_half(click("Close"), ctx)
-    assert s.reason == "unknown_dialog_label" and not s.attempted_send and s.gate_class == "safety"
+    assert s.reason == "dialog_allowlist" and s.unknown_dialog and not s.attempted_send and s.gate_class == "safety"
     s = slow_half(click("Cancel", point=(905, 605)), ctx)
-    assert s.reason == "dialog_not_ok" and s.attempted_send
+    assert s.reason == "dialog_allowlist" and s.attempted_send and not s.unknown_dialog
     assert slow_half(click("Delete", "Send"), ctx).reason == "never_tokenize"
 
 
 def test_flag_recheck_refuses_guarded_keys_chords_shift_click_and_deny_rects():
     ctx = SafetyContext(flag=Flag.SET, deny_rects=(SEND,), chords=(Chord.parse("Shift+B"),))
-    assert slow_half(Action("press", keys=(VK_SPACE,), declared_guarded=True), ctx).reason == "blocked_key_dialog"
-    assert slow_half(Action("key_chord", keys=(ord("B"),), mods=frozenset({"shift"})), ctx).reason == \
-        "blocked_chord_dialog"
-    assert slow_half(Action("key_chord", keys=(VK_RETURN,), mods=frozenset({"ctrl"})), ctx).reason == \
-        "blocked_chord_dialog"
-    assert slow_half(click("Buy", mods=frozenset({"shift"})), ctx).reason == "shift_click_dialog"
-    assert slow_half(click("Price", point=(920, 610)), ctx).reason == "deny_rect"
+    for a in (Action("press", keys=(VK_SPACE,), declared_guarded=True), Action("press", keys=(VK_F1,)),
+              Action("key_chord", keys=(ord("B"),), mods=frozenset({"shift"})),
+              Action("key_chord", keys=(VK_RETURN,), mods=frozenset({"ctrl"}))):
+        s = slow_half(a, ctx)
+        assert s.reason == "guarded_key_refused" and s.attempted_send
+    s = slow_half(click("Buy", mods=frozenset({"shift"})), ctx)
+    assert s.reason == "shift_click_dialog" and s.attempted_send
+    s = slow_half(click("Price", point=(920, 610)), ctx)
+    assert s.reason == "deny_rect" and s.attempted_send
     ok = slow_half(click("Price", point=(10, 10)), ctx)
     assert not ok.refused and ok.dialog_ok
     assert not slow_half(Action("press", keys=(VK_TAB,)), ctx).refused
@@ -302,22 +306,22 @@ BYPASS = [
     # name, gateway action, raw events, expected refusal, expected raw drop, attempted send (Enter and Space on
     # the open dialog; the rest with the drill ticket visible, which keeps the flag set, as in 6.5)
     ("enter_on_dialog", Action("press", keys=(VK_RETURN,), declared_guarded=True),
-     [InputEvent("key_down", vk=VK_RETURN, origin="drill")], "blocked_key_dialog", "blocked_key_dialog", True),
+     [InputEvent("key_down", vk=VK_RETURN, origin="drill")], "guarded_key_refused", "blocked_key_dialog", True),
     ("space_on_dialog", Action("press", keys=(VK_SPACE,), declared_guarded=True),
-     [InputEvent("key_down", vk=VK_SPACE, origin="drill")], "blocked_key_dialog", "blocked_key_dialog", True),
+     [InputEvent("key_down", vk=VK_SPACE, origin="drill")], "guarded_key_refused", "blocked_key_dialog", True),
     ("auto_send_ladder_click", Action("click", point=(300, 700), resolved_name="Buy", under_point_text="Buy",
                                       target_kind="ladder_order_cell"),
-     [InputEvent("button_down", 300, 700, button="left", origin="drill")], "order_geometry", "no_token", False),
+     [InputEvent("button_down", 300, 700, button="left", origin="drill")], "deny_profile", "no_token", False),
     ("shift_click", Action("click", point=(50, 50), resolved_name="Buy", under_point_text="Buy",
                            mods=frozenset({"shift"})),
      [InputEvent("button_down", 50, 50, button="left", mods=frozenset({"shift"}), origin="drill")],
      "shift_click_dialog", "shift_click_dialog", True),
     ("bound_order_hotkey", Action("key_chord", keys=(ord("B"),), mods=frozenset({"shift"})),
      [InputEvent("key_down", vk=ord("B"), mods=frozenset({"shift"}), origin="drill")],
-     "blocked_chord_dialog", "blocked_chord_dialog", True),
+     "guarded_key_refused", "blocked_chord_dialog", True),
     ("order_bubble_drag", Action("drag", point=(400, 300), resolved_name="order", under_point_text="order",
                                  target_kind="order_bubble", end_kind=None),
-     [InputEvent("button_down", 400, 300, button="left", origin="drill")], "order_geometry", "no_token", False),
+     [InputEvent("button_down", 400, 300, button="left", origin="drill")], "deny_profile", "no_token", False),
 ]
 
 
@@ -332,8 +336,8 @@ def test_every_known_send_path_is_refused_dropped_and_counted(name, action, raw,
     assert [d.reason for d in hook.decisions] == [dropped]
     assert rig.sent_orders == 0 and rig.dialog_open == on_dialog
     ledger = DropLedger()
-    from sentinel.orchestrator.gateway import SlowDecision
-    res = ledger.record(refusal(SlowDecision(True, refused)), unit="flow.x", order_stage=True)
+    assert r.refused.attempted_send is send
+    res = ledger.record(refusal(r.refused), unit="flow.x", order_stage=True)
     assert ledger.run_count == 1
     if send:
         assert res.run_status == "aborted_safety" and res.run_reason == "attempted_send"
@@ -442,9 +446,10 @@ def test_uncounted_and_exempt_drops():
 
 
 def test_unknown_dialog_label_depends_on_order_stage():
-    staged = DropLedger().record(GatewayDrop("unknown_dialog_label", "refused", "safety"), unit="f", order_stage=True)
+    unknown = GatewayDrop("dialog_allowlist", "refused", "safety", unknown_dialog=True)
+    staged = DropLedger().record(unknown, unit="f", order_stage=True)
     assert staged.run_reason == "unknown_dialog_in_order_stage" and staged.has("kill_switch")
-    loose = DropLedger().record(GatewayDrop("unknown_dialog_label", "refused", "safety"), unit="f")
+    loose = DropLedger().record(unknown, unit="f")
     assert loose.run is None and loose.has("quarantine_flow") and loose.findings[0].kind == "unknown_popup"
 
 
@@ -453,3 +458,12 @@ def test_agent_session_aborts_when_the_flag_is_set():
     assert r.step == "failed" and r.step_reason == "ticket_visible_in_agent_mode" and r.has("end_session")
     with pytest.raises(ValueError):
         agent_flag_abort("explorer")
+
+
+def test_gateway_drops_carry_only_4_13_codes():
+    with pytest.raises(ValueError):
+        GatewayDrop("unknown_dialog_label", "refused", "safety")
+    with pytest.raises(ValueError):
+        SlowDecision(True, "no_token")                     # a hook code, never a slow-half refusal
+    assert {"never_tokenize", "dialog_allowlist", "deny_profile", "guarded_key_refused", "hook_host_dead"} <= \
+        GATEWAY_REASONS

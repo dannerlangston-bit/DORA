@@ -67,7 +67,7 @@ class SimScenario:
     settings: dict[str, Any] = field(default_factory=default_settings)
     unreadable_reads: dict[str, int] = field(default_factory=dict)       # row -> reads that come back unreadable
     confirmation: ConfirmationCheck = field(default_factory=lambda: ConfirmationCheck(True, 0, _sha("a9")))
-    notifications: NotificationsRead = field(default_factory=lambda: NotificationsRead(True, False))
+    notifications: NotificationsRead = field(default_factory=lambda: NotificationsRead(True, False, _sha("a10")))
     workspace: WorkspaceObservation = field(default_factory=lambda: WorkspaceObservation(WORKSPACE_SHA, True, TABS, 1))
     accounts: tuple[AccountState, ...] = (
         AccountState(GOLDEN, "golden", {"AAPL": 100.0, "/MESZ26": 1.0}, 0, 50000.0),
@@ -167,6 +167,7 @@ class SimulatedRig(Rig):
         return self.s.confirmation
 
     def read_notifications(self) -> NotificationsRead:
+        self._log("read_notifications")
         return self.s.notifications
 
     # -- workspace and fixture --------------------------------------------------------------------------
@@ -283,7 +284,7 @@ class SimulatedRig(Rig):
         s = slow_half(action, ctx)
         if s.refused:
             self.refusals += 1
-            return EmitResult(refused_reason=s.reason)
+            return EmitResult(refused=s)
         out = self._emit(action, s.dialog_ok)
         self._frame += 1
         self._watch()

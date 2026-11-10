@@ -14,7 +14,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
-from .gateway import Action, Chord, InputEvent
+from .gateway import Action, Chord, InputEvent, SlowDecision
 
 
 # -- observations -----------------------------------------------------------------------------------------
@@ -127,6 +127,7 @@ class NotificationsRead:
 
     explorer_login_distinct: bool
     verified_contact: bool | None       # None when the Notifications page is unreadable
+    screenshot_sha256: str | None = None
 
 
 @dataclass(frozen=True)
@@ -228,9 +229,13 @@ class GatewayLog:
 class EmitResult:
     """What `Rig.send_input` did: refused in the slow half, or each event's hook decision (5.4.3 stages 4 to 7)."""
 
-    refused_reason: str | None = None
+    refused: SlowDecision | None = None
     decisions: tuple[Any, ...] = ()     # gateway.HookDecision per emitted event
     events: tuple[InputEvent, ...] = ()
+
+    @property
+    def refused_reason(self) -> str | None:
+        return self.refused.reason if self.refused else None
 
 
 # -- the interface ----------------------------------------------------------------------------------------

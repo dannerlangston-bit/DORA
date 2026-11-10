@@ -168,7 +168,7 @@ def crash_signal(signals: Sequence[CrashSignal]) -> CrashSignal | None:
     return next((s for s in signals if s.cause == "oom"), signals[0])
 
 
-def app_failure(sig: CrashSignal, budgets: ShardBudgets, *, phase: str, step_id: str | None = None) -> ControlResult:
+def app_failure(sig: CrashSignal, budgets: ShardBudgets, *, phase: str) -> ControlResult:
     """One app failure (10.1, 10.2, F36, F44, F62). `phase` is `first_launch`, `relaunch_gates` (a gate sequence
     of the shard), `running` or `teardown`."""
     if sig.cause not in APP_CAUSES:

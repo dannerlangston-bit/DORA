@@ -100,6 +100,12 @@ class CheckpointOutcome:
     stability_cause: str | None = None
     decision_ref: str | None = None
     synthetic: bool = False
+    flow_class: str | None = None
+    paper_assertion: dict | None = None      # {account_id_sha256, asserted_at} (6.4)
+    base_source_run_id: str | None = None    # frozen base reused from this run (3.1)
+    data_epoch_id: str | None = None
+    fingerprint_id: str | None = None
+    captured_at: str | None = None
     recorded_at: str = field(default_factory=now)
 
     def __post_init__(self):
@@ -140,6 +146,10 @@ class StepOutcome:
     locator_rung: str | None = None
     duration_ms: int = 0
     finding_ref: str | None = None
+    side: str | None = None
+    shard_id: str | None = None
+    pre_screenshot: str | None = None
+    gateway_event: dict | None = None        # {decision, reason, class} (4.13)
     recorded_at: str = field(default_factory=now)
 
     def __post_init__(self):
@@ -190,6 +200,11 @@ class Finding:
     phash: str | None = None
     category: str | None = None
     evidence: dict = field(default_factory=dict)
+    detail: str | None = None                # e.g. `static_impact` on missed_in_pr_run, gap reasons (1.8, 2.10)
+    synthetic: bool = False
+    severity: str | None = None
+    side: str | None = None
+    step_id: str | None = None
     triage_state: str = "open"
     decision_ref: str | None = None
     ticket: str | None = None
@@ -209,6 +224,9 @@ class Finding:
     def to_dict(self) -> dict:
         return _asdict(self)
 
+
+# L-DEC-01 and the 8.3 CHECK: identities that are never a human decider
+NON_HUMAN = frozenset({"", "reviewer", "system", "ai", "orchestrator", "reporter"})
 
 # 4.14: action -> stored verdict
 ACTION_VERDICT = {
@@ -244,6 +262,12 @@ class Decision:
     status: str = "active"
     source: str = "report_ui"
     reason: str | None = None
+    run_id: str | None = None
+    build_pair_id: str | None = None
+    finding_ref: str | None = None
+    confirmed_by: str | None = None
+    expires_at: str | None = None
+    supersedes: str | None = None
     decided_at: str = field(default_factory=now)
 
     def __post_init__(self):
@@ -263,7 +287,7 @@ class Decision:
             raise TaxonomyError(f"source {self.source!r}")
         if self.status not in ("active", "superseded", "revoked", "expired", "reopened"):
             raise TaxonomyError(f"status {self.status!r}")
-        if self.decided_by in ("", "reviewer", "system", "ai"):
+        if self.decided_by in NON_HUMAN:
             raise TaxonomyError("decisions are human-only (4.14)")
 
     def to_dict(self) -> dict:
@@ -280,3 +304,22 @@ def to_jsonable(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {k: to_jsonable(v) for k, v in obj.items()}
     return obj
+
+
+def from_dict(cls, data: dict):
+    """Build a record from a dict as written by to_dict (nested Classification, DiffSummary, Signature)."""
+    data = dict(data)
+    if cls is CheckpointOutcome:
+        if isinstance(data.get("classification"), dict):
+            data["classification"] = Classification(**data["classification"])
+        if isinstance(data.get("diff"), dict):
+            d = dict(data["diff"])
+            d["regions"] = [RegionDiff(**r) for r in d.get("regions", [])]
+            d["components"] = [Component(**c) for c in d.get("components", [])]
+            if "shift" in d:
+                d["shift"] = tuple(d["shift"])
+            data["diff"] = DiffSummary(**d)
+    if cls is Decision and isinstance(data.get("signature"), dict):
+        data["signature"] = Signature(**data["signature"])
+    names = {f.name for f in dataclasses.fields(cls)}
+    return cls(**{k: v for k, v in data.items() if k in names})

@@ -42,3 +42,20 @@ def test_decisions_are_human_and_mapped():
         Decision("dec-4", "noise_signature", "noise", sig, decided_by="reviewer")
     with pytest.raises(TaxonomyError):
         Decision("dec-5", "confirm_bug", "noise", sig, decided_by="alice")
+
+
+def test_round_trip_and_new_fields():
+    from sentinel.records import Classification, from_dict
+    o = CheckpointOutcome(run_id="r", checkpoint_id=CID, outcome="collateral", workspace_id="ws.a",
+                          persona="active_trader", data_mode="frozen", base_source_run_id="run-0",
+                          classification=Classification(category="collateral", by="rule"))
+    back = from_dict(CheckpointOutcome, o.to_dict())
+    assert back.classification.category == "collateral" and back.base_source_run_id == "run-0"
+    f = Finding(finding_id="F-2", run_id="r", kind="missed_in_pr_run", description="x", first_seen_run_id="r",
+                detail="static_impact")
+    assert f.to_dict()["detail"] == "static_impact"
+    sig = Signature(CID, "rgn.a", "0123456789abcdef", "collateral")
+    with pytest.raises(TaxonomyError):
+        Decision("dec-9", "noise_signature", "noise", sig, decided_by="orchestrator")
+    d = Decision("dec-8", "confirm_bug", "confirmed_bug", sig, decided_by="alice", ticket="TOS-1", build_pair_id="bp-1")
+    assert from_dict(Decision, d.to_dict()).signature.region_id == "rgn.a"

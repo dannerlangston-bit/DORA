@@ -1,9 +1,10 @@
 """Typed field values as thinkorswim displays them (2.8.1 typed fields, 2.8.3 R10).
 
 `parse(fmt, text)` turns one displayed cell into a typed value or raises `FormatError` naming
-what is wrong with it; `format_error(fmt, text)` is the R10 test (the same parser, as a reason or
-None); `show(fmt, value)` writes a value back in a canonical display form for `detail` and
-`raw_values`; `rows(text)` splits a multi-row region read into its rows.
+what is wrong with it (`number` is the same for the numeric formats); `format_error(fmt, text)`
+is the R10 test (the same parser, as a reason or None); `show(fmt, value)` writes a value back in
+a canonical display form for `detail` and `raw_values`; `rows(text)` splits a multi-row region
+read into its rows.
 
 Formats (`FORMATS`): the `format` enum of 4.7 (`money`, `price`, `int`, `percent`, `time`,
 `text`) plus `date`, the typed field 2.8.1 lists for OCR and R07 reads.
@@ -170,6 +171,13 @@ def parse(fmt: str, text: str | None) -> Value:
     if fmt == "time":
         return _time(text)
     return normalize_text(text)
+
+
+def number(fmt: str, text: str | None) -> Decimal:
+    """`parse` for a numeric format (money, price, int, percent)."""
+    if fmt not in NUMERIC_FORMATS:
+        raise ValueError(f"{fmt!r} is not a numeric format")
+    return _number(fmt, text) if text is not None else _number(fmt, "")
 
 
 def format_error(fmt: str, text: str | None) -> str | None:

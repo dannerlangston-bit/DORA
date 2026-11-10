@@ -64,12 +64,12 @@ from typing import Any
 
 from ..classify import EnvFailure, HarnessFailure
 from ..taxonomy import ASSERTION_ID
-from .rules import RuleResult, RuleSpec, evaluate_rule
-from .sources import (SOURCES, ApiReader, ApiUnavailable, Attempt, Extraction, ExportReader, Reading, SourceFallback,
-                      ValueSource, extract, problem)
+from .rules import DEFAULT_RULES, NO_CONTEXT, RuleResult, RuleSpec, evaluate_rule
+from .sources import (EXACT_CONFIDENCE, SOURCES, ApiReader, ApiUnavailable, Attempt, Extraction, ExportReader, Reading,
+                      SourceFallback, ValueSource, extract, problem)
 from .tables import (EvalContext, OracleConfigError, RuleConfig, Tolerance, api_comparison, default_tolerance,
                      resolve_ref, tick_size)
-from .values import FormatError, coerce, normalize_text, parse, show, to_cent
+from .values import NUMERIC_FORMATS, FormatError, coerce, normalize_text, number, parse, show, to_cent
 
 KINDS: tuple[str, ...] = ("equals", "matches", "within_tol", "present", "absent", "changed_since_previous_step",
                           "unchanged_since_previous_step", "count", "export_equals", "api_within", "rule",
@@ -118,9 +118,16 @@ class Assertion:
                 raise OracleConfigError(f"{aid}: {kind} needs {req.replace('|', ' or ')}")
         if kind != "rule" and not a.get("region"):
             raise OracleConfigError(f"{aid}: {kind} needs a region (4.7)")
+        if kind in _DEFAULT_FORMAT and a.get("format") not in (None, *NUMERIC_FORMATS):
+            raise OracleConfigError(f"{aid}: {kind} compares numbers; format {a.get('format')!r} is not numeric")
         rng = a.get("range")
-        return cls(id=aid, kind=kind, source=source, region=a.get("region"), expected=a.get("expected"),
-                   range=(Decimal(str(rng["min"])), Decimal(str(rng["max"]))) if rng else None,
+        try:
+            bounds = (Decimal(str(rng["min"])), Decimal(str(rng["max"]))) if rng else None
+            if kind == "count" and rng is None:
+                Decimal(str(a.get("expected")))
+        except (ArithmeticError, KeyError, TypeError) as exc:
+            raise OracleConfigError(f"{aid}: count needs a number or a range {{min, max}}") from exc
+        return cls(id=aid, kind=kind, source=source, region=a.get("region"), expected=a.get("expected"), range=bounds,
                    value_ref=a.get("value_ref"), pattern=a.get("pattern"), fmt=a.get("format"),
                    tol=Tolerance.parse(a["tol"]) if a.get("tol") is not None else None,
                    since_step=a.get("since_step"), export_column=a.get("export_column"), api_field=a.get("api_field"),
@@ -258,7 +265,8 @@ class _Stop(Exception):
     def __init__(self, status: str, detail: str, *, unreadable: Sequence[str] = (), reason: str | None = None,
                  gate: str | None = None):
         super().__init__(detail)
-        self.status, self.detail, self.unreadable, self.reason, self.gate = status, detail, tuple(unreadable), reason, gate
+        self.status, self.detail, self.unreadable = status, detail, tuple(unreadable)
+        self.reason, self.gate = reason, gate
 
 
 class _Fail(Exception):
@@ -270,7 +278,7 @@ class _Fail(Exception):
 def _palette_class(color: tuple[int, int, int], palette: Mapping[str, tuple[int, int, int]], tol: float) -> str | None:
     best, best_d = None, float("inf")
     for name, ref in palette.items():
-        d = sum((a - b) ** 2 for a, b in zip(color, ref)) ** 0.5
+        d = sum((a - b) ** 2 for a, b in zip(color, ref, strict=True)) ** 0.5
         if d < best_d:
             best, best_d = name, d
     return best if best_d <= tol else None
@@ -329,6 +337,12 @@ class _Evaluator:
     def expected(self, a: Assertion) -> Any:
         return resolve_ref(self.fixture, a.value_ref) if a.value_ref else a.expected
 
+    def want(self, a: Assertion, fmt: str, literal: Any) -> Any:
+        try:
+            return coerce(fmt, literal)
+        except FormatError as exc:
+            raise OracleConfigError(f"{a.id}: expected value {literal!r} is not a valid {fmt}: {exc}") from exc
+
     def tick(self, price: Decimal | None = None) -> Decimal | None:
         return tick_size(self.context.symbol, self.config, self.fixture, price) if self.context.symbol else None
 
@@ -338,7 +352,7 @@ class _Evaluator:
         fmt = a.fmt or ("text" if isinstance(lit, str) else "date" if isinstance(lit, date) else "price")
         ext = self.region(a, fmt)
         self.readable()
-        want, got = coerce(fmt, lit), self.value(ext)
+        want, got = self.want(a, fmt, lit), self.value(ext)
         if fmt == "money":
             want, got = to_cent(want), to_cent(got)
         if want != got:
@@ -358,7 +372,7 @@ class _Evaluator:
         fmt = a.fmt or _DEFAULT_FORMAT["within_tol"]
         ext = self.region(a, fmt)
         self.readable()
-        want, got = coerce(fmt, self.expected(a)), self.value(ext)
+        want, got = self.want(a, fmt, self.expected(a)), self.value(ext)
         tol = a.tol or default_tolerance(fmt, self.context.data_mode, self.tick(want) if fmt == "price" else None)
         if not tol.allows(got, want):
             raise _Fail(f"{show(fmt, want)} +/- {tol}", show(fmt, got),
@@ -415,7 +429,8 @@ class _Evaluator:
     def unchanged_since_previous_step(self, a: Assertion) -> tuple[str, str]:
         changed, before, now = self._compare_previous(a)
         if changed:
-            raise _Fail(f"{before} as at {a.since_step}", now, f"{a.region} reads {now}; it read {before} at {a.since_step}")
+            raise _Fail(f"{before} as at {a.since_step}", now,
+                        f"{a.region} reads {now}; it read {before} at {a.since_step}")
         return f"{before} as at {a.since_step}", now
 
     def count(self, a: Assertion) -> tuple[str, str]:
@@ -442,19 +457,20 @@ class _Evaluator:
         label = f"export:{a.export_column}"
         if column is None and exp.produced and exp.header_matches:
             raise OracleConfigError(f"{a.id}: column {a.export_column!r} is not in the declared export header")
-        why = None if column is not None else (
-            "nothing exported within the step timeout" if not exp.produced else "Copy All header differs from the declared set")
-        reading = Reading(label, "export", "\n".join(column), 100.0) if column is not None else None
+        why = (None if column is not None else "nothing exported within the step timeout" if not exp.produced
+               else "Copy All header differs from the declared set")
+        reading = Reading(label, "export", "\n".join(column), EXACT_CONFIDENCE) if column is not None else None
         self.operands["export"] = Extraction(label, fmt, "export", (Attempt("export", reading, why),), reading)
         self.readable()
-        screen = self.value(ext)
+        screen: Decimal = self.value(ext)
         cells = [c for c in column or () if c.strip()]
-        values = []
+        values: list[Decimal] = []
         for i, c in enumerate(cells):
             try:
-                values.append(parse(fmt, c))
+                values.append(number(fmt, c))
             except FormatError as exc:
-                raise _Fail(f"a valid {fmt}", repr(c), f"{label} cell {i + 1} {c!r} is not a valid {fmt}: {exc}") from exc
+                raise _Fail(f"a valid {fmt}", repr(c),
+                            f"{label} cell {i + 1} {c!r} is not a valid {fmt}: {exc}") from exc
         export_total = sum(values, Decimal(0))
         tol = a.tol or default_tolerance(fmt, self.context.data_mode, self.tick(screen) if fmt == "price" else None)
         if fmt == "money":
@@ -464,13 +480,18 @@ class _Evaluator:
                         f"{show(fmt, export_total)}; {ext.field} shows {show(fmt, screen)} (tolerance {tol})")
         return show(fmt, screen), show(fmt, export_total)
 
-    def api_within(self, a: Assertion) -> tuple[str, str]:
+    def api_gate(self, a: Assertion) -> None:
+        """2.8.1 Market-data API: a failed preflight N3, or an API already lost in this run, is an
+        environment fault of the cross-check, ahead of any harness fault (1.10 precedence)."""
         if not self.api_preflight_ok:
             raise _Stop("env_error", "market-data API preflight N3 failed", gate="preflight.N3")
         if self.api_lost:
             raise _Stop("env_error", f"market-data API lost mid-run: {self.api_lost}", gate="connectivity")
         if self.api is None:
             raise OracleConfigError(f"{a.id}: api_within needs the market-data API source")
+
+    def api_within(self, a: Assertion) -> tuple[str, str]:
+        assert self.api is not None
         fmt = a.fmt or _DEFAULT_FORMAT["api_within"]
         ext = self.region(a, fmt)
         cmp = api_comparison(self.context, self.fixture)
@@ -482,16 +503,18 @@ class _Evaluator:
             raise _Stop("env_error", f"market-data API failed mid-run: {exc}", gate="connectivity") from exc
         label = f"api:{a.api_field}"
         why = problem(reading, fmt)
+        api_value: Decimal | None = None
         if why is None:
             try:
-                parse(fmt, reading.text)                   # type: ignore[union-attr]
+                api_value = number(fmt, reading.text)          # type: ignore[union-attr]
             except FormatError as exc:
                 why = f"API value is not a valid {fmt}: {exc}"
         api_reading = replace(reading, field=label) if reading is not None else None
         self.operands["api"] = Extraction(label, fmt, "api", (Attempt("api", api_reading, why),),
                                           api_reading if why is None else None)
         self.readable()
-        screen, api_value = self.value(ext), parse(fmt, api_reading.text)       # type: ignore[union-attr]
+        assert api_value is not None
+        screen: Decimal = self.value(ext)
         needs_tick = cmp.mode == "tick" and a.tol is None
         tol = cmp.tolerance(a.tol, self.tick(api_value) if needs_tick else None)
         want = f"{show(fmt, api_value)} +/- {tol} (API {a.api_field} as of {cmp.as_of.isoformat()})"
@@ -508,7 +531,8 @@ class _Evaluator:
         self.readable()
         color = ext.accepted.color if ext.accepted else None
         if color is None:
-            raise _Stop("unreadable", f"{ext.field}: no text color read by {ext.source}", unreadable=[f"{ext.field}:color"])
+            raise _Stop("unreadable", f"{ext.field}: no text color read by {ext.source}",
+                        unreadable=[f"{ext.field}:color"])
         value = self.value(ext)
         expected = "positive" if value > 0 else "negative" if value < 0 else "neutral"
         if expected == "neutral" and "neutral" not in self.config.palette:
@@ -525,7 +549,8 @@ class _Evaluator:
         operands: dict[str, Extraction | Decimal] = {}
         for name, ref in spec.inputs.items():
             if isinstance(ref, str):
-                operands[name] = self.read(name, ref, spec.operand_format(name), spec.operand_source(name, a.region_source))
+                source = spec.operand_source(name, a.region_source)
+                operands[name] = self.read(name, ref, spec.operand_format(name), source)
             else:
                 operands[name] = ref
         return evaluate_rule(spec, operands, self.fixture, self.config, self.context)
@@ -534,6 +559,8 @@ class _Evaluator:
     def evaluate(self, a: Assertion) -> AssertionResult:
         self.operands = {}
         try:
+            if a.kind == "api_within":
+                self.api_gate(a)
             self.guard(a)
             if a.kind == "rule":
                 r = self.rule(a)
@@ -552,7 +579,7 @@ class _Evaluator:
 
 def evaluate_assertions(flow_step: Mapping[str, Any], values_by_source: Mapping[str, ValueSource | ApiReader],
                         previous_values: Mapping[str, Mapping[str, Extraction]], fixture: Mapping[str, Any],
-                        rules: RuleConfig = RuleConfig(), *, context: EvalContext = EvalContext(),
+                        rules: RuleConfig = DEFAULT_RULES, *, context: EvalContext = NO_CONTEXT,
                         ocr_calibrated: bool = True, api_preflight_ok: bool = True) -> list[AssertionResult]:
     """Evaluate every assertion of `flow_step` on the capture's reads.
 

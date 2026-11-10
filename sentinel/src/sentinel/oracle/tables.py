@@ -71,6 +71,7 @@ from .values import CENT, NUMERIC_FORMATS
 DATA_MODES = ("frozen", "masked_live")
 ASSETS = ("equity", "option", "future", "future_option", "forex", "index")     # 4.9 symbol.asset
 ACCOUNT_KINDS = ("margin", "ira")                                              # 4.9 account.kind
+BRACKET_BASES = ("notional", "initial_margin")                                 # margin_rules.yaml `of`
 FUTURE_MULTIPLIERS: dict[str, Decimal] = {"ES": Decimal(50), "NQ": Decimal(20), "MES": Decimal(5), "MNQ": Decimal(2)}
 OPTION_MULTIPLIER = Decimal(100)
 FUTURE_TICKS: dict[str, Decimal] = {"ES": Decimal("0.25"), "NQ": Decimal("0.25"), "MES": Decimal("0.25"),
@@ -170,7 +171,7 @@ class MarginBracket:
     high: Decimal
 
     def __post_init__(self) -> None:
-        if self.asset not in ASSETS or self.account not in ACCOUNT_KINDS or self.of not in ("notional", "initial_margin"):
+        if self.asset not in ASSETS or self.account not in ACCOUNT_KINDS or self.of not in BRACKET_BASES:
             raise OracleConfigError(f"margin bracket {self.asset}/{self.account}/{self.of} is outside the 4.9 enums")
         if not Decimal(0) <= self.low <= self.high:
             raise OracleConfigError(f"margin bracket {self.asset}/{self.account}: need 0 <= low <= high")

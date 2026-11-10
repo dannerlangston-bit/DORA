@@ -396,12 +396,14 @@ def extract(field: str, fmt: str, sources: Mapping[str, ValueSource], declared: 
         raise ValueError(f"unknown field format {fmt!r}")
     order = [declared] + [s for s in FALLBACK_ORDER if s != declared]
     attempts: list[Attempt] = []
+    why: str | None
     for name in order:
         src = sources.get(name)
         if src is None or name in exclude:
             continue
         if isinstance(src, ExportReader) and not src.header_matches:
-            why = "nothing exported within the step timeout" if not src.produced else "header differs from the declared set"
+            why = ("nothing exported within the step timeout" if not src.produced
+                   else "header differs from the declared set")
             attempts.append(Attempt(name, None, why))
             continue
         reading = src.read(field)

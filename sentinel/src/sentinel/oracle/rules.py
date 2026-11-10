@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from datetime import date
 from decimal import Decimal
 from typing import Any
@@ -65,9 +65,11 @@ from ..lint.rules import RULE_OPERANDS
 from .sources import Attempt, Extraction, literal, problem
 from .tables import (CENT, EvalContext, OracleConfigError, RuleConfig, Tolerance, money_tolerance, multiplier_for,
                      symbol_root, tick_size)
-from .values import FORMATS, FormatError, Value, format_error, parse, show, to_cent
+from .values import FORMATS, FormatError, Value, format_error, number, parse, show, to_cent
 
 RULE_IDS: tuple[str, ...] = tuple(f"R{n:02d}" for n in range(1, 11))
+DEFAULT_RULES = RuleConfig()
+NO_CONTEXT = EvalContext()
 NEW_YORK = ZoneInfo("America/New_York")
 DELTA_TOLERANCE = CENT                                  # 2.8.2 Greeks: delta 0.01
 HALF_CENT = Decimal("0.005")
@@ -117,10 +119,6 @@ class RuleSpec:
         tol = Tolerance.parse(a["tol"]) if a.get("tol") is not None else None
         return cls(str(a.get("id")), str(a.get("rule_id")), inputs, tol, a.get("format"))
 
-    def regions(self) -> dict[str, str]:
-        """Operand name to region id, for the operands that are regions."""
-        return {k: v for k, v in self.inputs.items() if isinstance(v, str)}
-
     def operand_format(self, name: str) -> str:
         return self.fmt if self.rule_id == "R10" else _FORMATS[self.rule_id][name]   # type: ignore[return-value]
 
@@ -160,7 +158,6 @@ class _Ops:
     context: EvalContext
     config: RuleConfig
     fixture: Mapping[str, Any]
-    seen: list[str] = field(default_factory=list)
 
     def has(self, name: str) -> bool:
         return name in self.operands
@@ -202,23 +199,29 @@ class _Ops:
             return [op] * n
         symbols = op.rows()
         if len(symbols) != n:
-            raise _Fail(f"{n} instruments", f"{len(symbols)}", f"{op.field} holds {len(symbols)} instruments for {n} rows")
+            raise _Fail(f"{n} instruments", f"{len(symbols)}",
+                        f"{op.field} holds {len(symbols)} instruments for {n} rows")
         return [multiplier_for(s, self.config, self.fixture) for s in symbols]
 
     def ticks(self, name: str, prices: Sequence[Decimal]) -> list[Decimal]:
         """One price tick per row: each row's instrument when the multiplier names them, else the context symbol."""
         op = self.operands.get(name)
         if isinstance(op, Extraction):
-            return [tick_size(s, self.config, self.fixture, p) for s, p in zip(op.rows(), prices)]
+            return [tick_size(s, self.config, self.fixture, p) for s, p in zip(op.rows(), prices, strict=True)]
         symbol = self.context.need_symbol("a masked_live money tolerance")
         return [tick_size(symbol, self.config, self.fixture, p) for p in prices]
 
-    def money_tol(self, legs: Callable[[], Sequence[tuple[Decimal, Decimal, Decimal]]] = lambda: ()) -> Tolerance:
-        """The assertion's `tol`, else 2.8.2 money: 0 in frozen, 0.01 plus one tick per leg in masked_live."""
+    @property
+    def live(self) -> bool:
+        """The money tolerance depends on the legs' ticks: `masked_live` and no `tol` given."""
+        return self.context.data_mode == "masked_live" and self.spec.tol is None
+
+    def money_tol(self, legs: Sequence[tuple[Decimal, Decimal, Decimal]] = ()) -> Tolerance:
+        """The assertion's `tol`, else 2.8.2 money: 0 in frozen, 0.01 plus one tick per leg (quantity,
+        tick, multiplier) in masked_live."""
         if self.spec.tol is not None:
             return self.spec.tol
-        mode = self.context.data_mode
-        return Tolerance(money_tolerance(mode, legs() if mode == "masked_live" else ()))
+        return Tolerance(money_tolerance(self.context.data_mode, legs if self.live else ()))
 
 
 def _money_ok(observed: Decimal, expected: Decimal, tol: Tolerance) -> bool:
@@ -238,20 +241,20 @@ def _r01(o: _Ops) -> tuple[str, str]:
     if len(q) != len(p):
         raise _Fail(f"{len(q)} price rows", f"{len(p)}", f"{len(q)} quantity rows and {len(p)} price rows")
     mult = o.multipliers("multiplier", len(q))
-    legs = [qi * pi * mi for qi, pi, mi in zip(q, p, mult)]
+    legs = [qi * pi * mi for qi, pi, mi in zip(q, p, mult, strict=True)]
     net = sum(legs, Decimal(0))
     costs = o.numbers("total")
-    tol = o.money_tol(lambda: list(zip(q, o.ticks("multiplier", p), mult)))
+    tol = o.money_tol(list(zip(q, o.ticks("multiplier", p), mult, strict=True)) if o.live else ())
     if len(costs) == 1:
         pairs = [("total", net, costs[0])]
     elif len(costs) in (len(legs), len(legs) + 1):
-        pairs = [(f"leg {i + 1}", leg, c) for i, (leg, c) in enumerate(zip(legs, costs))]
+        pairs = [(f"leg {i + 1}", leg, c) for i, (leg, c) in enumerate(zip(legs, costs[:len(legs)], strict=True))]
         if len(costs) == len(legs) + 1:
             pairs.append(("total", net, costs[-1]))
     else:
         raise _Fail(f"1, {len(legs)} or {len(legs) + 1} cost rows", f"{len(costs)}",
                     f"{o.label('total')} holds {len(costs)} rows for {len(legs)} legs")
-    formula = " + ".join(f"{_n(qi)} x {_n(pi)} x {_n(mi)}" for qi, pi, mi in zip(q, p, mult))
+    formula = " + ".join(f"{_n(qi)} x {_n(pi)} x {_n(mi)}" for qi, pi, mi in zip(q, p, mult, strict=True))
     for what, want, got in pairs:
         if not _money_ok(abs(got), abs(want), tol):
             raise _Fail(_m(abs(want)), _m(abs(got)), f"{what}: {formula} = {_m(abs(want))}, but {o.label('total')} "
@@ -293,7 +296,7 @@ def _r03(o: _Ops) -> tuple[str, str]:
     bid, mark, ask = o.numbers("bid"), o.numbers("mark"), o.numbers("ask")
     if not len(bid) == len(mark) == len(ask):
         raise _Fail("equal row counts", f"{len(bid)}/{len(mark)}/{len(ask)}", "bid, mark and ask row counts differ")
-    for i, (b, m, a) in enumerate(zip(bid, mark, ask)):
+    for i, (b, m, a) in enumerate(zip(bid, mark, ask, strict=True)):
         if not b <= m <= a:
             raise _Fail("bid <= mark <= ask", f"{_n(b)} / {_n(m)} / {_n(a)}",
                         f"row {i + 1}: bid {_n(b)}, mark {_n(m)}, ask {_n(a)} are out of order")
@@ -303,8 +306,9 @@ def _r03(o: _Ops) -> tuple[str, str]:
     if all(session):
         last, low, high = o.numbers("last"), o.numbers("low"), o.numbers("high")
         if not len(last) == len(low) == len(high) == len(bid):
-            raise _Fail("equal row counts", f"{len(last)}/{len(low)}/{len(high)}", "last, low and high row counts differ")
-        for i, (la, lo, hi) in enumerate(zip(last, low, high)):
+            raise _Fail("equal row counts", f"{len(last)}/{len(low)}/{len(high)}",
+                        "last, low and high row counts differ")
+        for i, (la, lo, hi) in enumerate(zip(last, low, high, strict=True)):
             if not lo <= la <= hi:
                 raise _Fail(f"{_n(lo)} <= last <= {_n(hi)}", _n(la),
                             f"row {i + 1}: last {_n(la)} is outside the session range {_n(lo)} to {_n(hi)}")
@@ -339,13 +343,13 @@ def _r04(o: _Ops) -> tuple[str, str]:
 
 def _int(text: str, where: str) -> int:
     try:
-        return int(parse("int", text))
+        return int(number("int", text))
     except FormatError as exc:
         raise _Fail("an integer", repr(text), f"{where} {text!r} is not a valid int: {exc}") from exc
 
 
 def _monotone(values: Sequence[Decimal], tol: Decimal) -> bool:
-    pairs = list(zip(values, values[1:]))
+    pairs = list(zip(values, values[1:], strict=False))
     return all(b <= a + tol for a, b in pairs) or all(b >= a - tol for a, b in pairs)
 
 
@@ -365,7 +369,8 @@ def _r05(o: _Ops) -> tuple[str, str]:
     if o.has("theta") and o.context.long_options:
         for i, v in enumerate(o.numbers("theta")):
             if v > 0:
-                raise _Fail("theta <= 0", _n(v), f"{o.label('theta')} row {i + 1}: theta {_n(v)} is positive for a long option")
+                raise _Fail("theta <= 0", _n(v),
+                            f"{o.label('theta')} row {i + 1}: theta {_n(v)} is positive for a long option")
     return "Greeks within bounds", f"{len(delta)} rows"
 
 
@@ -413,7 +418,7 @@ def _r07(o: _Ops) -> tuple[str, str]:
     exps = [d for d in o.rows("expiration") if isinstance(d, date)]
     if len(dtes) != len(exps):
         raise _Fail(f"{len(exps)} DTE rows", f"{len(dtes)}", f"{len(dtes)} DTE rows and {len(exps)} expiration rows")
-    for dte, exp in zip(dtes, exps):
+    for dte, exp in zip(dtes, exps, strict=True):
         want = (exp - today).days
         if dte != want:
             raise _Fail(str(want), str(dte), f"DTE {dte} for expiration {exp.isoformat()}; {exp.isoformat()} minus "
@@ -424,19 +429,22 @@ def _r07(o: _Ops) -> tuple[str, str]:
 def _r08(o: _Ops) -> tuple[str, str]:
     mark, trade, qty = o.numbers("mark"), o.numbers("trade_price"), o.numbers("qty")
     if not len(mark) == len(trade) == len(qty):
-        raise _Fail("equal row counts", f"{len(mark)}/{len(trade)}/{len(qty)}", "mark, trade price and qty row counts differ")
+        raise _Fail("equal row counts", f"{len(mark)}/{len(trade)}/{len(qty)}",
+                    "mark, trade price and qty row counts differ")
     n = len(mark)
     mult = o.multipliers("multiplier", n)
     pl = o.numbers("pl_open")
     if len(pl) not in (n, n + 1):
-        raise _Fail(f"{n} or {n + 1} P/L rows", f"{len(pl)}", f"{o.label('pl_open')} holds {len(pl)} rows for {n} positions")
-    ticks = o.ticks("multiplier", mark) if o.context.data_mode == "masked_live" and o.spec.tol is None else [Decimal(0)] * n
+        raise _Fail(f"{n} or {n + 1} P/L rows", f"{len(pl)}",
+                    f"{o.label('pl_open')} holds {len(pl)} rows for {n} positions")
+    ticks = o.ticks("multiplier", mark) if o.live else [Decimal(0)] * n
     for i in range(n):
         want = (mark[i] - trade[i]) * qty[i] * mult[i]
-        tol = o.money_tol(lambda i=i: [(qty[i], ticks[i], mult[i])])
+        tol = o.money_tol([(qty[i], ticks[i], mult[i])])
         if not _money_ok(pl[i], want, tol):
-            raise _Fail(_m(want), _m(pl[i]), f"row {i + 1}: ({_n(mark[i])} - {_n(trade[i])}) x {_n(qty[i])} x {_n(mult[i])} "
-                                             f"= {_m(want)}, but P/L Open shows {_m(pl[i])} (tolerance {tol})")
+            raise _Fail(_m(want), _m(pl[i]), f"row {i + 1}: ({_n(mark[i])} - {_n(trade[i])}) x {_n(qty[i])} x "
+                                             f"{_n(mult[i])} = {_m(want)}, but P/L Open shows {_m(pl[i])} "
+                                             f"(tolerance {tol})")
     if len(pl) == n + 1:
         rows_sum = sum(pl[:n], Decimal(0))
         tol = Tolerance(o.money_tol().bound(rows_sum) + HALF_CENT * n)
@@ -499,8 +507,8 @@ def rebind(extraction: Extraction, fmt: str) -> Extraction:
 
 
 def check_rules(values: Mapping[str, Extraction | str | int | float | Decimal], fixture: Mapping[str, Any],
-                rules: Sequence[RuleSpec | Mapping[str, Any]], *, config: RuleConfig = RuleConfig(),
-                context: EvalContext = EvalContext()) -> list[RuleResult]:
+                rules: Sequence[RuleSpec | Mapping[str, Any]], *, config: RuleConfig = DEFAULT_RULES,
+                context: EvalContext = NO_CONTEXT) -> list[RuleResult]:
     """Re-run rules over stored values (2.8.1): `values` maps a region id to its stored extraction,
     its text (taken as a clean read) or a number; `rules` are `RuleSpec`s or 4.7 `rule` assertions."""
     out = []

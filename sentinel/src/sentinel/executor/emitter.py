@@ -361,8 +361,8 @@ def agent_rung_block(step: Mapping[str, Any], target: Mapping[str, Any] | None, 
 
 
 def click_crop(frame: Frame, point: tuple[int, int], size: int | tuple[int, int] = CROP_PX) -> Any:
-    """The crop of `size` (one side, or width and height) centred on `point`, clipped to the frame; None when the
-    frame has no image or the point is outside it."""
+    """The crop of `size` (one side, or width and height) centred on `point` and clipped to the frame (an edge point
+    gives a smaller crop); None when the frame has no image or the point is outside it."""
     img = frame.image
     if img is None:
         return None
@@ -371,8 +371,8 @@ def click_crop(frame: Frame, point: tuple[int, int], size: int | tuple[int, int]
     height, width = img.shape[0], img.shape[1]
     if not (0 <= x < width and 0 <= y < height):
         return None
-    x0, y0 = max(0, x - w // 2), max(0, y - h // 2)
-    return img[y0:min(height, y0 + h), x0:min(width, x0 + w)].copy()
+    left, top = x - w // 2, y - h // 2
+    return img[max(0, top):min(height, top + h), max(0, left):min(width, left + w)].copy()
 
 
 def declares_guarded(step: Mapping[str, Any]) -> bool:

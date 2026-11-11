@@ -197,3 +197,35 @@ def test_acknowledge_marks_every_pending_request_handled(tmp_path):
     pipe.post(pipe_req)
     assert acknowledge(ch, pipe) == [REQ, pipe_req] and pending(ch, pipe) == {}
     assert acknowledge(ch, None) == []
+
+
+# -- review fixes (wave 1) -------------------------------------------------------------------------------------------
+def test_a_flag_that_is_not_utf8_is_an_unreadable_stop_and_acknowledge_removes_it(tmp_path):
+    """killswitch:8: a flag written as UTF-16 (PowerShell 5 `>`) is the unreadable stop request (choice 2), from the
+    channel's own poll as from the module's, and acknowledging it removes the flag instead of raising."""
+    ch = flag(tmp_path)
+    ch.path.parent.mkdir(parents=True)
+    ch.path.write_bytes("stop\r\n".encode("utf-16"))
+    own = ch.poll()
+    assert own is not None and own.channel == "unreadable" and "not a request" in own.reason
+    assert poll(ch) == own
+    assert acknowledge(ch) == [own] and not ch.path.exists()
+
+
+def test_a_non_utf8_flag_written_mid_run_ends_the_run_aborted_safety_with_a_proof(tmp_path):
+    """killswitch:8 end to end: the sequence runs, the proof is produced and the flag is cleared."""
+    clock = ManualClock()
+    rig = SimulatedRig(SimScenario(kill_root=tmp_path), clock=clock)
+    sink = MemorySink(["c1", "c2", "c3"])
+    ch, _ = rig.kill_channels()
+
+    def work(o: Orchestrator) -> None:
+        o.sink.record("c1", "identical")
+        assert o.flow_boundary(flow_id=FLOW) is None
+        ch.path.write_bytes("stop\r\n".encode("utf-16"))
+        assert o.step_boundary() is o.stop is not None
+
+    report = Orchestrator(rig, default_context(), sink, clock=clock).run(work)
+    assert (report.verdict.status, report.verdict.reason) == ("aborted_safety", "kill_switch")
+    assert report.proof.line == PROVEN_NONE and set(report.filled) == {"c2", "c3"}
+    assert not ch.path.exists()

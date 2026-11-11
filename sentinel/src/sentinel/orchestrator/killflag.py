@@ -95,13 +95,13 @@ class FileFlagChannel:
 
     def poll(self) -> KillRequest | None:
         try:
-            text = self.path.read_text(encoding="utf-8")
+            data = self.path.read_bytes()
         except FileNotFoundError:
             return None
         except OSError as e:
             return _unreadable(f"kill flag {self.path} unreadable: {e}")
-        try:
-            return KillRequest(**json.loads(text))
+        try:                                     # bytes that are not UTF-8 (UnicodeDecodeError) are no request either
+            return KillRequest(**json.loads(data.decode("utf-8")))
         except (ValueError, TypeError) as e:
             return _unreadable(f"kill flag {self.path} not a request: {e}")
 

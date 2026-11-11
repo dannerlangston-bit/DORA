@@ -63,10 +63,10 @@ the example allowlist, settings attestation, workspace, fixture verification and
 `running`, where the Executor (`_ShardWork`) re-reads the build id before each unit of work, then calls
 `Orchestrator.flow_boundary` (the kill channels and trip-wires, the Watchdog, free space, the 11.2 wall budget
 of the shard, the rate caps, the spend ceiling, the model re-check, the paper-mode assertion of 6.4 and the
-proactive relaunch), writes a heartbeat at every step and calls `step_boundary` before every flow step (the
-trip-wires, the flow's budget, the assertion before an order-stage step or on the two-minute timer), sends each
-input-bearing flow step through the gateway (`Rig.send_input`, the drop ledger of 5.4.8), runs the Watchdog's
-hang detector (an app failure relaunches through `Orchestrator.relaunch("app_failure")`, every gate again, and
+proactive relaunch), writes a heartbeat at every step and calls `step_boundary` before every flow step and
+every sweep or split step after its ladder's first (the trip-wires, the flow's budget, the assertion before an
+order-stage step or on the two-minute timer), sends each input-bearing flow step through the gateway
+(`Rig.send_input`, the drop ledger of 5.4.8), runs the Watchdog's hang detector (an app failure relaunches through `Orchestrator.relaunch("app_failure")`, every gate again, and
 writes a `relaunch` step event), and captures the checkpoints of every shard in `running` in plan order, each
 stamped with the session's paper-asserted stamp (`paper_stamp`; none means `aborted_safety (paper_mode_mismatch)`
 through the kill switch, and a stamp `may_release` refuses keeps the frame from the Reviewer); then each shard's
@@ -1910,14 +1910,27 @@ class _ShardWork:
                                                "and the tier C workspace reload (2.5.1)"
                                                + ("" if ok else "; the reset or the reload failed")))
             st.host = host
+        started = False
         for i, cp in enumerate(unit):
             if st.orch.stop is not None:
                 return
             if cp not in self._todo(st):
                 continue
+            if started and not self._ladder_boundary(st, cp):
+                return                  # the unreached steps take the stop's outcome at `_finish` (1.10, 6.6)
+            started = True
             path = list((self.cfg.surfaces.get(cp.surface_id) or {}).get("path") or ())
             self._execute(st, census_unit(cp.checkpoint_id, [s for s in path if s.get("type") == "wait_for"],
                                           workspace_id=cp.workspace_id), [cp], unit[i + 1:])
+
+    def _ladder_boundary(self, st: _Shard, cp: PlannedCheckpoint) -> bool:
+        """The Orchestrator's `step_boundary` before a sweep or split step after its ladder's first (the unit's
+        `flow_boundary` covers the first): each ladder size is a step (2.5.1), and the kill channels and trip-wires are
+        evaluated at every step boundary (6.6 Triggers). False when the shard stopped."""
+        st.orch.step_boundary(BoundaryObservations(order_dialog_visible=st.rig.dialog_open,
+                                                   tripwires=TripWires(dialog_owned=st.exec.order_stage)))
+        self._note_new(st, checkpoint=cp)
+        return st.orch.stop is None
 
     def _execute(self, st: _Shard, u: Unit, cps: Sequence[PlannedCheckpoint], rest: Sequence[PlannedCheckpoint]) -> None:
         """Run one unit and take what it decided (`_absorb`)."""

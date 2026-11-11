@@ -4,6 +4,7 @@ that does not end the flow (1.10, 5.4.3 stage 7, L-OUT-07), a failed post-run ch
 the base evidence of an unsettled pair (9.2, 8.4) and a harness_error cell in the coverage row (2.12)."""
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 from datetime import date
 
@@ -46,3 +47,20 @@ def test_a_clean_fire_drill_leaves_the_nightly_complete(tmp_path):
     n = _nightly(tmp_path)
     assert (n.status, n.reason) == ("complete", None)
     assert n.shards[0]["kill_switch"] is None
+
+
+def test_a_stop_during_a_sweep_ladder_trips_at_the_next_ladder_step(tmp_path):
+    """pipeline:2 (6.6 Triggers, 2.5.1, 1.10): `sentinel stop` while the first Ladder S step is captured trips the
+    kill switch at the next ladder step's boundary; the eleven steps not reached are `env_error (running,
+    kill_switch)`, none of them captured."""
+    from sentinel.demo import AT, app_crash_scenario
+    from sentinel.pipeline.orchestration import RigScript
+    sc = dataclasses.replace(app_crash_scenario(TODAY), rig=RigScript(stop_at=f"sweep/{AT}/flexgrid/960x720"),
+                             name="sweep-stop")
+    r = pipeline_run.run_pipeline(EXAMPLE, sc, tmp_path, TODAY)
+    assert (r.status, r.reason) == ("aborted_safety", "kill_switch")
+    ladder = {o.checkpoint_id.rsplit("/", 1)[1]: o for o in r.outcomes if o.checkpoint_id.startswith(f"sweep/{AT}/")}
+    assert len(ladder) == 12 and ladder.pop("960x720").outcome == "identical"
+    assert {(o.outcome, o.reason, o.gate) for o in ladder.values()} == {("env_error", "kill_switch", "running")}
+    assert not [o for o in ladder.values() if o.artifacts]
+

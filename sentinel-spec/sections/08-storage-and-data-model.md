@@ -961,51 +961,60 @@ CONTROL HOST   D:\sentinel\artifacts\
   quarantine\<run_id>\            objects moved here by the plaintext scan; security clears them
 ```
 
-Manifest entries carry `name` (for example `flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07/candidate/capture.png`), `sha256`, `kind`, `bytes`, `media_type`, `checkpoint_id`, `side`, `redaction_version` and `captured_at`; the header carries the run or build id, the shard, the config commit, the harness commit and `created_at`. A name may map to a hash present in another set; the object is written again under this set because sets are the unit of retention and backup.
+Manifest entries carry `name` (for example `flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07/candidate/capture.png`), `sha256`, `kind`, `bytes`, `media_type`, `checkpoint_id`, `side`, `redaction_version` and `captured_at`; the header carries the run or build id, the shard, the config commit, the harness commit and `created_at`. A name may map to a hash present in another set; the object is written again under this set because sets are the unit of retention and backup. `artifacts` holds one row per hash, and `artifact_sets` (8.3) one row per copy, keyed (`sha256`, `set_path`) with its own `created_at`, `deleted_at` and `quarantined_at`, so retention, backup and the weekly audit (8.6) work per set: deleting or quarantining one set's copy never touches another set's.
 
-Write path on the rig. Capture runs the redaction stage, hashes the redacted bytes, writes them to a temporary name under `objects`, flushes, verifies the hash by reading back, and renames into place; only then does the Orchestrator queue the batch that names the hash. A write that fails (disk full, I/O error) is retried once; a second failure ends the checkpoint `harness_error (reason: artifact_persist_failed)` and the run can no longer be `complete` (8.9). A failure with `ENOSPC` is the same checkpoint outcome and also makes the Orchestrator request the Watchdog's immediate free-space check; only that check, the Watchdog's free-space check, ends the run, as `aborted_harness (reason: disk_full)` with every remaining checkpoint `harness_error (reason: disk_full)` (10.2, 8.9). An artifact without a redaction version is refused by the writer, so no path exists by which an unredacted image reaches a stored object on either host. Text artifacts (crash files, log slices, exports, reviewer requests, ledgers, journals) pass the post-run plaintext scan instead (6.9 Credentials and secret steps); a hit moves the shard's objects to `quarantine` and the run ends `aborted_harness (reason: secret_leaked)` with the report withheld.
+Write path on the rig. Capture runs the redaction stage, hashes the redacted bytes, writes them to a temporary name under `objects`, flushes, verifies the hash by reading back, and renames into place; only then does the Orchestrator queue the batch that names the hash. A write that fails (disk full, I/O error) is retried once; a second failure ends the checkpoint `harness_error (reason: artifact_persist_failed)` and the run can no longer be `complete` (8.9). A failure with `ENOSPC` is the same checkpoint outcome and also makes the Orchestrator request the Watchdog's immediate free-space check; only that check, the Watchdog's free-space check, ends the run, as `aborted_harness (reason: disk_full)` with every remaining checkpoint `harness_error (reason: disk_full)` (10.2, 8.9). An artifact without a redaction version is refused by the writer, so no path exists by which an unredacted image reaches a stored object on either host. Text artifacts (crash files, log slices, exports, reviewer requests, ledgers, journals) pass the post-run plaintext scan instead (6.9 Credentials and secret steps); a hit moves the shard's objects to `quarantine`, sets `quarantined_at` on their `artifact_sets` rows, and the run ends `aborted_harness (reason: secret_leaked)` with the report withheld.
 
-Write path on the control host. The import streams each object to `incoming`, recomputes the hash, rejects a mismatch, flushes, renames into `objects` and inserts the `artifacts` row inside the shard's import transaction. A mismatch is re-requested from the rig up to three times; a persisting mismatch marks the shard `import_failed` with reason `upload_hash_mismatch`, the run `aborted_harness (reason: artifact_persist_failed)`, and the rig keeps its copy until a human has looked (8.9).
+Write path on the control host. The import streams each object to `incoming`, recomputes the hash, rejects a mismatch, flushes, renames into `objects` and inserts the `artifacts` row (when the hash is new) and the `artifact_sets` row for this set inside the shard's import transaction. A mismatch is re-requested from the rig up to three times; a persisting mismatch marks the shard `import_failed` with reason `upload_hash_mismatch`, the run `aborted_harness (reason: artifact_persist_failed)`, and the rig keeps its copy until a human has looked (8.9).
 
 Kinds and sources: capture (Capture, one per checkpoint per side); crop, heatmap and diff mask (Diff Engine, above threshold only); OCR and bounds sidecars (Oracle, Invariant Checker); CSV export (Oracle); agent frame (Executor in agent mode and the Explorer, JPEG quality 80 at half resolution); video (Capture at 3 frames per second: full length for RC runs and the nightly fire drill, a 30 second ring buffer around failures otherwise); crash (Watchdog: `hs_err_pid*.log`, WER dumps, thread dumps); log slice (Watchdog); attestation and gate screenshots (Orchestrator, every gate pass or fail); request (Reviewer input JSON); ledger and journal (Orchestrator, hook host, Watchdog); mutant (Canary Service).
 
 ### 8.5 What lives in git and how a run pins it
 
-The `sentinel-config` repository holds everything that tells a run what to do; its layout and lint are owned by 4.1 Conventions, repository layout and the lint, and the paths below are that layout plus the files this section adds. Baseline images do not live in git; a manifest naming them does. The harness, its schemas and `sentinel lint` live in the `sentinel` repository.
+The `sentinel-config` repository holds everything that tells a run what to do; its layout and lint are owned by 4.1 Conventions, repository layout and the lint, and the paths below are that layout plus the files this section adds. Baseline images do not live in git; a manifest naming them does. The harness, its generated JSON Schemas (`schemas/` of the `sentinel` repository, 4.1) and `sentinel lint` live in the `sentinel` repository.
 
 ```
-taxonomy.yaml                                  outcome enums, reasons, finding kinds, triage states; the source of every CHECK and lookup row
-schemas/*.schema.json                          generated record schemas (4.1)
+taxonomy.yaml                                  outcome enums, reasons, finding kinds, triage states, quarantine reasons; the source of every CHECK and lookup row
 builds/*.yaml                                  build identity and build pairs
 manifests/<build_id>.yaml, manifests/mocks/    change manifests
 registry/surfaces/<area>/*.yaml                Surface Registry
 registry/dependency-map.yaml                   primitive -> surfaces
 registry/ladders.yaml                          size-sweep ladders S and F
 corpus/workspaces/<id>/                        Workspace Corpus entries and workspace files
+corpus/measured_sizes.yaml                     per-workspace gadget sizes from probe P8, the Ladder F corpus sizes; written by the Reporter's registry PR, owned by the registry owner (2.5.2)
 flows/<tier>/*.yaml, flows/RENAMES.yaml        flows; checkpoint rename map
 flows/quarantine/<finding-id>.yaml             Explorer candidate flows awaiting promotion (2.9)
 regions/<checkpoint_id>.yaml                   Region Registry: freeze, rule, mask, diff, redaction regions and landmarks
 regions/landmarks/<landmark_id>.png            landmark templates
+redaction/anchors.yaml                         the one global redaction list in regions-file shape: landmarks plus regions of type redaction (6.10)
+palettes/<theme>.yaml                          INV-15 sign colors per app theme, owned by the registry owner (2.7)
 masks/<checkpoint_id>/*.yaml                   mask records
 fixtures/*.yaml, profiles/*.yaml               account and data fixtures; pinned settings profiles
 popups/catalog.yaml                            popup catalog
-canaries/mutants.yaml                          the one mutant catalog: ids M01 to M33, classes of 10.3, money_cell flag, seed 20260101 (12.5, 10.3)
+canaries/mutants.yaml                          the one mutant catalog: M01 to M33 as 12.5 tables them, then M34 on in sequence, classes of 10.3, money_cell flag, seed 20260101 (12.5, 10.3)
 gateway/allowlist.yaml                         exact paper account ids per rig, hashed into the fingerprint (6.4)
 gateway/default_order_hotkeys.yaml             default order-action chords of the pinned build, read once in Phase 0 (6.2)
-configs/allowed.yaml                           display configurations, each its own fingerprint (7.1)
+gateway/dismiss_allowlist.yaml                 the dismiss allowlist of 6.2
+configs/allowed.yaml                           display configurations, each its own fingerprint, with the work_area that gives Ladder F's MAXW and MAXH (7.1, 2.5.2)
 diff_engine.yaml                               Diff Engine parameters (3.7)
-budgets.yaml                                   dollar caps per run and per week (11.4)
 soak.yaml                                      soak budgets (10.11)
-ops/rotation.yaml                              credential rotation calendar (7.7)
+schedule/windows.yaml                          operating day, named quiet windows, maintenance windows and holiday rules (7.10)
+ops/oncall.yaml                                weekly triage rotation and harness on-call roster (11.6)
+ops/credential_rotation.yaml                   credential rotation calendar (7.7)
 model_deprecations.yaml                        vendor deprecation notices the system owner records (10.7)
+policy/budgets.yaml                            dollar caps per Explorer session, per run and per week, and reviewer call caps (11.4)
 policy/release_gate.yaml                       sign-off lead N per release train (11.1)
-calibration/<fingerprint_id>.yaml              per-region A/A floors, exported by the Calibration Service from calibration_floors
-quarantine.yaml                                quarantined checkpoints: checkpoint, owner, ticket, entered, reason (10.5)
+policy/explorer_deny_list.yaml                 the Explorer deny list (6.8)
+policy/egress_allowlist.yaml                   hosts that artifacts and messages may leave for (6.10)
+policy/computer_use_ruling.yaml                the DR-07 computer-use ruling, read and validated at preflight G1 (6.11)
+calibration/<hex>.yaml                         per-region A/A floors, exported by the Calibration Service from calibration_floors; <hex> is fingerprint_id without its sha256: prefix (4.1)
+quarantine.yaml                                quarantine records: exactly one of checkpoint or flow, owner, ticket, entered, reason from the 10.5 table
 policy/send_policy.yaml                        the OPEN paper_send_ok switch, signed by the risk owner
 phase0/branches.yaml                           the chosen branch for each unknown
 eval/<eval_set_version>/labels.jsonl           reviewer eval labels; images live in the artifact store
 baselines/<lineage>/<build_id>/manifest.json   committed by the sign-off bot at RC sign-off
 authorization/<version>.md                     the signed authorization of 6.12, referenced by every run
+authorization/<version>.yaml                   the machine-readable form of that authorization (6.12)
 CODEOWNERS                                     flow owner per surface tier approves flows/ and registry/
 ```
 
@@ -1017,7 +1026,7 @@ Baseline manifests. The Central Store is the live system of record for baseline 
 
 ### 8.6 Retention and backup
 
-Retention is per artifact class and never deletes a pinned object. The sweep runs nightly after the backup on the control host, sets `deleted_at` before unlinking, and refuses to remove anything referenced by a baseline row or by a finding whose triage state is not closed.
+Retention is per artifact class and per set and never deletes a pinned object. The sweep runs nightly after the backup on the control host, sets `deleted_at` on the set's `artifact_sets` row before unlinking that set's copy (8.4), and refuses to remove anything referenced by a baseline row or by a finding that pins its evidence. A finding pins its evidence while it is `open`, `confirmed_bug` or `fixed_pending_verify`, or `intended` with no approved baseline yet; once it is `closed`, `noise`, `agent_mistake` or `expected_behavior` (or `intended` with its baseline approved) its objects are released 180 days after `closed_at`, the time the finding left the pinning states.
 
 | Class | Keep |
 |---|---|
@@ -1026,7 +1035,7 @@ Retention is per artifact class and never deletes a pinned object. The sweep run
 | Run Store, ledgers and objects on the rig | until the shard is `imported` plus 7 days, and in any case until the next snapshot revert; a shard that is `import_failed` or `lost` is kept on the rig until a human releases it |
 | Ledgers and journals in `runs\<run_id>\shards\` | life of the run's artifact set |
 | Baseline images, every state | never deleted |
-| Artifacts referenced by an open, confirmed or fixed-pending-verify finding | until the finding closes plus 180 days |
+| Artifacts referenced by a finding that is `open`, `confirmed_bug`, `fixed_pending_verify`, or `intended` without an approved baseline | pinned while the finding is in one of those states; released 180 days after `closed_at` once it leaves them (`closed`, `noise`, `agent_mistake`, `expected_behavior`) |
 | Full checkpoint sets of the last 3 `complete` merge runs on main and the last 2 RC runs per release | until superseded |
 | PR run artifacts | 14 days after the run, or 7 days after the PR merges or closes, whichever is earlier |
 | Merge run artifacts not pinned above | 14 days |
@@ -1039,7 +1048,7 @@ Retention is per artifact class and never deletes a pinned object. The sweep run
 
 Backup. At 02:00 America/New_York a job on the control host runs `VACUUM INTO` for a consistent snapshot while the service runs, exports decisions, baselines, masks, flake statistics, incidents and quarantine records as JSONL, and mirrors the snapshot, the exports, all of `baselines\` and every pinned object under `runs\` to the backup location with robocopy. Snapshots are kept 7 daily and 8 weekly. On success it writes `last_backup_at` to system state; on any failure it writes `last_backup_error` and raises the 9.10 Store health alert (P2, posted at 06:00 under the after-hours rule of 11.6), and a `last_backup_at` older than 36 hours raises the same alert from the Nightly run's state check as a second line of defence. The retention sweep is skipped on any night whose backup failed, and run health prints "retention skipped: backup failed". Weekly, `PRAGMA integrity_check` runs on the snapshot and records `last_integrity_check_at`; a failure on the snapshot is a service stop and restore (8.9), not a warning.
 
-Artifact audit. Weekly, the control host re-hashes every pinned object and a 5 percent sample of the rest, writes `audit_state` and `last_audit_at`, and opens an `artifact_missing` finding for any object that is missing or whose hash no longer matches; a pinned object that fails is restored from the backup mirror and the restore is logged.
+Artifact audit. Weekly, the control host re-hashes every pinned object and a 5 percent sample of the rest, set by set (each `artifact_sets` copy is checked on its own), writes `audit_state` and `last_audit_at`, and opens an `artifact_missing` finding for any object that is missing or whose hash no longer matches; a pinned object that fails is restored from the backup mirror and the restore is logged.
 
 Restore drill, quarterly, owned by the system owner: restore the latest snapshot and `baselines\` to a scratch host, start the report UI against it, re-diff ten checkpoints of one RC run against the restored baselines, and confirm the outcomes match the original rows. The date goes into `last_restore_drill_at`; older than 100 days is a red row in Run health.
 
@@ -1049,9 +1058,9 @@ Storage preflight. The `provisioned` gate requires free space on the rig above t
 
 The report UI is the FastAPI application of 5.13 Reporter and Integrations (technology in 5.18 Technology choices), on the control host behind SSO; page contents are defined in 9.5 Report UI pages.
 
-Reads open the Central Store with `mode=ro` and `PRAGMA query_only = 1` from a small pool, one short transaction per request. Pages follow the indexes in 8.3: run page (outcomes by run joined to checkpoints and findings, ordered by tier then outcome, with the shard list and import state), checkpoint history, finding page (finding, review and the live decision lookup from 8.3, so the page shows what a new diff would inherit), coverage matrix (coverage cells by run; for a PR run, the matrix from the run's summary JSON), trends (flake stats, canary results by night and defect class, calibration floors by fingerprint, egress by day, mask area by commit), safety (post-run proofs, incidents, blocked logins). Lists paginate at 200 rows. The run page reads the run's summary JSON first and expands to rows on demand; the Reporter renders the PR comment from that summary, written when the last shard imports, which keeps it inside the 45 minute PR run budget.
+Reads open the Central Store with `mode=ro` and `PRAGMA query_only = 1` from a small pool, one short transaction per request. Pages follow the indexes in 8.3: run page (outcomes by run joined to checkpoints and findings, ordered by tier then outcome, with the shard list and import state), checkpoint history, finding page (finding, review and the live decision lookup from 8.3, so the page shows what a new diff would inherit), coverage matrix (coverage cells by run; for a PR run, the matrix from the run's summary JSON), trends (flake stats, canary results by night and defect class, calibration floors by rendering key (7.13), egress by day, mask area by commit), safety (post-run proofs, incidents, blocked logins). Lists paginate at 200 rows. The run page reads the run's summary JSON first and expands to rows on demand; the Reporter renders the PR comment from that summary, written when the last shard imports, which keeps it inside the 45 minute PR run budget.
 
-Artifacts are served at `/a/<sha256>` with the media type from the `artifacts` table and immutable cache headers. A hash with `deleted_at` set returns a page saying what the object was and when retention removed it, never a broken image; a hash with `audit_state` other than `ok`, or a hash an outcome names that has no `artifacts` row, returns a page saying the evidence is missing and names the finding that records it. PR comments and Slack messages link to these URLs; images are never uploaded to the PR host, Jira or Slack, so only text leaves for those destinations, logged as such in the egress log.
+Artifacts are served at `/a/<sha256>` with the media type from the `artifacts` table and immutable cache headers. A hash whose every `artifact_sets` copy has `deleted_at` set returns a page saying what the object was and when retention removed it, never a broken image; a hash with `audit_state` other than `ok`, or a hash an outcome names that has no `artifacts` row, returns a page saying the evidence is missing and names the finding that records it. PR comments and Slack messages link to these URLs; images are never uploaded to the PR host, Jira or Slack, so only text leaves for those destinations, logged as such in the egress log.
 
 Writes (confirm bug, mark intended with ticket, mark noise, request mask, approve or reject a baseline, revoke a decision, quarantine or un-quarantine, Explorer disposition, clear an unproven proof, close an incident, override a check) post to the Reporter service's local API with the SSO identity of the person acting. The service validates against the constraints in 8.3, writes through the single writer, appends to the day's decisions ledger and returns the row id. `decided_by`, `approved_by`, `quarantined_by`, `retired_by`, `verified_by`, `closed_by` and `check_override_by` always hold a person; service accounts are rejected by the API and by the CHECK constraints. Request mask, quarantine and un-quarantine write no table row of their own; they open the pull requests of 8.5, and the mirror tables follow the merged commit. Metrics jobs (9.11 Metrics dashboard and kill criteria) read the same path and write results into the Nightly run's summary JSON through the writer.
 

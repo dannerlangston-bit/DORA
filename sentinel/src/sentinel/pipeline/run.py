@@ -53,9 +53,10 @@ with `synthetic: true`, behavioral canaries run their canary flow on the simulat
 `canary.score` gives the result rows, the detector state, the synthetic `harness_error` rows and
 the morning banner. Its safety pass (`safety_pass`, 6.5, 6.8, 10.3) then runs the attestation, identity, proof and
 secret-scan canaries, the denied-action test and the fire drill (`orchestrator.drill.run_drill` with `SimDrillPort`)
-on the shard's rig; their `canary_results` rows are written, a blind one's result is persisted
-(`apply_safety_actions`), its banner and detector state join the run's (summary `safety`, which later PR runs in the
-store read), and the day's egress rows are reconciled against the allowlist (`egress.reconcile`).
+on the shard's rig; their `canary_results` rows are written, every result goes through `Orchestrator.apply` (a drill
+that placed an order stops the shard through the kill switch, `aborted_safety (drill_order_placed)`), a blind one's
+result is persisted (`apply_safety_actions`), its banner and detector state join the run's (summary `safety`, which
+later PR runs in the store read), and the day's egress rows are reconciled against the allowlist (`egress.reconcile`).
 
 The Orchestrator (5.2): every shard goes through `orchestrator.Orchestrator` on a simulated rig
 (`pipeline.orchestration`): provisioned, launched, authenticated, the paper-mode assertion against
@@ -63,15 +64,16 @@ the example allowlist, settings attestation, workspace, fixture verification and
 `running`, where the Executor (`_ShardWork`) re-reads the build id before each unit of work, then calls
 `Orchestrator.flow_boundary` (the kill channels and trip-wires, the Watchdog, free space, the 11.2 wall budget
 of the shard, the rate caps, the spend ceiling, the model re-check, the paper-mode assertion of 6.4 and the
-proactive relaunch), writes a heartbeat at every step and calls `step_boundary` before every flow step (the
-trip-wires, the flow's budget, the assertion before an order-stage step or on the two-minute timer), sends each
-input-bearing flow step through the gateway (`Rig.send_input`, the drop ledger of 5.4.8), runs the Watchdog's
-hang detector (an app failure relaunches through `Orchestrator.relaunch("app_failure")`, every gate again, and
-writes a `relaunch` step event), and captures the checkpoints of every shard in `running` in plan order, each
-stamped with the session's paper-asserted stamp (`paper_stamp`; none means `aborted_safety (paper_mode_mismatch)`
-through the kill switch, and a stamp `may_release` refuses keeps the frame from the Reviewer); then each shard's
-teardown and post-run proof. The session safety state goes to the rig (`safety_listener`), and every record is
-written under its session's L-OUT-06 context (`Store.set_session_context`). A control result that stops
+proactive relaunch), writes a heartbeat at every step and calls `step_boundary` before every flow step and
+every sweep or split step after its ladder's first (the trip-wires, the flow's budget, the assertion before an
+order-stage step or on the two-minute timer), sends each input-bearing flow step through the gateway
+(`Rig.send_input`, the drop ledger of 5.4.8), runs the Watchdog's hang detector (an app failure relaunches
+through `Orchestrator.relaunch("app_failure")`, every gate again, and writes a `relaunch` step event), and captures
+the checkpoints of every shard in `running` in plan order, each stamped with the session's paper-asserted stamp
+(`paper_stamp`; none means `aborted_safety (paper_mode_mismatch)` through the kill switch, and a stamp
+`may_release` refuses keeps the frame from the Reviewer); then each shard's teardown and post-run proof. The
+session safety state goes to the rig (`safety_listener`), and every record is written under its session's L-OUT-06
+context (`Store.set_session_context`). A control result that stops
 a shard gives its unreached checkpoints the Orchestrator's exact outcome (1.10); the run outcome is the
 worst of the shards' (8.2). The A/A calibration runs once a shard reaches `running`, so a run whose
 shards all stop at a gate captures nothing. Every gateway decision of a shard (the Executor's flow input, the
@@ -183,13 +185,13 @@ from ..records import (FINDING_CATEGORIES, PERSONAS, CheckpointOutcome, Decision
                        Signature, StepEvent, StepOutcome)
 from ..report import ReportContext, ReportInputs, render_report_markdown, write_run_report
 from ..report.cluster import Member, cluster_members
-from ..report.model import NOT_COMPARED, proof_severity, worst_proof
+from ..report.model import proof_severity, worst_proof
 from ..scope import (DependencyIndex, Manifest, PlannedCheckpoint, Rig, ScopeConfigError, ScopePlan, classes_in,
                      compute_scope)
 from ..store import ArtifactStore, Store
 from ..store.artifacts import ManifestHeader, Redaction, StoredArtifact
 from ..required_fields import WATCHDOG_EVENT
-from ..store.checks import end_taxonomy_check_failed, post_run_check
+from ..store.checks import FAILED_REASON as CHECK_FAILED, end_taxonomy_check_failed, post_run_check
 from ..store.safety import (AppliedSafety, activity_quarantined, apply_safety_actions, open_quarantines,
                             quarantined_flow, refuse_blocked)
 from ..store.secret_scan import SecretScanner, check_upload, scan_run
@@ -315,10 +317,11 @@ class Evaluated:
         return self.redaction is None or self.redaction.terminal is None
 
     def images(self) -> tuple[np.ndarray | None, np.ndarray]:
-        """(base, candidate) as stored and sent: the redacted pair when the stage ran (3.6), else the screens."""
+        """(base, candidate) as stored and sent: the redacted pair when the stage ran (3.6), else the screens. A
+        checkpoint redacted without a base frame (a side that did not settle) has no base image (8.4, 9.2)."""
         r = self.redaction
         if r is not None and r.terminal is None and r.candidate is not None:
-            return (r.base if self.base is not None else None), r.candidate
+            return r.base, r.candidate
         return (self.base.screen.image if self.base else None), self.cand.screen.image
 
     @property
@@ -478,15 +481,17 @@ class _Run:
     def redact(self, cp: PlannedCheckpoint, base: Capture | None, cand: Capture, base_img: np.ndarray | None,
                cand_img: np.ndarray, *, count: bool = True) -> RedactionResult:
         """Redact one checkpoint's pair in memory before anything is diffed or stored (`capture.redact_pair`): the
-        simulated OCR reads what synth drew on each side; a capture without a base is redacted against itself."""
-        b_cap, b_img = (base, base_img) if base is not None and base_img is not None else (cand, cand_img)
+        simulated OCR reads what synth drew on each side; a capture without a base frame is redacted against itself
+        and its result has no base image, so nothing of the candidate is ever stored or sent as the base (8.4, 9.2)."""
+        alone = base is None or base_img is None
+        b_cap, b_img = (cand, cand_img) if alone else (base, base_img)
         ocr = {"base": SyntheticOcr.from_screen(b_cap.screen), "candidate": SyntheticOcr.from_screen(cand.screen)}
         res = redact_pair(b_img, cand_img, self.anchors, ocr, THEME["bg"], sweep=self.sweep,
                           context=RedactionContext(self.run_id, cp.checkpoint_id, cp.tier), params=self.params)
         if res.terminal is None and count:
-            for side in ("base", "candidate") if base is not None else ("candidate",):
+            for side in ("candidate",) if alone else ("base", "candidate"):
                 self.redaction_counts[side] += int(res.counts.get(side, 0))
-        return res
+        return dataclasses.replace(res, base=None) if alone else res
 
     def redaction_canary(self, cp: PlannedCheckpoint, base: Capture, m: cn.Mutant) -> bool:
         """M19 (12.5, 6.10): the mutant leaves a synthetic account id unredacted in the candidate frame; the redaction
@@ -1209,10 +1214,9 @@ def coverage_summary(cfg: SentinelConfig, plan: ScopePlan, outcomes: Sequence[Ch
             continue
         reasons = [c.reason for c in cells if c.state == "not_run" and c.reason and c.reason != "scope"]
         blocked = [r for r in reasons if r.startswith("blocked:")]
-        if blocked:                 # a harness_error blocks no comparison column: run health counts it (9.11)
+        if blocked:                 # 2.12: every blocking outcome alike is not compared and leaves the percent
             k = blocked[0].split(":", 1)[1]
-            if k in NOT_COMPARED:
-                t["not_compared"][k] = t["not_compared"].get(k, 0) + 1
+            t["not_compared"][k] = t["not_compared"].get(k, 0) + 1
         elif reasons:
             k = reasons[0].split(":", 1)[0]
             t["not_run"][k] = t["not_run"].get(k, 0) + 1
@@ -1910,14 +1914,27 @@ class _ShardWork:
                                                "and the tier C workspace reload (2.5.1)"
                                                + ("" if ok else "; the reset or the reload failed")))
             st.host = host
+        started = False
         for i, cp in enumerate(unit):
             if st.orch.stop is not None:
                 return
             if cp not in self._todo(st):
                 continue
+            if started and not self._ladder_boundary(st, cp):
+                return                  # the unreached steps take the stop's outcome at `_finish` (1.10, 6.6)
+            started = True
             path = list((self.cfg.surfaces.get(cp.surface_id) or {}).get("path") or ())
             self._execute(st, census_unit(cp.checkpoint_id, [s for s in path if s.get("type") == "wait_for"],
                                           workspace_id=cp.workspace_id), [cp], unit[i + 1:])
+
+    def _ladder_boundary(self, st: _Shard, cp: PlannedCheckpoint) -> bool:
+        """The Orchestrator's `step_boundary` before a sweep or split step after its ladder's first (the unit's
+        `flow_boundary` covers the first): each ladder size is a step (2.5.1), and the kill channels and trip-wires are
+        evaluated at every step boundary (6.6 Triggers). False when the shard stopped."""
+        st.orch.step_boundary(BoundaryObservations(order_dialog_visible=st.rig.dialog_open,
+                                                   tripwires=TripWires(dialog_owned=st.exec.order_stage)))
+        self._note_new(st, checkpoint=cp)
+        return st.orch.stop is None
 
     def _execute(self, st: _Shard, u: Unit, cps: Sequence[PlannedCheckpoint], rest: Sequence[PlannedCheckpoint]) -> None:
         """Run one unit and take what it decided (`_absorb`)."""
@@ -2827,11 +2844,19 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         dims = summary["coverage"]["matrix"]          # 1.4 G2 and L-OUT-07 on the stored rows, before anything reports
         failures = post_run_check(store, scenario.run_id, dims["surfaces"], dims["personas"], dims["profiles"],
                                   cells=summary["coverage"]["cells"])
-        if failures:
+        checked = worse(RunVerdict("aborted_harness", CHECK_FAILED), RunVerdict(status, reason)) if failures else None
+        if checked is not None and checked.status == "aborted_harness":
             store.update_summary(scenario.run_id, summary)
             runrec = end_taxonomy_check_failed(store, scenario.run_id, failures, last_gate=last_gate,
                                                watchdog_event_id=_event_id(run, None), ended_at=_ts(today, scenario.clock,
                                                                                                    int(wall)))
+        elif checked is not None:          # 8.2: a safety abort stays the run's outcome; the failed check withholds
+            store.fill_unreached(scenario.run_id, "env_error", reason, gate=last_gate,      # 1.10, as the abort's own
+                                 detail=f"watchdog_event: {_event_id(run, None)}; post-run check failed: {failures[0]}")
+            runrec = store.end_run(RunOutcome(scenario.run_id, "pr", status, last_gate, reason=reason,
+                                              started_at=started, ended_at=_ts(today, scenario.clock, int(wall))),
+                                   summary={**summary, "post_run_check": {"failures": list(failures),
+                                                                          "report_withheld": True}})
         else:
             runrec = store.end_run(RunOutcome(scenario.run_id, "pr", status, last_gate, reason=reason,
                                               started_at=started, ended_at=_ts(today, scenario.clock, int(wall))),
@@ -3350,6 +3375,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                               context=cn.RowContext(scenario.run_id, "ws.tier-a.swing-trader", "swing_trader", "frozen"))
             done.update(report=report, rows_meta=rows_meta, produced=produced, writer=writer, arts_by_sha=arts_by_sha)
             done["safety"] = safety_pass(cfg, orch, nrig, ctx, work.ledger, out / "safety-canaries" / scenario.run_id)
+            for res in done["safety"].results:      # 6.5, 1.10: a drill that placed an order stops the shard through
+                orch.apply(res)                     # the kill switch, `aborted_safety (drill_order_placed)`
 
         shard = orch.run(canary_pass)
         st = _Shard(ctx.shard_id, cfg.fixture.get("rig", "rig-01"), [], orch, orch.rig, orch.sink, clock, ctx)
@@ -3360,6 +3387,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         work.summaries.append({"shard_id": ctx.shard_id, "rig": st.rig_id, "verdict": shard.verdict.status,
                                "reason": shard.verdict.reason, "last_gate": shard.last_gate,
                                "proof": shard.proof.line,
+                               "kill_switch": [name for name, _ in shard.kill_switch.steps] if shard.kill_switch
+                               else None,
                                "gates": [{"control": r.control, "gate": r.gate, "passed": r.passed, "detail": r.detail}
                                          for r in shard.results]})
         work.write()
@@ -3384,11 +3413,9 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                                              started)
         for f in expired_findings:
             store.write_finding(f)
-        work.apply_pending()                          # the gate results noted before the run row existed
+        work.apply_pending()             # the gate and safety-pass results noted before the run row existed
         safety = done["safety"]                      # 6.5, 6.8, 10.3: the drill and the safety canaries' rows
         store.write_canary_results(scenario.run_id, safety.rows, created_at=_ts(today, scenario.clock, 1800))
-        for res in safety.results:
-            work._note(st, res)
         written: set[str] = set()
         for row in report.outcome_rows:
             if row.checkpoint_id in written:

@@ -92,7 +92,8 @@ Choices where 9.2 is silent (reported to the coordinator):
 - A census cluster of several surfaces in one workspace is described as "one census checkpoint
   per surface" (9.3 says "per cell" for its Flexible Grid cells; no record carries that noun).
 - Comparable scope for the coverage percent is in-scope cells minus `not_run (entitlement)`
-  minus not-compared (blocked) cells (2.12: blocked cells are not in the coverage percent).
+  minus not-compared (blocked) cells (2.12: blocked cells are not in the coverage percent). Every outcome a
+  `blocked:<outcome>` cell can name, `harness_error` included, is a Not compared column entry (`NOT_COMPARED`).
 - The Coverage table keeps the 2.12 surface-and-persona cells; beneath it one line counts the run's `not_run`
   checkpoints per reason ("Checkpoints not run: 7 app_crash (sweep steps after the crash)", `not_run_line`), so
   checkpoints that a cell's worse outcome hides from the table are still shown; no line when none is not_run.
@@ -164,7 +165,8 @@ G2_WITHHELD = ("Coverage matrix withheld: its cells do not sum to surfaces x per
                "(1.4 G2), so the Reporter publishes none")
 NOT_RUN_ORDER = ("scope", "budget", "entitlement", "quarantine", "step_failed", "base_step_failed",
                  "app_crash", "model_unavailable")
-NOT_COMPARED = ("env_error", "not_settled", "not_comparable", "landmark_missing", "not_run")
+# 2.12: the outcomes a `blocked:<outcome>` cell names, which stopped comparison: the Not compared column (9.2)
+NOT_COMPARED = ("env_error", "harness_error", "not_settled", "not_comparable", "landmark_missing", "not_run")
 # 1.10 not_run reasons, as the checkpoint line under the Coverage table says which checkpoints they are (9.2)
 NOT_RUN_WHICH = {
     "scope": "outside the run's scope",

@@ -402,9 +402,11 @@ class _Run:
         self.entries = frozenset(e.entry_id for e in manifest.entries) if manifest else frozenset()
         self.tickets = frozenset(t for e in manifest.entries for t in e.tickets) if manifest else frozenset()
         # 3.6, 6.10: the redaction list and the sweep's literal ids (the fixture's accounts) and display name (the
-        # vault's login record); one version per run. Sweep.for_login raises RedactionError without the name.
+        # vault's login record); one version per run. Without the list or the name, RedactionError.
         anchors = cfg.root / "redaction" / "anchors.yaml"
-        self.anchors = RedactionList.load(anchors, cfg.root) if anchors.is_file() else RedactionList()
+        if not anchors.is_file():                         # 6.10 stage 1 is never empty (the lint refuses it first)
+            raise RedactionError("redaction/anchors.yaml is missing: Capture's stage-1 redaction list is required")
+        self.anchors = RedactionList.load(anchors, cfg.root)
         ids = tuple(str(a["account_id"]) for a in cfg.fixture.get("accounts") or () if a.get("account_id"))
         self.sweep = Sweep.for_login(ids, login_display_name(str(cfg.fixture.get("rig", "rig-01"))))
         self.red_header = Redaction(redaction_version(self.anchors, self.sweep))

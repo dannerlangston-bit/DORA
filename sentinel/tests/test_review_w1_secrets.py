@@ -403,6 +403,41 @@ def test_secrets_7_a_clean_nightly_run_is_scanned_and_reports(tmp_path, monkeypa
     assert list(tmp_path.glob("nightly-report-*.html")) and list(tmp_path.glob("canary-results-*.json"))
 
 
+# == secrets:9: a missing redaction list is config_invalid, never an empty stage 1 ===================================
+
+def test_secrets_9_the_lint_refuses_a_config_without_its_redaction_list(tmp_path):
+    """6.10 stage 1, 4.1: `redaction/anchors.yaml` is required; without it (or without an identity-field region in
+    it) the lint reports an error, so the run-start lint aborts the run `config_invalid`."""
+    from sentinel.lint import lint
+    cfg = _config_without(tmp_path, "redaction/anchors.yaml")
+    errors = [(v.rule, v.file) for v in lint(cfg, phase=1, today=TODAY).errors]
+    assert ("L-MSK-03", "redaction/anchors.yaml") in errors
+    r = run_pipeline(cfg, clean_scenario(TODAY), tmp_path / "out", today=TODAY)
+    assert (r.status, r.reason) == ("aborted_harness", "config_invalid")
+    shutil.copy(EXAMPLE / "redaction" / "anchors.yaml", cfg / "redaction" / "anchors.yaml")
+    p = cfg / "redaction" / "anchors.yaml"
+    p.write_text(p.read_text().replace("identity_field: true", "identity_field: false"))
+    msgs = [v.message for v in lint(cfg, phase=1, today=TODAY).errors if v.file == "redaction/anchors.yaml"]
+    assert any("identity_field" in m for m in msgs)
+
+
+def test_secrets_9_a_run_never_falls_back_to_an_empty_redaction_list(tmp_path):
+    """6.10: past the lint, the run itself refuses to build its redaction stage without the file."""
+    from datetime import datetime, timezone
+
+    import pytest
+
+    import sentinel.pipeline.run as pr
+    from sentinel.capture import RedactionError
+    from sentinel.demo import BASE_ID
+    from sentinel.pipeline.config import SentinelConfig
+    from sentinel.pipeline.sim import SimBuild
+    cfg = SentinelConfig.load(_config_without(tmp_path, "redaction/anchors.yaml"))
+    with pytest.raises(RedactionError, match="anchors.yaml"):
+        pr._Run(cfg, "run-x", "pr", SimBuild(BASE_ID), SimBuild(BASE_ID), datetime.now(timezone.utc), None, None,
+                lambda s: "undeclared")
+
+
 def test_secrets_6_scan_run_reads_a_ledger_tail_and_in_memory_texts(tmp_path):
     """6.9 choice 1: a shared results.jsonl is scanned from the offset where this run began (an earlier run's lines
     are not this run's), and text the run has not written yet (the report's inputs) is scanned from memory."""

@@ -386,6 +386,20 @@ def test_confirm_and_send_needs_order_stage_attestation_and_paper_assertion():
     assert s.reason == "deny_profile" and "empty dismiss allowlist" in s.detail
 
 
+@pytest.mark.parametrize("other", ["Submit Order", "Flatten Position", "Replace Order", "Blast All Orders",
+                                   "Auto Send ON"])
+def test_confirm_and_send_exempts_only_its_own_label_from_the_send_like_check(other):
+    """6.2 Slow half, 5.4.3 stage 4: the under-point OCR is a second, independent check, so a send-like label beside
+    `Confirm and Send` (the resolver's anchor offset landed on a neighbour) is an attempted send, either way round,
+    even where Confirm and Send itself would be refused for another reason."""
+    ctx = pinned(attestation_passed=True, paper_assertion_current=True)
+    for rn, ocr in (("Confirm and Send", other), (other, "Confirm and Send")):
+        for c in (ctx, SafetyContext()):
+            s = slow_half(click(rn, ocr, order_stage_step=True), c)
+            assert (s.refused, s.reason, s.attempted_send) == (True, "never_tokenize", True), (rn, ocr, c)
+    assert not slow_half(click("Confirm and Send", order_stage_step=True), ctx).refused
+
+
 def test_dialog_allowlist_inverts_inside_the_order_dialog():
     ctx = pinned(flag=Flag.SET, order_dialog_present=True, deny_rects=(SEND,))
     ok = slow_half(click("Delete", point=DELETE_POINT), ctx)

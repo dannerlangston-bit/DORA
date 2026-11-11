@@ -807,16 +807,18 @@ def slow_half(a: Action, ctx: SafetyContext) -> SlowDecision:
     send_click = pointer and len(labels) == 2 and all(s == SEND_LABEL for s in labels)
     gate_says = ctx.send_gate.check(a, ctx) if send_click and ctx.send_gate is not None else "no send gate"
     send_ok = send_click and gate_says is None
-    # never-tokenize (exact list anywhere; the send-like regex outside the Order Confirmation dialog)
+    # never-tokenize (exact list anywhere; the send-like regex outside the Order Confirmation dialog, on every label
+    # but `Confirm and Send` itself, so the under-point OCR stays an independent check beside it, 6.2)
     if pointer and not send_ok:
         if any(NEVER_TOKENIZE_RE.match(s) for s in labels):
             return _refuse("never_tokenize", f"label {labels}" + (f"; {gate_says}" if send_click else ""), send=True)
+        others = [s for s in labels if s.lower() != CONFIRM_AND_SEND]
+        if not ctx.order_dialog_present and any(SEND_LIKE_RE.search(s) for s in others):
+            return _refuse("never_tokenize", f"send-like label {labels}", send=True)
         if confirm:
             hit = _confirm_refusal(a, ctx)
             if hit is not None:
                 return hit
-        elif not ctx.order_dialog_present and any(SEND_LIKE_RE.search(s) for s in labels):
-            return _refuse("never_tokenize", f"send-like label {labels}", send=True)
         if a.profile == "scripted":
             if "cancel all" in lowered and a.teardown_action != "cancel_all":
                 return _refuse("deny_profile", "Cancel All outside the cancel_all teardown action")

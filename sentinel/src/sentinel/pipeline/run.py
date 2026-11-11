@@ -2010,7 +2010,8 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         if live is None and live_factory is not None:
             live = live_factory(gate)
         items = ItemBuilder(scenario.run_id, arts, run.red_header, _EvalIndex(work), manifest=manifest, epoch=run.epoch,
-                            flow_docs=cfg.flow_docs, pad=(live.config if live else ReviewerConfig()).crop.pad_px)
+                            flow_docs=cfg.flow_docs, pad=(live.config if live else ReviewerConfig()).crop.pad_px,
+                            sweep=run.sweep)
         if reviewer is None and live is not None:          # 3.12: the real Reviewer; crops from the artifact store
             rev = ModelReviewer(live, items)
         if isinstance(rev, CollectingReviewer):            # `sentinel review`: its live items go through `gate`

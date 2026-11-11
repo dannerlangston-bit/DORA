@@ -181,3 +181,59 @@ def test_secrets_2_a_run_with_no_display_name_for_the_sweep_does_not_start(tmp_p
     assert not any(o.artifacts for o in r.outcomes)
     with Store(tmp_path / "sentinel.db") as store:
         assert "display name" in " ".join(store.run_summary(r.run_id)["lint_errors"])
+
+
+# == secrets:3: the Reviewer item's text is redacted like its pixels ===========================================
+
+def test_secrets_3_an_identifier_blacked_out_in_pixels_is_not_sent_as_text(tmp_path, monkeypatch):
+    """6.10 stage 3, 6.12 S1: the redaction-miss scenario draws an account id on the Order Confirmation; the stage
+    fills it, and the Reviewer item built for that checkpoint carries it neither in `ocr_text` nor in the prompt."""
+    import sentinel.pipeline.run as pr
+    from sentinel.demo import DEFAULT_TODAY, PR_SCENARIOS
+    from sentinel.pipeline.live import ItemBuilder
+    from sentinel.pipeline.reviewer import ReviewRequest
+    from sentinel.reviewer.prompt import item_text
+    saved = {}
+
+    class Spy(ItemBuilder):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            saved["b"] = self
+    monkeypatch.setattr(pr, "ItemBuilder", Spy)
+    pr.run_pipeline(EXAMPLE, PR_SCENARIOS["redaction-miss"](DEFAULT_TODAY), tmp_path, DEFAULT_TODAY)
+    b = saved["b"]
+    cid = "flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07"
+    ev = b.evals[cid]
+    assert [f.kind for f in ev.redaction.findings] == ["redaction_miss"]
+    assert any(w.text == "D-20481134" for w in ev.cand.model.words)          # drawn, and filled in the pixels
+    req = ReviewRequest("describe_collateral", (cid,), ev.cp.surface_id, None, ev.cp.tier, ev.cp.data_mode,
+                        ev.cp.workspace_id, {"changed_px": 10}, (), (0, 0, 1, 1),
+                        edge={"primitive": "p", "entry_id": "e"})
+    item = b(req)
+    assert item.ocr_text and "D-20481134" not in item.ocr_text
+    assert "D-20481134" not in item_text(item, [])
+
+
+def test_secrets_3_split_identifiers_and_the_title_are_scrubbed():
+    """6.10: a phone number split into words, a word under a filled box, and a display name in the window title
+    are not sent; other words are."""
+    from types import SimpleNamespace as NS
+
+    from sentinel.capture import Sweep
+    from sentinel.diff.regions import Rect as RRect
+    from sentinel.invariants import Rect, WordBox
+    from sentinel.pipeline.live import REDACTED, ItemBuilder
+
+    def word(text, x):
+        return WordBox(text, Rect(x, 100, 30, 10), 95.0)
+    words = [word("Call", 10), word("555", 50), word("867", 90), word("5309", 130), word("now", 170),
+             word("hidden", 210), word("Buy", 250)]
+    ev = NS(cand=NS(model=NS(words=words), screen=NS(components=[
+        NS(kind="titlebar", text="thinkorswim - Wren Halvorsen-Tate - Main", bbox=(0, 0, 400, 20))])),
+        redaction=NS(boxes=[NS(rect=RRect(205, 95, 40, 20))]))
+    b = ItemBuilder.__new__(ItemBuilder)
+    b.matchers = [m for _, m in Sweep.for_login(("D-20481133",), "Wren Halvorsen-Tate").matchers()]
+    assert b._visible_words(ev, (0, 0, 400, 400)) == ["Call", "now", "Buy"]
+    assert b._title(ev) == f"thinkorswim - {REDACTED} - Main"
+    ev.redaction = NS(boxes=[NS(rect=RRect(300, 2, 80, 12))])                # a filled box on the title bar
+    assert b._title(ev) == REDACTED

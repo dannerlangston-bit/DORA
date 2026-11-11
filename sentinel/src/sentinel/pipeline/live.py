@@ -16,7 +16,12 @@ so `ItemBuilder` turns each request into the full 3.12 `ReviewItem`:
 - the diff metrics in crop coordinates, the flow context (the last three step actions before the
   checkpoint, its must-see landmark, its masks and rule regions), the OCR words inside the crop as
   untrusted screen text, the manifest entry (task A) or dependency edge (task B), and the version fields
-  of the verdict cache (base and candidate crop hashes, mask, redaction and registry versions).
+  of the verdict cache (base and candidate crop hashes, mask, redaction and registry versions);
+- the text goes through the same redaction as the pixels (6.10 stage 3: only the redacted artifact is sent):
+  an OCR word whose box meets a box the redaction stage filled on the pair is dropped, and so is every word a
+  stage-2 pattern of the run's sweep matches, alone or with its neighbours (a phone number or a name split into
+  words); the window title is withheld (`REDACTED`) when the title bar meets a filled box, and any sweep match in
+  it is replaced by `REDACTED`.
 
 `CollectingReviewer` answers a run offline and keeps every request's `ReviewItem`. `sentinel review --live` gives
 the run a `live_factory` too: the run binds the gated job it builds (`CollectingReviewer.live`), and each item is
@@ -34,6 +39,7 @@ import cv2
 import numpy as np
 import yaml
 
+from ..capture import Sweep
 from ..egress import EgressGate
 from ..reviewer import ConfigError, ReviewerConfig, ReviewerJob, Verdict
 from ..reviewer.images import crop_box
@@ -43,6 +49,7 @@ from ..store.artifacts import ArtifactStore, Redaction
 from .reviewer import ReviewRequest, SimulatedReviewer
 
 Box = tuple[int, int, int, int]
+REDACTED = "[redacted]"           # what replaces screen text the redaction stage hides (6.10 stage 3)
 
 
 def load_reviewer_config(path: str | Path | None) -> ReviewerConfig:
@@ -79,13 +86,53 @@ def _decode(data: bytes) -> np.ndarray:
     return cv2.cvtColor(cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR), cv2.COLOR_BGR2RGB)
 
 
+def _meets(a: Box, b: Box) -> bool:
+    return a[0] < b[0] + b[2] and b[0] < a[0] + a[2] and a[1] < b[1] + b[3] and b[1] < a[1] + a[3]
+
+
 class ItemBuilder:
-    """`item_for(ReviewRequest) -> ReviewItem` over one run's evaluated checkpoints (module docstring)."""
+    """`item_for(ReviewRequest) -> ReviewItem` over one run's evaluated checkpoints (module docstring). `sweep` is
+    the run's stage-2 sweep, applied to the text the item carries."""
 
     def __init__(self, run_id: str, arts: ArtifactStore, redaction: Redaction, evals: Mapping[str, Any], *,
-                 manifest: Any, epoch: str, flow_docs: Mapping[str, Mapping[str, Any]], pad: int):
+                 manifest: Any, epoch: str, flow_docs: Mapping[str, Mapping[str, Any]], pad: int, sweep: Sweep):
         self.run_id, self.arts, self.redaction, self.evals = run_id, arts, redaction, evals
         self.manifest, self.epoch, self.flow_docs, self.pad = manifest, epoch, flow_docs, pad
+        self.matchers = [m for _, m in sweep.matchers()]
+
+    @staticmethod
+    def _filled(ev: Any) -> list[Box]:
+        """The boxes the redaction stage filled on both captures of `ev` (3.6: the union, applied to both)."""
+        red = ev.redaction
+        return [b.rect.as_tuple() for b in red.boxes] if red is not None else []
+
+    def _visible_words(self, ev: Any, box: Box) -> list[str]:
+        """The candidate's OCR words whose centre lies in `box`, without any word under a filled box or matched by
+        the sweep alone or with its neighbours (module docstring)."""
+        filled = self._filled(ev)
+        words = [w for w in ev.cand.model.words
+                 if box[0] <= w.bbox.center[0] < box[0] + box[2] and box[1] <= w.bbox.center[1] < box[1] + box[3]
+                 and not any(_meets((w.bbox.x, w.bbox.y, w.bbox.w, w.bbox.h), f) for f in filled)]
+        spans, at = [], 0
+        for w in words:
+            spans.append((at, at + len(w.text)))
+            at += len(w.text) + 1
+        line = " ".join(w.text for w in words)
+        hit = [(m.start(), m.end()) for rx in self.matchers for m in rx.finditer(line)]
+        return [w.text for w, (a, b) in zip(words, spans) if not any(a < he and hs < b for hs, he in hit)]
+
+    def _title(self, ev: Any) -> str:
+        """The candidate's window title (3.12 item header), withheld when the title bar meets a filled box and with
+        every sweep match replaced (module docstring)."""
+        bar = next((d for d in ev.cand.screen.components if d.kind == "titlebar" and d.text), None)
+        if bar is None:
+            return ""
+        if any(_meets(tuple(bar.bbox), f) for f in self._filled(ev)):
+            return REDACTED
+        title = bar.text
+        for rx in self.matchers:
+            title = rx.sub(REDACTED, title)
+        return title
 
     def _stored(self, img: np.ndarray, cid: str, side: str) -> np.ndarray:
         """The capture as the artifact store holds it (written once, read back)."""
@@ -146,8 +193,7 @@ class ItemBuilder:
         sizes = list(req.sizes) if len(ends) == 2 else [None]
         built = [self._step(ev, req.region_id, size) for ev, size in zip(ends, sizes)]
         rep, (_, box, comps) = ends[0], built[0]
-        words = [w.text for w in rep.cand.model.words
-                 if box[0] <= w.bbox.center[0] < box[0] + box[2] and box[1] <= w.bbox.center[1] < box[1] + box[3]]
+        words = self._visible_words(rep, box)
         entry = edge = None
         if req.entry is not None:
             declared = ()
@@ -159,7 +205,7 @@ class ItemBuilder:
                                      str(req.entry.get("expected_visual") or ""))
         if req.edge is not None:
             edge = DependencyEdge(str(req.edge["primitive"]), str(req.edge["entry_id"]))
-        title = next((d.text for d in rep.cand.screen.components if d.kind == "titlebar" and d.text), "")
+        title = self._title(rep)
         hashes = [hashlib.sha256(s.base.tobytes()).hexdigest() for s, _, _ in built]
         chashes = [hashlib.sha256(s.candidate.tobytes()).hexdigest() for s, _, _ in built]
         masks = ",".join(sorted(str(r.mask_ref) for r in rep.registry.regions if r.mask_ref))

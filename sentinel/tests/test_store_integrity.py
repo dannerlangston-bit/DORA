@@ -459,3 +459,53 @@ def test_a_matrix_whose_cells_do_not_sum_is_refused(store):
     assert any("more than once" in f for f in matrix_failures(doubled, 2, 1, 2))
     assert post_run_check(store, RUN, 2, 1, 2, cells=short) == matrix_failures(short, 2, 1, 2)
     assert post_run_check(store, RUN, 2, 1, 2) == ["G2 matrix: the run has no coverage matrix"]
+
+
+# -- 10.2 late arrival -------------------------------------------------------------------------------------------------
+
+DEADLINE = "2026-11-09T16:00:00+00:00"
+
+
+def dead_man(store):
+    store.fill_unreached(RUN, "harness_error", "dead_man", detail="watchdog_event: wd-40")
+    store.end_run(RunOutcome(RUN, "pr", "aborted_harness", "running", reason="dead_man", ended_at=DEADLINE))
+    store.end_shard(SHARD, "complete")
+    store.mark_shard_imported(SHARD)
+
+
+def test_late_rows_replace_the_dead_man_run(store):
+    dead_man(store)
+    rows = [out(cid, diff=D) for cid in (CENSUS, SWEEP, FLOW)]
+    r = store.replace_dead_man_run(RUN, rows, outcome=RunOutcome(RUN, "pr", "complete", "reported"),
+                                   arrived_at="2026-11-09T16:05:00+00:00")
+    assert (r.status, r.reason) == ("complete", None) and r.counts["identical"] == 3
+    assert {o.outcome for o in store.outcomes(RUN)} == {"identical"}
+    kept = store.conn.execute("SELECT checkpoint_id, outcome, reason FROM outcomes_superseded ORDER BY 1").fetchall()
+    assert [tuple(k) for k in kept] == [(cid, "harness_error", "dead_man") for cid in sorted((CENSUS, SWEEP, FLOW))]
+    summ = store.run_summary(RUN)
+    assert summ["late_arrival"] == {"dead_man_at": DEADLINE, "arrived_at": "2026-11-09T16:05:00+00:00",
+                                    "delay_s": 300} == summ["health"]["late_arrival"]
+    assert summ["alerts"][-1]["closed_as"] == "late arrival"
+    with pytest.raises(sqlite3.IntegrityError, match="immutable"):        # the keep triggers are back
+        store.conn.execute("DELETE FROM outcomes WHERE run_id = ?", (RUN,))
+    with pytest.raises(StoreRefused, match="dead_man"):                   # once only
+        store.replace_dead_man_run(RUN, rows, outcome=RunOutcome(RUN, "pr", "complete", "reported"))
+
+
+def test_a_run_that_did_not_end_dead_man_is_not_replaced(store):
+    store.fill_unreached(RUN, "harness_error", "watchdog_dead", detail="watchdog_event: wd-41")
+    store.end_run(RunOutcome(RUN, "pr", "aborted_harness", "running", reason="watchdog_dead"))
+    with pytest.raises(StoreRefused, match="dead_man"):
+        store.replace_dead_man_run(RUN, [out(CENSUS, diff=D)], outcome=RunOutcome(RUN, "pr", "complete", "reported"))
+
+
+def test_a_refused_late_row_leaves_the_dead_man_run_as_it_was(store):
+    dead_man(store)
+    bad = out(SWEEP, diff=D, artifacts={"candidate": "e" * 64})           # names an artifact nobody stored
+    with pytest.raises(StoreRefused, match="not stored"):
+        store.replace_dead_man_run(RUN, [out(CENSUS, diff=D), bad],
+                                   outcome=RunOutcome(RUN, "pr", "complete", "reported"))
+    run = store.run_outcome(RUN)
+    assert (run.status, run.reason) == ("aborted_harness", "dead_man")
+    assert {o.reason for o in store.outcomes(RUN)} == {"dead_man"}
+    assert store.conn.execute("SELECT count(*) FROM outcomes_superseded").fetchone()[0] == 0

@@ -1545,13 +1545,13 @@ class Store:
 
     def _prepare_checkpoint(self, outcome: CheckpointOutcome, steps: Sequence[StepOutcome],
                             findings: Sequence[Finding], artifacts: Sequence[StoredArtifact], shard_id: str | None,
-                            step_side: str | None, *, reopened: bool = False) -> _Prepared | None:
-        """Every write-time check of one checkpoint batch; None for a replay of the record already written."""
+                            step_side: str | None) -> _Prepared | None:
+        """Every write-time check of one checkpoint batch; None for a replay of the record already written. Reads
+        only, so it also runs inside a batch (`replace_dead_man_run`)."""
         o = _revalidate(outcome)
         placed = [(s, *self._step_place(s, shard_id, step_side)) for s in map(_revalidate, steps)]
         findings = [_revalidate(f) for f in findings]
-        if not reopened:
-            self._running(o.run_id)
+        self._running(o.run_id)
         record = _json(o)
         old = self._one("SELECT record_json FROM outcome_records WHERE run_id = ? AND checkpoint_id = ?",
                         (o.run_id, o.checkpoint_id))
@@ -1674,6 +1674,76 @@ class Store:
                 flow_id=c["flow_id"], step_id=c["step_id"]))
             filled.append(cid)
         return filled
+
+    _KEEP_TRIGGERS = ("trg_outcome_keep", "trg_outcome_record_keep")
+
+    def replace_dead_man_run(self, run_id: str, rows: Sequence[CheckpointOutcome], *, outcome: RunOutcome,
+                             artifacts: Sequence[StoredArtifact] = (), findings: Sequence[Finding] = (),
+                             arrived_at: str | None = None) -> RunOutcome:
+        """10.2 crash during teardown, late arrival: the run the control host ended `aborted_harness (reason:
+        dead_man)` at the deadline takes its real rows and outcome when they arrive.
+
+        In one batch: the `harness_error (reason: dead_man)` placeholders of the checkpoints `rows` cover move to
+        `outcomes_superseded` (kept for diagnosis, never counted, 8.3); `rows`, their `artifacts` and `findings`
+        are written with every write-time check; the run is ended `outcome` with the late arrival in its summary
+        (`late_arrival` with the deadline, the arrival and the delay in seconds, also under `health`, and the
+        dead-man alert closed as "late arrival" in `alerts`). Refused for a run that did not end dead_man, and with
+        everything rolled back when any row or the outcome is refused. The caller ends and imports the shards first.
+        """
+        run = self._one("SELECT * FROM runs WHERE run_id = ?", (run_id,))
+        if run is None:
+            raise StoreRefused(f"unknown run {run_id}")
+        if (run["outcome"], run["abort_reason"]) != ("aborted_harness", "dead_man"):
+            raise StoreRefused(f"run {run_id} ended {run['outcome']}, not aborted_harness (reason: dead_man): only a "
+                               "dead-man placeholder is replaced by late rows (10.2)")
+        r = _revalidate(outcome)
+        if r.run_id != run_id or (r.status, self._split_reason(r.status, r.reason)[0]) == ("aborted_harness",
+                                                                                           "dead_man"):
+            raise StoreRefused("the late arrival carries the run's real outcome (10.2)")
+        if not rows or any(o.run_id != run_id for o in rows):
+            raise StoreRefused(f"a late arrival carries rows of run {run_id}, and only of it (10.2)")
+        at = utc(arrived_at) or now()
+        delay = int((datetime.fromisoformat(at) - datetime.fromisoformat(run["finished_at"])).total_seconds())
+        old = json.loads(run["summary_json"] or "{}")
+        late = {"dead_man_at": run["finished_at"], "arrived_at": at, "delay_s": delay}
+        extra = {"late_arrival": late, "health": {**old.get("health", {}), "late_arrival": late},
+                 "alerts": [*old.get("alerts", []), {"alert": "dead_man", "closed_as": "late arrival", "at": at}]}
+        ids = [o.checkpoint_id for o in rows]
+        marks = ",".join("?" * len(ids))
+        with self._batch("late_arrival") as batch:
+            placeholders = [c for (c,) in self._conn.execute(
+                f"SELECT checkpoint_id FROM outcomes WHERE run_id = ? AND checkpoint_id IN ({marks}) AND synthetic = 0 "
+                "AND outcome = 'harness_error' AND reason = 'dead_man'", (run_id, *ids))]
+            if placeholders:
+                pm = ",".join("?" * len(placeholders))
+                self._conn.execute(f"INSERT INTO outcomes_superseded SELECT o.*, 1 FROM outcomes o WHERE o.run_id = ? "
+                                   f"AND o.checkpoint_id IN ({pm})", (run_id, *placeholders))
+                keep = self._conn.execute(f"SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name IN "
+                                          f"({_sql_list(self._KEEP_TRIGGERS)})").fetchall()
+                for name, _ in keep:
+                    self._conn.execute(f"DROP TRIGGER {name}")
+                for table in ("outcome_records", "outcomes"):
+                    self._conn.execute(f"DELETE FROM {table} WHERE run_id = ? AND checkpoint_id IN ({pm})",
+                                       (run_id, *placeholders))
+                for _, sql in keep:                 # restored as they were, in the same transaction
+                    self._conn.execute(sql)
+                batch.append({"op": "supersede", "table": "outcomes", "key": {"run_id": run_id},
+                              "checkpoints": placeholders, "cause": "late arrival (10.2)"})
+            self._update(batch, "runs", {"run_id": run_id}, {"lifecycle": "running", "outcome": None,
+                                                             "abort_reason": None, "abort_detail": None,
+                                                             "finished_at": None})
+            for a in artifacts:
+                self._verify_artifact(a)
+                self._put_artifact(batch, a, run_id)
+            for o in rows:
+                p = self._prepare_checkpoint(o, (), (), (), None, None)
+                if p is not None:
+                    self._put_checkpoint(batch, p)
+            for f in findings:
+                self._put_finding(batch, _revalidate(f), False)
+            reopened = self._one("SELECT * FROM runs WHERE run_id = ?", (run_id,))
+            self._update(batch, "runs", {"run_id": run_id}, self._end_change(reopened, r, extra))
+        return self.run_outcome(run_id)
 
     # -- canary results (8.3 canary_results, 10.3) ---------------------------------------------------------
     _CANARY_KEY = ("run_id", "kind", "mutant_id", "checkpoint_id")

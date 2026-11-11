@@ -1703,8 +1703,6 @@ class Store:
         written (the record itself for a replay of it). L-OUT-06 and every other refusal propagate: they are not
         repairable, so they are checked on the record as given before any repair, and a missing or foreign
         paper-mode stamp is never replaced by an exempt harness_error (SD-48 exempts records that captured nothing)."""
-        kw: dict[str, Any] = {"steps": steps, "findings": findings, "artifacts": artifacts, "shard_id": shard_id,
-                              "step_side": step_side}
         o = outcome
         if errs := self.record_errors(o):
             if self._prepare_checkpoint(o, steps, findings, artifacts, shard_id, step_side, required=False) is None:
@@ -1719,7 +1717,8 @@ class Store:
                     test_kind=o.test_kind, tier=o.tier, flow_id=o.flow_id, step_id=o.step_id, size_step=o.size_step,
                     flow_class=o.flow_class, profile_id=o.profile_id, outcome_id=o.outcome_id, pair_id=o.pair_id,
                     synthetic=o.synthetic, mutant_id=o.mutant_id, recorded_at=o.recorded_at)
-        self.write_checkpoint(o, **kw)
+        self.write_checkpoint(o, steps=steps, findings=findings, artifacts=artifacts, shard_id=shard_id,
+                              step_side=step_side)
         return o
 
     def write_steps(self, steps: Sequence[StepOutcome], *, shard_id: str | None = None, side: str | None = None,
@@ -2205,9 +2204,6 @@ class Store:
         self._human(d.decided_by, "decided_by")
         self._human(confirmed_by, "confirmed_by")
         self._human(proposed_by, "proposed_by")
-        if d.role == "system_owner" and d.decided_by not in self.system_owners:
-            raise StoreRefused(f"{d.decided_by} is not a system owner of this store and cannot decide in that role "
-                               "(9.7: the system owner's decision ends a frozen signature)")
         if not d.reason:
             raise StoreRefused("a decision carries its reason (8.3 decisions.reason)")
         if d.status != "active":
@@ -2310,11 +2306,15 @@ class Store:
                               source_finding: int | None, manifest_entries: Iterable[str],
                               manifest_tickets: Iterable[str]) -> str | None:
         """9.7 Two humans, one signature: on a frozen signature only a system owner decides, in that role (the role
-        to store is returned: `system_owner` there, the decision's own elsewhere); a plain decision made on a
-        finding is refused while an applicable active decision matches the signature."""
+        to store is returned: `system_owner` there, the decision's own elsewhere; only a configured system owner
+        claims that role, since it ends a freeze); a plain decision made on a finding is refused while an applicable
+        active decision matches the signature."""
+        role = d.role
+        if role == "system_owner" and d.decided_by not in self.system_owners:
+            raise StoreRefused(f"{d.decided_by} is not a system owner of this store and cannot decide in that role "
+                               "(9.7: the system owner's decision ends a frozen signature)")
         look = lookup_decisions(self._conn, d.signature, at=at, run_id=run_id, manifest_entries=manifest_entries,
                                 manifest_tickets=manifest_tickets)
-        role = d.role
         if look.frozen:
             if d.decided_by not in self.system_owners:
                 raise StoreRefused(f"the signature of {d.signature.checkpoint_id} / {d.signature.region_id} is frozen "

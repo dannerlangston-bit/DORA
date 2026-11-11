@@ -50,6 +50,10 @@ Inputs beyond the records, and where each comes from:
     lint and is treated as missing (4.3); printed in the Intended section with the manifest template link.
   - `expiring` [str]: `lint.runstart.ExpiryWarning.line()` of every mask that expires within seven days
     (`expiring_soon`), the owner warning of 3.8, the "Masks expiring within 7 days" row.
+  - `sweep_minimums` [{surface_id, host, w, h, clamped_w, clamped_h}]: the run's achieved minimum per gadget and
+    host (`capture.sweep.minimums_summary`, 2.5.1), one "Sweep minimums" line each (`MinSize.report_line`).
+  - `health_rows` [[label, text]]: further run-health rows the run adds as they are (the popup rate, the
+    fingerprint notes, the Phase 0 branches, the decision lifecycle lines), each printed only when present.
   - `post_run_check` {failures [str], report_withheld bool}: what `store.checks.end_taxonomy_check_failed` writes.
     `report_withheld` makes the comment and the page the abort block alone, with each failure (1.4 G2, L-OUT-07).
   - `safety` {banner, nightly_run_id}: `orchestrator.safety_canaries.banner(results)` of the last Nightly (null when
@@ -1529,6 +1533,12 @@ def health_rows(b: _Builder, items: list[Item], intended_clusters: list[Cluster]
         rows.append(("Expired records", (T("; ".join(h["expired"])),)))
     if b.summary.get("expiring"):                 # the seven-day owner warning (3.8)
         rows.append(("Masks expiring within 7 days", (T("; ".join(b.summary["expiring"])),)))
+    if b.summary.get("sweep_minimums"):           # 2.5.1: the achieved minimum of every gadget and host
+        from ..capture.sweep import MinSize
+        lines = [MinSize(**m).report_line() for m in b.summary["sweep_minimums"]]
+        rows.append(("Sweep minimums", (T("; ".join(lines)),)))
+    for label, text in b.summary.get("health_rows") or ():
+        rows.append((str(label), (T(str(text)),)))
     if "canary" in h:
         rows.append(("Canary (last Nightly)", _canary_row(h["canary"])))
     if "safety" in h:

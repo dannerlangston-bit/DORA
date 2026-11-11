@@ -7,7 +7,8 @@ entry, its calibration and the redaction boxes, and returns a `DiffResult`: the 
 `mask_budget_exceeded`), a heatmap, full per-region metrics (the `calibration_stats` row of 3.9
 step 3) and components. A checkpoint the engine cannot diff ends in a `Terminal` outcome instead:
 `landmark_missing (landmark:<id>)` or `harness_error (mask_budget_exceeded)`. `compare_fingerprints`
-refuses a pair before any pixel is read (3.3, 4.12), and `global_shift_prepass` is the run-level
+refuses a pair before any pixel is read (3.3, 4.12) and refuses outright (ValueError) a fingerprint
+with a null field, which can never be compared (7.4); `global_shift_prepass` is the run-level
 granularity-0 pass.
 
 Order of work (3.7, 5.8): bring both captures to 3 channels (grayscale repeated, alpha dropped);
@@ -84,6 +85,7 @@ from skimage.color import deltaE_ciede2000, rgb2lab
 from skimage.metrics import structural_similarity
 
 from ..canonical import fingerprint_id  # noqa: F401  (4.12, 7.4: the one definition, re-exported)
+from ..lint.rules import fingerprint_differences
 from ..records import Component, DiffSummary, Finding, RegionDiff
 from ..taxonomy import load as load_taxonomy
 from . import load_params
@@ -258,20 +260,13 @@ class DiffResult:
 # --------------------------------------------------------------------------------------------
 
 def compare_fingerprints(base: Mapping[str, Any], candidate: Mapping[str, Any]) -> Terminal | None:
-    """The comparability rule of 3.3 and L-FPR-03/05: every `match` field equal except `build_id`;
-    `render_probe_hash` at Hamming distance 0. Returns `not_comparable (fingerprint_mismatch)` with
-    the differing field names in `detail`, or None when the pair may be diffed. A missing
+    """The comparability rule of 3.3 and L-FPR-03/05 (`lint.rules.fingerprint_differences`): every
+    `match` field equal except `build_id`; `render_probe_hash` at Hamming distance 0. Returns
+    `not_comparable (fingerprint_mismatch)` with the differing field names in `detail`, or None when
+    the pair may be diffed. A null or one-sided field raises ValueError instead of being classified:
+    an unreadable field is `env_error (fingerprint_unreadable:<field>)` at its gate (7.4). A missing
     calibration is never a comparability failure (3.3)."""
-    mb, mc = base.get("match", {}), candidate.get("match", {})
-    fields = sorted((set(mb) | set(mc)) - {"build_id"})
-    differing = []
-    for f in fields:
-        a, b = mb.get(f), mc.get(f)
-        if f == "render_probe_hash" and isinstance(a, str) and isinstance(b, str):
-            if a.lower() != b.lower():
-                differing.append(f)
-        elif a != b or a is None:
-            differing.append(f)
+    differing = fingerprint_differences(base.get("match", {}), candidate.get("match", {}))
     if not differing:
         return None
     return Terminal("not_comparable", "fingerprint_mismatch", side="both", detail="field: " + ", ".join(differing))

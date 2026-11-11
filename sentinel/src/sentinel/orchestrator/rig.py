@@ -72,6 +72,8 @@ class LaunchObservation:
     windows: tuple[WindowInfo, ...] = ()
     processes: tuple[str, ...] = ()
     screenshot_sha256: str | None = None
+    jab_properties_present: bool | None = None   # 7.5: .accessibility.properties in the profile (Branch A); None unread
+    jab_query_answers: bool | None = None        # 7.5: one JAB query answered (Branch A); None unread
 
 
 @dataclass(frozen=True)

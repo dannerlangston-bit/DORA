@@ -1,5 +1,9 @@
 # The chosen branch of each Phase 0 unknown (brief 1.11, decision records DR-01 to DR-07 of 11.8), and the
 # Phase 0 reads other files depend on (4.16). A placeholder: the reads below are not made yet.
+# An unknown not yet decided reads {branch: undecided, deadline: YYYY-MM-DD}; the run uses its 11.8 default until it
+# is decided, and L-XREF-15 warns once the deadline has passed (sentinel.branches).
+# Safety item 5 read as different lists the formats found: observed: ["paper: <regex>", "live: <regex>"].
+# Safety item 10 lists the Order Confirmation dialog's labels as observed; only those may be dismiss-allowlisted.
 schema_version: 1
 jab: {branch: A}              # DR-01 Java Access Bridge exposes names, roles and bounds
 data_fixture: {branch: A}     # DR-02 the test backend replays a frozen market-data fixture
@@ -9,7 +13,7 @@ aa_floor: {branch: A}         # DR-05 A/A floor near zero on frozen checkpoints
 session_rule: {branch: A}     # DR-06 a second login kicks the first; one session per login
 computer_use: {branch: A}     # DR-07 computer use allowed on the approved endpoint
 batch_api: undecided
-reviewer: {}                  # model_id once pinned (3.15)
+reviewer: {model_id: simulated-reviewer-offline}   # the pinned model (3.15); the demo's offline stand-in
 version_read: {}              # title_regex and about_regex once read (4.2, 7.3)
 safety:                       # the ten Phase 0 assumptions of 6.13, all still to be read
   - {item: 1, result: undecided}

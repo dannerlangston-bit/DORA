@@ -69,8 +69,13 @@ def mutant(cat: list, mid: str) -> dict:
     return next(m for m in cat if m["mutant_id"] == mid)
 
 
-def popup(cat: list, pid: str) -> dict:
-    return next(p for p in cat if p["popup_id"] == pid)
+def popup(cat: list | dict, pid: str) -> dict:
+    return next(p for p in entries(cat) if p["popup_id"] == pid)
+
+
+def entries(cat: list | dict) -> list:
+    """The catalog's entries: the example is in the `{schema_version, entries}` form (SD-47)."""
+    return cat["entries"] if isinstance(cat, dict) else cat
 
 
 def region(rf: dict, rid: str) -> dict:
@@ -202,7 +207,7 @@ MUTATIONS: list[tuple[str, str | None, Callable]] = [
     ("L-FIX-09", FIXTURE, lambda d: d["positions"].pop()),
     ("L-FIX-10", FIXTURE, lambda d: d["positions"].append({"account_ref": "D-20481134", "symbol_ref": "aapl", "qty": 1,
                                                           "avg_price": 1.0, "seeded_by": "x", "seeded_at": "2026-10-06T10:15:00-04:00"})),
-    ("L-POP-00", POPUPS, lambda d: d[0].update({"class": "nuisance"})),
+    ("L-POP-00", POPUPS, lambda d: entries(d)[0].update({"class": "nuisance"})),
     ("L-POP-01", POPUPS, lambda d: popup(d, "POP-16").update(popup_id="POP-99")),
     ("L-POP-02", POPUPS, lambda d: popup(d, "POP-07").update(key="enter")),
     ("L-POP-03", POPUPS, lambda d: popup(d, "POP-14").update({"class": "dismissable"})),
@@ -258,11 +263,14 @@ def test_tbd_glob_warns_in_phase0_and_errors_after(base):
         assert [v.severity for v in found] == [sev]
 
 
-def test_unresolved_branch_warns_in_phase0_and_errors_after(base):
-    for phase, sev in ((0, "warn"), (1, "error")):
+def test_unresolved_branch_warns_past_its_deadline_in_phase0_and_errors_after(base):
+    """The coordinator's decision (4.15 row with 11.8 and R23): in Phase 0 an undecided record warns only once its
+    deadline passed; from Phase 1 any undecided record is an error."""
+    for phase, deadline, sevs in ((0, "2026-12-01", []), (0, "2026-11-01", ["warn"]), (1, "2026-12-01", ["error"])):
         r = copy.deepcopy(base)
-        r.docs[BRANCHES].data["session_rule"] = {"branch": "undecided", "deadline": "2026-12-01"}   # 4.16 branch_choice
-        assert [v.severity for v in lint_repo(r, phase, TODAY).violations if v.rule == "L-XREF-15"] == [sev]
+        r.docs[BRANCHES].data["session_rule"] = {"branch": "undecided", "deadline": deadline}   # 4.16 branch_choice
+        found = [v.severity for v in lint_repo(r, phase, TODAY).violations if v.rule == "L-XREF-15"]
+        assert sorted(set(found)) == sevs, (phase, deadline, found)
 
 
 def test_golden_list_is_warn_until_phase2(base):
@@ -464,16 +472,93 @@ def test_fingerprint_rig_spec_and_pair():
     assert [v.rule for v in lint_fingerprint_pair(fp, fp, {"base": "main-1998.2.0-4f1c9a2"})] == ["L-FPR-03"]
 
 
+@pytest.mark.parametrize("path,value", [
+    ("cleartype.smoothing", False),
+    ("cleartype.type", "FE_FONTSMOOTHINGSTANDARD"),
+    ("display.awareness", "SYSTEM_AWARE"),
+    ("display.bits", 16),
+    ("java2d_pipeline.pinned", "d3d"),
+    ("os_theme.transparency", True),
+    ("os_theme.animations", True),
+    ("keyboard.locale", "de-DE"),
+    ("keyboard.toggle_keys.caps", True),
+])
+def test_fingerprint_rig_spec_covers_every_pinned_value(path, value):
+    # 7.1 and 7.12 pins; java2d confirmation left "unknown" so the pinned pipeline alone is checked
+    fp = _fingerprint()
+    fp["match"]["java2d_pipeline"]["confirmed"] = "unknown"
+    assert R.lint_fingerprint_rig_spec(fp) == []
+    *parents, leaf = path.split(".")
+    node = fp["match"]
+    for p in parents:
+        node = node[p]
+    node[leaf] = value
+    assert [(v.rule, v.path) for v in R.lint_fingerprint_rig_spec(fp)] == [("L-FPR-02", f"match.{path}")]
+
+
+def test_fingerprint_rig_spec_by_rig_kind():
+    fp = _fingerprint()
+    d3d = copy.deepcopy(fp)
+    d3d["match"]["java2d_pipeline"] = {"pinned": "d3d", "confirmed": "d3d"}
+    assert R.lint_fingerprint_rig_spec(d3d, rig_kind="physical") == []
+    assert [v.path for v in R.lint_fingerprint_rig_spec(fp, rig_kind="physical")] == ["match.java2d_pipeline.pinned"]
+    fp["match"]["java2d_pipeline"]["confirmed"] = "opengl"
+    assert [v.path for v in R.lint_fingerprint_rig_spec(fp)] == ["match.java2d_pipeline.confirmed"]
+    with pytest.raises(ValueError, match="rig kind"):
+        R.lint_fingerprint_rig_spec(fp, rig_kind="laptop")
+
+
+def test_fingerprint_rig_spec_follows_the_declared_display_config():
+    fp = _fingerprint()
+    cfg = {"id": "cfg.1920x1080-125.light-large", "width": 1920, "height": 1080, "scale_percent": 125, "theme": "light",
+           "font_size": "large", "work_area": {"w": 1536, "h": 807}}
+    assert {v.path for v in R.lint_fingerprint_rig_spec(fp, display_config=cfg)} == {
+        "match.display.scale_percent", "match.display.dpi", "match.app_theme.scheme", "match.app_theme.font_size"}
+    fp["match"]["display"].update(scale_percent=125, dpi=120)
+    fp["match"]["app_theme"] = {"scheme": "light", "font_size": "large"}
+    assert R.lint_fingerprint_rig_spec(fp, display_config=cfg) == []
+    assert {v.path for v in R.lint_fingerprint_rig_spec(fp)} == {"match.display.scale_percent", "match.display.dpi"}
+
+
+def test_fingerprint_rig_spec_against_the_snapshot_manifest():
+    fp = _fingerprint()
+    manifest = copy.deepcopy(fp["match"])
+    assert R.lint_fingerprint_rig_spec(fp, manifest=manifest) == []
+    manifest["windows_build"]["ubr"] = "2400"
+    manifest["cleartype"]["gamma"] = 2200
+    manifest["gpu"]["driver_version"] = "10.0.26100.2"
+    assert {v.path for v in R.lint_fingerprint_rig_spec(fp, manifest=manifest)} == {
+        "match.windows_build.ubr", "match.cleartype.gamma", "match.gpu.driver_version"}
+    del manifest["vmoptions_hash"]
+    with pytest.raises(ValueError, match="vmoptions_hash"):
+        R.lint_fingerprint_rig_spec(fp, manifest=manifest)
+
+
+def test_fingerprint_differences_is_the_one_pair_comparison():
+    m = _fingerprint()["match"]
+    other = copy.deepcopy(m)
+    other.update(build_id="main-1998.2.0-4f1c9a2", render_probe_hash="E3B0C44298FC1C14")
+    assert R.fingerprint_differences(m, other) == []                       # build id aside; one 64-bit value
+    other["gpu"] = {"name": "other", "driver_version": "1"}
+    other["keyboard"] = {**m["keyboard"], "locale": "en-GB"}
+    assert R.fingerprint_differences(m, other) == ["gpu", "keyboard"]
+    assert R.fingerprint_differences(m, other, ["gpu", "display"]) == ["gpu"]
+    with pytest.raises(ValueError, match="cleartype"):
+        R.fingerprint_differences(m, {**other, "cleartype": None})
+    with pytest.raises(ValueError):
+        lint_fingerprint_pair({"match": m}, {"match": {k: v for k, v in m.items() if k != "gpu"}})
+
+
 @pytest.mark.parametrize("rel,path,bad,rule", [
     (DEPMAP, ("edges", 0, "surface"), ["x"], "L-DEP-00"),
     (FLOW, ("steps", 1, "target"), {"a": 1}, "L-FLW-00"),
     (FIXTURE, ("accounts", 0, "account_id"), [], "L-FIX-00"),
     (MUTANTS, (0, "checkpoint_id"), [], "L-MUT-00"),
-    (POPUPS, (0, "popup_id"), {}, "L-POP-00"),
+    (POPUPS, ("entries", 0, "popup_id"), {}, "L-POP-00"),
     (WS_AT, ("gadgets_present",), "trade.active-trader.ladder", "L-WSP-00"),
     (S07, ("regions", 0, "landmark"), [], "L-RGN-00"),
     (STOCK, ("parent",), [], "L-SRF-00"),
-    (POPUPS, (0, "on_abort", "reason"), 7, "L-POP-04"),
+    (POPUPS, ("entries", 0, "on_abort", "reason"), 7, "L-POP-04"),
 ])
 def test_malformed_values_do_not_crash(base, rel, path, bad, rule):
     """A list or map where a scalar belongs fails the schema; the rules still run (schemas.coerce_shapes)."""

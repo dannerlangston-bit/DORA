@@ -177,7 +177,7 @@ CREATE TABLE logins (
   blocked_at TEXT,
   blocked_reason   TEXT CHECK (blocked_reason IN ('unproven_proof','identity_unreadable_twice','cancel_all_failed',
                      'recovery_login_failed','explorer_teardown_incomplete','drill_order_placed','incident','rotation',
-                     'session_unavailable','live_identity')),   -- 6.4, 6.5, 6.6, 6.8; cleared by a human
+                     'session_unavailable','live_identity','authentication_failed')),   -- 6.4 to 6.8, 7.7; a human clears it
   unblocked_by TEXT, unblocked_at TEXT,
   CHECK ((blocked_at IS NULL) OR (blocked_reason IS NOT NULL))
 );

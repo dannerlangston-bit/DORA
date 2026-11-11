@@ -2,7 +2,8 @@
 
 Settle. Capture happens only when, checked in order within `max_wait` (15 s; 30 s for chart and
 scan checkpoints): (1) the mouse is parked at the declared dead-area coordinate and the 1 s
-tooltip delay has passed; (2) focus was dropped on the declared neutral control; (3) every
+tooltip delay has passed; (2) focus was dropped on the declared neutral control, a condition a
+`keep_focus` checkpoint skips (its caret is masked instead; 3.5, 4.7, SD-27); (3) every
 must-see anchor matches at 0.92 or better; (4) no anti-anchor (`Loading`, `Reconnecting`,
 `Disconnected`, spinner templates, the empty-grid placeholder) is present anywhere in the target
 window; (5) three consecutive frames 250 ms apart are pixel-identical outside masks, redactions
@@ -15,10 +16,10 @@ that held at the end ("whichever held at timeout", 4.7 `wait_for`): `unexpected_
 `anchor_missing` (conditions 2 and 3, the control or anchor named in `detail`),
 `anti_anchor_present`, or `frames_unstable`. A condition that failed earlier and holds again by
 the end is not the reason: conditions 1 to 4 recover on a frame that passes them, and condition 5
-on a frame identical to the one before it. `timeout` is the remaining case: the condition failing
-at the end was the parking condition (1), which has no code of its own, or nothing was failing
-any more but too few frames arrived to form the triple; `detail` names the last failing condition
-either way (marked recovered when it no longer held). Frames closer than 250 ms to the previous
+on a frame identical to the one before it. Nothing failing any more but too few frames to form the
+triple is `frames_unstable` (SD-26: `timeout` only when no frame was obtained); the parking
+condition (1), which has no code of its own, failing at the end keeps `timeout`; `detail` names the
+last failing condition either way (marked recovered when it no longer held). Frames closer than 250 ms to the previous
 frame of the run are skipped, never compared.
 
 Frames are RGB like every capture (an `mss` grab, BGRA, is converted by the platform side);
@@ -56,9 +57,9 @@ class Frame:
 
     The platform side reports what it knows about the frame: when the mouse reached the parking
     coordinate (`parked_at_ms`, None while it is not there; the default means long before the
-    wait), whether focus was dropped on the neutral control (always true for a `keep_focus`
-    checkpoint), the title of an unexpected modal window if one is up, and OCR words for text
-    anti-anchors.
+    wait), whether focus was dropped on the neutral control (not read for a `keep_focus`
+    checkpoint, which keeps its field focused), the title of an unexpected modal window if one is
+    up, and OCR words for text anti-anchors.
     """
 
     t_ms: int
@@ -95,7 +96,14 @@ class Anchor:
 
 @dataclass
 class SettleSpec:
-    """The checkpoint's settle parameters (4.7 checkpoint record, 5.7 inputs)."""
+    """The checkpoint's settle parameters (4.7 checkpoint record, 5.7 inputs).
+
+    `max_wait_ms` set is the declared wait (4.7 `max_settle_ms`, else 4.5 `settle.max_wait_ms`);
+    unset, the 3.5 default applies, the long one for a chart or scan checkpoint (`long_wait`).
+    `keep_focus` (4.7, SD-27) skips condition 2: the checkpoint needs a focused field, and its
+    caret is one of the masks in `ignore`. `sentinel.evaluation.settle_spec_for` builds this record
+    from the configuration.
+    """
 
     anchors: Sequence[Anchor] = ()
     anti_anchors: Sequence[Anchor] = field(
@@ -105,6 +113,7 @@ class SettleSpec:
     neutral_control: str = "neutral control"
     long_wait: bool = False
     max_wait_ms: int | None = None
+    keep_focus: bool = False
 
 
 @dataclass(frozen=True)
@@ -145,7 +154,7 @@ def _failing(frame: Frame, spec: SettleSpec, confidence: float, tooltip_ms: int,
         return f"unexpected_window:{frame.modal_title}", f"modal window {frame.modal_title!r}"
     if frame.parked_at_ms is None or frame.t_ms - frame.parked_at_ms < tooltip_ms:
         return "park", "condition 1: mouse not parked or tooltip delay not passed"
-    if not frame.focus_dropped:
+    if not spec.keep_focus and not frame.focus_dropped:
         return "anchor_missing", f"condition 2: focus not dropped on {spec.neutral_control}"
     for a in spec.anchors:
         if not a.present(frame, confidence, seen):
@@ -198,14 +207,14 @@ def settle(frames: Iterable[Frame], spec: SettleSpec, params: Mapping[str, Any] 
             first = run[0]
             return SettleResult(True, first.image, first.t_ms, run[-1].t_ms, None, None, None, run[-1].t_ms)
     elapsed = last.t_ms if last is not None else 0
-    if last_fail is None or last_fail[0] == "park":
-        if last_fail is not None:
-            detail = last_fail[1]
-        elif prior_fail is not None:
-            detail = f"{prior_fail[1]} (recovered; fewer than {need} frames {interval} ms apart within {max_wait} ms)"
-        else:
-            detail = f"fewer than {need} frames {interval} ms apart within {max_wait} ms"
-        reason = "timeout"
+    if last is None:                              # SD-26: timeout only when no frame was obtained
+        reason, detail = "timeout", f"no frame obtained within {max_wait} ms"
+    elif last_fail is None:                       # SD-26: too few frames to form the triple
+        reason = "frames_unstable"
+        detail = (f"{prior_fail[1]} (recovered; " if prior_fail is not None else "(") + \
+            f"fewer than {need} frames {interval} ms apart within {max_wait} ms)"
+    elif last_fail[0] == "park":
+        reason, detail = "timeout", last_fail[1]
     else:
         reason, detail = last_fail
     return SettleResult(False, None, None, None, reason, detail, last.image if last is not None else None, elapsed)

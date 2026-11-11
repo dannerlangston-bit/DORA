@@ -32,13 +32,21 @@ Choices where the spec is ambiguous or silent (reported):
    an enumeration hit on a draft regex still sets the flag, since a hit can only raise it. The consequence that
    matters before Phase 0, an empty dismiss allowlist, is `gateway_config.load_dismiss_allowlist`'s.
 3. The foreground window the detector captures is the topmost enumerated window that has bounds (lowest
-   `z_order`); without one the whole grab is searched, which can only add matches. An order window without
-   bounds is searched over the whole grab for the same reason.
+   `z_order`) when it is a frame or a dialog (`SunAwtFrame`, `SunAwtDialog`). When the topmost is anything else
+   the foreground window is not known: a heavyweight Swing tooltip, menu or combo popup is an owned `SunAwtWindow`,
+   above its owner in z-order but never activated, so the foreground window (the main frame with a docked ticket)
+   lies under it; a window of another class is not known to be the app's. Then, and without a window that has
+   bounds, the whole grab is searched, which can only add matches. An order window without bounds is searched over
+   the whole grab for the same reason.
 4. Templates are matched in grayscale (`TM_CCOEFF_NORMED`), every match at or above the floor, so two Active
    Trader panels with an Auto Send each give two rectangles. Source 1 searches order windows at full scale with
    the same 0.90 floor, since 5.4.6 gives no other.
 5. On a failed enumeration the previous classification and first-seen times are kept (the flag is unknown
    anyway), so an intermittent failure never resets the 30 s age of a dialog.
+6. On a failed or stale capture the send controls the last good capture located (sources 1 and 2) are kept as deny
+   rectangles, with the ladder columns the caller passes. A poll without a picture knows nothing about what is
+   visible, and 5.4.6 makes a failed capture unknown, handled as set: never less protected. A rectangle goes only
+   when a good capture no longer finds its control.
 """
 from __future__ import annotations
 
@@ -53,6 +61,7 @@ import numpy as np
 from .gateway import CONFIRM_AND_SEND, DenyRect, Flag, FlagWatcher, GatewayError, GatewayState, Rect
 
 AWT_CLASSES = frozenset({"SunAwtFrame", "SunAwtDialog", "SunAwtWindow"})        # 5.4.6 source 1
+FOREGROUND_CLASSES = frozenset({"SunAwtFrame", "SunAwtDialog"})                  # choice 3
 SEND_CONTROL_LABELS = ("Send", "Auto Send", "Flatten", "Blast All", "Replace")   # the never-tokenize controls
 TEMPLATE_LABELS = SEND_CONTROL_LABELS + ("Confirm and Send",)                    # what the detector may match
 DETECTOR_FLOOR = 0.90
@@ -236,10 +245,11 @@ def detect_ticket(frame: Any, area: tuple[int, int, int, int] | None, templates:
 
 
 def _foreground(windows: Sequence[Any]) -> tuple[int, int, int, int] | None:
-    """The topmost enumerated window with bounds (choice 3)."""
+    """The detector's area (choice 3): the bounds of the topmost enumerated window with bounds when it is a frame or
+    a dialog; None (the whole grab) when there is no such window or the topmost is a popup or of another class."""
     framed = [w for w in windows if w.visible and getattr(w, "rect", None) is not None]
     ranked = sorted(framed, key=lambda w: z if (z := getattr(w, "z_order", None)) is not None else 1 << 30)
-    return ranked[0].rect if ranked else None
+    return ranked[0].rect if ranked and ranked[0].cls in FOREGROUND_CLASSES else None
 
 
 def _merge(rects: Iterable[DenyRect]) -> tuple[DenyRect, ...]:
@@ -264,27 +274,28 @@ class WindowWatcher:
         self._frame_ts: float | None = None
         self._detector_hit = False
         self._detected: tuple[DenyRect, ...] = ()
+        self._located: tuple[DenyRect, ...] = ()      # sources 1 and 2 on the last good capture (choice 6)
 
     def poll(self, windows: Sequence[Any] | None, frame: Any | None, templates: Sequence[SendTemplate], *,
              now: float, sticky: bool = False, ladder_columns: Sequence[Rect] = ()) -> tuple[Flag, tuple[DenyRect, ...]]:
         """One poll. `windows` is the enumeration (None: it failed), `frame` the newest grab (`ports.Frame`; None
         or stale: the capture failed), `templates` the active theme's send-control templates, `sticky` the flow's
         `order_stage` declaration (source 3) and `ladder_columns` the Active Trader ladder's order columns.
-        Returns the flag and the un-inflated deny rectangles to write."""
+        Returns the flag and the un-inflated deny rectangles to write; a failed or stale capture keeps the last good
+        capture's send controls (choice 6)."""
         enumerated = windows is not None
         if enumerated:
             self.classes = classify_windows(windows, self.titles, now, self.classes.first_seen)
         captured = frame is not None and now - frame.mono_s <= DETECTOR_STALE_S
-        rects: list[DenyRect] = []
         if captured:
             if frame.mono_s != self._frame_ts:
                 area = _foreground(windows) if enumerated else None
                 self._detector_hit, self._detected = detect_ticket(frame, area, templates, self.floor)
                 self._frame_ts = frame.mono_s
-            for w in self.classes.order_windows:
-                rects += locate_send_controls(frame, getattr(w.window, "rect", None), templates, self.floor)
-            rects += self._detected
-        rects += [DenyRect(r, LADDER_COLUMN) for r in ladder_columns]
+            self._located = tuple(d for w in self.classes.order_windows
+                                  for d in locate_send_controls(frame, getattr(w.window, "rect", None), templates,
+                                                                self.floor)) + self._detected
+        rects = list(self._located) + [DenyRect(r, LADDER_COLUMN) for r in ladder_columns]
         flag = self.flags.poll(enumeration_hit=enumerated and self.classes.enumeration_hit,
                                detector_hit=captured and self._detector_hit, sticky=sticky,
                                failed=not (enumerated and captured))

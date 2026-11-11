@@ -53,6 +53,28 @@ def test_rule4_console_input_is_foreign_and_untokened_injection_is_logged():
     assert (drop.reason, drop.gate_class) == ("untokened_injected", "safety")
 
 
+def test_rule4_another_processs_injected_moves_are_dropped_and_logged_like_its_clicks():
+    """6.2 rule 4, 5.4.1 layer 2: a move injected by any process other than the emitter is dropped `no_token` (logged
+    `untokened_injected`, or tagged `drill` inside the drill's raw phase), with no token pending and inside a drag's
+    `move_allow` box alike; the emitter's own moves still pass. Rule 2 keeps its codes for another origin's keys."""
+    g = armed()
+    for origin in ("foreign_process", "drill"):
+        e = ev("move", 300, 300, origin=origin)
+        d = hook_decide(g, e, T)
+        assert (d.allowed, d.reason) == (False, "no_token")
+        assert drain(d, e).reason == ("untokened_injected" if origin == "foreign_process" else "no_token")
+    assert drain(hook_decide(g, ev("move", 3, 3, origin="drill"), T), ev("move", 3, 3, origin="drill"),
+                 drill_phase=True).tag == "drill"
+    assert hook_decide(g, ev("move", 300, 300), T).allowed
+    g.issue_click(100, 100, T, hold_ms=300)
+    g.open_move_allow(Rect(90, 90, 200, 50), T, 300)
+    assert hook_decide(g, ev("button_down", 100, 100), T).allowed
+    assert hook_decide(g, ev("move", 150, 110, origin="foreign_process"), T).reason == "no_token"   # steers no drag
+    assert hook_decide(g, ev("move", 150, 110), T).allowed
+    g = armed(Flag.SET)
+    assert hook_decide(g, ev("key_down", vk=VK_RETURN, origin="foreign_process"), T).reason == "blocked_key_dialog"
+
+
 def test_click_token_is_one_shot_with_2px_tolerance():
     g = armed()
     t = g.issue_click(100, 100, T)
@@ -386,6 +408,20 @@ def test_confirm_and_send_needs_order_stage_attestation_and_paper_assertion():
     assert s.reason == "deny_profile" and "empty dismiss allowlist" in s.detail
 
 
+@pytest.mark.parametrize("other", ["Submit Order", "Flatten Position", "Replace Order", "Blast All Orders",
+                                   "Auto Send ON"])
+def test_confirm_and_send_exempts_only_its_own_label_from_the_send_like_check(other):
+    """6.2 Slow half, 5.4.3 stage 4: the under-point OCR is a second, independent check, so a send-like label beside
+    `Confirm and Send` (the resolver's anchor offset landed on a neighbour) is an attempted send, either way round,
+    even where Confirm and Send itself would be refused for another reason."""
+    ctx = pinned(attestation_passed=True, paper_assertion_current=True)
+    for rn, ocr in (("Confirm and Send", other), (other, "Confirm and Send")):
+        for c in (ctx, SafetyContext()):
+            s = slow_half(click(rn, ocr, order_stage_step=True), c)
+            assert (s.refused, s.reason, s.attempted_send) == (True, "never_tokenize", True), (rn, ocr, c)
+    assert not slow_half(click("Confirm and Send", order_stage_step=True), ctx).refused
+
+
 def test_dialog_allowlist_inverts_inside_the_order_dialog():
     ctx = pinned(flag=Flag.SET, order_dialog_present=True, deny_rects=(SEND,))
     ok = slow_half(click("Delete", point=DELETE_POINT), ctx)
@@ -558,7 +594,14 @@ def test_three_per_flow_quarantine_and_ten_per_run_trip_the_kill_switch():
     for _ in range(2):
         assert not ledger.record(nonsend, unit="flow.a").has("quarantine_flow")
     third = ledger.record(nonsend, unit="flow.a")
-    assert third.step == "failed" and third.has("quarantine_flow") and third.has("end_flow")
+    # 5.4 Failure outcomes, 5.4.8 rule 3, SD-53: the threshold adds the quarantine; the scripted step stays blocked
+    assert third.step == "blocked_by_gateway" and third.has("quarantine_flow") and third.has("end_flow")
+    agent = DropLedger()
+    rescue = replace(nonsend, mode="agent")
+    for _ in range(2):
+        assert agent.record(rescue, unit="rescue").step == "failed"
+    third_rescue = agent.record(rescue, unit="rescue")                      # an agent rescue's step is failed (5.4.8)
+    assert third_rescue.step == "failed" and third_rescue.actions == ("end_session", "quarantine_flow")
     for i in range(6):
         assert ledger.record(nonsend, unit=f"flow.b{i}").run is None
     tenth = ledger.record(nonsend, unit="flow.c")
@@ -583,8 +626,14 @@ def test_integrity_drop_of_own_token_retries_once_then_fails_closed():
     again = ledger.record(d, unit="f", retried=True)
     assert again.step == "blocked_by_gateway" and again.checkpoint.reason == "hook_lost"
     assert again.has("kill_tree") and again.has("restart_hook_host")
-    silent = DropLedger().record(d, unit="g", probe_answered=False)
-    assert silent.checkpoint.outcome == "harness_error"
+    # 5.4.3 stage 7, SD-52: a hook that does not answer the probe never saw the event, so the step is failed (a hook
+    # that answered and dropped the retry again blocked it); the checkpoint and the fail-closed sequence are the same
+    for silent in (DropLedger().record(d, unit="g", step_id="s05", probe_answered=False),
+                   DropLedger().record(d, unit="g", step_id="s05", retried=True, probe_answered=False)):
+        assert (silent.step, silent.checkpoint.outcome, silent.checkpoint.reason) == ("failed", "harness_error",
+                                                                                     "hook_lost")
+        assert silent.has("kill_tree") and silent.has("restart_hook_host") and silent.has("end_flow")
+        assert any(o.selector == "rest_of_flow" for o in silent.outcomes)
 
 
 def test_untokened_and_foreign_input_raise_gateway_integrity_and_the_run_continues():
@@ -735,7 +784,7 @@ def test_a_non_send_refusal_ends_the_flow_and_its_later_checkpoints_are_not_run(
     for _ in range(2):
         ledger.record(GatewayDrop("deny_profile", "refused", "integrity"), unit="flow.q", step_id="s01")
     third = ledger.record(GatewayDrop("deny_profile", "refused", "integrity"), unit="flow.q", step_id="s02")
-    assert third.step == "failed" and rest(third) == [("not_run", "step_failed:s02")]
+    assert third.step == "blocked_by_gateway" and rest(third) == [("not_run", "step_failed:s02")]
 
 
 def test_an_own_token_drop_after_the_retry_marks_its_checkpoint_hook_lost_and_the_rest_not_run():

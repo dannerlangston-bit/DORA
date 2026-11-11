@@ -223,3 +223,37 @@ def test_token_notes_are_bounded(tmp_path):
     for i in range(1, 5000):
         d.note_token(TokenNote(i, "scripted"))
     assert len(d.notes) == 4096 and 1 not in d.notes and 4999 in d.notes
+
+
+def test_a_secret_steps_keys_stay_redacted_when_the_kill_switch_drops_them(tmp_path):
+    """6.9 (choice 3): the kill switch fires while a secret step types; no row and no journal line carries a vk of
+    the secret, the up of the key that passed before the trip included."""
+    g = GatewayState(armed=True)
+    g.stamp_watcher(Flag.CLEAR, T)
+    toks = [g.issue_key(vk, T, secret=True) for vk in (0x50, 0x57, 0x39)]
+    buf = segment(g)
+    d = drainer(tmp_path, flow_id="f.login", step_id="s2")
+    for t in toks:
+        d.note_token(TokenNote(t.id, "scripted", "f.login", "s2", target_text="<redacted:login.password>"))
+    decide_from_segment(buf, HookEvent("key_down", vk=0x50), to_ns(T))
+    g.deny_all = True
+    SegmentWriter(buf).publish(g)
+    for e in (HookEvent("key_up", vk=0x50), HookEvent("key_down", vk=0x57), HookEvent("key_up", vk=0x57),
+              HookEvent("key_down", vk=0x39), HookEvent("key_up", vk=0x39)):
+        decide_from_segment(buf, e, to_ns(T))
+    rows = d.drain_ring(buf)
+    assert [r.keys for r in rows] == ["key_down:<redacted>", "key_up:<redacted>"] * 3
+    assert [r.gate_reason for r in rows] == [None] + ["deny_all"] * 5
+    text = json.dumps([r.to_dict() for r in rows]) + (tmp_path / JOURNAL_NAME).read_text()
+    assert not any(code in text for code in ("0x50", "0x57", "0x39"))
+
+
+def test_the_up_of_a_secret_down_is_redacted_even_when_its_own_record_is_not_flagged(tmp_path):
+    """Choice 3: a key up the hook could not flag (its secret token's slot was freed between the down and the up)
+    follows a secret down of the same key, so it is redacted too, once."""
+    down = sg.RingRecord(0, "key_down", "emitter", "deny_all", frozenset({"shift"}), True, True, to_ns(T), 0, 0,
+                         0x50, 0, 7)
+    up = sg.RingRecord(1, "key_up", "emitter", "deny_all", frozenset({"shift"}), True, False, to_ns(T), 0, 0, 0x50, 0,
+                       None)
+    rows = drainer(tmp_path).drain([down, up, up._replace(seq=2)])
+    assert [r.keys for r in rows] == ["key_down:<redacted>", "key_up:<redacted>", "key_up:shift+0x50"]

@@ -126,6 +126,11 @@ Choices where the spec is ambiguous (reported):
    issue order and falls back to the first expired one only when every match has expired, which keeps the
    `token_expired` drop (5.4.5). So a dead token left armed after `token_mismatch_coords` or `no_token` cannot drop
    a fresh token's down `token_expired`. A wheel match is unexpired already (choice 5).
+19. Rule 4 covers moves (6.2 rule 4, 5.4.1 layer 2: "an injected event from any process other than the emitter is
+   dropped and logged `untokened_injected`"). It runs after rules 1 and 2, whose codes another origin's events keep
+   (the drill's raw Enter under the flag is `blocked_key_dialog`, 6.5), and drops every remaining event that is not
+   the emitter's `no_token`, moves included, so `drain` logs it `untokened_injected` (or tags it `drill` inside the
+   drill's raw phase). A foreign move never passes while no token is pending, nor steers a drag inside `move_allow`.
 """
 from __future__ import annotations
 
@@ -540,8 +545,9 @@ def hook_decide(state: GatewayState, e: InputEvent, now: float) -> HookDecision:
                 return _spend(state, e, now, "blocked_key_dialog")
         if e.type == "button_down" and "shift" in e.mods:
             return _spend(state, e, now, "shift_click_dialog")
-    tokened = e.origin == "emitter"                                          # rule 3
-    if e.type == "move":
+    if e.origin != "emitter":                                                # rule 4: another process injected it
+        return _drop("no_token")                                             # (moves included; choice 19)
+    if e.type == "move":                                                     # rule 3
         ma = state.move_allow
         if ma is not None and now <= ma.until and ma.bbox.contains(e.x, e.y):
             return HookDecision(True)
@@ -553,11 +559,11 @@ def hook_decide(state: GatewayState, e: InputEvent, now: float) -> HookDecision:
         val = e.button if e.type == "button_up" else e.vk
         kind = "click" if e.type == "button_up" else "key"
         for t in state.tokens.values():
-            if tokened and t.kind == kind and t.state == "half_consumed" and getattr(t, key) == val:
+            if t.kind == kind and t.state == "half_consumed" and getattr(t, key) == val:
                 t.state = "consumed"
                 return HookDecision(True, token_id=t.id, late_up=now > t.expires)
         for t in state.tokens.values():
-            if tokened and t.kind == "release" and t.state == "armed" and getattr(t, key) == val:
+            if t.kind == "release" and t.state == "armed" and getattr(t, key) == val:
                 t.state = "consumed"                                         # a release alone activates nothing
                 return HookDecision(True, token_id=t.id)
         return _drop("no_token")
@@ -807,16 +813,18 @@ def slow_half(a: Action, ctx: SafetyContext) -> SlowDecision:
     send_click = pointer and len(labels) == 2 and all(s == SEND_LABEL for s in labels)
     gate_says = ctx.send_gate.check(a, ctx) if send_click and ctx.send_gate is not None else "no send gate"
     send_ok = send_click and gate_says is None
-    # never-tokenize (exact list anywhere; the send-like regex outside the Order Confirmation dialog)
+    # never-tokenize (exact list anywhere; the send-like regex outside the Order Confirmation dialog, on every label
+    # but `Confirm and Send` itself, so the under-point OCR stays an independent check beside it, 6.2)
     if pointer and not send_ok:
         if any(NEVER_TOKENIZE_RE.match(s) for s in labels):
             return _refuse("never_tokenize", f"label {labels}" + (f"; {gate_says}" if send_click else ""), send=True)
+        others = [s for s in labels if s.lower() != CONFIRM_AND_SEND]
+        if not ctx.order_dialog_present and any(SEND_LIKE_RE.search(s) for s in others):
+            return _refuse("never_tokenize", f"send-like label {labels}", send=True)
         if confirm:
             hit = _confirm_refusal(a, ctx)
             if hit is not None:
                 return hit
-        elif not ctx.order_dialog_present and any(SEND_LIKE_RE.search(s) for s in labels):
-            return _refuse("never_tokenize", f"send-like label {labels}", send=True)
         if a.profile == "scripted":
             if "cancel all" in lowered and a.teardown_action != "cancel_all":
                 return _refuse("deny_profile", "Cancel All outside the cancel_all teardown action")
@@ -944,7 +952,8 @@ class DropLedger:
         """Apply 5.4.8 to one drop or refusal. `unit` is the flow id (or the agent or Explorer session id) and
         `step_id` the step it blocked, for `rest_of_flow` (choice 13); `order_stage` is whether an order-stage
         step is in force; `probe_answered` and `retried` decide the single retry of an own-token integrity drop
-        (5.4.3 stage 7); `budgets` are the shard's restart budgets, which a `hook_host_dead` refusal needs
+        (5.4.3 stage 7: a silent probe makes the step `failed`, a retry the answering hook dropped again
+        `blocked_by_gateway`); `budgets` are the shard's restart budgets, which a `hook_host_dead` refusal needs
         (choice 14)."""
         res = self._record(drop, unit=unit, step_id=step_id, order_stage=order_stage, exempt=exempt,
                            probe_answered=probe_answered, retried=retried, budgets=budgets)
@@ -1008,8 +1017,10 @@ class DropLedger:
         quarantine = self.unit_counts[unit] >= self.per_flow
         own_integrity = drop.gate_class == "integrity" and drop.decision == "dropped" and drop.own_token
         if own_integrity and (retried or not probe_answered):
-            # 5.4.3 stage 7: the retry dropped again or the hook did not answer: fail closed (5.4.2)
-            return ControlResult("gateway", False, "running", step="blocked_by_gateway", step_reason=drop.reason,
+            # 5.4.3 stage 7: the retry dropped again or the hook did not answer: fail closed (5.4.2). A silent hook never
+            # saw the event, so the step is failed (SD-52); a hook that answered and dropped the retry blocked it
+            return ControlResult("gateway", False, "running", step="blocked_by_gateway" if probe_answered else "failed",
+                                 step_reason=drop.reason,
                                  checkpoint=Outcome("harness_error", "hook_lost"),
                                  actions=("end_flow", "kill_tree", "restart_hook_host")
                                  + (("quarantine_flow",) if quarantine else ()),
@@ -1021,9 +1032,12 @@ class DropLedger:
                 return ControlResult("gateway", False, "running", step="blocked_by_gateway", step_reason=drop.reason,
                                      actions=("end_session",), findings=findings, evidence=ev,
                                      detail=f"{self.unit_counts[unit]} denied attempts end the session (6.8)")
-            end = "end_session" if drop.mode == "agent" else "end_flow"
-            return ControlResult("gateway", False, "running", step="failed", step_reason=drop.reason,
-                                 actions=(end, "quarantine_flow"), alert=alert or alerts.flow_quarantined(),
+            # the threshold adds the quarantine; the step outcome stays rule 3's by mode (choice 15)
+            agent = drop.mode == "agent"
+            return ControlResult("gateway", False, "running", step="failed" if agent else "blocked_by_gateway",
+                                 step_reason=drop.reason, actions=("end_session" if agent else "end_flow",
+                                                                   "quarantine_flow"),
+                                 alert=alert or alerts.flow_quarantined(),
                                  findings=findings, incident="S3",
                                  detail=f"{self.unit_counts[unit]} drops or refusals in {unit}", evidence=ev)
         if drop.reason in INTEGRITY_FINDING:

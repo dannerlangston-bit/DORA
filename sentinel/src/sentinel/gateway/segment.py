@@ -52,7 +52,8 @@ Choices where the spec is silent or ambiguous (reported):
    `deny_all`: there is no consistent picture to act on, and 5.4.2 fails closed. A writer whose transaction
    raises leaves `seq` odd for the same reason.
 5. The ring keeps a record for every drop and for every event that matched a token (5.4.4: "every consumed
-   token writes a compact record"), the probe included; allowed moves with no token write nothing. A record's
+   token writes a compact record"), the probe included; the emitter's allowed moves with no token write nothing,
+   while another process's move is a drop (rule 4, `orchestrator.gateway` choice 19) and writes one. A record's
    `origin` is what the hook can tell from the injected flag and the emitter's tag (`emitter`,
    `foreign_process`, `drill`, `console`), so the drainer can name `untokened_injected` and the drill tag. A
    control record (event type `control`: the hook host's own `hook_reinstalled` log, aux 1 when the reinstall
@@ -65,6 +66,11 @@ Choices where the spec is silent or ambiguous (reported):
    `GatewayState` no longer holds, and `GatewayState._slot` lets an expired armed token go when its slot is needed.
    Of several matching tokens, rule 3 takes the first unexpired one and the first expired one only when all have
    expired (`orchestrator.gateway` choice 18), so a dead token cannot drop a fresh token's down `token_expired`.
+7. The secret flag of a key event's record (6.9: a secret never becomes a record). A key down or key up is flagged
+   secret when it matched a secret token, and also when any secret key token for the same vk sits in a slot,
+   whatever its state: the up of a key whose down was dropped (deny-all, not armed, rule 2), came after its token
+   expired, or passed before the kill switch matches no half consumed token, and without the flag the drainer would
+   write its vk. With no consistent picture (choice 4) the hook cannot tell, so every key event is flagged.
 """
 from __future__ import annotations
 
@@ -141,6 +147,7 @@ BUTTON_CODE = {name: i for i, name in enumerate(BUTTONS) if name}
 MOD_BITS = {"shift": 1, "ctrl": 2, "alt": 4, "win": 8}
 RF_INJECTED, RF_SECRET = 16, 32
 FLAG_CLEAR, FLAG_SET, FLAG_UNKNOWN = 0, 1, 2
+KEY_EVENTS = ("key_down", "key_up")
 
 # The same tables as orchestrator.gateway (5.4.7), restated because this module imports the stdlib only;
 # tests/test_gateway_segment.py checks they are equal.
@@ -692,10 +699,17 @@ def _match(toks: list[TokenSlot], e: EventLike, now_ns: int) -> tuple[str | None
     return (None, _unexpired_first(near, now_ns)) if near else ("token_mismatch_coords", None)
 
 
+def _secret_key(toks: list[TokenSlot], e: EventLike) -> bool:
+    """A key event whose vk a secret key token in any slot carries, whatever the token's state (choice 7)."""
+    return e.type in KEY_EVENTS and any(t.kind == KIND_KEY and t.flags & TF_SECRET and not t.release
+                                        and t.button_or_vk == e.vk for t in toks)
+
+
 def _spend(buf: Any, e: EventLike, now_ns: int, reason: str, toks: list[TokenSlot]) -> Decision:
     """A rule 1 or rule 2 drop (choice 6): the token the event would have used is spent `dropped` with the reason."""
     t = _match(toks, e, now_ns)[1]
-    return _commit(buf, e, now_ns, Decision(False, reason, t.id if t else None), t, DROPPED if t else None)
+    return _commit(buf, e, now_ns, Decision(False, reason, t.id if t else None), t, DROPPED if t else None,
+                   secret=_secret_key(toks, e))
 
 
 def decide_from_segment(buf: Any, e: EventLike, now_ns: int, *, deny_all: bool = False) -> Decision:
@@ -704,10 +718,11 @@ def decide_from_segment(buf: Any, e: EventLike, now_ns: int, *, deny_all: bool =
     ring record. `deny_all` is the hook host's own latch (orchestrator gone, layout mismatch), ORed with the
     segment's flag. `buf` must be writable."""
     snap = read_snapshot(buf)
-    if snap is None:                                                         # choice 4
-        return _commit(buf, e, now_ns, Decision(False, "deny_all"), None, None)
+    if snap is None:                                                         # choices 4 and 7
+        return _commit(buf, e, now_ns, Decision(False, "deny_all"), None, None, secret=e.type in KEY_EVENTS)
     armed, seg_deny_all, flag, deny_count, chord_count, _o, _h, watcher_ns, _r = _HEADER_SLOW.unpack_from(snap, 16)
     toks = _tokens(snap)
+    secret = _secret_key(toks, e)
     probe = None
     if e.type == "move" and e.origin == "emitter":
         probe = next((t for t in toks if t.kind == KIND_PROBE and t.state == ARMED and _near(t, e)
@@ -720,7 +735,7 @@ def decide_from_segment(buf: Any, e: EventLike, now_ns: int, *, deny_all: bool =
             return _commit(buf, e, now_ns, Decision(False, reason, probe.id), probe, CONSUMED)
         return _spend(buf, e, now_ns, reason, toks)
     if e.origin == "console":                                                # rule 4
-        return _commit(buf, e, now_ns, Decision(False, "foreign_input"), None, None)
+        return _commit(buf, e, now_ns, Decision(False, "foreign_input"), None, None, secret=secret)
     if now_ns - watcher_ns > WATCHER_STALE_NS:
         flag = FLAG_UNKNOWN
     if flag != FLAG_CLEAR:                                                   # rule 2, regardless of token
@@ -735,6 +750,8 @@ def decide_from_segment(buf: Any, e: EventLike, now_ns: int, *, deny_all: bool =
                 return _spend(buf, e, now_ns, "blocked_key_dialog", toks)
         if e.type == "button_down" and "shift" in e.mods:
             return _spend(buf, e, now_ns, "shift_click_dialog", toks)
+    if e.origin != "emitter":                                                # rule 4: another process, moves too
+        return _commit(buf, e, now_ns, Decision(False, "no_token"), None, None, secret=secret)
     if e.type == "move":                                                     # rule 3
         active, until, bx, by, bw, bh = _MOVE_ALLOW.unpack_from(snap, OFF_MOVE_ALLOW)
         pid = probe.id if probe else None
@@ -746,22 +763,21 @@ def decide_from_segment(buf: Any, e: EventLike, now_ns: int, *, deny_all: bool =
     if e.type in ("button_up", "key_up"):
         kind = KIND_BUTTON if e.type == "button_up" else KIND_KEY
         val = BUTTON_CODE.get(e.button or "", -1) if e.type == "button_up" else e.vk
-        mine = toks if e.origin == "emitter" else []
-        for t in mine:
+        for t in toks:
             if t.kind == kind and not t.release and t.state == HALF_CONSUMED and t.button_or_vk == val:
                 return _commit(buf, e, now_ns, Decision(True, token_id=t.id, late_up=now_ns > t.expires_ns), t,
-                               CONSUMED)
-        for t in mine:
+                               CONSUMED, secret=secret)
+        for t in toks:
             if t.kind == kind and t.release and t.state == ARMED and t.button_or_vk == val:
-                return _commit(buf, e, now_ns, Decision(True, token_id=t.id), t, CONSUMED)
-        return _commit(buf, e, now_ns, Decision(False, "no_token"), None, None)
+                return _commit(buf, e, now_ns, Decision(True, token_id=t.id), t, CONSUMED, secret=secret)
+        return _commit(buf, e, now_ns, Decision(False, "no_token"), None, None, secret=secret)
     miss, t = _match(toks, e, now_ns)                                        # button down, key down, wheel
     if t is None:
-        return _commit(buf, e, now_ns, Decision(False, miss or "no_token"), None, None)
+        return _commit(buf, e, now_ns, Decision(False, miss or "no_token"), None, None, secret=secret)
     if e.type == "wheel":
         return _commit(buf, e, now_ns, Decision(True, token_id=t.id), t, CONSUMED)
     if now_ns > t.expires_ns:
-        return _commit(buf, e, now_ns, Decision(False, "token_expired", t.id), t, EXPIRED)
+        return _commit(buf, e, now_ns, Decision(False, "token_expired", t.id), t, EXPIRED, secret=secret)
     if e.type == "button_down":
         for i in range(deny_count):
             rx, ry, rw, rh, is_send = _DENY_RECT.unpack_from(snap, OFF_DENY_RECTS + i * _DENY_RECT.size)
@@ -772,15 +788,17 @@ def decide_from_segment(buf: Any, e: EventLike, now_ns: int, *, deny_all: bool =
                 return _commit(buf, e, now_ns, Decision(False, "deny_rect", t.id), t, DROPPED)
         if flag != FLAG_CLEAR and not t.flags & TF_DIALOG_OK:
             return _commit(buf, e, now_ns, Decision(False, "dialog_not_ok", t.id), t, DROPPED)
-    return _commit(buf, e, now_ns, Decision(True, token_id=t.id), t, HALF_CONSUMED)
+    return _commit(buf, e, now_ns, Decision(True, token_id=t.id), t, HALF_CONSUMED, secret=secret)
 
 
 def _chords(snap: bytes, count: int) -> set[tuple[int, int]]:
     return {_CHORD.unpack_from(snap, OFF_CHORDS + i * _CHORD.size) for i in range(count)}
 
 
-def _commit(buf: Any, e: EventLike, now_ns: int, d: Decision, t: TokenSlot | None, new_state: int | None) -> Decision:
-    """Write the token's new state (state, then state_id; choice 2) and the event's ring record (choice 5)."""
+def _commit(buf: Any, e: EventLike, now_ns: int, d: Decision, t: TokenSlot | None, new_state: int | None, *,
+            secret: bool = False) -> Decision:
+    """Write the token's new state (state, then state_id; choice 2) and the event's ring record (choice 5), flagged
+    secret when the token is a secret one or `secret` says the event is a secret key's (choice 7)."""
     if t is not None and new_state is not None:
         off = OFF_TOKENS + t.slot * TOKEN_SIZE + TOKEN_SLOW_SIZE
         reason = REASON_CODE[d.reason] if new_state in (DROPPED, EXPIRED) and d.reason else 0
@@ -788,7 +806,7 @@ def _commit(buf: Any, e: EventLike, now_ns: int, d: Decision, t: TokenSlot | Non
         buf[off + 5] = reason
         _U32.pack_into(buf, off, t.id)
     late = (now_ns - t.expires_ns) // 1_000_000 if d.late_up and t is not None else 0
-    rec = record_for(e, d, now_ns, secret=bool(t is not None and t.flags & TF_SECRET), delay_ms=late)
+    rec = record_for(e, d, now_ns, secret=secret or bool(t is not None and t.flags & TF_SECRET), delay_ms=late)
     if rec is not None:
         append_record(buf, rec)
     return d

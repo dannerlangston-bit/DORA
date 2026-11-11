@@ -80,12 +80,14 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from PIL import Image
 
+from .. import checkpoints as cps
 from ..canonical import epoch_id
 from ..canonical import fingerprint_id_of as fingerprint_id
+from ..diff import load_params as load_diff_params
 from ..taxonomy import is_checkpoint_id, is_slug, load as load_taxonomy
 from . import schemas
 from .repo import Doc, Repo
@@ -141,7 +143,7 @@ RULES: dict[str, Rule] = {r.id: r for r in (
     Rule("L-DEP-08", "error", "the edge FlexibleGrid -> trade.active-trader.ladder exists"),
     Rule("L-SRF-00", "error", "surface entry reads and validates against schemas/surface.schema.json"),
     Rule("L-SRF-01", "error", "surface id unique, a slug, and equal to the file name"),
-    Rule("L-SRF-02", "error", "tier 1 has owner, smoke, a must_see landmark, anti_anchors, labels and a required control"),
+    Rule("L-SRF-02", "error", "tier 1 has owner, a must_see landmark, anti_anchors, labels and a required control"),
     Rule("L-SRF-03", "error", "resizable needs hosts and P8 or splitters; size_ladder exists with a reason; ladders S and F as 2.5.2"),
     Rule("L-SRF-04", "error", "dialog, detached and popup windows need title_regex; main forbids it"),
     Rule("L-SRF-05", "error", "path ends with wait_for on a must_see landmark; every path target resolves on two rungs"),
@@ -195,12 +197,13 @@ RULES: dict[str, Rule] = {r.id: r for r in (
          "asserted, on a census checkpoint a rule region"),
     Rule("L-RGN-05", "error", "floor_exception carries its human fields and a future expiry, on diff regions only"),
     Rule("L-RGN-06", "warn", "no non-zero calibration floor on a frozen checkpoint (calibration/<hex>.yaml)", _PENDING),
-    Rule("L-RGN-07", "error", "masks on frozen checkpoints only on the clock, connection indicator, caret or parking rectangle"),
+    Rule("L-RGN-07", "error", "masks on frozen checkpoints only on the clock, connection indicator, parking rectangle or, "
+         "with keep_focus, the caret"),
     Rule("L-RGN-08", "error", "money_cell iff money_role; money_role only on order_confirmation and order_ticket panels",
          _PENDING),
     Rule("L-MSK-00", "error", "mask record reads and validates against schemas/mask.schema.json"),
     Rule("L-MSK-01", "error", "created_by human (the decision_ref lives in the Central Store)"),
-    Rule("L-MSK-02", "error", "expires_at is in the future (CI)"),
+    Rule("L-MSK-02", "error", "expires_at is in the future (CI); at run start the mask is dropped and listed in run health"),
     Rule("L-MSK-03", "error", "masked plus non-identity redacted area per panel class within the mask budget"),
     Rule("L-MSK-04", "warn", "mask growth over 30 days at most 2 percent of a tier-1 checkpoint",
          "needs the mask history of the last 30 days (git history and the regions table)"),
@@ -337,12 +340,20 @@ LADDER_F_CORNERS = ((240, 160), (240, "MAXH"), ("MAXW", 160), ("MAXW", "MAXH"))
 LADDER_F_ASCENDING = tuple((w, 480) for w in (320, 400, 480, 640, 800, 960))
 EXPLORER_BUDGET_6_8 = {"max_actions": 400, "max_minutes": 90, "max_no_change_actions": 20,
                        "max_usd_per_session": 25, "max_usd_per_week": 500}
-MASK_BUDGET = {"order_confirmation": 0.10, "order_ticket": 0.10, "position_statement": 0.10, "account_info": 0.05}
 FROZEN_MASK_SEGMENTS = ("clock", "connection-indicator", "caret", "parking")
+CARET_SEGMENT = "caret"                   # allowed on a frozen checkpoint only with keep_focus: true (SD-27, L-RGN-07)
+MONEY_PANELS = ("order_confirmation", "order_ticket")       # the panels money_role may sit on (SD-28, L-RGN-08)
 # operands of the rule assertion kind: (required, optional) per rule, generated from the 2.8.3 operand table through
 # taxonomy.yaml `rule_operands` (SD-34)
 RULE_OPERANDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     rule: load_taxonomy().rule_operands(rule) for rule in load_taxonomy().data["rule_operands"]}
+# the 2.8.3 type of every operand (integer, price, money, percent, date, text, decimal), from the same table
+RULE_OPERAND_TYPES: dict[str, dict[str, str]] = {
+    rule: {name: str(op["type"]) for name, op in ops.items()} for rule, ops in load_taxonomy().data["rule_operands"].items()}
+# 2.8.3: optional operands that are given all together or not at all (R03 "last, low and high, all three or none")
+RULE_OPERAND_GROUPS: dict[str, tuple[frozenset[str], ...]] = {"R03": (frozenset({"last", "low", "high"}),)}
+# operand types a literal number may stand for (2.8.3: "or, where the type allows, a literal"); integer ones whole
+LITERAL_OPERAND_TYPES = frozenset({"integer", "price", "money", "percent", "decimal"})
 JIRA = re.compile(r"^[A-Z][A-Z0-9]+-[0-9]+$")
 FLAG = re.compile(r"^[a-z0-9_.]+$")
 PASCAL = re.compile(r"^[A-Z][A-Za-z0-9]*$")
@@ -350,8 +361,18 @@ POP_ID = re.compile(r"^POP-[0-9]{2,}$")
 MUTANT_ID = re.compile(r"^M[0-9]{2,}$")
 ACCOUNT = re.compile(r"^D-[0-9A-Z]+$")
 FUTURE_MONTH = re.compile(r"^/(?P<root>[A-Z0-9]+?)(?P<month>[FGHJKMNQUVXZ])(?P<year>[0-9]{2})$")
-ENTER_KEYS = frozenset({"enter", "return", "space", "spacebar", "ctrl+enter"})
+MONTH_CODES = "FGHJKMNQUVXZ"              # January to December (4.9 futures month code)
+VAULT_REF = re.compile(r"^vault://[^#]+#.+$")               # 4.1 secrets: vault://<path>#<field>
+# L-POP-02 after chord normalization (`_chord`): Enter, Space and Ctrl+Enter in every spelling
+ENTER_KEYS = frozenset({"enter", "space", "ctrl+enter"})
+_KEY_SYNONYMS = {"return": "enter", "numpad_enter": "enter", "numpadenter": "enter", "kp_enter": "enter",
+                 "keypad_enter": "enter", "spacebar": "space", "space_bar": "space", "control": "ctrl", "ctl": "ctrl"}
 TARGET_FIELDS = ("target", "from", "to", "at")
+# 6.7 gated branch: send caps per run and per day, and the price distance of an equity order (percent of the last)
+SEND_CAPS_6_7 = {"per_run": 5, "per_day": 20}
+DISTANCE_PCT_EQUITY_6_7 = 20.0
+# a fixture price rule the distance check reads (4.9 `prices.rule`): "last_delayed x 0.65", "last - 1000"
+_PRICE_RULE = re.compile(r"^\s*last(?:_delayed)?\s*(?P<op>[x*×+-])\s*(?P<n>[0-9]+(?:\.[0-9]+)?)")
 
 # The keyword may sit inside a snake_case key (`db_password`, `client_secret`, S-19) and a quoted key's closing quote
 # may sit before the separator (`"password": ...` in JSON, S-20); 4.15 L-XREF-07, 4.9 L-FIX-04.
@@ -420,9 +441,11 @@ class Violation:
 
 @dataclass
 class LintReport:
-    """Violations sorted by file and rule, plus the rules skipped as not checkable from files."""
+    """Violations sorted by file and rule, plus the rules skipped as not checkable from files. A run-start lint
+    (`lint_repo(..., run_start=True)`) lists the expired records it left out of the violations in `expired`."""
     violations: list[Violation]
     skipped: dict[str, str] = field(default_factory=dict)
+    expired: list["ExpiredRecord"] = field(default_factory=list)
 
     @property
     def errors(self) -> list[Violation]:
@@ -440,6 +463,33 @@ class LintReport:
     def rules(self) -> set[str]:
         """The rule ids that fired."""
         return {v.rule for v in self.violations}
+
+
+# finding kind (taxonomy.yaml finding_kinds) and run-health wording of each expiry the run drops (4.5, 4.8)
+EXPIRY_KINDS = {"mask_expired": "mask expired", "floor_exception_expired": "floor exception expired",
+                "invariant_exception_expired": "invariant exception expired"}
+
+
+@dataclass(frozen=True, order=True)
+class ExpiredRecord:
+    """A record whose `expires_at` has passed (L-MSK-02, L-RGN-05, L-SRF-11). In CI it is that rule's error; at run
+    start it simply stops applying: the run drops it, lists `run_health_line()` and writes a finding of `kind`
+    (`mask_expired`, `floor_exception_expired`, `invariant_exception_expired`), never `config_invalid` (4.1, 4.8).
+
+    `record_id` is the mask id, the floor exception's region id or the surface's invariant id; `scope` the checkpoint
+    (masks and floor exceptions) or the surface (invariant exceptions)."""
+    kind: str
+    record_id: str
+    scope: str
+    file: str
+    path: str
+    expires_at: str
+    rule: str
+    owner: str = ""
+
+    def run_health_line(self) -> str:
+        """The run-health line, for example `mask expired: msk.ps.last-update-01` (4.8 L-MSK-02)."""
+        return f"{EXPIRY_KINDS[self.kind]}: {self.record_id}"
 
 
 # -- small helpers ---------------------------------------------------------------------------------
@@ -494,6 +544,100 @@ def _inside(inner: tuple[int, int, int, int], outer: tuple[int, int, int, int]) 
             and inner[0] + inner[2] <= outer[0] + outer[2] and inner[1] + inner[3] <= outer[1] + outer[3])
 
 
+def _clip(r: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> tuple[int, int, int, int] | None:
+    x0, y0 = max(r[0], b[0]), max(r[1], b[1])
+    x1, y1 = min(r[0] + r[2], b[0] + b[2]), min(r[1] + r[3], b[1] + b[3])
+    return (x0, y0, x1 - x0, y1 - y0) if x1 > x0 and y1 > y0 else None
+
+
+def _union_area(bounds: tuple[int, int, int, int], rects: Iterable[tuple[int, int, int, int]]) -> int:
+    """Area of the union of `rects` inside `bounds` (overlapping boxes count once, as the runtime's canvas does)."""
+    clipped = [c for r in rects if (c := _clip(r, bounds))]
+    xs = sorted({x for r in clipped for x in (r[0], r[0] + r[2])})
+    area = 0
+    for x0, x1 in zip(xs, xs[1:]):
+        covered, end = 0, None
+        for top, bottom in sorted((r[1], r[1] + r[3]) for r in clipped if r[0] <= x0 and r[0] + r[2] >= x1):
+            if end is None or top >= end:
+                covered += bottom - top
+                end = bottom
+            elif bottom > end:
+                covered += bottom - end
+                end = bottom
+        area += covered * (x1 - x0)
+    return area
+
+
+def mask_budgets() -> dict[str, float]:
+    """The panel budgets of the Diff Engine parameters file (`diff_engine.yaml` `mask_budget`, 3.8), the one source
+    the run-time mask budget reads too; classes absent from it (`other`) have no budget."""
+    return {str(k): float(v) for k, v in load_diff_params()["mask_budget"].items()}
+
+
+@dataclass(frozen=True)
+class PanelShare:
+    """The masked plus non-identity redacted share of one panel class on one landmark (4.8 Mask budget, L-MSK-03)."""
+    panel: str
+    landmark: str
+    share: float
+    budget: float
+
+    @property
+    def exceeded(self) -> bool:
+        return self.share > self.budget
+
+
+def _is_money_cell(x: dict) -> bool:
+    """A region the zero mask budget protects: `money_cell: true` or a `money_role` (4.8)."""
+    return x.get("money_cell") is True or x.get("money_role") is not None
+
+
+def _cover(regions: Iterable[Any], masks: Iterable[Any], proposed_rect: Any) -> list[dict]:
+    out = [x for x in map(_d, regions) if x.get("type") == "mask"] + [_d(m) for m in masks]
+    if proposed_rect is not None:
+        out.append({"id": "proposed mask", **_d(proposed_rect)})
+    return [x for x in out if _rect(x.get("rect"))]
+
+
+def panel_share(regions: Iterable[Any], masks: Iterable[Any] = (), proposed_rect: Any = None,
+                budgets: Mapping[str, float] | None = None) -> list[PanelShare]:
+    """The mask budget of a regions file, computed geometrically as the run time does (3.8, 4.8 Mask budget).
+
+    `regions` are the regions file's regions; its `mask` regions cover. `masks` are further covering boxes, each
+    `{landmark, rect, identity_field?}` (the redaction anchors on this file's landmarks); a box with
+    `identity_field: true` is excluded from the share. `proposed_rect` is a mask a human proposes, `{landmark,
+    rect}` (L-DEC-04: no mask over the panel budget). A panel's bounds are the bounding box of the regions of its
+    class on one landmark (choice 9); every covering box on that landmark counts, whatever its own `panel` label, as
+    the union of its intersections with the bounds. One `PanelShare` per (panel class with a budget, landmark) that
+    has bounds; `budgets` defaults to `mask_budgets()`."""
+    budgets = mask_budgets() if budgets is None else dict(budgets)
+    regs = [x for x in map(_d, regions) if _rect(x.get("rect"))]
+    cover = [x for x in _cover(regs, masks, proposed_rect) if x.get("identity_field") is not True]
+    out = []
+    for panel, budget in budgets.items():
+        for lm in sorted({str(x.get("landmark")) for x in regs if x.get("panel", "other") == panel}):
+            rects = [_rect(x["rect"]) for x in regs if x.get("panel", "other") == panel and x.get("landmark") == lm]
+            x0, y0 = min(r[0] for r in rects), min(r[1] for r in rects)  # type: ignore[index]
+            x1, y1 = max(r[0] + r[2] for r in rects), max(r[1] + r[3] for r in rects)  # type: ignore[index]
+            bounds = (x0, y0, x1 - x0, y1 - y0)
+            covered = _union_area(bounds, [_rect(c["rect"]) for c in cover if c.get("landmark") == lm])  # type: ignore[misc]
+            out.append(PanelShare(panel, lm, covered / (bounds[2] * bounds[3]), float(budget)))
+    return out
+
+
+def money_cells_covered(regions: Iterable[Any], masks: Iterable[Any] = (),
+                        proposed_rect: Any = None) -> list[tuple[str, str]]:
+    """(money cell id, covering box id) for every mask, redaction box (identity or not) or proposed mask that
+    touches a money cell on its landmark: the money cell's budget is 0 percent (4.8 Mask budget, L-MSK-03)."""
+    regs = [x for x in map(_d, regions) if _rect(x.get("rect"))]
+    hits = []
+    for c in _cover(regs, masks, proposed_rect):
+        for x in regs:
+            if _is_money_cell(x) and x.get("landmark") == c.get("landmark") and _overlap(_rect(c["rect"]), _rect(x["rect"])):  # type: ignore[arg-type]
+                hits.append((str(x.get("id")), str(c.get("id"))))
+    return hits
+
+
 def _channel(build_id: str) -> str:
     return build_id.split("-", 1)[0] if isinstance(build_id, str) else ""
 
@@ -522,6 +666,7 @@ class CheckpointDef:
     tier: Any
     file: str
     flow: str | None = None
+    keep_focus: bool = False
 
 
 # -- the linter ------------------------------------------------------------------------------------
@@ -570,15 +715,19 @@ def _rule_view(repo: Repo) -> Repo:
 class _Linter:
     """One lint pass over a loaded repository; `run()` returns the violations."""
 
-    def __init__(self, repo: Repo, phase: int, today: date, flow_p50_s: dict[str, float] | None):
+    def __init__(self, repo: Repo, phase: int, today: date, flow_p50_s: dict[str, float] | None,
+                 run_start: bool = False):
         self.raw = repo
         self.r = _rule_view(repo)
         self.phase = phase
         self.today = today
         self.now = datetime.combine(today, time(0), tzinfo=timezone.utc)
         self.p50 = flow_p50_s or {}
+        self.run_start = run_start
         self.tax = load_taxonomy()
+        self.budgets = mask_budgets()
         self.out: list[Violation] = []
+        self.expired: list[ExpiredRecord] = []
         self._index()
 
     # -- reporting -------------------------------------------------------------------------------
@@ -588,6 +737,14 @@ class _Linter:
 
     def _phase_sev(self, until_phase: int) -> str:
         return "warn" if self.phase < until_phase else "error"
+
+    def expiry(self, rec: ExpiredRecord, message: str) -> None:
+        """An `expires_at` in the past (L-MSK-02, L-RGN-05, L-SRF-11): the rule's error in CI; at run start the
+        record is dropped and listed instead, never a violation (4.1, 4.5, 4.8)."""
+        if self.run_start:
+            self.expired.append(rec)
+        else:
+            self.add(rec.rule, rec.file, message, rec.path)
 
     # -- index -----------------------------------------------------------------------------------
 
@@ -647,52 +804,53 @@ class _Linter:
         self.retired = {x.get("old") for x in self.renames if x.get("new") == "retired"}
         red = r.one("redaction")
         self.redaction = [_d(x) for x in _l(_d(red.data).get("regions"))] if red else []
-        self.ladder_sizes = self._ladder_sizes()
+        self.sweep_steps = self._sweep_steps()
         self.defined: dict[str, CheckpointDef] = {}
         self._define_checkpoints()
 
-    def _ladder_sizes(self) -> list[tuple[int, int]]:
+    def _sweep_steps(self) -> list[cps.SweepStep]:
+        """Every w x h step any ladder of registry/ladders.yaml can plan (2.5.2): MAXW and MAXH from the work areas
+        of configs/allowed.yaml, the ascending pass as `-asc` steps, plus the corpus sizes of
+        corpus/measured_sizes.yaml on their host. Without ladders.yaml, ladders S and F of 2.5.2."""
         doc = self.r.one("ladders")
-        sizes: list[tuple[int, int]] = []
-        for lad in map(_d, _l(_d(doc.data).get("ladders")) if doc else []):
-            for st in map(_d, _l(lad.get("steps"))):
-                w, h = st.get("w"), st.get("h")
-                if isinstance(w, int) and isinstance(h, int) and (w, h) not in sizes:
-                    sizes.append((w, h))
+        allowed = self.r.one("configs_allowed")
+        areas = [_d(_d(c).get("work_area")) for c in _l(_d(allowed.data).get("configs") if allowed else [])]
+        maxw = sorted({a["w"] for a in areas if isinstance(a.get("w"), int)})
+        maxh = sorted({a["h"] for a in areas if isinstance(a.get("h"), int)})
+        steps: list[cps.SweepStep] = []
+        raw = [(st.get("w"), st.get("h"), st.get("part", "grid")) for lad in map(_d, _l(_d(doc.data).get("ladders")) if doc else [])
+               for st in map(_d, _l(lad.get("steps")))]
         if not doc:
-            sizes = list(dict.fromkeys(LADDER_S + LADDER_F_GRID + ((240, 160),)))
-        return sizes
+            raw = [(w, h, "grid") for w, h in dict.fromkeys(LADDER_S + LADDER_F_GRID)] + [(w, h, "corner") for w, h in LADDER_F_CORNERS]
+            raw += [(w, h, "ascending") for w, h in LADDER_F_ASCENDING]
+        for w, h, part in raw:
+            for ww in (maxw if w == "MAXW" else [w]):
+                for hh in (maxh if h == "MAXH" else [h]):
+                    if isinstance(ww, int) and isinstance(hh, int):
+                        steps.append(cps.SweepStep(ww, hh, ascending=part == "ascending"))
+        ms = self.r.one("measured_sizes")
+        self.corpus_sizes: dict[str, list[cps.SweepStep]] = {}
+        for x in map(_d, _l(_d(ms.data).get("sizes") if ms else [])):
+            if isinstance(x.get("w"), int) and isinstance(x.get("h"), int) and isinstance(x.get("host"), str):
+                self.corpus_sizes.setdefault(_s(x.get("surface")), []).append(cps.SweepStep(x["w"], x["h"], host=x["host"]))
+        return list(dict.fromkeys(steps))
 
     def _define_checkpoints(self) -> None:
+        """The checkpoint ids the registry and the flows define, enumerated by sentinel.checkpoints (the scope's
+        enumeration too, so lint and scope agree on which ids exist)."""
+        tiers = {wid: w.get("tier") for wid, (_rel, w) in self.workspaces.items()}
         for sid, s in self.surfaces.items():
             file, mode, tier = self.surface_file[sid], s.get("data_mode"), s.get("tier")
-            census = _d(s.get("census"))
-            if census.get("enabled", True):
-                dims = [(k, _l(v)) for k, v in _d(census.get("dimensions")).items()]
-                combos = list(itertools.product(*[[f"{k}={v}" for v in vals] for k, vals in dims])) if dims else [()]
-                for ws in _l(census.get("workspaces")):
-                    for combo in combos:
-                        cid = f"census/{sid}/{ws}" + (f"/{','.join(combo)}" if combo else "")
-                        self.defined.setdefault(cid, CheckpointDef(cid, "census", sid, mode, tier, file))
-            if s.get("resizable") is True:
-                for host in _l(s.get("hosts")):
-                    for w, h in self.ladder_sizes:
-                        cid = f"sweep/{sid}/{host}/{w}x{h}"
-                        self.defined.setdefault(cid, CheckpointDef(cid, "sweep", sid, mode, tier, file))
-            for sp in map(_d, _l(s.get("splitters"))):
-                fractions = [f for f in (_l(sp.get("fractions")) or SPLIT_FULL) if _num(f) is not None]
-                for f in fractions:
-                    if f in (0.0, 1.0) and not sp.get("collapsible"):
-                        continue
-                    cid = f"split/{sid}/{sp.get('id')}/{float(f):.2f}"
-                    self.defined.setdefault(cid, CheckpointDef(cid, "split", sid, mode, tier, file))
+            for cid, kind in cps.surface_checkpoints(s, tiers, self.sweep_steps + self.corpus_sizes.get(sid, [])):
+                self.defined.setdefault(cid, CheckpointDef(cid, kind, sid, mode, tier, file))
         for fid, doc in self.flows.items():
             for st in self._seq(doc.data):
                 if st.get("type") == "checkpoint" and isinstance(st.get("checkpoint_id"), str):
                     sid = _s(st.get("surface_id"))
                     tier = st.get("tier", _d(self.surfaces.get(sid)).get("tier"))
                     cid = st["checkpoint_id"]
-                    self.defined.setdefault(cid, CheckpointDef(cid, "flow", sid, _s(st.get("data_mode")), tier, doc.rel, fid))
+                    self.defined.setdefault(cid, CheckpointDef(cid, "flow", sid, _s(st.get("data_mode")), tier, doc.rel, fid,
+                                                               st.get("keep_focus") is True))
 
     @staticmethod
     def _seq(flow: Any) -> list[dict]:
@@ -1547,31 +1705,18 @@ class _Linter:
         return out
 
     def _mask_budget(self, cid: str, f: str, regions: list[dict]) -> None:
+        """L-MSK-03 by the run-time geometry (choice 9): every mask region and non-identity redaction box on a
+        landmark covers the panels on it whatever its own panel label, overlaps counted once; budgets from the Diff
+        Engine parameters file. No mask or box, identity or not, touches a money cell (4.8 mask budget, S-21)."""
         doc = self.regions.get(cid)
         landmarks = {_d(x).get("id") for x in _l(_d(doc.data).get("landmarks") if doc else [])}
-        masks = [x for x in regions if x.get("type") == "mask"]
         boxes = [x for x in self.redaction if x.get("landmark") in landmarks]
-        # identity_field exempts a redaction box from the panel share only; no mask or box ever covers a money cell
-        # (4.8 mask budget, S-21)
-        for m in masks + boxes:
-            rm = _rect(m.get("rect"))
-            for x in regions:
-                rx = _rect(x.get("rect"))
-                if x.get("money_cell") is True and rm and rx and x.get("landmark") == m.get("landmark") and _overlap(rm, rx):
-                    self.add("L-MSK-03", f, f"mask or redaction box {m.get('id')} covers money cell {x.get('id')} (budget 0 percent)")
-        masks += [x for x in boxes if x.get("identity_field") is not True]
-        for panel, budget in MASK_BUDGET.items():
-            for lm in landmarks:
-                members = [x for x in regions + masks if x.get("panel", "other") == panel and x.get("landmark") == lm and _rect(x.get("rect"))]
-                masked = sum(_rect(x["rect"])[2] * _rect(x["rect"])[3] for x in masks if x in members)  # type: ignore[index]
-                if not masked:
-                    continue
-                rects = [_rect(x["rect"]) for x in members]
-                x0, y0 = min(r[0] for r in rects), min(r[1] for r in rects)  # type: ignore[index]
-                x1, y1 = max(r[0] + r[2] for r in rects), max(r[1] + r[3] for r in rects)  # type: ignore[index]
-                share = masked / max(1, (x1 - x0) * (y1 - y0))
-                if share > budget:
-                    self.add("L-MSK-03", f, f"{panel} panel is {share:.1%} masked; the budget is {budget:.0%} (mask budget, 4.8)")
+        for cell, by in money_cells_covered(regions, boxes):
+            self.add("L-MSK-03", f, f"mask or redaction box {by} covers money cell {cell} (budget 0 percent)")
+        for p in panel_share(regions, boxes, budgets=self.budgets):
+            if p.exceeded:
+                self.add("L-MSK-03", f, f"{p.panel} panel on {p.landmark} is {p.share:.1%} masked; the budget is "
+                                        f"{p.budget:.0%} (mask budget, 4.8)")
 
     def check_masks(self) -> None:
         for doc in self.r.of("mask"):

@@ -398,3 +398,64 @@ def test_a_late_verdict_is_idempotent_on_the_reviews_key(store):
     from sentinel.store import ImportConflict
     with pytest.raises(ImportConflict):
         store.apply_review(review(CENSUS, confidence=0.5))
+
+
+# -- the post-run check of 1.4 G2 and L-OUT-07 ------------------------------------------------------------------------
+
+def cells(surfaces=("s.a", "s.b"), personas=("active_trader",), profiles=("paper-margin", "paper-ira")):
+    return [{"surface_id": s, "persona": p, "entitlement": f, "state": "covered"}
+            for s in surfaces for p in personas for f in profiles]
+
+
+def test_a_clean_run_passes_the_post_run_check(store):
+    from sentinel.store.checks import post_run_check
+    for cid in (CENSUS, SWEEP, FLOW):
+        store.write_checkpoint(out(cid, diff=D))
+    assert post_run_check(store, RUN, 2, 1, 2, cells=cells()) == []
+    store.update_summary(RUN, {"coverage": {"cells": cells()}})           # a PR run keeps its matrix in the summary
+    assert post_run_check(store, RUN, 2, 1, 2) == []
+
+
+def test_a_silent_checkpoint_ends_the_run_aborted_harness_with_the_report_withheld(store):
+    from sentinel.store.checks import end_taxonomy_check_failed, post_run_check
+    store.write_checkpoint(out(CENSUS, diff=D))
+    store.write_checkpoint(out(SWEEP, diff=D))
+    failures = post_run_check(store, RUN, 2, 1, 2, cells=cells())
+    assert failures == [f"L-OUT-07: 1 scoped checkpoint(s) without an outcome record, first {FLOW}"]
+    r = end_taxonomy_check_failed(store, RUN, failures, last_gate="teardown", watchdog_event_id="wd-31")
+    assert (r.status, r.reason) == ("aborted_harness", "taxonomy_check_failed")
+    filled = store.get_outcome(RUN, FLOW)
+    assert (filled.outcome, filled.reason) == ("harness_error", "taxonomy_check_failed")
+    assert filled.detail.startswith("watchdog_event: wd-31")
+    assert store.run_summary(RUN)["post_run_check"] == {"failures": failures, "report_withheld": True}
+    assert post_run_check(store, RUN, 2, 1, 2, cells=cells()) == []
+
+
+def test_a_retired_reason_fails_the_taxonomy_check(tmp_path):
+    import copy
+    from sentinel.store.checks import post_run_check
+    from sentinel.taxonomy import Taxonomy, load
+    db = tmp_path / "t.db"
+    with Store(db) as s:
+        s.begin_run(plan())
+        s.write_checkpoint(out(CENSUS, "needs_baseline", reason="explorer_replay", side="base"))
+        s.write_checkpoint(out(SWEEP, diff=D))
+        s.write_checkpoint(out(FLOW, diff=D))
+        assert post_run_check(s, RUN, 2, 1, 2, cells=cells()) == []
+    data = copy.deepcopy(load().data)
+    data["reasons"]["needs_baseline"].remove("explorer_replay")            # retired in the seed at the next open
+    with Store(db, taxonomy=Taxonomy(data)) as s:
+        failures = post_run_check(s, RUN, 2, 1, 2, cells=cells())
+        assert len(failures) == 1 and failures[0].startswith("taxonomy: 1 outcome reason(s) retired")
+
+
+def test_a_matrix_whose_cells_do_not_sum_is_refused(store):
+    from sentinel.store.checks import matrix_failures, post_run_check
+    for cid in (CENSUS, SWEEP, FLOW):
+        store.write_checkpoint(out(cid, diff=D))
+    short = cells()[:-1]
+    assert matrix_failures(short, 2, 1, 2) == ["G2 matrix: 3 cells, expected 2 surfaces x 1 personas x 2 profiles = 4"]
+    doubled = short + short[:1]
+    assert any("more than once" in f for f in matrix_failures(doubled, 2, 1, 2))
+    assert post_run_check(store, RUN, 2, 1, 2, cells=short) == matrix_failures(short, 2, 1, 2)
+    assert post_run_check(store, RUN, 2, 1, 2) == ["G2 matrix: the run has no coverage matrix"]

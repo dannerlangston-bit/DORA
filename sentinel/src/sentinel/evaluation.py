@@ -76,7 +76,7 @@ import numpy as np
 
 from .classify import Condition, EnvFailure
 from .diff import load_params
-from .diff.regions import Rect, RegionsFile
+from .diff.regions import Landmark, Rect, RegionsFile
 from .diff.settle import (
     DEFAULT_ANTI_ANCHOR_TEXTS, Anchor, Frame, Recapture, RerunBudget, SettleResult, SettleSpec, Stability,
     diff_stability, invariant_stability, recaptures_allowed, settle,
@@ -152,7 +152,7 @@ def neutral_control(cfg: ConfigView, checkpoint: PlannedCheckpoint) -> str | Non
     return None
 
 
-def _regions_anchor(lm: Any, pos: tuple[int, int] | None, margin: int) -> Anchor:
+def _regions_anchor(lm: Landmark, pos: tuple[int, int] | None, margin: int) -> Anchor:
     th, tw = lm.template.shape[:2]
     if lm.search_rect is not None:
         box = lm.search_rect
@@ -180,10 +180,11 @@ def settle_spec_for(cfg: ConfigView, checkpoint: PlannedCheckpoint, *, regfile: 
     surface = cfg.surfaces.get(checkpoint.surface_id, {})
     step = flow_step(cfg, checkpoint)
     resolve = template or read_template(cfg.root)
-    pos = {lm.id: lm.expected for lm in (regfile.landmarks if regfile else ()) if lm.expected is not None}
+    landmarks = regfile.landmarks if regfile else []
+    pos = {lm.id: lm.expected for lm in landmarks if lm.expected is not None}
     pos.update(positions or {})
 
-    anchors: list[Anchor] = [_regions_anchor(lm, pos.get(lm.id), margin) for lm in (regfile.landmarks if regfile else ())]
+    anchors: list[Anchor] = [_regions_anchor(lm, pos.get(lm.id), margin) for lm in landmarks]
     seen = {a.name for a in anchors}
     for lm in surface.get("landmarks") or ():
         if lm.get("must_see") is True and str(lm["id"]) not in seen:
@@ -520,7 +521,8 @@ def rerun_stability(plan: RecapturePlan, first: np.ndarray, taken: Sequence[Take
     return st
 
 
-def flake_event(stability: Stability, captures: Sequence[str], *, region_id: str | None = None) -> dict[str, Any] | None:
+def flake_event(stability: Stability, captures: Sequence[str], *,
+                region_id: str | None = None) -> dict[str, Any] | None:
     """The keyword arguments of `Store.write_flake_event` for an `unstable` re-run (3.10 step 5): both (or all)
     capture hashes, the region and the metrics; None for any other stability."""
     if stability.stability != "unstable":

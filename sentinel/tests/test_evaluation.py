@@ -212,7 +212,8 @@ def test_a_candidate_step_failure_is_the_candidate_rule():
     c = classify(Facts(**base_side_outcome(results, None, "gadget.new", led_to=True, assertion_ids=("qty",)).facts))
     assert (c.outcome, c.reason) == ("assertion_failed", "assertion:qty")
     env = EnvFailure("connectivity", "maintenance")
-    assert classify(Facts(**base_side_outcome(results, None, "gadget.new", led_to=True, env=env).facts)).outcome == "env_error"
+    with_env = base_side_outcome(results, None, "gadget.new", led_to=True, env=env)
+    assert classify(Facts(**with_env.facts)).outcome == "env_error"
     blocked = base_side_outcome([step("s1", "blocked_by_gateway")], None, "gadget.new", led_to=True)
     assert classify(Facts(**blocked.facts)).reason == "step_failed:s1"
 
@@ -288,7 +289,8 @@ def test_a_base_that_ends_not_settled_is_recaptured_once():
     assert env.failures == ("env_error", "harness_error") and env.details == ("occluded", None)
     assert b_input_reason(env.evidence(), new_surface=False).reason == "base_harness_error"
     once = settle_base(_grabs(SHAKY), SPEC, recapturable=False)          # the session moved on (choice 9)
-    assert once.failures == ("not_settled",) and b_input_reason(once.evidence(), new_surface=False).reason == "base_not_settled"
+    assert once.failures == ("not_settled",)
+    assert b_input_reason(once.evidence(), new_surface=False).reason == "base_not_settled"
     with pytest.raises(ValueError):
         CaptureFailure("not_settled")
 
@@ -406,8 +408,8 @@ def test_a_missing_landmark_refuses_every_panel_after_the_hash_short_circuit():
     res = diff_pair(IMG, cand, reg, context=ctx)
     assert res.terminal is not None and (res.terminal.outcome, res.terminal.reason, res.terminal.side) == (
         "landmark_missing", "landmark:lm.positions", "candidate")
-    assert res.level is None and not res.regions                              # no panel is diffed, not even the found one
-    same = diff_pair(cand, cand.copy(), reg, context=ctx)                    # hash-equal: zero before the landmark check
+    assert res.level is None and not res.regions              # no panel is diffed, not even the one found
+    same = diff_pair(cand, cand.copy(), reg, context=ctx)    # hash-equal: zero before the landmark check
     assert same.terminal is None and same.level == "zero"
     c = classify(Facts(landmark=Condition(res.terminal.reason, side=res.terminal.side)))
     assert (c.outcome, c.reason) == ("landmark_missing", "landmark:lm.positions")

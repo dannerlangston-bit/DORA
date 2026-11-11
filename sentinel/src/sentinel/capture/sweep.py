@@ -13,12 +13,12 @@ Every step of a w x h ladder measures the achieved size after the set or drag an
   every later step of that (surface, host) ladder `not_run (reason: step_failed:<step>)`.
 
 `classify_size_step(requested, measured, reference)` is the table; `check_size_reached(...)` adds the one retry and
-the outcomes; `SizeLadder` keeps one (surface, host) ladder: the reference sizes for each step, the stop after a
-failed step, the detach control or splitter the locator ladder cannot find (2.5.1: the step `failed`, its
-checkpoint `landmark_missing`, the rest `not_run`), and the achieved minimum stored with the run (`MinSize`), which
-the Reporter prints per gadget and host (`MinSize.report_line`) and which, moved between builds by more than
-4 px, raises `window_geometry_changed` (`compare_minimums`). `size_step_event` is the 8.3 `step_events` row of a
-step.
+the outcomes; `SizeLadder` keeps one (surface, host) ladder: the reference sizes for each step (`needs_retry` says
+when the one retry is due, `measure` records the step), the stop after a failed step (`blocked`), the detach control
+or splitter the locator ladder cannot find (2.5.1: the step `failed`, its checkpoint `landmark_missing`, the rest
+`not_run`), and the achieved minimum stored with the run (`MinSize`, `minimums_summary`), which the Reporter prints
+per gadget and host (`MinSize.report_line`) and which, moved between builds by more than 4 px, raises
+`window_geometry_changed` (`compare_minimums`). `size_step_event` is the 8.3 `step_events` row of a step.
 
 Choices where the spec is ambiguous or silent (reported):
 

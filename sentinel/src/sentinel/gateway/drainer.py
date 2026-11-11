@@ -40,7 +40,7 @@ Choices where the spec is silent or ambiguous (reported):
    context's, and its click crop from `crop_at` when one is given (the drainer runs within a poll interval of
    the event, which is as close to action time as the hook allows).
 6. The journal holds the dropped and refused rows only, as its name says; emitted rows go to the store alone.
-   The journal is flushed per row, not fsynced: it covers an Orchestrator death, and the rig's own crash
+   The journal is flushed with every write, not fsynced: it covers an Orchestrator death, and the rig's own crash
    handling covers the OS.
 7. `step_events.seq` orders a whole shard, so it comes from the caller's shard-wide allocator (`next_seq`),
    shared with every other writer of the shard's step events.

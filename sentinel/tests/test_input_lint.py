@@ -78,8 +78,8 @@ def test_the_gateway_emitter_may_inject(rel):
 
 
 def test_the_rest_of_the_gateway_may_not():
-    assert set(kinds("import pyautogui\nimport ctypes\nctypes.windll.user32.SendInput", "src/sentinel/gateway/drainer.py")) \
-        == {"input-import", "injection-reference"}
+    source = "import pyautogui\nimport ctypes\nctypes.windll.user32.SendInput"
+    assert set(kinds(source, "src/sentinel/gateway/drainer.py")) == {"input-import", "injection-reference"}
 
 
 @pytest.mark.parametrize("source", [
@@ -125,7 +125,8 @@ def test_drill_injector_passes_with_its_recorded_hash_only(tmp_path):
     wrong = check_tree(root, drill_hashes={DRILL: "0" * 64})
     assert [v.kind for v in wrong] == ["drill-hash", "injection-reference"] and "not the recorded" in wrong[0].message
     unlisted = check_tree(root, drill_hashes={})
-    assert [v.kind for v in unlisted] == ["drill-hash", "injection-reference"] and "not allowlisted" in unlisted[0].message
+    assert [v.kind for v in unlisted] == ["drill-hash", "injection-reference"]
+    assert "not allowlisted" in unlisted[0].message
     (root / "src/sentinel/gateway/drill/SHA256SUMS").write_text(f"# recorded at signing\n{digest}  {DRILL}\n")
     assert check_tree(root) == []                                                   # the default allowlist file
     assert load_drill_allowlist(root / "missing") == {}

@@ -52,7 +52,8 @@ def test_ring_records_become_rows_with_every_5_4_8_field(tmp_path):
     d.note_token(TokenNote(click.id, "scripted", "f.ladder", "s3", attempt=2, target_text="Buy Custom",
                            click_crop_sha256=CROP, rect_w=60, rect_h=22))
     d.note_token(TokenNote(key.id, "scripted", "f.login", "s1", target_text="<redacted:login.password>"))
-    for e, t in ((HookEvent("button_down", 401, 299, button="left"), T), (HookEvent("button_up", 401, 299, button="left"), T + 0.8),
+    for e, t in ((HookEvent("button_down", 401, 299, button="left"), T),
+                 (HookEvent("button_up", 401, 299, button="left"), T + 0.8),
                  (HookEvent("key_down", vk=0x41), T), (HookEvent("key_up", vk=0x41), T),
                  (HookEvent("button_down", 10, 20, button="right", origin="foreign_process"), T),
                  (HookEvent("key_down", vk=0x0D, mods=frozenset({"ctrl"}), origin="console"), T)):

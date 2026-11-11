@@ -223,7 +223,8 @@ def load_drill_allowlist(path: str | Path) -> dict[str, str]:
     return out
 
 
-def check_tree(root: str | Path = DEFAULT_ROOT, *, drill_hashes: Mapping[str, str] | None = None) -> list[CodeViolation]:
+def check_tree(root: str | Path = DEFAULT_ROOT, *,
+               drill_hashes: Mapping[str, str] | None = None) -> list[CodeViolation]:
     """Every violation under `<root>/src` (choice 6). `drill_hashes` maps drill files to their recorded SHA-256;
     by default they are read from `<root>/src/sentinel/gateway/drill/SHA256SUMS`."""
     root = Path(root)

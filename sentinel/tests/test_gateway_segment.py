@@ -375,7 +375,8 @@ def test_record_for_is_the_hooks_record_rule_without_a_segment():
     assert rec == sg.RingRecord(0, "button_up", "emitter", "late_up", frozenset({"shift"}), True, False, 99, 3, 4,
                                 2, 40, 7)
     assert record_for(InputEvent("move", 1, 1), gw.HookDecision(True), 1) is None             # untokened allowed
-    drop = record_for(InputEvent("wheel", 1, 1, delta=-120, origin="console"), gw.HookDecision(False, "foreign_input"), 1)
+    wheel = InputEvent("wheel", 1, 1, delta=-120, origin="console")
+    drop = record_for(wheel, gw.HookDecision(False, "foreign_input"), 1)
     assert (drop.reason, drop.decision, drop.injected, drop.aux, drop.token_id) == ("foreign_input", "dropped", False,
                                                                                   -120, None)
 

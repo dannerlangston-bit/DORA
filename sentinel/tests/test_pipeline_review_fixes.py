@@ -159,3 +159,48 @@ def test_a_failed_post_run_check_after_a_safety_abort_keeps_aborted_safety_and_r
     assert [(o.outcome, o.reason, o.gate) for o in filled] == [("env_error", "paper_mode_mismatch", "running")]
     assert "L-OUT-07" in (tmp_path / "pr-comment.md").read_text()
     assert json.loads((tmp_path / "commit-status.json").read_text())["state"] == "error"
+
+
+def _unsettled(tmp_path, noisy_side: str):
+    """The Position Statement census checkpoint with one side's frames replaced by changing noise (it never settles),
+    evaluated and written through `_Writer.artifacts`: the outcome, the stored sides and the candidate image used."""
+    from datetime import datetime, timezone
+
+    import numpy as np
+
+    from sentinel.demo import BASE_ID, PS_CENSUS
+    from sentinel.pipeline.config import SentinelConfig, materialize
+    from sentinel.pipeline.sim import SimBuild
+    from sentinel.store.artifacts import ArtifactStore
+    cfg = SentinelConfig.load(materialize(EXAMPLE, {}, tmp_path / "cfg"))
+    cp = pipeline_run.planned_for(cfg, PS_CENSUS)
+    run = pipeline_run._Run(cfg, f"run-unsettled-{noisy_side}", "pr", SimBuild(BASE_ID), SimBuild(BASE_ID),
+                            datetime(2026, 11, 10, 15, 31, tzinfo=timezone.utc), None, None, lambda s: "undeclared")
+    base, cand = run.capture(cp, "base"), run.capture(cp, "candidate", tick=1)
+    rng = np.random.default_rng(0)
+    noisy = base if noisy_side == "base" else cand
+    noisy.frames = [dataclasses.replace(f, image=rng.integers(0, 255, f.image.shape, dtype=np.uint8))
+                    for f in noisy.frames]
+    ev = pipeline_run.evaluate(run, cp, base, cand, x="undeclared", primitive=None, entry_ref=None,
+                               recapture=lambda: cand)
+    w = pipeline_run._Writer(run, ArtifactStore(tmp_path / f"arts-{noisy_side}", "runs/x"), TODAY, "15:31")
+    out, stored = w.artifacts(ev)
+    return ev, out, stored, run
+
+
+def test_an_unsettled_base_stores_no_candidate_pixels_as_the_base(tmp_path):
+    """pipeline:5 (8.4, 9.2, 1.10 needs_baseline): a base that never settles is `needs_baseline (base_not_settled)`;
+    no pair was formed, so only the candidate is stored and sent, never its pixels under side `base`."""
+    ev, out, stored, run = _unsettled(tmp_path, "base")
+    assert (ev.classified.outcome, ev.classified.reason) == ("needs_baseline", "base_not_settled")
+    assert ev.images()[0] is None and set(out) == {"candidate"}
+    assert [a.side for a in stored] == ["candidate"] and run.redaction_counts["base"] == 0
+
+
+def test_an_unsettled_candidate_stores_no_candidate_pixels_as_the_base(tmp_path):
+    """pipeline:5 (1.10 not_settled, Last frame kept; 8.4): the candidate's last frame is stored as the candidate and
+    nothing of it is stored as the base."""
+    ev, out, stored, _ = _unsettled(tmp_path, "candidate")
+    assert ev.classified.outcome == "not_settled"
+    assert ev.images()[0] is None and set(out) == {"candidate"} and [a.side for a in stored] == ["candidate"]
+

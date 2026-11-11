@@ -315,10 +315,11 @@ class Evaluated:
         return self.redaction is None or self.redaction.terminal is None
 
     def images(self) -> tuple[np.ndarray | None, np.ndarray]:
-        """(base, candidate) as stored and sent: the redacted pair when the stage ran (3.6), else the screens."""
+        """(base, candidate) as stored and sent: the redacted pair when the stage ran (3.6), else the screens. A
+        checkpoint redacted without a base frame (a side that did not settle) has no base image (8.4, 9.2)."""
         r = self.redaction
         if r is not None and r.terminal is None and r.candidate is not None:
-            return (r.base if self.base is not None else None), r.candidate
+            return r.base, r.candidate
         return (self.base.screen.image if self.base else None), self.cand.screen.image
 
     @property
@@ -478,15 +479,17 @@ class _Run:
     def redact(self, cp: PlannedCheckpoint, base: Capture | None, cand: Capture, base_img: np.ndarray | None,
                cand_img: np.ndarray, *, count: bool = True) -> RedactionResult:
         """Redact one checkpoint's pair in memory before anything is diffed or stored (`capture.redact_pair`): the
-        simulated OCR reads what synth drew on each side; a capture without a base is redacted against itself."""
-        b_cap, b_img = (base, base_img) if base is not None and base_img is not None else (cand, cand_img)
+        simulated OCR reads what synth drew on each side; a capture without a base frame is redacted against itself
+        and its result has no base image, so nothing of the candidate is ever stored or sent as the base (8.4, 9.2)."""
+        alone = base is None or base_img is None
+        b_cap, b_img = (cand, cand_img) if alone else (base, base_img)
         ocr = {"base": SyntheticOcr.from_screen(b_cap.screen), "candidate": SyntheticOcr.from_screen(cand.screen)}
         res = redact_pair(b_img, cand_img, self.anchors, ocr, THEME["bg"], sweep=self.sweep,
                           context=RedactionContext(self.run_id, cp.checkpoint_id, cp.tier), params=self.params)
         if res.terminal is None and count:
-            for side in ("base", "candidate") if base is not None else ("candidate",):
+            for side in ("candidate",) if alone else ("base", "candidate"):
                 self.redaction_counts[side] += int(res.counts.get(side, 0))
-        return res
+        return dataclasses.replace(res, base=None) if alone else res
 
     def redaction_canary(self, cp: PlannedCheckpoint, base: Capture, m: cn.Mutant) -> bool:
         """M19 (12.5, 6.10): the mutant leaves a synthetic account id unredacted in the candidate frame; the redaction

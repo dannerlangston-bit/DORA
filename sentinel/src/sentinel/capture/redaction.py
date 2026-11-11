@@ -34,9 +34,10 @@ Choices where the spec is ambiguous (reported):
 2. The sweep reads the raw frame. A hit is covered by stage 1 when its box, shrunk by the 1 px that mapping a 3x
    box back can add on each edge, lies inside the union of both captures' stage-1 boxes; otherwise it is a miss
    and its whole box is filled, so a partly covered identifier is never left half visible.
-3. Lines: words whose vertical extents overlap by at least half the smaller height and whose horizontal gap is at
-   most twice the smaller height are one line, joined with single spaces. Patterns match lines, so a phone
-   number or a display name split into words is found; a match fills the bounding box of every word it touches.
+3. Lines: words whose vertical extents overlap by at least half the smaller height form a row; a row splits where
+   the horizontal gap between neighbours exceeds twice the smaller height. A line is its words joined with single
+   spaces. Patterns match lines, so a phone number or a display name split into words is found; a match boxes
+   every word it touches, and a hit inside another hit's box (a name token inside the whole name) is that hit.
 4. Patterns (6.10 names them, not their syntax): paperMoney `D-` and 4 to 12 digits; live id 8 or 9 digits not
    part of a longer or decimal number (3.6); email; North American phone. Literal ids match whole words, case
    blind; the display name matches whole and token by token (5.7 "name tokens"), tokens of two characters or more.
@@ -304,21 +305,28 @@ def _down(rect: Rect, scale: int) -> Rect:
 
 
 def _lines(words: Sequence[tuple[str, Rect]]) -> list[list[tuple[str, Rect]]]:
-    """Group words into lines (choice 3)."""
-    lines: list[list[tuple[str, Rect]]] = []
+    """Group words into lines (choice 3): rows by vertical overlap, then split a row where a gap is too wide."""
+    rows: list[list[tuple[str, Rect]]] = []
     for word in sorted(words, key=lambda w: (w[1].y + w[1].h / 2.0, w[1].x)):
         r = word[1]
-        for line in lines:
-            last = max(line, key=lambda w: w[1].x)[1]
-            small = max(1, min(r.h, last.h))
-            overlap = min(r.y + r.h, last.y + last.h) - max(r.y, last.y)
-            gap = r.x - (last.x + last.w)
-            if overlap * 2 >= small and -small <= gap <= 2 * small:
-                line.append(word)
+        for row in rows:
+            a = row[0][1]
+            if (min(r.y + r.h, a.y + a.h) - max(r.y, a.y)) * 2 >= max(1, min(r.h, a.h)):
+                row.append(word)
                 break
         else:
-            lines.append([word])
-    return [sorted(line, key=lambda w: w[1].x) for line in lines]
+            rows.append([word])
+    lines: list[list[tuple[str, Rect]]] = []
+    for row in rows:
+        row.sort(key=lambda w: w[1].x)
+        line = [row[0]]
+        for prev, word in zip(row, row[1:]):
+            if word[1].x - (prev[1].x + prev[1].w) > 2 * max(1, min(prev[1].h, word[1].h)):
+                lines.append(line)
+                line = []
+            line.append(word)
+        lines.append(line)
+    return lines
 
 
 def _sweep(image: np.ndarray, ocr: WordOcr, matchers: Sequence[tuple[str, re.Pattern[str]]],
@@ -344,10 +352,13 @@ def _sweep(image: np.ndarray, ocr: WordOcr, matchers: Sequence[tuple[str, re.Pat
                 box = Rect.bounding(touched)
                 if box not in found or _KIND_ORDER.index(kind) < _KIND_ORDER.index(found[box]):
                     found[box] = kind
-    return [SweepHit(side, kind, box) for box, kind in sorted(found.items(), key=lambda kv: kv[0].as_tuple())]
+    kept = [(box, kind) for box, kind in found.items()          # a token inside a whole-name or id hit is that hit
+            if not any(other != box and other.intersect(box) == box for other in found)]
+    return [SweepHit(side, kind, box) for box, kind in sorted(kept, key=lambda kv: kv[0].as_tuple())]
 
 
-def verify(image: np.ndarray, ocr: WordOcr, sweep: Sweep | None = None, *, side: str = "candidate") -> tuple[SweepHit, ...]:
+def verify(image: np.ndarray, ocr: WordOcr, sweep: Sweep | None = None, *,
+           side: str = "candidate") -> tuple[SweepHit, ...]:
     """Re-read a redacted frame: the hits still legible (6.10 Proof: the canary output must contain zero)."""
     return tuple(_sweep(_rgb(image), ocr, (sweep or Sweep()).matchers(), side))
 

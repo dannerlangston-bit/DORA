@@ -6,6 +6,6 @@ from .redaction import (OcrWord, RedactionContext, RedactionError, RedactionList
 
 __all__ = [
     "OcrWord", "RedactionContext", "RedactionError", "RedactionList", "RedactionRegion", "RedactionResult",
-    "SelfTest", "Sweep", "SweepHit", "SyntheticOcr", "WordOcr", "h6_frame", "h6_self_test", "redact_pair", "redaction_version",
-    "sample_artifacts", "verify",
+    "SelfTest", "Sweep", "SweepHit", "SyntheticOcr", "WordOcr", "h6_frame", "h6_self_test", "redact_pair",
+    "redaction_version", "sample_artifacts", "verify",
 ]

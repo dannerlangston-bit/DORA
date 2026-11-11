@@ -436,7 +436,7 @@ A sixth, bounded activity, not a test kind. Under DR-07 branch B (computer use n
 - Order stage in a session: if the ticket or dialog flag (`order_stage`, 6.2) is ever set in an Explorer session, the gateway drops all input, closes the window through its recovery path (Escape token), and the session ends with the finding `explorer_order_stage` (S1, paged and notified per 9.10, plus the Explorer owner); the event counts toward the per-run trip of 10 (5.4.8) and the RC run itself continues. The 30-second open-dialog kill-switch timer of 6.6 applies to scripted flows and agent rescue only, never to an Explorer session.
 - Budgets, enforced by the Orchestrator and never by the prompt: 400 actions, 90 minutes wall clock, 25 dollars per session (plus the weekly cap of 11.4), and early stop after 20 consecutive actions with no new screenshot hash. The RC run's capture deadline caps the session as well: a session that starts late ends at the deadline (1.9). Exhaustion ends the session with a run-health line naming the budget hit; it never ends the run. If the model endpoint is unavailable at T+6:20 (`agent_available: false` after preflight N2 or N5, 12.7, with no recovery logged), the session does not start: it is `not_run (reason: model_unavailable)`, the RC report's Explorer section and run health print "Explorer: not run, model endpoint unavailable", the Explorer owner is notified, and the run is unaffected; a recovery logged before T+6:20 lets it start as planned.
 - Steering: toward surfaces with the fewest flow checkpoints in the current RC run and surfaces whose `primitives` intersect the manifest's touched primitives, from a target list the Orchestrator computes before the session starts. Odd inputs come from the seeded corpus with the pass rule of 2.6.3.
-- Logging per action (`step_events`, 8.3 Schema): index, time, stated target and expected outcome, resolved rect, keys, gate decision, pre and post screenshot hashes, 96x96 click crop, model id, prompt hash, usage. Before each action the agent states target and expected outcome; after it, the post-action state is verified by the cheapest means available (JAB focused element under branch A, else a template or OCR check of the expected anchor). A mismatch is logged `agent_error` and is never a product finding.
+- Logging per action (one `step_events` row with `mode: explorer`, 8.3 Schema): index (`seq`), time (`wall_at`, `mono_ms`), stated target (`target_text`) and expected outcome (`expected_outcome`), resolved rect (`screen_x`, `screen_y`, `rect_w`, `rect_h`), keys (`keys`), gate decision (`gate_decision`, `gate_reason`), pre and post screenshot hashes (`pre_hash`, `post_hash`), 96x96 click crop (`click_crop_sha256`), model id (`model_id`), prompt hash (`prompt_hash`), usage (`usage_json`). Before each action the agent states target and expected outcome; after it, the post-action state is verified by the cheapest means available (JAB focused element under branch A, else a template or OCR check of the expected anchor). A mismatch is logged `agent_error` and is never a product finding.
 - Findings: record with signature (surface, invariant or observation, crop hash), severity, confidence, raw values, trace reference, build, first and last seen; the same signature on a later night updates last seen instead of opening a new finding. Each is emitted as a candidate flow in `flows/quarantine/<finding-id>.yaml` (class `explorer_candidate`, 4.7 Flow file) from the trace since the last named stable state, anchored by click crops, and replayed exactly once in scripted mode on the same build within the RC run. No automatic trace minimization: a replay with steps removed costs minutes per probe against a live session, so trimming is a human step (an owner may enable a bounded mode of at most 8 replays for one finding). Only a reproducing finding is reported, through the replayed flow's own checkpoint outcomes: `invariant_violation` or `assertion_failed` when the finding is one of those, else `needs_baseline (reason: explorer_replay)` with the Explorer trace and the candidate flow attached, since a new flow has no base capture; never `needs_human`. A non-reproducing one is held with triage state `agent_mistake` or `expected_behavior` (8.3), listed under "Explorer: not reproduced" in the RC report (9.4 Merge and RC report structure) and counted in Explorer precision. A human trims and promotes the flow into the library; until the next good build captures a baseline, the promoted flow's checkpoints are `needs_baseline`.
 - Teardown: every session ends by replaying the server-side mutation ledger (items the Explorer created on its login), deleting each and verifying by reading, then the snapshot revert (6.8).
 - Metrics per RC run: Explorer precision (reproduced over emitted findings), agent-error ratio (agent errors over actions), deny-list hits, budget hit, dollars. Precision under 30 percent on two consecutive RC runs pauses the Explorer until the steering list or toolset is fixed; the pause is a run-health line, not silence.
@@ -483,11 +483,13 @@ The map is derived, not hand-written. A pipeline job runs a bytecode dependency 
 
 #### 2.10.2 Static impact step
 
-PR runs do not trust the committed map alone. The Orchestrator takes the diff's changed classes, computes their reverse transitive dependents on the candidate build's own dependency index (depth bounded at 6, configurable), intersects with every surface's `roots`, and obtains the surfaces the change can reach. Any such surface not reached through the committed map's expansion of the touched primitives and not declared in the manifest produces `dependency_map_gap` naming the missing edge (primitive or unowned class root, surface) and opens a proposed PR against the map. A changed class in no primitive's and no surface's `roots` is reported in the same finding as an unowned root, so the primitive vocabulary grows instead of silently missing an edge.
+PR runs do not trust the committed map alone. The Orchestrator takes the diff's changed classes, computes their reverse transitive dependents on the candidate build's own dependency index (depth bounded at 6, configurable), intersects with every surface's `roots`, and obtains the surfaces the change can reach. Any such surface not reached through the committed map's expansion of the touched primitives and not declared in the manifest produces `dependency_map_gap` (detail `missing_edge`) naming the missing edge (primitive, surface) and opens a proposed PR against the map. A changed class in no primitive's and no surface's `roots` is a gap only when it reaches a registered surface; it is then recorded as one `dependency_map_gap` (detail `unowned_root`), separate from the `missing_edge` findings, so the primitive vocabulary grows instead of silently missing an edge. A changed class that reaches no surface (backend code) is not a gap.
 
 ### 2.11 Scope computation per run type
 
-Inputs: registry R, committed Dependency Map D, manifest M (declared surfaces, touched primitives, tickets; may be absent), diff delta, candidate dependency index S (may be absent), entitlement profile E, quarantine list Q, flow library F, corpus W with its `hosted_by` relation, budget B with per-item durations from the run database, and the rig pool for the run.
+Inputs: registry R, committed Dependency Map D, manifest M (declared surfaces, touched primitives, tickets; may be absent), diff delta, candidate dependency index S (may be absent), entitlement profile E, quarantine list Q, flow library F, corpus W with its `hosted_by` relation, the capture budget B per rig with per-item durations, and the rig pool for the run.
+
+Budget B is capture time per rig, by one rule for every run type: `B = capture_time(run_type)`, the run type's wall budget (11.2) minus the 10-minute report margin minus the session startup of the 11.2 capacity table for every session the rig runs (4 minutes, 8 minutes when the session includes a fixture reset). Per-item durations are the 30-day p50 from the run store, with the planning defaults of 11.1 for an item without history, and each workspace switch costs its measured load time. The minute marks of 1.7 and 1.8 are illustrative; this budget and the capacity model of 11.2 are normative.
 
 ```
 function common_filters(items, E, Q):
@@ -497,10 +499,13 @@ function common_filters(items, E, Q):
   return items
 
 function order_and_cut(items, B, rigs):
-  sort by (tier asc, kind order flows, sweeps, census, estimated_duration desc)
-  shard by stable hash of item.id across rigs; flows sharing a fixture stay on one rig
+  sort by (tier asc, declared surface first within a tier, kind order flows, sweeps, census,
+           estimated_duration desc); census items grouped by workspace
+  shard: census items keyed by (surface tab, data_mode); flows by stable hash of flow_id within their tier;
+         flows sharing a state_scope (4.7) or a fixture pinned to one shard; shards packed longest first
+         (LPT) by measured p50, session startups included (4 min, 8 min with a fixture reset; 11.2)
   frozen items: base then candidate on the same rig, back to back; a stored base capture is reused when
-                fingerprint and fixture epoch match (3.1)
+                its reuse key matches (3.1); a frozen shard may run on an idle pair rig
   masked_live items: two identically fingerprinted rigs in lockstep; with one rig free they are
                 not_run(budget), never captured minutes apart
   while estimated duration on any rig > B:
@@ -509,8 +514,13 @@ function order_and_cut(items, B, rigs):
   return items per rig
 
 function smoke_subset(R):
-  return { s in R : s.smoke }   # all tier-1 surfaces, one surface per top-level tab,
-                                 # every attested Application Settings page; lint caps it at 40 (2.2.4)
+  return { s in R : s.smoke }   # flagged by the registry owner, at most 40 (2.2.4): tier-1 surfaces with
+                                 # money cells or order entry first, one surface per top-level tab,
+                                 # every attested Application Settings page
+
+function sweeps(s, ladder, splitter_steps):          # 2.5.1: w x h steps only on hosts that take a size;
+  sized = s.hosts intersect {flexgrid, detached, dialog}   # tab and sidebar hosts only through splitters
+  return { (s, host, step) : host in sized, step in ladder } union { (s, step) : step in splitter_steps(s) }
 
 function scope_pr(R, D, M, delta, S, E, Q, F, B):
   declared        = M.surfaces if M present else {}
@@ -523,38 +533,43 @@ function scope_pr(R, D, M, delta, S, E, Q, F, B):
      if static_surfaces union map_expanded non-empty or S absent:
           emit manifest_missing                      # case (a): UI-touching PR; diffs will be collateral
      else: mark run no_manifest                      # case (b): non-UI PR; diffs will be needs_human(no_manifest)
-  for s in static_surfaces - map_expanded - declared:
-      emit dependency_map_gap(edge = (owning_primitive_or_unowned_root(s, changed), s)); propose map PR
+  for s in static_surfaces - map_expanded - declared, reached from a changed class owned by primitive p:
+      emit dependency_map_gap(missing_edge = (p, s)); propose map PR
   for c in changed with no owning primitive and no owning surface, and reverse_closure(S, {c}) reaching a surface:
-      emit dependency_map_gap(unowned_root = c)    # a UI-reaching class nobody owns; a backend class that reaches no surface is not a gap
+      emit dependency_map_gap(unowned_root = c)    # one finding per class, separate from missing_edge;
+                                                   # a backend class that reaches no surface is not a gap
   change_surfaces = declared union map_expanded union static_surfaces
   census_surfaces = change_surfaces union smoke_subset(R)
-  census_items    = { (s, s.census.workspaces[0]) : s in census_surfaces }   # the canonical workspace only in PR runs
-  sweep_items     = { (s, host, step) : s in change_surfaces, s.resizable, s.tier == 1,
-                      host in s.hosts, step in ladder_S union splitters_short(s) }    # smoke adds census only (11.2 budget)
+  census_items    = { (s, w) : s in change_surfaces, w in s.census.workspaces }
+                    union { (s, s.census.workspaces[0]) : s in smoke_subset(R) - change_surfaces }
+                                                   # undeclared smoke surfaces: the canonical workspace only
+  sweep_items     = union over s in change_surfaces with s.resizable and s.tier == 1
+                      of sweeps(s, ladder_S, splitters_short)     # smoke adds census only (11.2 budget)
   flow_items      = { f in F : f.tier == 1 and (f.surfaces intersects change_surfaces
                                                 or f.primitives intersects touched_prims) }
   if run is no_manifest (case (b)):                # no UI scope, but a backend change can still move values
      flow_items  = flow_items union { f in F : f.tier == 1, f.class == standard, f.surfaces intersects smoke_subset(R) }
   for s in R - census_surfaces: outcome(s) = not_run(scope)
-  return order_and_cut(common_filters(census_items union sweep_items union flow_items, E, Q), B = 45 min, rigs)
+  return order_and_cut(common_filters(census_items union sweep_items union flow_items, E, Q),
+                       B = capture_time(pr), rigs)
 
 function scope_merge(R, E, Q, F, W, B):
   census_items = { (s, w) : s in R, w in W.tierA, s hosted_by w or s.global }
-  sweep_items  = { (s, host, step) : s in R, s.resizable, s.tier <= 2, host in s.hosts,
-                   step in ladder_S union splitters_short(s) }
+  sweep_items  = union over s in R with s.resizable and s.tier <= 2 of sweeps(s, ladder_S, splitters_short)
   flow_items   = { f in F : f.tier == 1 }
   for (s, w) with s not hosted_by w and not s.global: outcome = not_run(scope)
-  return order_and_cut(common_filters(census_items union sweep_items union flow_items, E, Q), B = 3 h, rigs)
+  return order_and_cut(common_filters(census_items union sweep_items union flow_items, E, Q),
+                       B = capture_time(merge), rigs)
 
 function scope_rc(R, E, Q, F, W, B):
   census_items = { (s, w) : s in R, w in W.tierA union W.tierB, s hosted_by w or s.global }
-  sweep_items  = { (s, host, step) : s in R, s.resizable, host in s.hosts,
-                   step in (ladder_F union splitters_full(s) if s.tier <= 2 else ladder_S) }
+  sweep_items  = union over s in R with s.resizable of
+                   (sweeps(s, ladder_F, splitters_full) if s.tier <= 2       # splitters_full for tiers 1 and 2,
+                    else sweeps(s, ladder_S, splitters_short))               # splitters_short for tier 3
   flow_items   = F                          # all tiers and classes, migration flows on tier B
   soak_items   = the 24 soak cycle checkpoints flow/<workspace-surface-id>/soak/c<nn> on rig 5 (10.11 Soak; 1.9)
   plan = order_and_cut(common_filters(census_items union sweep_items union flow_items union soak_items, E, Q),
-                       B = 8 h - 10 min - explorer_budget, rigs)   # explorer_budget = 90 min (2.9); scripted work ends by T+6:20
+                       B = capture_time(rc) - explorer_budget, rigs)   # explorer_budget = 90 min (2.9); scripted work ends by T+6:20
   append Explorer session on rig 6 with its own login, last (2.9); a later start is cut at the deadline (1.9)
   return plan
 ```
@@ -562,25 +577,28 @@ function scope_rc(R, E, Q, F, W, B):
 Rules the pseudocode relies on:
 
 - A manifest with zero declared surfaces is allowed (pure refactor) and still yields the static impact set. A missing manifest file has two cases, decided by the static impact step. Case (a), the PR touches UI code (`static_surfaces` or `map_expanded` is non-empty): finding `manifest_missing`, the run proceeds with nothing declared, and every above-threshold diff is `collateral`, because an undeclared UI change is by definition unexpected and the developer must declare it or fix it. Case (b), the PR touches no UI code: no finding, `intended` is disabled, and every above-threshold diff is `needs_human (reason: no_manifest)`, since a side effect from non-UI code is possible but intent cannot be checked. The PR comment header states which case applied and links the manifest template.
+- Tier 1 does not imply smoke. The smoke subset is the set of surfaces the registry owner flags, at most 40 (2.2.4); an unflagged tier-1 surface is still reached by the merge and RC census and by the tier-1 standard flows.
 - Budget cuts hit the highest tier number first and never a declared or smoke surface. If those alone exceed the PR budget the run proceeds, run health prints the projected overrun at scope time, and at the 45-minute deadline the Orchestrator marks every unreached checkpoint `not_run (reason: budget)` and the run `aborted_budget` (1.7 How a PR run works, minute by minute); the comment still posts.
 - Every registry surface outside the computed scope is `not_run (reason: scope)`, so the PR matrix shows exactly what was not looked at.
 - Checkpoints a run never reached because it aborted take the abort's class: `env_error` for `aborted_safety`, `harness_error` for `aborted_harness`, `not_run (reason: budget)` for `aborted_budget` (1.10).
 - Nightly and calibration runs compute no scope; they take the canary and calibration checkpoint lists (10.3 Canary Service and the mutant catalog; 3.9 A/A calibration and threshold derivation).
 - If the candidate's dependency index is missing from the pipeline artifact, the static step is skipped, all other outcomes are produced, and one `dependency_map_gap` with reason `no_dependency_index` appears in run health. Without the index case (b) cannot be told from case (a), so a missing manifest with a missing index is treated as case (a). The absence is never silent.
-- `splitters_short(s)` and `splitters_full(s)` are the short and full fraction sets of 2.5.2 intersected with each declared splitter's `fractions` list (2.2.1); a surface with no `splitters` contributes no split checkpoints.
+- `splitters_short(s)` and `splitters_full(s)` are the short and full fraction sets of 2.5.2 intersected with each declared splitter's `fractions` list (2.2.1); a surface with no `splitters` contributes no split checkpoints. `ladder_F` includes Ladder F's ascending pass, whose steps carry the `-asc` id suffix (2.5.2). A surface with `streaming: true` contributes no sweep items; its sweep checkpoints are `not_run (reason: scope)` (2.5.3).
 
 ### 2.12 Coverage accounting and the matrix
 
 The Reporter prints the coverage matrix for every run, defined exactly so runs compare cell by cell.
 
 - Rows: every surface id at the build's registry commit, plus one synthetic row per `unregistered_surface` found this run.
-- Columns: persona (active trader, options trader, futures trader, swing trader, beginner; a tier B workspace maps to its persona tag) times entitlement profile (phase 1: paperMoney margin, paperMoney IRA; more as logins are granted).
+- Columns: persona (active trader, options trader, futures trader, swing trader, beginner; a tier B workspace maps to its persona tag, which every tier B entry must carry, 4.6; the tier C harness carries none, so its sweeps count toward the surface's primary persona) times entitlement profile (phase 1: paperMoney margin, paperMoney IRA; more as logins are granted).
 - Cell key: (surface id, persona, entitlement profile). State is exactly one of `covered`, `not_run`, `not_registered`.
 
 ```
 cell(surface, persona, profile):
   if surface is synthetic: return not_registered
-  C = checkpoints this run with this surface, a workspace carrying persona, a login with profile
+  C = checkpoints this run with this surface, a workspace carrying persona, a login with profile;
+      sweep and split checkpoints count toward the surface's primary persona (personas[0], 4.5),
+      wherever they run
   if C is empty:
      if not surface.entitlements subset_of profile.entitlements: return not_run(entitlement)
      if surface in Q:                                        return not_run(quarantine)
@@ -615,12 +633,12 @@ What the model does not look at is printed, not implied. Each class below has a 
 
 | Id | Not detectable | How it is labeled | Changes in |
 |---|---|---|---|
-| B01 | Anything after Send: fills, rejections, server-side validation (buying power, price limits, exchange quantity rules), Working to Filled, cancel and replace, Blast All, status rows | Flows carry `requires: [paper_send]`; every cell `not_run (entitlement)`; the count and the line "send policy: no sends" print in every report | Phase 2 if `paper_send_ok` is approved (6.7 Send policy: both branches), else never; fills stay labeled untested even then until a human verifies that paperMoney simulates them on the delayed feed |
+| B01 | Anything after Send: fills, rejections, server-side validation (buying power, price limits, exchange quantity rules), Working to Filled, cancel and replace, Blast All, status rows | Flows carry `requires: [paper_send]`; every cell `not_run (entitlement)`; every report prints the line "send policy: default (no sends); N order-lifecycle surfaces not run (entitlement)" (9.2) | Phase 2 if `paper_send_ok` is approved (6.7 Send policy: both branches), else never; fills stay labeled untested even then until a human verifies that paperMoney simulates them on the delayed feed |
 | B02 | A value wrong in both builds with no Oracle rule or assertion over it | Ends as `identical` or `noise`; an Oracle coverage table lists per tier-1 surface the value regions with and without a rule | Grows with rules; never complete |
 | B03 | Temporal behavior: cell flashes, ladder re-centering, Level II and Time and Sales churn, flicker, frozen quotes | Captures are stills; streaming regions are `rule` or `mask`; the report lists surfaces with masked streaming regions and their masked share | Phase 3 soak adds frame-energy checks on a few checkpoints |
 | B04 | Entitlement states paperMoney cannot produce: option approval tiers, cash-account unsettled funds, pattern day trade counter, portfolio margin, multi-account | `not_run (entitlement)` on every cell of the missing profile; the profile list prints what exists, and a paperMoney-versus-live known-gaps line (delayed data, simulated fills, no real rejections) prints under it | When fixed-entitlement test logins are granted; whether paperMoney mirrors the live login's option approval level is unverified and is read in-platform in Phase 0 |
 | B05 | Live-feed data-format defects when `frozen` mode replays data (OnDemand or fixture) | Every checkpoint records its data mode; the report prints `frozen` versus `masked_live` counts per tier; `masked_live` chain and quote checkpoints stay in merge runs for this reason | DR-02 branch A reduces, never removes |
-| B06 | Rendering at non-canonical configurations: 125 and 150 percent scaling, light theme, large app font, 1366x768, mixed-DPI multi-monitor | Configuration is in the fingerprint; the matrix is per configuration and prints "configurations covered: 1 of N planned" | Phase 3 tier B configurations; mixed-DPI needs physical hardware |
+| B06 | Rendering at non-canonical configurations: 125 and 150 percent scaling, light theme, large app font, 1366x768, mixed-DPI multi-monitor | Configuration is in the fingerprint; the matrix is per configuration and the report header prints "configurations covered: N of M" (9.2) | Phase 3 tier B configurations; mixed-DPI needs physical hardware |
 | B07 | macOS and Linux builds | Non-goal; no registry entries; the report header prints "platform: Windows 11 desktop only" | Not in phases 1 to 3; the registry, flow and checkpoint formats carry no Windows-only field, so nothing precludes it |
 | B08 | Study mathematics beyond the verification set and thinkScript corpus | Only corpus studies have expected values; the report prints corpus size and the count of corpus-workspace studies without expectations | Grows with the corpus |
 | B09 | Accessibility conformance | Branch A diffs the accessible tree build to build and reports lost names as `collateral`; nothing absolute is asserted; branch B prints "accessible tree: not available" | Not a goal |

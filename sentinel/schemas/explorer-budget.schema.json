@@ -1,0 +1,39 @@
+{
+  "$id": "sentinel:schemas/explorer-budget.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approved_by": {
+      "type": "string"
+    },
+    "max_actions": {
+      "type": "integer"
+    },
+    "max_minutes": {
+      "type": "integer"
+    },
+    "max_no_change_actions": {
+      "type": "integer"
+    },
+    "max_usd_per_session": {
+      "type": "number"
+    },
+    "max_usd_per_week": {
+      "type": "number"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "max_actions",
+    "max_minutes",
+    "max_no_change_actions",
+    "max_usd_per_session",
+    "max_usd_per_week"
+  ],
+  "title": "explorer-budget (explorer_budget)",
+  "type": "object"
+}

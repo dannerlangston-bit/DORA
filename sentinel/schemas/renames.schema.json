@@ -1,0 +1,41 @@
+{
+  "$id": "sentinel:schemas/renames.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "renames": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "build": {
+            "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+            "type": "string"
+          },
+          "new": {
+            "type": "string"
+          },
+          "old": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "old",
+          "new",
+          "build"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "renames"
+  ],
+  "title": "renames (renames_file)",
+  "type": "object"
+}

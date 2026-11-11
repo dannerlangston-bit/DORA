@@ -1,0 +1,1014 @@
+{
+  "$defs": {
+    "finding": {
+      "additionalProperties": false,
+      "properties": {
+        "category": {
+          "enum": [
+            "intended",
+            "collateral",
+            "noise",
+            "needs_human",
+            "invariant_violation",
+            "assertion_failed"
+          ]
+        },
+        "checkpoint_id": {
+          "pattern": "^(?:census/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+)*(?:/[a-z]+=[A-Za-z0-9.-]+(?:,[a-z]+=[A-Za-z0-9.-]+)*)?|sweep/[a-z0-9]+(?:[.-][a-z0-9]+)*/(?:flexgrid|detached|dialog)/[0-9]+x[0-9]+(?:-asc)?|split/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+)*/(?:0|1)\\.[0-9]{2}|flow/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z][a-z0-9-]*)$",
+          "type": "string"
+        },
+        "closed_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        "cluster_id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "contested": {
+          "default": false,
+          "type": "boolean"
+        },
+        "created_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        "decision_ref": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "evidence": {
+          "additionalProperties": false,
+          "properties": {
+            "artifacts": {
+              "items": {
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "raw_values": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "step_events": {
+              "additionalProperties": false,
+              "properties": {
+                "first_seq": {
+                  "type": "integer"
+                },
+                "last_seq": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "first_seq",
+                "last_seq"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "artifacts"
+          ],
+          "type": "object"
+        },
+        "explorer": {
+          "additionalProperties": false,
+          "properties": {
+            "candidate_flow": {
+              "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+              "type": "string"
+            },
+            "confidence": {
+              "type": "number"
+            },
+            "replayed": {
+              "enum": [
+                "not_replayed",
+                "reproduced",
+                "not_reproduced",
+                "lint_failed"
+              ]
+            },
+            "session_id": {
+              "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+              "type": "string"
+            },
+            "severity": {
+              "enum": [
+                "low",
+                "medium",
+                "high"
+              ]
+            },
+            "signature": {
+              "additionalProperties": false,
+              "properties": {
+                "crop_sha256": {
+                  "pattern": "^sha256:[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "observation": {
+                  "type": "string"
+                },
+                "surface_id": {
+                  "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "surface_id",
+                "observation",
+                "crop_sha256"
+              ],
+              "type": "object"
+            },
+            "trace_ref": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "session_id",
+            "signature",
+            "severity",
+            "confidence",
+            "trace_ref",
+            "replayed"
+          ],
+          "type": "object"
+        },
+        "finding_id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "first_seen_run_id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "held": {
+          "default": false,
+          "type": "boolean"
+        },
+        "kind": {
+          "enum": [
+            "collateral",
+            "intended",
+            "needs_human",
+            "invariant_violation",
+            "assertion_failed",
+            "landmark_missing",
+            "needs_baseline",
+            "unregistered_surface",
+            "dependency_map_gap",
+            "manifest_missing",
+            "unknown_popup",
+            "popup_rate_increase",
+            "locator_failure",
+            "app_crash",
+            "explorer_candidate",
+            "layout_shift",
+            "landmark_moved",
+            "color_shift",
+            "window_geometry_changed",
+            "global_rendering_shift",
+            "settle_regression",
+            "gateway_integrity",
+            "new_log_signature",
+            "jab_tree_changed",
+            "mask_budget_exceeded",
+            "mask_expired",
+            "floor_exception_expired",
+            "invariant_exception_expired",
+            "redaction_miss",
+            "secret_leaked",
+            "explorer_order_stage",
+            "missed_in_pr_run",
+            "artifact_missing",
+            "orphaned_baseline",
+            "canary_miss",
+            "intended_change_not_observed",
+            "flow_maintenance_needed",
+            "harness_error",
+            "memory_warning",
+            "hardening"
+          ]
+        },
+        "manifest_entry_ref": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "phash": {
+          "type": "string"
+        },
+        "pre_existing": {
+          "default": false,
+          "type": "boolean"
+        },
+        "primitive": {
+          "pattern": "^[A-Z][A-Za-z0-9]*$",
+          "type": "string"
+        },
+        "region_id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "run_id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "ticket": {
+          "type": "string"
+        },
+        "tier": {
+          "enum": [
+            1,
+            2,
+            3
+          ]
+        },
+        "triage_state": {
+          "default": "open",
+          "enum": [
+            "open",
+            "confirmed_bug",
+            "intended",
+            "noise",
+            "agent_mistake",
+            "expected_behavior",
+            "fixed_pending_verify",
+            "closed"
+          ]
+        }
+      },
+      "required": [
+        "finding_id",
+        "run_id",
+        "kind",
+        "description",
+        "evidence",
+        "first_seen_run_id",
+        "created_at"
+      ],
+      "type": "object"
+    },
+    "run_outcome": {
+      "additionalProperties": false,
+      "properties": {
+        "authorization_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "base_commit_distance": {
+          "type": "integer"
+        },
+        "comment_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "counts": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "propertyNames": {
+            "enum": [
+              "identical",
+              "noise",
+              "intended",
+              "collateral",
+              "needs_human",
+              "invariant_violation",
+              "assertion_failed",
+              "not_settled",
+              "not_comparable",
+              "landmark_missing",
+              "env_error",
+              "harness_error",
+              "not_run",
+              "unregistered_surface",
+              "needs_baseline"
+            ]
+          },
+          "type": "object"
+        },
+        "coverage_matrix_ref": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "egress_log_ref": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "ended_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        "last_gate": {
+          "type": "string"
+        },
+        "pair_id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "post_run_proof_ref": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "report_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "run_id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "run_type": {
+          "enum": [
+            "pr",
+            "merge",
+            "rc",
+            "nightly",
+            "calibration"
+          ]
+        },
+        "started_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "complete",
+            "complete_with_env_errors",
+            "aborted_safety",
+            "aborted_budget",
+            "aborted_harness"
+          ]
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "pair_id",
+        "run_type",
+        "status",
+        "last_gate",
+        "counts",
+        "summary",
+        "coverage_matrix_ref",
+        "egress_log_ref",
+        "authorization_sha256",
+        "started_at",
+        "ended_at"
+      ],
+      "type": "object"
+    },
+    "step_outcome": {
+      "additionalProperties": false,
+      "properties": {
+        "app_restart_count": {
+          "type": "integer"
+        },
+        "app_uptime_s": {
+          "type": "integer"
+        },
+        "attempt": {
+          "type": "integer"
+        },
+        "click_crop": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "duration_ms": {
+          "type": "integer"
+        },
+        "finding_ref": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "flow_id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "gateway_event": {
+          "additionalProperties": false,
+          "properties": {
+            "class": {
+              "enum": [
+                "allowed",
+                "safety",
+                "integrity",
+                "none"
+              ]
+            },
+            "decision": {
+              "enum": [
+                "emitted",
+                "dropped",
+                "refused",
+                "late_up",
+                "none"
+              ]
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "decision"
+          ],
+          "type": "object"
+        },
+        "locator_rung": {
+          "enum": [
+            "jab",
+            "image",
+            "ocr",
+            "agent",
+            "none"
+          ]
+        },
+        "mode": {
+          "enum": [
+            "scripted",
+            "agent",
+            "explorer"
+          ]
+        },
+        "post_screenshot": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "pre_screenshot": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "recorded_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        "run_id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "rung_results": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "result": {
+                "type": "string"
+              },
+              "rung": {
+                "enum": [
+                  "jab",
+                  "image",
+                  "ocr",
+                  "agent"
+                ]
+              },
+              "score": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "rung",
+              "result"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "passed",
+            "passed_after_retry",
+            "passed_via_agent_fallback",
+            "failed",
+            "blocked_by_gateway"
+          ]
+        },
+        "step_id": {
+          "pattern": "^[a-z][a-z0-9_-]*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id",
+        "flow_id",
+        "step_id",
+        "attempt",
+        "status",
+        "mode",
+        "duration_ms",
+        "gateway_event",
+        "recorded_at"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "sentinel:schemas/outcome.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "app_restart_count": {
+      "type": "integer"
+    },
+    "app_uptime_s": {
+      "type": "integer"
+    },
+    "artifacts": {
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "candidate": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "crops": {
+          "items": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "heatmap": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "assertion_ids": {
+      "items": {
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "base_rig_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "base_source_run_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "cand_rig_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "captured_at": {
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+      "type": "string"
+    },
+    "checkpoint_id": {
+      "pattern": "^(?:census/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+)*(?:/[a-z]+=[A-Za-z0-9.-]+(?:,[a-z]+=[A-Za-z0-9.-]+)*)?|sweep/[a-z0-9]+(?:[.-][a-z0-9]+)*/(?:flexgrid|detached|dialog)/[0-9]+x[0-9]+(?:-asc)?|split/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+)*/(?:0|1)\\.[0-9]{2}|flow/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z][a-z0-9-]*)$",
+      "type": "string"
+    },
+    "classification": {
+      "additionalProperties": false,
+      "properties": {
+        "by": {
+          "enum": [
+            "rule",
+            "reviewer"
+          ]
+        },
+        "category": {
+          "enum": [
+            "intended",
+            "collateral",
+            "noise",
+            "needs_human"
+          ]
+        },
+        "confidence": {
+          "type": "number"
+        },
+        "description": {
+          "type": "string"
+        },
+        "model_id": {
+          "type": "string"
+        },
+        "prompt_hash": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "region_pointer": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "category",
+        "by"
+      ],
+      "type": "object"
+    },
+    "data_epoch_id": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "data_mode": {
+      "enum": [
+        "frozen",
+        "masked_live"
+      ]
+    },
+    "decision_ref": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "detail": {
+      "type": "string"
+    },
+    "diff": {
+      "additionalProperties": false,
+      "properties": {
+        "components": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "area": {
+                "type": "integer"
+              },
+              "bbox": {
+                "additionalProperties": false,
+                "properties": {
+                  "h": {
+                    "type": "integer"
+                  },
+                  "w": {
+                    "type": "integer"
+                  },
+                  "x": {
+                    "type": "integer"
+                  },
+                  "y": {
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "x",
+                  "y",
+                  "w",
+                  "h"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "area",
+              "bbox"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "regions": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "above_threshold": {
+                "type": "boolean"
+              },
+              "pixel_fraction": {
+                "type": "number"
+              },
+              "region_id": {
+                "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                "type": "string"
+              },
+              "ssim": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "region_id",
+              "pixel_fraction",
+              "ssim",
+              "above_threshold"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "whole": {
+          "additionalProperties": false,
+          "properties": {
+            "pixel_fraction": {
+              "type": "number"
+            },
+            "shift": {
+              "additionalProperties": false,
+              "properties": {
+                "dx": {
+                  "type": "integer"
+                },
+                "dy": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "dx",
+                "dy"
+              ],
+              "type": "object"
+            },
+            "ssim": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "pixel_fraction",
+            "ssim",
+            "shift"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "whole",
+        "regions",
+        "components"
+      ],
+      "type": "object"
+    },
+    "diff_pixels": {
+      "type": "integer"
+    },
+    "fingerprint_id": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "flow_class": {
+      "enum": [
+        "standard",
+        "login",
+        "fixture_reset",
+        "teardown",
+        "canary",
+        "paper_send_ok",
+        "explorer_candidate"
+      ]
+    },
+    "flow_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "gate": {
+      "type": "string"
+    },
+    "invariant_ids": {
+      "items": {
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "lower_results": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "outcome": {
+            "enum": [
+              "identical",
+              "noise",
+              "intended",
+              "collateral",
+              "needs_human",
+              "invariant_violation",
+              "assertion_failed",
+              "not_settled",
+              "not_comparable",
+              "landmark_missing",
+              "env_error",
+              "harness_error",
+              "not_run",
+              "unregistered_surface",
+              "needs_baseline"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "manifest_entry_ref": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "masked_pct": {
+      "type": "number"
+    },
+    "mutant_id": {
+      "type": "string"
+    },
+    "outcome": {
+      "enum": [
+        "identical",
+        "noise",
+        "intended",
+        "collateral",
+        "needs_human",
+        "invariant_violation",
+        "assertion_failed",
+        "not_settled",
+        "not_comparable",
+        "landmark_missing",
+        "env_error",
+        "harness_error",
+        "not_run",
+        "unregistered_surface",
+        "needs_baseline"
+      ]
+    },
+    "outcome_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "pair_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "paper_assertion": {
+      "additionalProperties": false,
+      "properties": {
+        "account_id_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "asserted_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        "mode": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "account_id_sha256",
+        "mode",
+        "asserted_at"
+      ],
+      "type": "object"
+    },
+    "persona": {
+      "enum": [
+        "active_trader",
+        "options_trader",
+        "futures_trader",
+        "swing_trader",
+        "beginner"
+      ]
+    },
+    "primitive": {
+      "pattern": "^[A-Z][A-Za-z0-9]*$",
+      "type": "string"
+    },
+    "profile_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "recaptures": {
+      "default": 0,
+      "type": "integer"
+    },
+    "recorded_at": {
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+      "type": "string"
+    },
+    "rescued": {
+      "default": false,
+      "type": "boolean"
+    },
+    "review_state": {
+      "default": "none",
+      "enum": [
+        "none",
+        "pending",
+        "done"
+      ]
+    },
+    "run_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "settle_ms": {
+      "type": "integer"
+    },
+    "side": {
+      "enum": [
+        "candidate",
+        "base",
+        "both"
+      ]
+    },
+    "size_step": {
+      "additionalProperties": false,
+      "properties": {
+        "h": {
+          "type": "integer"
+        },
+        "host": {
+          "type": "string"
+        },
+        "w": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "host",
+        "w",
+        "h"
+      ],
+      "type": "object"
+    },
+    "stability": {
+      "enum": [
+        "stable",
+        "unstable",
+        "unknown"
+      ]
+    },
+    "stability_cause": {
+      "enum": [
+        "not_recapturable",
+        "budget"
+      ]
+    },
+    "step_id": {
+      "pattern": "^[a-z][a-z0-9_-]*$",
+      "type": "string"
+    },
+    "surface_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "synthetic": {
+      "default": false,
+      "type": "boolean"
+    },
+    "test_kind": {
+      "enum": [
+        "census",
+        "sweep",
+        "split",
+        "flow"
+      ]
+    },
+    "threshold_source": {
+      "enum": [
+        "calibrated",
+        "uncalibrated"
+      ]
+    },
+    "workspace_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "outcome_id",
+    "run_id",
+    "pair_id",
+    "checkpoint_id",
+    "surface_id",
+    "test_kind",
+    "workspace_id",
+    "persona",
+    "profile_id",
+    "data_mode",
+    "outcome",
+    "artifacts",
+    "recorded_at"
+  ],
+  "title": "outcome (checkpoint_outcome)",
+  "type": "object"
+}

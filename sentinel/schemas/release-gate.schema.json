@@ -1,0 +1,53 @@
+{
+  "$id": "sentinel:schemas/release-gate.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "default_business_days": {
+      "default": 3,
+      "type": "integer"
+    },
+    "owner": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "trains": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "business_days": {
+            "type": "integer"
+          },
+          "ga_date": {
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+            "type": "string"
+          },
+          "rc_cut_date": {
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+            "type": "string"
+          },
+          "train": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "train",
+          "ga_date",
+          "rc_cut_date"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "trains",
+    "owner"
+  ],
+  "title": "release-gate (release_gate)",
+  "type": "object"
+}

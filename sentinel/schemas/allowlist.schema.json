@@ -1,0 +1,61 @@
+{
+  "$id": "sentinel:schemas/allowlist.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "ondemand_virtual_account": {
+      "additionalProperties": false,
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "valid_while_template": {
+          "pattern": "^(?![/\\\\])(?!.*\\.\\.)[^\\\\]+$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "account_id",
+        "valid_while_template"
+      ],
+      "type": "object"
+    },
+    "rigs": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "account_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "login_ref": {
+            "type": "string"
+          },
+          "rig": {
+            "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rig",
+          "account_ids",
+          "login_ref"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "rigs"
+  ],
+  "title": "allowlist (allowlist)",
+  "type": "object"
+}

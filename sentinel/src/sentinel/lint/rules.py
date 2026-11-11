@@ -485,7 +485,7 @@ _SCHEMA_OF: dict[str, tuple[str, str]] = {      # doc kind -> (schema name, rule
     "explorer_budget": ("explorer-budget", "L-XREF-14"), "branches": ("branches", "L-XREF-15"),
     "quarantine": ("quarantine", "L-XREF-11"),
 }
-_CATALOGS = {"popups": ("popup", "L-POP-00", "popups"), "mutants": ("mutant", "L-MUT-00", "mutants")}
+_CATALOGS = {"popups": ("popup#popup", "L-POP-00", "popups"), "mutants": ("mutant#mutant", "L-MUT-00", "mutants")}   # one catalog entry
 
 
 def _rule_view(repo: Repo) -> Repo:
@@ -573,7 +573,8 @@ class _Linter:
             m = _d(doc.data)
             self.masks.setdefault((_s(m.get("checkpoint_id")), _s(m.get("mask_id"))), doc)
         b = r.one("branches")
-        self.branches = _d(b.data) if b else {}
+        # 4.16: each unknown is a branch_choice whose `branch` is A, B or undecided; the rules read that letter
+        self.branches = {k: (v.get("branch") if isinstance(v, dict) else v) for k, v in _d(b.data if b else {}).items()}
         sp = r.one("send_policy")
         self.send_policy = _d(sp.data) if sp else {}
         eb = r.one("explorer_budget")

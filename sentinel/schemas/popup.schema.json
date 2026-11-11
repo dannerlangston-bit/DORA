@@ -1,0 +1,176 @@
+{
+  "$defs": {
+    "popup": {
+      "additionalProperties": false,
+      "properties": {
+        "action": {
+          "enum": [
+            "dismiss_key",
+            "click",
+            "wait",
+            "relogin",
+            "abort",
+            "ignore"
+          ]
+        },
+        "class": {
+          "enum": [
+            "dismissable",
+            "env",
+            "login",
+            "app_failure",
+            "safety",
+            "order_event"
+          ]
+        },
+        "expected_phases": {
+          "items": {
+            "enum": [
+              "launch",
+              "login",
+              "workspace_load",
+              "running",
+              "teardown"
+            ]
+          },
+          "type": "array"
+        },
+        "first_seen_build": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "last_seen_build": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "name": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "notes": {
+          "type": "string"
+        },
+        "on_abort": {
+          "additionalProperties": false,
+          "properties": {
+            "gate": {
+              "type": "string"
+            },
+            "invariant_id": {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+              "type": "string"
+            },
+            "outcome": {
+              "enum": [
+                "env_error",
+                "invariant_violation",
+                "aborted_run"
+              ]
+            },
+            "reason": {
+              "type": "string"
+            },
+            "run_outcome": {
+              "enum": [
+                "aborted_safety",
+                "aborted_harness"
+              ]
+            }
+          },
+          "required": [
+            "outcome"
+          ],
+          "type": "object"
+        },
+        "owner": {
+          "type": "string"
+        },
+        "popup_id": {
+          "type": "string"
+        },
+        "retired": {
+          "default": false,
+          "type": "boolean"
+        },
+        "retired_reason": {
+          "type": "string"
+        },
+        "seed_titles": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "severity": {
+          "enum": [
+            "info",
+            "medium",
+            "high",
+            "critical"
+          ]
+        },
+        "status": {
+          "enum": [
+            "verified",
+            "unverified",
+            "disabled"
+          ]
+        },
+        "target": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "template": {
+          "pattern": "^(?![/\\\\])(?!.*\\.\\.)[^\\\\]+$",
+          "type": "string"
+        },
+        "title_regex": {
+          "type": "string"
+        },
+        "wait_timeout_ms": {
+          "type": "integer"
+        },
+        "window_class_hint": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "popup_id",
+        "name",
+        "class",
+        "title_regex",
+        "action",
+        "severity",
+        "expected_phases",
+        "owner",
+        "status",
+        "first_seen_build"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "sentinel:schemas/popup.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "entries": {
+      "items": {
+        "$ref": "#/$defs/popup"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "entries"
+  ],
+  "title": "popup (popup_catalog)",
+  "type": "object"
+}

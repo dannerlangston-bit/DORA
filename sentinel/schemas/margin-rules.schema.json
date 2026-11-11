@@ -1,0 +1,71 @@
+{
+  "$id": "sentinel:schemas/margin-rules.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "brackets": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "account": {
+            "enum": [
+              "margin",
+              "ira"
+            ]
+          },
+          "asset": {
+            "enum": [
+              "equity",
+              "option",
+              "future",
+              "future_option",
+              "forex",
+              "index"
+            ]
+          },
+          "high": {
+            "type": "number"
+          },
+          "low": {
+            "type": "number"
+          },
+          "of": {
+            "enum": [
+              "notional",
+              "initial_margin"
+            ]
+          }
+        },
+        "required": [
+          "asset",
+          "account",
+          "of",
+          "low",
+          "high"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "initial_margin": {
+      "additionalProperties": {
+        "type": "number"
+      },
+      "type": "object"
+    },
+    "pinned": {
+      "default": false,
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "brackets"
+  ],
+  "title": "margin-rules (margin_rules_file)",
+  "type": "object"
+}

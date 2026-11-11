@@ -2,6 +2,7 @@
 # Identity fields (account number, account holder name) are redacted in Capture, excluded from the
 # mask budget and never diffed (4.8).
 schema_version: 1
+owner: security-contact           # the security contact (6.10)
 landmarks:
   - {id: lm.order-confirmation-title, template: regions/landmarks/lm.order-confirmation-title.png}
   - {id: lm.position-statement-header, template: regions/landmarks/lm.position-statement-header.png}

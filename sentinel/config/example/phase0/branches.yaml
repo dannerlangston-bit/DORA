@@ -1,9 +1,24 @@
-# The chosen branch of each Phase 0 unknown (brief 1.11, decision records DR-01 to DR-07 of 11.8).
+# The chosen branch of each Phase 0 unknown (brief 1.11, decision records DR-01 to DR-07 of 11.8), and the
+# Phase 0 reads other files depend on (4.16). A placeholder: the reads below are not made yet.
 schema_version: 1
-jab: A              # DR-01 Java Access Bridge exposes names, roles and bounds
-data_fixture: A     # DR-02 the test backend replays a frozen market-data fixture
-login_mfa: A        # DR-03 test-backend credential without MFA
-pinned_install: A   # DR-04 pipeline artifact with auto-update disabled
-aa_floor: A         # DR-05 A/A floor near zero on frozen checkpoints
-session_rule: A     # DR-06 a second login kicks the first; one session per login
-computer_use: A     # DR-07 computer use allowed on the approved endpoint
+jab: {branch: A}              # DR-01 Java Access Bridge exposes names, roles and bounds
+data_fixture: {branch: A}     # DR-02 the test backend replays a frozen market-data fixture
+login_mfa: {branch: A}        # DR-03 test-backend credential without MFA
+pinned_install: {branch: A}   # DR-04 pipeline artifact with auto-update disabled
+aa_floor: {branch: A}         # DR-05 A/A floor near zero on frozen checkpoints
+session_rule: {branch: A}     # DR-06 a second login kicks the first; one session per login
+computer_use: {branch: A}     # DR-07 computer use allowed on the approved endpoint
+batch_api: undecided
+reviewer: {}                  # model_id once pinned (3.15)
+version_read: {}              # title_regex and about_regex once read (4.2, 7.3)
+safety:                       # the ten Phase 0 assumptions of 6.13, all still to be read
+  - {item: 1, result: undecided}
+  - {item: 2, result: undecided}
+  - {item: 3, result: undecided}
+  - {item: 4, result: undecided}
+  - {item: 5, result: undecided}
+  - {item: 6, result: undecided}
+  - {item: 7, result: undecided}
+  - {item: 8, result: undecided}
+  - {item: 9, result: undecided}
+  - {item: 10, result: undecided}

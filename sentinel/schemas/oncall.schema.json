@@ -1,0 +1,117 @@
+{
+  "$id": "sentinel:schemas/oncall.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "flow_owners": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "deputy": {
+            "type": "string"
+          },
+          "person": {
+            "type": "string"
+          },
+          "tier": {
+            "enum": [
+              1,
+              2,
+              3
+            ]
+          }
+        },
+        "required": [
+          "tier",
+          "person",
+          "deputy"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "roles": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "deputy": {
+            "type": "string"
+          },
+          "person": {
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "system_owner",
+              "accountable_owner",
+              "risk_owner",
+              "security_contact",
+              "explorer_owner",
+              "accounts_owner",
+              "release_manager",
+              "registry_owner"
+            ]
+          }
+        },
+        "required": [
+          "role",
+          "person",
+          "deputy"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "rotations": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+            "type": "string"
+          },
+          "person": {
+            "type": "string"
+          },
+          "rotation": {
+            "enum": [
+              "triage",
+              "harness_oncall"
+            ]
+          },
+          "to": {
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "rotation",
+          "person",
+          "from",
+          "to"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "triage_roster": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "roles",
+    "flow_owners",
+    "rotations",
+    "triage_roster"
+  ],
+  "title": "oncall (oncall)",
+  "type": "object"
+}

@@ -5,6 +5,9 @@ persona: futures_trader
 file: corpus/workspaces/ws.tier-a.futures-trader/workspace.sentinel-futures
 file_sha256: "sha256:94e925f156844d687f0b8b282cb4abc71ad9201cdd3b477738c198093c285e1e"
 display_config: {width: 1920, height: 1080, scale_percent: 100, theme: dark, font_size: medium}
+tabs: [Monitor, Trade, Analyze, Scan, MarketWatch, Charts, Tools]   # placeholder until Phase 0 reads the pinned build's tab bar (4.6)
+windows:
+  - {title_regex: "thinkorswim", rect: {x: 0, y: 0, w: 1920, h: 1040}}
 link_groups:
   - {color: red, symbol_ref: mes_front}
   - {color: green, symbol_ref: es_continuous}

@@ -1,0 +1,148 @@
+{
+  "$defs": {
+    "calibration_region": {
+      "additionalProperties": false,
+      "properties": {
+        "exact_fallback": {
+          "default": false,
+          "type": "boolean"
+        },
+        "fault_separation": {
+          "type": "integer"
+        },
+        "floor_exception": {
+          "default": false,
+          "type": "boolean"
+        },
+        "floors": {
+          "additionalProperties": false,
+          "properties": {
+            "changed_px": {
+              "type": "integer"
+            },
+            "component_area": {
+              "type": "integer"
+            },
+            "delta_e": {
+              "type": "number"
+            },
+            "shift_px": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "changed_px",
+            "component_area",
+            "delta_e",
+            "shift_px"
+          ],
+          "type": "object"
+        },
+        "hamming_tolerance": {
+          "type": "integer"
+        },
+        "noise_spread": {
+          "type": "integer"
+        },
+        "region_id": {
+          "type": "string"
+        },
+        "ssim_min": {
+          "type": "number"
+        },
+        "thresholds": {
+          "additionalProperties": false,
+          "properties": {
+            "changed_px_min": {
+              "type": "integer"
+            },
+            "component_area_min": {
+              "type": "integer"
+            },
+            "delta_e_min": {
+              "type": "number"
+            },
+            "shift_px_min": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "component_area_min",
+            "changed_px_min",
+            "delta_e_min",
+            "shift_px_min"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "region_id",
+        "floors",
+        "thresholds"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "sentinel:schemas/calibration.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "calibration_key": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "calibration_run_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "checkpoints": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "checkpoint_id": {
+            "pattern": "^(?:census/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+)*(?:/[a-z]+=[A-Za-z0-9.-]+(?:,[a-z]+=[A-Za-z0-9.-]+)*)?|sweep/[a-z0-9]+(?:[.-][a-z0-9]+)*/(?:flexgrid|detached|dialog)/[0-9]+x[0-9]+(?:-asc)?|split/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+)*/(?:0|1)\\.[0-9]{2}|flow/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z][a-z0-9-]*)$",
+            "type": "string"
+          },
+          "regions": {
+            "items": {
+              "$ref": "#/$defs/calibration_region"
+            },
+            "type": "array"
+          },
+          "settle_p50_ms": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "checkpoint_id",
+          "settle_p50_ms",
+          "regions"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "exported_at": {
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+      "type": "string"
+    },
+    "fingerprint_id": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "calibration_key",
+    "fingerprint_id",
+    "calibration_run_id",
+    "exported_at",
+    "checkpoints"
+  ],
+  "title": "calibration (calibration_file)",
+  "type": "object"
+}

@@ -1,0 +1,395 @@
+{
+  "$defs": {
+    "account": {
+      "additionalProperties": false,
+      "properties": {
+        "account_id": {
+          "type": "string"
+        },
+        "cash": {
+          "type": "number"
+        },
+        "cash_floor": {
+          "type": "number"
+        },
+        "cash_tolerance": {
+          "type": "number"
+        },
+        "kind": {
+          "enum": [
+            "margin",
+            "ira"
+          ]
+        },
+        "role": {
+          "enum": [
+            "golden",
+            "empty"
+          ]
+        }
+      },
+      "required": [
+        "account_id",
+        "kind",
+        "role",
+        "cash",
+        "cash_tolerance"
+      ],
+      "type": "object"
+    },
+    "position": {
+      "additionalProperties": false,
+      "properties": {
+        "account_ref": {
+          "type": "string"
+        },
+        "avg_price": {
+          "type": "number"
+        },
+        "qty": {
+          "type": "number"
+        },
+        "seeded_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        "seeded_by": {
+          "type": "string"
+        },
+        "symbol_ref": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "account_ref",
+        "symbol_ref",
+        "qty",
+        "avg_price",
+        "seeded_by",
+        "seeded_at"
+      ],
+      "type": "object"
+    },
+    "symbol": {
+      "additionalProperties": false,
+      "properties": {
+        "asset": {
+          "enum": [
+            "equity",
+            "option",
+            "future",
+            "future_option",
+            "forex",
+            "index"
+          ]
+        },
+        "id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "type": "string"
+        },
+        "purpose": {
+          "items": {
+            "enum": [
+              "ticket",
+              "chart",
+              "chain",
+              "watchlist",
+              "ladder"
+            ]
+          },
+          "type": "array"
+        },
+        "roll_date": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "type": "string"
+        },
+        "symbol": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "symbol",
+        "asset",
+        "purpose"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "sentinel:schemas/fixture.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "accounts": {
+      "items": {
+        "$ref": "#/$defs/account"
+      },
+      "type": "array"
+    },
+    "alerts_expected": {
+      "default": 0,
+      "type": "integer"
+    },
+    "churn_calendar": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "reapprove",
+              "skip_checkpoints",
+              "reseed",
+              "none"
+            ]
+          },
+          "date": {
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+            "type": "string"
+          },
+          "event": {
+            "enum": [
+              "expiration",
+              "roll",
+              "holiday",
+              "earnings",
+              "ex_dividend",
+              "reseed_due"
+            ]
+          },
+          "symbol_ref": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "date",
+          "event",
+          "action"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "data_mode": {
+      "additionalProperties": false,
+      "properties": {
+        "frozen": {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "enum": [
+                "backend_fixture",
+                "ondemand",
+                "none"
+              ]
+            },
+            "symbol_set": {
+              "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+              "type": "string"
+            },
+            "timestamp": {
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider"
+          ],
+          "type": "object"
+        },
+        "masked_live": {
+          "additionalProperties": false,
+          "properties": {
+            "delay_minutes": {
+              "default": 20,
+              "type": "integer"
+            },
+            "realtime": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "frozen",
+        "masked_live"
+      ],
+      "type": "object"
+    },
+    "epoch": {
+      "additionalProperties": false,
+      "properties": {
+        "data_delay": {
+          "enum": [
+            "delayed_20",
+            "realtime"
+          ]
+        },
+        "dataset_id": {
+          "type": "string"
+        },
+        "epoch_id": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "front_month": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "type": "object"
+        },
+        "nearest_monthly_expiration": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "type": "string"
+        },
+        "ondemand_timestamp": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        "option_expirations": {
+          "additionalProperties": {
+            "items": {
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": "object"
+        },
+        "window_date": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "epoch_id",
+        "window_date",
+        "front_month",
+        "nearest_monthly_expiration",
+        "data_delay"
+      ],
+      "type": "object"
+    },
+    "fixture_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "login_ref": {
+      "type": "string"
+    },
+    "order_defaults_profile": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "owner": {
+      "type": "string"
+    },
+    "positions": {
+      "items": {
+        "$ref": "#/$defs/position"
+      },
+      "type": "array"
+    },
+    "prices": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "computed_at": {
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+            "type": "string"
+          },
+          "id": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+            "type": "string"
+          },
+          "rule": {
+            "type": "string"
+          },
+          "symbol_ref": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+            "type": "string"
+          },
+          "value": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "symbol_ref",
+          "rule",
+          "value",
+          "computed_at"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "rig": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "settings_profile": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "symbols": {
+      "items": {
+        "$ref": "#/$defs/symbol"
+      },
+      "type": "array"
+    },
+    "watchlists": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "symbols": {
+            "items": {
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "symbols"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "working_orders_expected": {
+      "default": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "fixture_id",
+    "rig",
+    "login_ref",
+    "owner",
+    "accounts",
+    "settings_profile",
+    "order_defaults_profile",
+    "data_mode",
+    "symbols",
+    "prices",
+    "positions",
+    "watchlists",
+    "epoch",
+    "churn_calendar"
+  ],
+  "title": "fixture (fixture)",
+  "type": "object"
+}

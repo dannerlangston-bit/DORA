@@ -1,0 +1,68 @@
+{
+  "$defs": {
+    "deny_entry": {
+      "additionalProperties": false,
+      "properties": {
+        "control": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "denied": {
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "label_regex": {
+          "type": "string"
+        },
+        "order_path": {
+          "default": false,
+          "type": "boolean"
+        },
+        "surface": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        },
+        "window_title_regex": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "denied",
+        "why"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "sentinel:schemas/explorer-deny-list.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approved_by": {
+      "type": "string"
+    },
+    "entries": {
+      "items": {
+        "$ref": "#/$defs/deny_entry"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "approved_by",
+    "entries"
+  ],
+  "title": "explorer-deny-list (explorer_deny_list)",
+  "type": "object"
+}

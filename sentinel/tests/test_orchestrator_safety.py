@@ -649,6 +649,8 @@ def test_a_foreign_paper_id_at_the_recovery_login_is_paper_mode_mismatch_and_rec
     assert rep.proof_effect.evidence["instruction"] == CANCEL_BY_HAND
     clean_rig = SimulatedRig(clock=clock)
     assert _ks(clean_rig, clock, clean_rig.read_orders()).identity is None
+    from sentinel.orchestrator.killswitch import RecoveryLogin
+    assert RecoveryLogin(True) and not RecoveryLogin(False, rep.identity)             # truthy as the old bool was
 
 
 def test_the_orchestrator_applies_a_live_identity_its_kill_switch_recovery_login_saw():

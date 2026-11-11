@@ -558,6 +558,10 @@ class RecoveryLogin:
     ok: bool
     identity: ControlResult | None = None
 
+    def __bool__(self) -> bool:
+        """True when the session is usable for the proof, as the bool `recovery_login` used to return."""
+        return self.ok
+
     @property
     def live_identity(self) -> bool:
         return self.identity is not None and self.identity.run_reason == "live_identity"

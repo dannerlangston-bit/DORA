@@ -8,10 +8,10 @@ scoped checkpoint through the `OutcomeSink` (1.10, L-OUT-07).
 
 Inside `running` the Executor calls, in this order (boundary.py has the check sequences):
 
-- `flow_boundary(now, obs, flow_id=..., p50_s=...)` before every flow, census visit or sweep ladder: the trip-wires,
+- `flow_boundary(obs, now=..., flow_id=..., p50_s=...)` before every flow, census visit or sweep ladder: the trip-wires,
   the Watchdog's reverse heartbeat, free space, the run budgets, the spend ceiling, the model re-check, the
   paper-mode assertion and the proactive relaunch; it returns the result that stopped the run, or None;
-- `step_boundary(now, obs, order_stage_step=..., session_dialog=...)` before every step of a flow: the trip-wires,
+- `step_boundary(obs, now=..., order_stage_step=..., session_dialog=...)` before every step of a flow: the trip-wires,
   the flow's own budget (a returned result with `end_flow` ends the flow, the run continues) and the paper-mode
   assertion when due;
 - `relaunch(cause)` after a POP-05 dialog (`environment_relogin`, budget K), an app failure (`app_failure`, the
@@ -430,7 +430,7 @@ class Orchestrator:
         return res.result.passed
 
     # -- boundaries inside `running` (boundary.py) -----------------------------------------------------
-    def flow_boundary(self, now: float | None = None, obs: BoundaryObservations | None = None, *,
+    def flow_boundary(self, obs: BoundaryObservations | None = None, *, now: float | None = None,
                       flow_id: str | None = None, p50_s: float | None = None) -> ControlResult | None:
         """The checks before every flow, census visit or sweep ladder, in boundary.py's order; returns the result
         that stopped the run (already applied), or None, in which case the unit may start. `now` is the
@@ -468,7 +468,7 @@ class Orchestrator:
             self.flow = FlowTimer(flow_id, now, flow_budget_s(p50_s))
         return None
 
-    def step_boundary(self, now: float | None = None, obs: BoundaryObservations | None = None, *,
+    def step_boundary(self, obs: BoundaryObservations | None = None, *, now: float | None = None,
                       order_stage_step: bool = False, session_dialog: bool = False) -> ControlResult | None:
         """The checks before every step of a flow: the trip-wires, the flow's own budget and the paper-mode assertion
         when 6.4 makes it due (`order_stage_step`: the next step is an order-stage step; `session_dialog`: a re-login

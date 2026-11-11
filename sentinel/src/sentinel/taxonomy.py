@@ -54,9 +54,6 @@ class Taxonomy:
     def gates(self) -> list[str]:
         return self.data["gates"]
 
-    def list(self, key: str) -> list[str]:
-        return self.data[key]
-
     # -- generated lists of 4.1 beyond the outcome sets --------------------------------------
     @property
     def quarantine_reasons(self) -> list[str]:
@@ -185,6 +182,9 @@ class Taxonomy:
     def check_member(self, key: str, value: str) -> None:
         if value not in self.data[key]:
             raise TaxonomyError(f"{value!r} is not in {key}")
+
+    def list(self, key: str) -> list[str]:          # last in the class: annotations after it would read this method
+        return self.data[key]
 
 
 @lru_cache(maxsize=4)

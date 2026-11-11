@@ -1,6 +1,8 @@
 # The one mutant catalog (4.11): ids M01 to M33, classes and money_cell flags of 12.5, seed 20260101.
-# 12.5 is authoritative for ids, seed and money_cell; the bound checkpoints are this example's own,
+# 12.5 is authoritative for ids, seed and money_cell; the bound checkpoints and regions are this example's own,
 # since the example registry holds eight surfaces. M26 to M28 and M30 drive flow.canary.ticket-stock.
+# The simulated app renders and scores every entry (pipeline.sim mutant_capture). M25 binds s07 until the lint
+# accepts checkpoint_id "*" for aa_control (SD-43; schema notation, L-MUT-01, L-XREF-04, L-XREF-11).
 - mutant_id: M01
   name: mut.ticket.confirm-erased
   checkpoint_id: flow/trade.order-entry.stock/flow.trade.order-ticket.stock.limit/s06
@@ -57,7 +59,7 @@
   class: swapped_label
   mode: image
   money_cell: false
-  generator: {op: overlay, params: {source: rgn.confirm.symbol}, seed: 20260101}
+  generator: {op: overlay, params: {source: rgn.confirm.side-reverse}, seed: 20260101}   # SELL from the side toggle
   region_ref: rgn.confirm.side
   expected: {outcomes: [assertion_failed], assertion_id: side}
   owner: sentinel-canaries
@@ -78,7 +80,7 @@
   mode: image
   money_cell: false
   generator: {op: translate, params: {dx: 12, fill: background_sample}, seed: 20260101}
-  region_ref: rgn.ladder.viewport
+  region_ref: rgn.ladder.buy-mkt   # BUY MKT 12 px right into its neighbour, SELL MKT
   expected: {outcomes: [invariant_violation], invariant_id: INV-01}
   owner: sentinel-canaries
 - mutant_id: M09
@@ -98,7 +100,7 @@
   mode: image
   money_cell: false
   generator: {op: crop_right, params: {style: crop}, seed: 20260101}
-  region_ref: rgn.ps.header
+  region_ref: rgn.ps.header-mark   # "Mark" cut to a prefix in its header cell
   expected: {outcomes: [invariant_violation], invariant_id: INV-03}
   owner: sentinel-canaries
 - mutant_id: M11
@@ -108,7 +110,7 @@
   mode: image
   money_cell: false
   generator: {op: crop_right, params: {style: ellipsis}, seed: 20260101}
-  region_ref: rgn.ladder.column-header
+  region_ref: rgn.ladder.header-ask   # "Ask Size" ends in an ellipsis
   expected: {outcomes: [invariant_violation], invariant_id: INV-04}
   owner: sentinel-canaries
 - mutant_id: M12
@@ -123,13 +125,13 @@
   owner: sentinel-canaries
 - mutant_id: M13
   name: mut.positions.row-removed
-  checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
+  checkpoint_id: flow/monitor.activity.position-statement/flow.trade.active-trader.read-back/cp-positions   # R08 is asserted here
   class: missing_row
   mode: image
   money_cell: false
   generator: {op: remove_row, params: {}, seed: 20260101}
   region_ref: rgn.ps.trade-price
-  expected: {outcomes: [assertion_failed], assertion_id: R08}
+  expected: {outcomes: [assertion_failed], assertion_id: pl_math}   # the R08 assertion of cp-positions
   owner: sentinel-canaries
 - mutant_id: M14
   name: mut.chart.header-date
@@ -158,7 +160,7 @@
   mode: image
   money_cell: false
   generator: {op: overlay, params: {cap_height: 5}, seed: 20260101}
-  region_ref: rgn.ps.trade-price
+  region_ref: rgn.ps.header   # a declared one-row text region (SD-90)
   expected: {outcomes: [invariant_violation], invariant_id: INV-07}
   owner: sentinel-canaries
 - mutant_id: M17
@@ -290,8 +292,8 @@
   class: outside_parent
   mode: image
   money_cell: false
-  generator: {op: translate, params: {distance: 6}, seed: 20260101}
-  region_ref: rgn.ladder.order-strip
+  generator: {op: translate, params: {parent: rgn.ladder.order-strip, distance: 6}, seed: 20260101}
+  region_ref: rgn.ladder.buy-mkt   # BUY MKT 6 px toward the strip's nearest border, across it
   expected: {outcomes: [invariant_violation], invariant_id: INV-02}
   owner: sentinel-canaries
 - mutant_id: M30
@@ -312,7 +314,7 @@
   mode: image
   money_cell: false
   generator: {op: translate, params: {dx: 3}, seed: 20260101}
-  region_ref: rgn.ps.trade-price
+  region_ref: rgn.ps.trade-price-r3   # one numeric cell of the Trade Price column
   expected: {outcomes: [invariant_violation], invariant_id: INV-12}
   owner: sentinel-canaries
 - mutant_id: M32

@@ -58,6 +58,7 @@ LAYOUT: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("dependency_map", ("registry/dependency-map.yaml",)),
     ("ladders", ("registry/ladders.yaml",)),
     ("surface", ("registry/surfaces/**/*.yaml",)),
+    ("odd_inputs", ("corpus/odd-inputs.yaml",)),          # 4.1, 4.7: sentinel.oddinput reads its shape
     ("workspace", ("corpus/workspaces/*/*.yaml",)),
     ("regions", ("regions/**/*.yaml",)),
     ("mask", ("masks/**/*.yaml",)),

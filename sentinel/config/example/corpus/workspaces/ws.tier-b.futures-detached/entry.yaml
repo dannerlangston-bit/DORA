@@ -1,0 +1,19 @@
+schema_version: 1
+id: ws.tier-b.futures-detached
+tier: B
+persona: futures_trader
+file: corpus/workspaces/ws.tier-b.futures-detached/workspace.sentinel-futures-detached
+file_sha256: "sha256:7ad355503b14ec43c53e76b15b89a4c44a2b1a4824951a59d2d2d944e3b3fd15"
+saved_under_build: released-1998.0.0-3c9e7a1      # an older release
+display_config: {width: 1920, height: 1080, scale_percent: 100, theme: dark, font_size: medium}
+tabs: [Monitor, Trade, Analyze, Scan, MarketWatch, Charts, Tools]   # placeholder until Phase 0 reads the pinned build's tab bar (4.6)
+windows:
+  - {title_regex: "thinkorswim", rect: {x: 0, y: 0, w: 1920, h: 1040}}
+link_groups:
+  - {color: red, symbol_ref: aapl}
+gadgets_present:
+  - charts.flexible-grid.chart-cell
+  - monitor.activity.position-statement
+active_trader_panels: []
+owner: tos-trade-ui
+notes: Tier B power-user layout (2.3) with a detached chart window parked beside the main frame.

@@ -32,10 +32,15 @@ def clean(tmp_path_factory):
 
 
 def test_each_shard_stores_both_halves_and_every_record_carries_the_candidates_id(clean):
+    """A frozen shard and a lockstep pair's candidate rig hold both halves (the pair's frozen flow checkpoints compare
+    on that rig, 3.1); the pair's base rig stores its own base half only (11.3)."""
     out, r = clean
     with Store(out / "sentinel.db") as store:
-        shards = [s["shard_id"] for s in r.shards if s["checkpoints"]]
+        shards = [s["shard_id"] for s in r.shards if s["checkpoints"] and s["side"] != "base"]
         fps = {(sh, side): store.fingerprint(sh, side) for sh in shards for side in ("candidate", "base")}
+        lockstep = [s["shard_id"] for s in r.shards if s["side"] == "base"]
+        assert lockstep and all(store.fingerprint(sh, "base") and not store.fingerprint(sh, "candidate")
+                                for sh in lockstep)
     assert all(fps.values())
     cand = {sh: fps[(sh, "candidate")] for sh in shards}
     assert {o.fingerprint_id for o in r.outcomes} == {f.fingerprint_id for f in cand.values()}

@@ -1,0 +1,20 @@
+schema_version: 1
+id: ws.tier-b.active-dense
+tier: B
+persona: active_trader
+file: corpus/workspaces/ws.tier-b.active-dense/workspace.sentinel-active-dense
+file_sha256: "sha256:590fcd3332d4eaac6d9ff1213c03098868b47f0d291c60d0c9b54b30fe3ba3e8"
+saved_under_build: released-1998.0.0-3c9e7a1      # an older release
+display_config: {width: 1920, height: 1080, scale_percent: 100, theme: dark, font_size: medium}
+tabs: [Monitor, Trade, Analyze, Scan, MarketWatch, Charts, Tools]   # placeholder until Phase 0 reads the pinned build's tab bar (4.6)
+windows:
+  - {title_regex: "thinkorswim", rect: {x: 0, y: 0, w: 1920, h: 1040}}
+link_groups:
+  - {color: red, symbol_ref: aapl}
+gadgets_present:
+  - trade.active-trader.ladder
+  - monitor.activity.position-statement
+active_trader_panels:
+  - {panel_id: at-main, surface: trade.active-trader.ladder}
+owner: tos-trade-ui
+notes: Tier B power-user layout (2.3) with Active Trader and custom ladder columns.

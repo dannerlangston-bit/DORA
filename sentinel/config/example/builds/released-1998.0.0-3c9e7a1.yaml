@@ -1,0 +1,14 @@
+# A released build: tier B workspaces record the release that saved them (4.6 saved_under_build).
+schema_version: 1
+build:
+  build_id: released-1998.0.0-3c9e7a1
+  channel: released
+  version_string: "1998.0.0"
+  commit_sha: 3c9e7a1b5d2f4e6a8c0b1d3f5e7a9c2b4d6f8e0a
+  pipeline_run_id: "tos-desktop/8611"
+  artifact:
+    uri: artifactory://tos-desktop/released/3c9e7a1/thinkorswim-win64.zip
+    sha256: "sha256:4b6e1f0c9a2d7e3b8c5f1a6d0e9b2c7f4a8d3e6b1c5f9a2e7d0b4c8f3a6e1d92"
+  install_method: artifact
+  built_at: 2026-09-14T20:00:00-04:00
+  released_at: 2026-09-21T06:00:00-04:00

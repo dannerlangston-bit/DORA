@@ -12,7 +12,8 @@ Inputs beyond the records, and where each comes from:
 - `coverage`: the PR run's matrix summary from `runs.summary_json` (2.12): per tier
   `registered`, `in_scope`, `covered`, `not_compared` {outcome: n} and `not_run` {reason: n};
   `scope` {declared_surfaces, edges, primitives, static_impact_added, smoke_census, send_policy,
-  order_surfaces_entitlement}; optional `flow_tasks` {entry_id: task key} and `cells` (matrix).
+  order_surfaces_entitlement, optional map_patch (the run output file holding the map PR's proposed edges, 4.4)};
+  optional `flow_tasks` {entry_id: task key} and `cells` (matrix).
 - `health`: the run-health facts not derivable from outcome rows (8.3 indexes, 9.11):
   `wall_clock`, `budget`, `shards`, `fingerprint` {candidate, base}, `reviewer` {cost_usd, tier,
   top_tier_usd}, `canary` {money_detected, money_total, other_detected, other_total,
@@ -41,7 +42,7 @@ Inputs beyond the records, and where each comes from:
     run start (4.8 L-MSK-02, L-RGN-05, L-SRF-11), the "Expired records" row. `health.redaction` {base, candidate}:
     the run's redaction box counts per side, summed over its checkpoints (`capture.RedactionResult.counts`, 3.6),
     the "Redaction" row with the run's `redaction_miss` count.
-  - `abort` {incident, trigger, gate, screenshot, rig, login, proof, rule_ids, not_requeued, requeued, deadline,
+  - `abort` {incident, trigger, gate, screenshot, rig, login, proof, rule_ids, not_requeued, requeued, rebuild, deadline,
     last_heartbeat, runs_ahead, cost, cap}: the abort block facts of `ReportContext.abort`, persisted with the run;
     a key the context also sets takes the context's value. `abort.incident` is the id that
     `store.safety.apply_safety_actions` returned (`AppliedSafety.incident_id`): the commit status reads
@@ -1298,6 +1299,8 @@ def scope_line(b: _Builder) -> Line:
         line.append(T(" ("))
         line += list(join_and([(Link(g.finding_id, b.urls.finding(g.finding_id)),) for g in gaps]))
         line.append(T(")"))
+    if s.get("map_patch"):                               # 4.4: the map PR's proposed edges, in the run output
+        line.append(T(f"; proposed map edges in {s['map_patch']}"))
     line.append(T("."))
     if s.get("send_policy"):
         orders = plural(int(s.get("order_surfaces_entitlement", 0)), "order lifecycle surface")
@@ -1585,12 +1588,19 @@ def _env_errors_line(b: _Builder, env: list[CheckpointOutcome]) -> Line:
 # --------------------------------------------------------------------------------------------
 
 def _withheld(b: _Builder, check: Mapping[str, Any]) -> tuple[str, str, list[Line]]:
-    """1.4 G2, 4.13 L-OUT-07: the post-run check failed and withheld the report; the abort block alone is posted."""
-    run = b.run
+    """1.4 G2, 4.13 L-OUT-07: the post-run check failed and withheld the report; the abort block alone is posted. A
+    safety abort keeps its safety lines (6.6, 9.2): the trigger, the gate, the post-run proof and the incident, which
+    are run facts, not findings, matrix or counts."""
+    run, a = b.run, b.abort
     lines: list[Line] = []
     if run.status == "aborted_harness":
         lines.append((T("Reason: "), C(run.reason or "")))
-    lines.append((T(f"Last gate reached: {run.last_gate}"),))
+    if run.status == "aborted_safety":
+        proof = a.get("proof") or b.health.get("safety", {}).get("proof", "unknown")
+        lines += [(T(f"Trigger: {a.get('trigger', run.reason)}"),), (T(f"Gate: {a.get('gate', run.last_gate)}"),),
+                  (T(f"Post-run proof: {proof}"),), (T(f"Incident: {a.get('incident', 'unknown')}"),)]
+    else:
+        lines.append((T(f"Last gate reached: {run.last_gate}"),))
     lines += [(T(f"Post-run check: {f}"),) for f in check.get("failures") or ()]
     lines.append((T("Report withheld: the post-run check failed (1.4 G2, 4.13 L-OUT-07), so no finding, matrix or "
                     "count is published"),))
@@ -1651,6 +1661,10 @@ def _abort(b: _Builder, members: list[Member]) -> tuple[str | None, str | None, 
         if reason == "config_invalid" and a.get("rule_ids"):
             rsn.append(T(f" (rules {', '.join(a['rule_ids'])})"))
         lines.append(tuple(rsn))
+        if reason == "base_build_missing" and a.get("trigger"):     # 3.1, 4.2: why there is no base
+            lines.append((T(f"Trigger: {a['trigger']}"),))
+        if a.get("rebuild"):                                       # 3.1: the pipeline builds the merge base
+            lines.append((T(f"Rebuild requested: main at merge base {str(a['rebuild'])[:7]}"),))
         lines.append((T(f"Last gate reached: {run.last_gate}"),))
         img = b.urls.image("screenshot", a.get("screenshot"))
         if img is not None:

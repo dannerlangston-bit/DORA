@@ -23,7 +23,9 @@ Choices where 4.13 is ambiguous or silent (each cites what it reads):
   `artifacts.candidate` (the last screenshot).
 - `harness_error`: "a Watchdog event id in detail" is `watchdog_event: <id>` (the form classification writes).
 - `not_run (reason: step_failed:<step>)`: with `flow_steps` (flow id to its step ids) given, the record needs its
-  `flow_id` and the step must be one of that flow's steps; without it (classification) the step is not checked.
+  `flow_id` and the step must be one of that flow's steps; without it (classification) the step is not checked. A
+  sweep or split checkpoint has no flow: each ladder size is a step (2.5.1), so its step is the id of another sweep
+  or split checkpoint of the same surface (the step whose size was not reached, `capture.sweep` choice 3).
 - Synthetic records (canary mutants, 10.3) are generated, not captured: the capture provenance rule skips them.
 """
 from __future__ import annotations
@@ -127,8 +129,13 @@ def errors(rec: Any, *, evidence: bool = True, flow_steps: Mapping[str, Collecti
         need(reason, "reason")
         if flow_steps is not None and (reason or "").startswith("step_failed:"):
             step, flow = reason.split(":", 1)[1], getattr(rec, "flow_id", None)
-            need(flow and step in flow_steps.get(flow, ()), f"step_failed:{step} names an existing step of flow_id "
-                                                            f"{flow}")
+            kind, cid = getattr(rec, "test_kind", None), getattr(rec, "checkpoint_id", None)
+            if kind in ("sweep", "split") and not flow:     # 2.5.1: the ladder step that failed
+                need(step != cid and step.startswith(f"{kind}/{getattr(rec, 'surface_id', None)}/"),
+                     f"step_failed:{step} names another {kind} step of surface {getattr(rec, 'surface_id', None)}")
+            else:
+                need(flow and step in flow_steps.get(flow, ()), f"step_failed:{step} names an existing step of "
+                                                                f"flow_id {flow}")
     elif o == "unregistered_surface":
         need((reason or "").startswith("probe:") and detail, "reason probe:<Pn> and detail with the label and where")
     elif o == "needs_baseline":

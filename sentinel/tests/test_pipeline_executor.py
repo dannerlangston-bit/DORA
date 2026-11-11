@@ -96,7 +96,11 @@ def test_a_precondition_that_resets_cannot_fix_is_env_error_for_the_unit(tmp_pat
     r, by, _, _, _ = _run(tmp_path, precondition_fail=(("working_orders", 3),))
     failed = {c: o for c, o in by.items() if o.reason == "precondition:working_orders"}
     assert failed and {(o.outcome, o.gate) for o in failed.values()} == {("env_error", "workspace_loaded")}
-    assert {o.flow_id for o in failed.values()} == {failed[next(iter(failed))].flow_id}     # one flow only
+    # the unit only: each rig's first flow reads the stuck precondition (SD-14 puts the two flows on two rigs); every
+    # checkpoint of a failed flow takes it, and the rest of each shard (its census visits) still runs
+    flows = {o.flow_id for o in failed.values()}
+    assert flows and all(o.outcome == "env_error" for o in by.values() if o.flow_id in flows)
+    assert {o.outcome for o in by.values() if o.test_kind == "census"} == {"identical"}
     assert r.status == "complete_with_env_errors"
 
 
@@ -162,7 +166,11 @@ def test_a_marked_workspace_selects_the_shards_remaining_census_visits():
 
 
 def test_the_app_crash_relaunch_counts_in_the_restart_tags(tmp_path):
-    r = run_pipeline(EXAMPLE, app_crash_scenario(TODAY), tmp_path)
+    # the freeze hits the first unit of a shard with more work after it (SD-14 places the app-crash scenario's sweep
+    # ladder alone on its rig, so its relaunch has no later capture there)
+    sc = dataclasses.replace(app_crash_scenario(TODAY),
+                             rig=RigScript(freeze_at="census/trade.active-trader.ladder/ws.tier-a.active-trader"))
+    r = run_pipeline(EXAMPLE, sc, tmp_path)
     rig = next(s["rig"] for s in r.shards if s["checkpoints"] and any(g["control"] == "relaunch" for g in s["gates"]))
     after = [o for o in r.outcomes if o.cand_rig_id == rig and o.app_restart_count == 1]
     assert after                                                   # captures after the relaunch carry it (10.2)

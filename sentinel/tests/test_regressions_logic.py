@@ -194,8 +194,10 @@ def test_l08_rc_scope_puts_no_scripted_work_on_the_explorer_rig():
 
 def test_l09_frozen_base_is_not_reused_on_a_rig_with_another_fingerprint():
     """L-09, 3.1: a frozen base capture is reused only when the stored fingerprint equals the live
-    one, which is the fingerprint of the rig the item is placed on."""
-    reg = _registry(40)
+    one, which is the fingerprint of the rig the item is placed on. The surfaces sit under two areas, so their census
+    items form two shard keys (SD-14: census is keyed by tab and data mode) and land on both rigs."""
+    reg = Registry.from_entries([Surface(id=f"{('monitor', 'trade')[i % 2]}.s{i:03d}", tier=3, kind="gadget",
+                                         census_workspaces=("ws-a",), personas=("active_trader",)) for i in range(40)])
     ids = [f"census/{s.id}/ws-a" for s in reg]
     stored = {cid: StoredBase("run-merge-0755", "fp-a", "E-1") for cid in ids}
     rigs = [Rig("rig-1", "fp-a"), Rig("rig-2", "fp-b")]

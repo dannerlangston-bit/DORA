@@ -685,8 +685,8 @@ def test_the_late_arrival_carries_the_rigs_proof_events_and_each_rows_shard(stor
         store.replace_dead_man_run(RUN, rows, shard_of={CENSUS: "run-01/9"}, proofs=[late_proof()], **late)
     assert (store.run_outcome(RUN).status, store.post_run_proofs(RUN)) == ("aborted_harness", [])
     event = StepEvent(run_id=RUN, shard_id=SHARD, side="candidate", seq=1, source="gateway_hook", wall_at=TS,
-                      mono_ms=4242, mode="scripted", action="click", gate_decision="dropped",
-                      gate_reason="no_token", gate_class="safety")
+                      mono_ms=4242, mode="scripted", action="gateway_decision", gate_decision="dropped",
+                      gate_reason="no_token", gate_class="safety")     # the drainer's row, which gateway_drops counts
     step = StepOutcome(RUN, FLOW_ID, "s07", "passed", shard_id=SHARD)
     x = Extraction(RUN, CENSUS, "candidate", "rule.rgn.qty.qty", "qty", "ocr", TS, region_id="rgn.qty", text="100",
                    value="100", confidence=91.5)

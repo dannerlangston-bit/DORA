@@ -1,0 +1,26 @@
+# The odd-input corpus (4.1, 2.6.3): symbol box, order fields, Analyze inputs and study parameters, sampled
+# nightly with a logged seed, pre-Send surfaces only; type_fixture steps reference entries as odd_inputs.<id> (4.7).
+# Pass is a visible rejection or a clamped value shown; a crash, freeze, silent acceptance, NaN, Infinity, null
+# or a third value fails. Shape: sentinel.oddinput.
+schema_version: 1
+corpus_version: 1
+seed: 20261101
+sample_size: 6
+entries:
+  - {id: sym-empty, field_class: symbol_box, value: "", expect: rejected}
+  - {id: sym-unknown, field_class: symbol_box, value: "ZZZZZZ", expect: rejected}
+  - {id: sym-lowercase-spaces, field_class: symbol_box, value: " aapl ", expect: rejected_or_clamped,
+     note: Normalized to AAPL counts as clamped; a third symbol fails}
+  - {id: sym-halted, field_class: symbol_box, source: halt_list, expect: rejected,
+     note: From the day's halt list read in a scripted step; no list that night is not_run (scope)}
+  - {id: qty-fractional, field_class: order_field, field: qty, value: "0.5", expect: rejected,
+     note: Fractional shares are a rejected expectation on desktop (2.6.3)}
+  - {id: qty-zero, field_class: order_field, field: qty, value: "0", expect: rejected}
+  - {id: qty-negative, field_class: order_field, field: qty, value: "-1", expect: rejected_or_clamped}
+  - {id: qty-huge, field_class: order_field, field: qty, value: "999999999", expect: rejected_or_clamped}
+  - {id: price-many-decimals, field_class: order_field, field: price, value: "150.123456", expect: rejected_or_clamped}
+  - {id: price-text, field_class: order_field, field: price, value: "NaN", expect: rejected}
+  - {id: analyze-strike-negative, field_class: analyze_input, field: strike, value: "-5", expect: rejected_or_clamped}
+  - {id: analyze-days-huge, field_class: analyze_input, field: days_to_expiration, value: "100000", expect: rejected_or_clamped}
+  - {id: study-length-zero, field_class: study_parameter, field: length, value: "0", expect: rejected_or_clamped}
+  - {id: study-length-huge, field_class: study_parameter, field: length, value: "1000000", expect: rejected_or_clamped}

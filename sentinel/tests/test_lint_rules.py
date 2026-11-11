@@ -139,7 +139,7 @@ MUTATIONS: list[tuple[str, str | None, Callable]] = [
     ("L-SRF-05", LADDER, lambda d: d["path"][-1]["anchor"].update(landmark="lm.ladder-buy-column-x")),
     ("L-SRF-06", PS, lambda d: d["controls"][0].update(template="registry/templates/monitor/missing.png")),
     ("L-SRF-07", PS, lambda d: d.update(roots=[])),
-    ("L-SRF-08", PS, lambda d: d["census"]["workspaces"].append("ws.tier-a.futures-trader")),
+    ("L-SRF-08", PS, lambda d: d["census"]["workspaces"].append("ws.tier-a.options-trader")),   # no regions file there
     ("L-SRF-09", LADDER, lambda d: d["controls"].append(copy.deepcopy(d["controls"][0]))),
     ("L-SRF-10", CHART, lambda d: d["census"].update(workspaces=[])),
     ("L-SRF-11", PS, lambda d: d.update(invariant_exceptions=[{"invariant_id": "INV-06", "owner": "o", "reason": "r",
@@ -212,6 +212,8 @@ MUTATIONS: list[tuple[str, str | None, Callable]] = [
     ("L-POP-02", POPUPS, lambda d: popup(d, "POP-07").update(key="enter")),
     ("L-POP-03", POPUPS, lambda d: popup(d, "POP-14").update({"class": "dismissable"})),
     ("L-POP-04", POPUPS, lambda d: popup(d, "POP-02").update(action="click")),
+    ("L-POP-05", POPUPS, lambda d: (popup(d, "POP-02").update(seed_titles=["What's New"]),
+                                    popup(d, "POP-01").update(title_regex="(?i)(updat|download)ing|New"))),
     ("L-POP-06", None, lambda r: (add_released_builds(r),
                                   popup(r.docs[POPUPS].data, "POP-08").update(last_seen_build="released-1997.0.0-0000000"))),
     ("L-MUT-00", MUTANTS, lambda d: d[0].update(mode="video")),
@@ -580,6 +582,30 @@ def test_flw07_type_fixture_committing_with_enter_after_confirm_and_send(base):
     assert "L-FLW-07" in _apply(base, FLOW, fn)
 
 
+@pytest.mark.parametrize("step_", [
+    {"type": "press", "key": "return"}, {"type": "press", "key": "Return"}, {"type": "press", "key": "spacebar"},
+    {"type": "press", "key": "ctrl+return"}, {"type": "press", "key": "numpad_enter"},
+    {"type": "key_chord", "keys": ["Control", "Return"]}, {"type": "key_chord", "keys": ["ctrl", "return"]},
+    {"type": "key_chord", "keys": ["return"]},
+])
+def test_flw07_enter_spellings_while_the_order_is_staged(base, step_):
+    """lint-oracle:0, L-FLW-07: every spelling of Enter, Space and Ctrl+Enter the Executor sends (return is VK_RETURN)
+    is caught after the order-stage step, folded as L-POP-02 folds them (`_chord`)."""
+    def fn(d):
+        i = next(k for k, st in enumerate(d["steps"]) if st.get("id") == "w-confirm")
+        d["steps"].insert(i + 1, {"id": "k-enter", **step_})
+    assert "L-FLW-07" in _apply(base, FLOW, fn)
+
+
+@pytest.mark.parametrize("step_", [{"type": "press", "key": "tab"}, {"type": "key_chord", "keys": ["shift", "tab"]},
+                                   {"type": "press", "key": "escape"}])
+def test_flw07_other_keys_while_the_order_is_staged(base, step_):
+    def fn(d):
+        i = next(k for k, st in enumerate(d["steps"]) if st.get("id") == "w-confirm")
+        d["steps"].insert(i + 1, {"id": "k-other", **step_})
+    assert "L-FLW-07" not in _apply(base, FLOW, fn)
+
+
 # -- w1 lint safety and correctness: pairs at run creation ------------------------------------------------------------
 
 def _violations(base: Repo, rel: str | None, fn: Callable, phase: int = 0) -> list:
@@ -827,6 +853,46 @@ def test_conforming_paper_send_ok_flow_lints_clean(base):
     assert _send_rules(base) == []
 
 
+def _ps_control(r: Repo, cid: str, label: str) -> None:
+    r.docs[PS].data["controls"].append({"id": cid, "template": "registry/templates/active-trader/flatten.png",
+                                        "ocr_text": label, "deny": True})
+
+
+def _click_after_cancel(r: Repo, cid: str) -> None:
+    fl = r.docs[FLOW].data
+    fl["steps"].insert(fl["steps"].index(step(fl, "cancel")) + 1,
+                       {"id": "x-deny", "type": "click_named", "target": f"monitor.activity.position-statement.{cid}"})
+
+
+@pytest.mark.parametrize("cid,label", [("cancel-replace", "Cancel/Replace"), ("cancel-all-orders", "Cancel All Orders"),
+                                       ("cancel-send", "Cancel")])
+def test_paper_send_ok_exempts_only_the_rows_cancel_action(base, cid, label):
+    """lint-oracle:2, 6.7: after the send, only the Working row's cancel action may touch a deny control; a replace (a
+    send path), a Cancel All Orders control and a control whose id is send-like stay under L-FLW-13."""
+    found = _send_rules(base, lambda r: _ps_control(r, cid, label), lambda r: _click_after_cancel(r, cid))
+    assert any(v.rule == "L-FLW-13" and cid in v.message for v in found), [v.message for v in found]
+
+
+def test_paper_send_ok_send_is_the_order_confirmations_send(base):
+    """lint-oracle:2, 6.7: the one Send click the token lifts is the Order Confirmation dialog's Send; a Send button
+    on another surface is neither exempt from L-FLW-13 nor the flow's Send for L-FLW-08."""
+    def chat_send(r: Repo) -> None:
+        _ps_control(r, "chat-send", "Send")
+        _flow_step(r, "send")["target"] = "monitor.activity.position-statement.chat-send"
+    found = _send_rules(base, chat_send)
+    assert any(v.rule == "L-FLW-13" and "chat-send" in v.message for v in found), [v.message for v in found]
+    assert any(v.rule == "L-FLW-08" and "exactly one Send click" in v.message for v in found)
+
+
+def test_cancel_all_orders_is_cancel_all_for_l_flw_19(base):
+    def fn(r: Repo) -> None:
+        r.docs[LADDER].data["controls"].append({"id": "ca-orders", "template": "registry/templates/active-trader/flatten.png",
+                                                "ocr_text": "Cancel All Orders"})
+        r.docs[READBACK].data["steps"].insert(1, {"id": "x1", "type": "click_named",
+                                                  "target": "trade.active-trader.ladder.ca-orders"})
+    assert "L-FLW-19" in {v.rule for v in _violations(base, None, fn)}
+
+
 def test_paper_send_ok_send_click_is_denied_without_the_policy(base):
     found = _send_rules(base, lambda r: r.docs["policy/send_policy.yaml"].data.update(enabled=False))
     assert {v.rule for v in found} == {"L-FLW-08", "L-FLW-13"}
@@ -887,6 +953,24 @@ def test_flow_and_region_field_checks(base, rule, rel, change, needle):
     assert any(v.rule == rule and needle in v.message for v in found), [v.line() for v in found]
 
 
+@pytest.mark.parametrize("rule,needle", [
+    ({"field": "money", "decimals": 2, "api_window": {"field": "last"}}, "api_window compares prices"),
+    ({"field": "text", "min": 0}, "min and max apply to numeric fields"),
+    ({"field": "time", "decimals": 2}, "does not apply to a time field"),
+    ({"field": "money", "must_change_within_s": 0}, "at least 1"),
+])
+def test_region_rules_the_oracle_refuses_are_l_rgn_00(base, rule, needle):
+    """lint-oracle:4, 4.15: a rule region the Oracle cannot evaluate (`RegionRule.from_dict`) fails the lint, so it is
+    config_invalid at run start instead of an OracleConfigError on every run."""
+    found = _violations(base, PS_CENSUS, lambda d: region(d, "rgn.ps.pl-open").update(rule=rule))
+    assert any(v.rule == "L-RGN-00" and needle in v.message for v in found), [v.line() for v in found]
+
+
+def test_region_rule_problems_are_reported_once(base):
+    found = _violations(base, S07, lambda d: region(d, "rgn.confirm.timestamp")["rule"].update(pattern="([0-9"))
+    assert len([v for v in found if v.rule == "L-RGN-00"]) == 1
+
+
 # -- 04b: mutant seed, expired contracts, popup actions ---------------------------------------------------------------
 
 def test_mutant_without_seed_is_l_mut_01(base):
@@ -921,3 +1005,255 @@ def test_escape_is_a_dismiss_key():
 def test_popup_action_fields(base, pid, change, needle):
     found = _violations(base, POPUPS, lambda d: change(popup(d, pid)))
     assert any(v.rule == "L-POP-04" and needle in v.message for v in found), [v.message for v in found]
+
+
+# -- w3 lint coverage: identifiers (04-identifier-uniqueness, SD-33) -------------------------------------------------
+
+def _copy_doc(r: Repo, rel: str, new_rel: str, **changes) -> dict:
+    d = copy.deepcopy(r.docs[rel].data)
+    d.update(changes)
+    r.docs[new_rel] = Doc(new_rel, r.docs[rel].kind, d)
+    return d
+
+
+def _tier_b_copy(r: Repo) -> None:
+    rel = "corpus/workspaces/ws.tier-b.options-trader/entry.yaml"
+    r.docs[rel] = Doc(rel, "workspace", {**copy.deepcopy(r.docs[WS_OPT].data), "id": "ws.tier-b.options-trader"})
+
+
+@pytest.mark.parametrize("rule,fn,needle", [
+    ("L-WSP-00", lambda r: _copy_doc(r, WS_OPT, "corpus/workspaces/ws.tier-a.options-trader/entry2.yaml"),
+     f"workspace id ws.tier-a.options-trader is also defined in {WS_OPT}"),
+    ("L-WSP-00", lambda r: r.docs[WS_OPT].data.update(id="ws.tier-a.options"), "differs from its directory"),
+    ("L-WSP-00", _tier_b_copy, "does not carry its tier"),
+    ("L-FIX-00", lambda r: _copy_doc(r, FIXTURE, "fixtures/fx.copy.yaml"), f"is also defined in {FIXTURE}"),
+    ("L-MAN-00", lambda r: r.docs[MANIFEST].data["entries"].append(copy.deepcopy(r.docs[MANIFEST].data["entries"][0])),
+     f"entry_id tos-48120-1 is also defined in {MANIFEST}"),
+    ("L-MSK-00", lambda r: _copy_doc(r, MASK, "masks/census/x/y/msk.ps.last-update-01.yaml", checkpoint_id="census/x/y"),
+     "mask_id msk.ps.last-update-01 is also defined in"),
+])
+def test_ids_are_unique_across_the_repository(base, rule, fn, needle):
+    found = _violations(base, None, fn)
+    assert any(v.rule == rule and needle in v.message for v in found), [v.line() for v in found]
+
+
+def test_a_second_manifest_file_for_one_candidate(tmp_path):
+    """4.1 layout and SD-33 on files of the checkout: manifest ids are unique and a manifest is
+    manifests/<candidate>.yaml. A manifest overlaid from elsewhere (runstart.lint_manifest) is judged on content."""
+    root = tmp_path / "cfg"
+    shutil.copytree(EXAMPLE, root)
+    shutil.copy(root / MANIFEST, root / "manifests/other.yaml")
+    found = [v for v in lint(root, today=TODAY).violations if v.file == "manifests/other.yaml"]
+    assert {v.message for v in found if v.rule == "L-MAN-00"} == {
+        f"manifest_id mf-branch-1998.3.0-5d3e812 is also defined in {MANIFEST}; ids are unique across the repository (4.1)",
+        "a manifest is manifests/<candidate build_id>.yaml: manifests/branch-1998.3.0-5d3e812.yaml"}
+
+
+# -- w3 lint coverage: build and manifest ids and refs (04-build-manifest-ref-format) ---------------------------------
+
+PREV_RELEASE, OLDER_RELEASE = "released-1998.1.0-8b2d4f6", "released-1998.0.0-3c9e7a1"     # the example's releases
+
+
+def _rc_pair(r: Repo, base: str) -> None:
+    rel = "builds/rc-1998.2.1-1111111.yaml"
+    r.docs[rel] = Doc(rel, "build", {"schema_version": 1, "build": {
+        "build_id": "rc-1998.2.1-1111111", "channel": "rc", "version_string": "1998.2.1", "commit_sha": "1111111" + "c" * 33,
+        "pipeline_run_id": "x", "artifact": {"uri": "x", "sha256": "sha256:" + "b" * 64}, "install_method": "artifact",
+        "built_at": "2026-11-09T00:00:00-05:00"}, "build_pair": {
+        "pair_id": f"rc-rc-1998.2.1-1111111-vs-{base}", "run_type": "rc", "candidate": "rc-1998.2.1-1111111", "base": base,
+        "base_rule": "last_released", "lineage_baseline_set": "bs-1", "created_at": "2026-11-09T00:00:00-05:00"}})
+
+
+
+
+@pytest.mark.parametrize("rule,fn,needle", [
+    ("L-MAN-00", lambda r: r.docs[MANIFEST].data.update(manifest_id="mf-other"), "must be mf-branch-1998.3.0-5d3e812"),
+    ("L-MAN-00", lambda r: r.docs[MANIFEST].data["entries"][0].update(entry_id="foo-1"), "not <ticket key lowercased>-<n>"),
+    ("L-MAN-00", lambda r: r.docs[MANIFEST].data.update(candidate="branch-9.9.9-aaaaaaa"),
+     "candidate branch-9.9.9-aaaaaaa is not a build"),
+    ("L-MAN-00", lambda r: r.docs[MANIFEST].data.update(base="branch-1998.3.0-5d3e812"), "is not the base of the pair"),
+    ("L-MAN-04", lambda r: r.docs[MANIFEST].data["entries"][0].update(mock_image="registry/templates/monitor/x.png"),
+     "not under manifests/mocks/"),
+    ("L-BLD-00", lambda r: r.docs[BRANCH_BUILD].data["build_pair"].update(pair_id="xyz"), "pair_id xyz must be"),
+    ("L-BLD-00", lambda r: r.docs[MAIN_BUILD].data["build_pair"].update(base="main-0.0.0-0000000"),
+     "base main-0.0.0-0000000 is not a build"),
+    ("L-BLD-04", lambda r: r.docs[BRANCH_BUILD].data["build_pair"].update(lineage_baseline_set="bs-1"), "rc pairs only, not pr"),
+    ("L-BLD-04", lambda r: _rc_pair(r, OLDER_RELEASE),
+     f"is not the last released build {PREV_RELEASE}"),
+])
+def test_build_and_manifest_ids_and_refs(base, rule, fn, needle):
+    found = _violations(base, None, fn)
+    assert any(v.rule == rule and needle in v.message for v in found), [v.line() for v in found]
+
+
+def test_rc_pair_on_the_last_release_is_clean(base):
+    found = _violations(base, None, lambda r: _rc_pair(r, PREV_RELEASE))
+    assert not [v for v in found if v.rule in ("L-BLD-00", "L-BLD-04")], [v.line() for v in found]
+
+
+def test_merge_base_is_the_previous_main(base):
+    def fn(r: Repo) -> None:
+        for bid, at in (("main-1998.2.1-2222222", "2026-11-09T05:00:00-05:00"),
+                        ("main-1998.2.2-3333333", "2026-11-09T09:00:00-05:00")):
+            d = copy.deepcopy(r.docs[MAIN_BUILD].data)
+            d["build"].update(build_id=bid, version_string=bid.split("-")[1], commit_sha=bid[-7:] + "d" * 33, built_at=at)
+            d.pop("build_pair")
+            r.docs[f"builds/{bid}.yaml"] = Doc(f"builds/{bid}.yaml", "build", d)
+        r.docs["builds/main-1998.2.2-3333333.yaml"].data["build_pair"] = {
+            "pair_id": "merge-main-1998.2.2-3333333-vs-main-1998.2.0-4f1c9a2", "run_type": "merge",
+            "candidate": "main-1998.2.2-3333333", "base": "main-1998.2.0-4f1c9a2", "base_rule": "previous_main",
+            "created_at": "2026-11-09T10:00:00-05:00"}
+    found = _violations(base, None, fn)
+    assert any(v.rule == "L-BLD-04" and "not the previous main build main-1998.2.1-2222222" in v.message for v in found)
+
+
+def test_pr_base_may_be_the_nearest_main_ancestor_within_20_commits():
+    """SD-02, L-BLD-04: the resolver vouches for the distance; without it the base must be the merge base."""
+    builds = {"branch-1998.3.0-5d3e812": {"channel": "branch", "merge_base_sha": "4f1c9a2" + "e" * 33},
+              "main-1998.1.9-0abcdef": {"channel": "main", "commit_sha": "0abcdef" + "e" * 33}}
+    pair = {"run_type": "pr", "candidate": "branch-1998.3.0-5d3e812", "base": "main-1998.1.9-0abcdef",
+            "base_rule": "merge_base_main"}
+    assert [v.rule for v in R.check_pair(pair, builds)] == ["L-BLD-04"]
+    assert R.check_pair(pair, builds, base_commit_distance=7) == []
+    assert R.check_pair(pair, builds, base_commit_distance=20) == []
+    over = R.check_pair(pair, builds, base_commit_distance=21)
+    assert [v.rule for v in over] == ["L-BLD-04"] and "base_build_missing" in over[0].message
+
+
+# -- w3 lint coverage: L-WSP-05 pin, tier B persona, L-DEP-07 first scan, L-POP-05, margin rules ----------------------
+
+def _wide(r: Repo) -> None:
+    r.docs["configs/allowed.yaml"].data["configs"].append(
+        {"id": "cfg.2560x1440-125.dark-medium", "width": 2560, "height": 1440, "scale_percent": 125, "theme": "dark",
+         "font_size": "medium", "work_area": {"w": 2560, "h": 1380}})
+    r.docs[WS_OPT].data["display_config"].update(width=2560, height=1440, scale_percent=125)
+
+
+def test_one_display_configuration_until_phase_3(base):
+    early = [v for v in _violations(base, None, _wide, phase=1) if v.rule == "L-WSP-05"]
+    assert {v.file for v in early} == {WS_OPT, "configs/allowed.yaml"}
+    assert not [v for v in _violations(base, None, _wide, phase=3) if v.rule == "L-WSP-05"]
+
+
+def test_tier_b_entries_carry_a_persona(base):
+    def fn(d):
+        d.update(tier="B", saved_under_build=PREV_RELEASE)
+        d.pop("persona")
+    found = _violations(base, WS_OPT, fn)
+    assert any(v.rule == "L-WSP-02" and "tier B entries name their persona" in v.message for v in found)
+
+
+def _first_scan(d: dict, first: str, theme: bool = False) -> None:
+    d["first_scan_at"] = first
+    edge(d, "FlexibleGrid", "trade.active-trader.ladder").update(confirmed_from_source=False)
+    if theme:
+        edge(d, "Theme", "*").update(confirmed_from_source=False)
+
+
+def test_unconfirmed_edges_warn_90_days_after_the_first_scan(base):
+    late = [v for v in _violations(base, DEPMAP, lambda d: _first_scan(d, "2026-08-01", True)) if v.rule == "L-DEP-07"]
+    assert any("FlexibleGrid -> trade.active-trader.ladder" in v.message and v.severity == "warn" for v in late)
+    assert not [v for v in late if "Theme" in v.message]                                  # global edges never age
+    assert not [v for v in _violations(base, DEPMAP, lambda d: _first_scan(d, "2026-10-01")) if v.rule == "L-DEP-07"]
+
+
+def _seed_titles(d) -> None:
+    popup(d, "POP-02")["seed_titles"] = ["What's New", "Order Confirmation"]
+    extra = copy.deepcopy(popup(d, "POP-02"))
+    extra.update(popup_id="POP-23", name="popup.whats-new-2", title_regex="What's New", seed_titles=["What's New in 1998"])
+    entries(d).append(extra)
+
+
+def test_two_popups_matching_one_seed_title_warn(base):
+    found = [v for v in _violations(base, POPUPS, _seed_titles) if v.rule == "L-POP-05"]
+    assert any("POP-02 and POP-23 both match the seed title \"What's New\"" in v.message for v in found), found
+    assert any("'Order Confirmation' is not matched by POP-02's own title_regex" in v.message for v in found)
+    assert all(v.severity == "warn" for v in found)
+    retired = [v for v in _violations(base, POPUPS, lambda d: (_seed_titles(d), entries(d)[-1].update(
+        retired=True, retired_reason="merged"))) if v.rule == "L-POP-05" and "both match" in v.message]
+    assert retired == []
+
+
+def _drop_equity_margin(d: dict) -> None:
+    d["brackets"].remove(next(b for b in d["brackets"] if b["asset"] == "equity" and b["account"] == "margin"))
+
+
+@pytest.mark.parametrize("change,needle", [
+    (lambda d: d["initial_margin"].pop("MES"), "no initial_margin for MES"),
+    (_drop_equity_margin, "no R02 bracket for equity on a margin account, which flow.trade.order-ticket.stock.limit asserts on AAPL"),
+])
+def test_margin_rules_cover_what_r02_and_futures_reach(base, change, needle):
+    """04b-margin-rules-lint: the gap fails CI as L-FIX-00 instead of an OracleConfigError at run time."""
+    found = _violations(base, "fixtures/margin_rules.yaml", change)
+    assert any(v.rule == "L-FIX-00" and needle in v.message for v in found), [v.line() for v in found]
+
+
+def test_a_mutant_catalog_in_the_4_11_file_form_reads_its_entries(base):
+    """4.11: canaries/mutants.yaml is {schema_version, entries}; the lint reads the entries as it reads a bare list."""
+    found = _violations(base, None, lambda r: setattr(r.docs[MUTANTS], "data", {"schema_version": 1,
+                                                                                 "entries": r.docs[MUTANTS].data}))
+    assert not [v for v in found if v.rule.startswith("L-MUT") or v.file == MUTANTS], [v.line() for v in found]
+
+
+def test_an_aa_control_mutant_may_bind_every_checkpoint(base):
+    """SD-43, 4.11: `checkpoint_id: "*"` on an aa_control entry (every bound checkpoint) passes the mutant schema."""
+    entry = copy.deepcopy(mutant(base.docs[MUTANTS].data, "M25"))
+    entry["checkpoint_id"] = "*"
+    entry.pop("region_ref", None)
+    assert [loc for loc, _ in schemas.validate("mutant#mutant", entry) if "checkpoint_id" in loc] == []
+    entry["checkpoint_id"] = "**"
+    assert [loc for loc, _ in schemas.validate("mutant#mutant", entry) if "checkpoint_id" in loc] == ["checkpoint_id"]
+
+    def star(cls: str) -> Callable:
+        def fn(d):
+            m = mutant(d, "M25")
+            m.update(checkpoint_id="*", **{"class": cls})
+            m.pop("region_ref", None)
+        return fn
+    ok = [v for v in _violations(base, MUTANTS, star("aa_control")) if "[24]" in v.path or "*" in v.message]
+    assert not [v for v in ok if v.rule in ("L-MUT-00", "L-MUT-01", "L-XREF-04", "L-XREF-11")], [v.line() for v in ok]
+    bad = _violations(base, MUTANTS, star("sub_floor"))
+    assert any(v.rule == "L-MUT-01" and '"*"' in v.message for v in bad), [v.line() for v in bad]
+
+
+def test_a_canary_flow_may_stage_one_confirm_and_send_closed_by_delete(base):
+    """SD-45, 4.11 L-MUT-04: a canary flow may hold one order_stage Confirm and Send step whose dialog is closed by
+    Delete through the dismiss allowlist (as A9); rules.py keeps only the canary-class and image halves, the
+    order-stage half is sentinel.lint.checks.mutants'."""
+    def fn(r: Repo) -> None:
+        steps = r.docs[CANARY].data["steps"]
+        steps[-1:-1] = [{"id": "x-stage", "type": "click_named", "target": "trade.order-entry.stock.confirm-and-send",
+                         "order_stage": True},
+                        {"id": "x-delete", "type": "click_named", "target": "dialog.order-confirmation.delete-button"}]
+    r = copy.deepcopy(base)
+    fn(r)
+    assert "L-MUT-04" not in {v.rule for v in R._Linter(r, 0, TODAY, None).run()}
+    assert "Confirm and Send" in R.RULES["L-MUT-04"].check and "Delete" in R.RULES["L-MUT-04"].check
+    next(s for s in r.docs[CANARY].data["steps"] if s["id"] == "x-stage")["order_stage"] = False
+    got = [v for v in R._Linter(r, 0, TODAY, None).run() if v.rule == "L-MUT-04"]
+    assert got and "outside its order-stage step" in got[0].message          # the one allowed click is the staged one
+
+
+def test_a_flow_quarantine_record_is_no_checkpoint_reference(base):
+    """10.5, L-XREF-11: a record names exactly one of checkpoint and flow; a flow record carries no checkpoint id to
+    check against the grammar (that its flow exists is sentinel.lint.checks.quarantine's)."""
+    rec = {"owner": "tos-trade-ui", "ticket": "TOS-1", "entered": "2026-11-01", "reason": "flake"}
+    flow = _violations(base, QUARANTINE, lambda d: d["records"].append({**rec, "flow": "flow.trade.order-ticket.stock.limit"}))
+    assert not [v for v in flow if v.rule == "L-XREF-11"], [v.line() for v in flow]
+    bad = _violations(base, QUARANTINE, lambda d: d["records"].append({**rec, "checkpoint": "flow/x"}))
+    assert any(v.path == "records[0].checkpoint" and "grammar" in v.message for v in bad if v.rule == "L-XREF-11")
+
+
+def _surface_rename(old: str, new: str) -> Callable:
+    return lambda d: d["renames"].append({"old": old, "new": new, "build": "main-1998.2.0-4f1c9a2"})
+
+
+def test_renames_name_a_build_and_may_rename_a_surface(base):
+    found = _violations(base, RENAMES, lambda d: d["renames"][0].update(build="main-0.0.0-0000000"))
+    assert any(v.rule == "L-FLW-03" and "build main-0.0.0-0000000 is not a build" in v.message for v in found)
+    ok = _violations(base, RENAMES, _surface_rename("trade.order-entry.equity", "trade.order-entry.stock"))
+    assert not [v for v in ok if v.rule in ("L-FLW-03", "L-XREF-11")], [v.line() for v in ok]
+    stale = _violations(base, RENAMES, _surface_rename("trade.order-entry.stock", "trade.order-entry.equity"))
+    assert {v.message for v in stale if v.rule == "L-FLW-03"} >= {
+        "renamed or retired surface trade.order-entry.stock is still registered",
+        "rename target surface trade.order-entry.equity is not registered (or 'retired')"}

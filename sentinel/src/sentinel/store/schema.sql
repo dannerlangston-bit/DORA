@@ -713,7 +713,7 @@ CREATE TABLE outbox (                       -- 9.1: every outbound post is a job
   job_id          INTEGER PRIMARY KEY,
   run_id          TEXT REFERENCES runs(run_id),
   kind            TEXT NOT NULL CHECK (kind IN ('pr_comment','commit_status','jira_create','jira_comment','jira_transition',
-                    'slack','page','digest','manifest_pr','mask_pr')),
+                    'slack','page','digest','manifest_pr','mask_pr','quarantine_pr')),   -- quarantine_pr: 10.5
   destination     TEXT NOT NULL,
   payload_sha256  TEXT NOT NULL,            -- the payload is an artifact; the row carries its hash
   attempts        INTEGER NOT NULL DEFAULT 0,

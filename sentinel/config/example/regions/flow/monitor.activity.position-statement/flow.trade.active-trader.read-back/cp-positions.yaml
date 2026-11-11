@@ -5,9 +5,9 @@ checkpoint_id: flow/monitor.activity.position-statement/flow.trade.active-trader
 landmarks:
   - {id: lm.position-statement-header, template: regions/landmarks/lm.position-statement-header.png, confidence_min: 0.92}
 regions:
-  - {id: rgn.ps.header, type: diff, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 0, dy: 24, w: 600, h: 18}}
-  - {id: rgn.ps.qty, type: diff, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 0, dy: 44, w: 60, h: 120}}
-  - {id: rgn.ps.trade-price, type: diff, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 64, dy: 44, w: 90, h: 120}}
-  - {id: rgn.ps.mark, type: rule, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 158, dy: 44, w: 90, h: 120}, rule: {field: price, min: 0, min_rows: 1}}
-  - {id: rgn.ps.pl-open, type: rule, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 252, dy: 44, w: 110, h: 120}, rule: {field: money, decimals: 2}}
-  - {id: rgn.ps.instrument, type: diff, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 364, dy: 44, w: 110, h: 120}}
+  - {id: rgn.ps.header, type: diff, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 0, dy: 24, w: 600, h: 14}}
+  - {id: rgn.ps.qty, type: diff, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 0, dy: 38, w: 60, h: 112}}
+  - {id: rgn.ps.trade-price, type: diff, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 64, dy: 38, w: 90, h: 112}}
+  - {id: rgn.ps.mark, type: rule, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 158, dy: 38, w: 90, h: 112}, rule: {field: price, min: 0, min_rows: 1}}
+  - {id: rgn.ps.pl-open, type: rule, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 252, dy: 38, w: 110, h: 112}, rule: {field: money, decimals: 2}}
+  - {id: rgn.ps.instrument, type: diff, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 364, dy: 38, w: 110, h: 112}}

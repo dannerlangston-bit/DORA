@@ -81,6 +81,22 @@ def test_step_failed_names_a_step_of_its_flow():
     assert errs(rec("not_run", reason="scope")) == []
 
 
+def test_step_failed_on_a_sweep_names_the_ladder_step_that_failed():
+    """2.5.1: a sweep checkpoint has no flow; the rest of its ladder is `not_run (step_failed:<the failed step>)`,
+    the id of another sweep checkpoint of the same surface (`capture.sweep` choice 3)."""
+    at = "charts.flexible-grid.active-trader-cell"
+
+    def sweep(size: str, reason: str) -> CheckpointOutcome:
+        return CheckpointOutcome(run_id=RUN, checkpoint_id=f"sweep/{at}/flexgrid/{size}", outcome="not_run",
+                                 workspace_id="ws.tier-c.sweep-harness", persona="active_trader", data_mode="frozen",
+                                 surface_id=at, test_kind="sweep", reason=reason,
+                                 size_step={"host": "flexgrid", "w": 640, "h": 360})
+    assert errs(sweep("640x360", f"step_failed:sweep/{at}/flexgrid/640x480")) == []
+    assert errs(sweep("640x360", f"step_failed:sweep/{at}/flexgrid/640x360"))          # not its own step
+    assert errs(sweep("640x360", "step_failed:sweep/trade.active-trader.ladder/detached/640x480"))
+    assert errs(sweep("640x360", "step_failed:s03"))
+
+
 def test_reason_names_the_first_invariant_by_catalog_order():
     kw = {**VALID["invariant_violation"][0], "reason": "INV-03"}
     assert errs(rec("invariant_violation", **kw))

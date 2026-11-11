@@ -1,7 +1,16 @@
 """`sentinel` command-line entry point.
 
 Subcommands:
-  sentinel lint <config-dir> [--phase N] [--today YYYY-MM-DD] [--json] [--show-skipped]
+  sentinel lint <config-dir> [--all] [--base-ref REV] [--phase N] [--today YYYY-MM-DD] [--json] [--show-skipped]
+                                              the whole checkout (Nightly); --base-ref adds the history rules (4.15)
+  sentinel lint <config-dir> --changed BASE [--review-comment FILE] [--approved FILE] [--aa-results FILE]
+                                              a sentinel-config pull request: errors block, warnings are the review
+                                              comment
+  sentinel lint [<config-dir>] --manifest PATH [--base-ref REV] [--ticket-types FILE]
+                                              a product pull request's manifest: the sentinel/manifest commit status
+  sentinel lint <config-dir> --all --config-commit SHA [--run-context FILE]
+                                              the run-start lint of the tree at SHA (12.7 G1)
+  sentinel lint <config-dir> --file FLOW      one flow in repository context (Recorder, Explorer candidate)
   sentinel lint --code [ROOT] [--drill-allowlist FILE] [--json]
                                               the gateway single-entry-point lint over ROOT/src (5.4.1, 5.4.9, 6.2)
   sentinel schemas [--check] [--out DIR]      write or check the generated JSON Schemas (L-XREF-09)
@@ -19,6 +28,12 @@ Subcommands:
                                               simulated rigs (orchestrator.killflag)
   sentinel reenable --db PATH {login|rig|quarantine|proof|incident} ...
                                               the human safety actions of 6.6 and 6.12 (sentinel.reenable)
+  sentinel calibrate <config-dir> PLAN.json --out DIR [--db PATH]
+                                              one Calibration run over the plan on the simulated rigs (3.9, 11.2):
+                                              floors and fix rows into DIR/sentinel.db (sentinel.calibration_run)
+  sentinel depmap --jdeps FILE --config DIR --build ID --now TIME [--out FILE] [--patch FILE] [--status FILE]
+                                              derive the Dependency Map from a bytecode scan and write the proposed
+                                              map and its patch (2.10.1, 4.4; sentinel.depscan)
 """
 from __future__ import annotations
 
@@ -151,6 +166,12 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "reenable":
         from .reenable import main as reenable_main
         return reenable_main(rest)
+    if cmd == "calibrate":
+        from .calibration_run import main as calibrate_main
+        return calibrate_main(rest)
+    if cmd == "depmap":
+        from .depscan import main as depmap_main
+        return depmap_main(rest)
     print(f"unknown command {cmd!r}\n{__doc__}", file=sys.stderr)
     return 2
 

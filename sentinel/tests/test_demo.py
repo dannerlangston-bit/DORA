@@ -145,22 +145,44 @@ def test_nightly_canary_goes_blind_on_a_money_cell(runs):
     assert [(r.mutant_id, r.produced_outcome) for r in blind] == [("M04", "identical")]
     assert "msk.confirm.clock-01" in blind[0].absorbed_by
     outs, finds, counts = stored(out, n2.run_id)
-    assert [(o.checkpoint_id, o.outcome, o.reason, o.synthetic) for o in outs] == \
-        [(S07, "harness_error", "detector_blind", True)]
-    assert all(v == 0 for v in counts.values())                     # synthetic rows count in no run metric
+    assert not [o for o in outs if o.synthetic]          # SD-91: outcomes holds real rows only
+    with Store(out / "sentinel.db") as store:            # the miss's synthetic row, linked from its canary_results row
+        synth = store.query("SELECT mutant_id, checkpoint_id, outcome, reason FROM synthetic_outcomes WHERE run_id = ? "
+                            "AND outcome = 'harness_error'", (n2.run_id,))
+        linked = store.query("SELECT count(*) FROM canary_results WHERE run_id = ? AND kind = 'mutant' AND "
+                             "synthetic_ref IS NOT NULL", (n2.run_id,))[0][0]
+        detector = json.loads(store.get_system_state("detector_state"))
+        manifests = store.query("SELECT run_id FROM canary_manifests ORDER BY run_id")
+    assert [tuple(r) for r in synth] == [("M04", S07, "harness_error", "detector_blind")]
+    assert linked == len([r for r in n2.canary["report"].results if r.kind == "mutant" and r.state != "generation_failed"])
+    assert (detector["state"], detector["run_id"]) == ("detector_blind", n2.run_id)          # 8.3 system_state
+    assert detector["since_text"].startswith(n2.run_id.split("-nightly")[0][4:])
+    assert [r[0] for r in manifests] == [n1.run_id, n2.run_id]                               # 10.3 Determinism
     assert [f.kind for f in finds] == ["canary_miss"]
-    assert stored(out, n1.run_id)[0] == []
+    assert [f.kind for f in stored(out, n1.run_id)[1]] == []
+    for n in (n1, n2):                                   # 10.6: the A/A pass gives the nights' real rows
+        rows = stored(out, n.run_id)[0]
+        assert rows and {o.outcome for o in rows} == {"identical"} and len(rows) == len(n.canary["aa"].rows)
+    assert "Calibration queued" in (out / "morning-report.txt").read_text()
     assert text.splitlines()[1] == "```text" and "DETECTOR BLIND since" in text and "M04 swapped_digit" in text
     assert "money cells 85.7 percent (6 of 7)" in text
     assert (out / "morning-report.txt").read_text().startswith("DETECTOR BLIND")
     body = json.loads((out / f"canary-results-{n2.run_id}.json").read_text())
-    assert body["detector_state"] == "detector_blind" and body["not_simulated"]
-    detected = {r.mutant_id for r in n1.canary["report"].results if r.state == "detected"}
-    assert {"M01", "M02", "M03", "M04", "M05", "M12", "M26", "M28"} <= detected
+    # 10.3: the whole catalog renders and scores on the simulated app; night 1 detects every mutant, the batch
+    # mutants M21 and M23 on every checkpoint of their synthetic batch
+    assert body["detector_state"] == "detector_blind" and body["not_simulated"] == {}
+    assert body["simulated"] == [f"M{i:02d}" for i in range(1, 34)]
+    assert {r.state for r in n1.canary["report"].results} == {"detected"}
+    assert {r.mutant_id for r in n1.canary["report"].results} == set(body["simulated"])
     runs_ = json.loads((out / "orchestrator.json").read_text())       # every run went through the gate machine
     assert [r["run_id"] for r in runs_] == [n1.run_id, n2.run_id, pr.run_id]
     assert all(s["verdict"] == "complete" and s["proof"] == "PROVEN: no orders sent" for r in runs_ for s in r["shards"])
-    assert n1.shards[0]["gates"][3]["control"] == "paper_mode" and json.loads((out / "alerts.json").read_text()) == []
+    assert n1.shards[0]["gates"][3]["control"] == "paper_mode"
+    # 9.10 Canary failure: night 2's blind state pages the harness on-call at P1; night 1 pages nobody
+    alerts = json.loads((out / "alerts.json").read_text())
+    assert [(a["run_id"], a["rule"], a["priority"], a["paged"]) for a in alerts] == \
+        [(n2.run_id, "canary_failure", "P1", ["harness_on_call"])]
+    assert [b["priority"] for b in n2.canary["sent_bugs"]] == ["Highest"] and n1.canary["sent_bugs"] == []
 
 
 def test_decision_inheritance_suppresses_and_inherits(runs):
@@ -201,3 +223,175 @@ def test_cli_usage(capsys):
         main(["no-such-scenario"])
     from sentinel.cli import main as cli
     assert cli(["run", "/no/such/dir", "--scenario", "clean-pr"]) == 2
+
+
+# -- w3 integration: build pairs, base resolution, reuse and lockstep (3.1, 4.2, 7.9, SD-02) ------------------------
+
+def _summary(out: Path, run_id: str) -> dict:
+    with Store(out / "sentinel.db") as store:
+        return store.run_summary(run_id)
+
+
+def test_base_distance_uses_the_nearest_main_build_and_declares_the_pr_merged_in_between(runs):
+    """SD-02, 3.1: the merge base has no main build; the base is main@2c91ae4, two commits back. The run row and run
+    health carry the distance, and PR 4823's manifest (merged at the commit in between) is declared for the run: its
+    chart cell change is intended against its own entry."""
+    out, (r,) = runs("base-distance")
+    outs, finds, _ = stored(out, r.run_id)
+    assert_legal(outs)
+    with Store(out / "sentinel.db") as store:
+        (row,) = store.query("SELECT base_commit_distance FROM runs WHERE run_id = ?", (r.run_id,))
+        (pair,) = store.query("SELECT base_build_id FROM build_pairs WHERE pair_id = (SELECT pair_id FROM runs "
+                              "WHERE run_id = ?)", (r.run_id,))
+    assert row[0] == 2 and pair[0] == "main-1998.3.0-2c91ae4"
+    rows = dict(map(tuple, _summary(out, r.run_id)["health_rows"]))
+    assert rows["Base"].startswith("2 commits before the merge base")
+    chart = by(outs, CHART)
+    assert chart and {o.outcome for o in chart} == {"intended"}
+    assert {o.manifest_entry_ref for o in chart} == {"tos-48211-1"}         # the intervening PR's entry
+    assert {o.outcome for o in by(outs, "charts.flexible-grid.level2-cell")} == {"intended"}
+    assert "2 commits before the merge base" in assert_outputs(out) and r.commit_status["state"] == "success"
+
+
+def test_base_missing_aborts_before_any_capture_and_requeues_once(runs):
+    """3.1, 4.2: no main build within 20 commits of the merge base: `aborted_harness (base_build_missing)` at
+    provisioned, the run-level proof of a run with no session, the P1 harness page, and the rebuild and the single
+    re-queue requested."""
+    out, (r,) = runs("base-missing")
+    assert (r.status, r.reason) == ("aborted_harness", "base_build_missing")
+    with Store(out / "sentinel.db") as store:
+        run = store.run_outcome(r.run_id)
+        assert store.outcomes(r.run_id) == [] and not store.query("SELECT 1 FROM shards WHERE run_id = ?", (r.run_id,))
+    assert run.last_gate == "provisioned" and r.proof == "PROVEN: no session established"
+    abort = _summary(out, r.run_id)["abort"]
+    assert abort["requeued"] == f"{r.run_id}-requeue" and abort["rebuild"].startswith("c0de000")
+    text = (out / "pr-comment.md").read_text()
+    assert "Reason: `base_build_missing`" in text and "21 commits searched" in text
+    assert "Re-queued once: " in text and "Rebuild requested: main at merge base c0de000" in text
+    (entry,) = [e for e in json.loads((out / "orchestrator.json").read_text()) if e["run_id"] == r.run_id]
+    assert {a["action"] for a in entry["persisted_actions"]} == {"rebuild_merge_base", "requeue"}
+    (page,) = r.alerts
+    assert page["priority"] == "P1" and page["run_reason"] == "base_build_missing"
+
+
+def test_a_base_build_that_will_not_install_aborts_every_shard_at_provisioned(tmp_path):
+    """4.2: the base build cannot be installed on the rig (`SimulatedRig.install_base`, the `base_install_fails`
+    knob): each shard stops at provisioned before launch with `pairs.base_missing_result`; its checkpoints are
+    `harness_error (base_build_missing)` and the abort block names the cause and the re-queue."""
+    from dataclasses import replace
+
+    from sentinel.demo import EXAMPLE, clean_scenario
+    from sentinel.pipeline.orchestration import RigScript
+    from sentinel.pipeline.run import run_pipeline
+    from datetime import date
+    sc = replace(clean_scenario(date(2026, 11, 10)), rig=RigScript(base_install_fails="installer checksum mismatch"))
+    r = run_pipeline(EXAMPLE, sc, tmp_path)
+    assert (r.status, r.reason) == ("aborted_harness", "base_build_missing")
+    assert {(o.outcome, o.reason) for o in r.outcomes} == {("harness_error", "base_build_missing")}
+    assert {s["last_gate"] for s in r.shards} == {"provisioned"}
+    abort = _summary(tmp_path, r.run_id)["abort"]
+    assert "could not be installed: installer checksum mismatch" in abort["trigger"]
+    assert abort["requeued"] == f"{r.run_id}-requeue"
+
+
+def test_base_reuse_reads_the_merge_runs_frozen_captures(runs):
+    """3.1, 7.4, 7.9: the PR run's base is the build the merge run captured; under the same reuse key every frozen
+    base comes from the merge run's stored capture (its outcome names the source run), the masked_live one is
+    captured, run health counts base_reused and the report says where the captures came from."""
+    out, (m, r) = runs("base-reuse")
+    assert m.run_type == "merge" and r.status == "complete"
+    outs, _, _ = stored(out, r.run_id)
+    assert_legal(outs)
+    frozen = [o for o in outs if o.data_mode == "frozen"]
+    assert frozen and {o.base_source_run_id for o in frozen} == {m.run_id}
+    assert {o.base_source_run_id for o in outs if o.data_mode == "masked_live"} == {None}
+    assert sorted(o.outcome for o in outs) == ["identical"] * 4 + ["intended"] * 4     # clean-pr's outcomes
+    s = _summary(out, r.run_id)
+    rows = dict(map(tuple, s["health_rows"]))
+    assert rows["Base reuse"] == f"base_reused {len(frozen)} (from {m.run_id}); re-captured 0; reuse_missing 0"
+    assert set(s["reuse_fixture"]) and all(k["fixture_sha256"].startswith("sha256:") for k in s["reuse_fixture"].values())
+    assert f"base captures reused from {m.run_id}" in (out / "pr-comment.md").read_text()
+
+
+def test_a_reused_base_whose_stored_capture_is_gone_is_needs_baseline_reuse_missing(tmp_path):
+    """3.11 input B: the plan expected to reuse the merge run's capture but its object is gone: `needs_baseline
+    (reuse_missing)`, counted under reuse_missing in run health."""
+    import shutil
+    from datetime import date
+
+    from sentinel.demo import EXAMPLE, base_reuse_scenarios
+    from sentinel.pipeline.run import run_pipeline
+    merge, pr = base_reuse_scenarios(date(2026, 11, 10))
+    run_pipeline(EXAMPLE, merge, tmp_path)
+    shutil.rmtree(tmp_path / "artifacts" / "runs" / merge.run_id / "objects")
+    r = run_pipeline(EXAMPLE, pr, tmp_path)
+    frozen = [o for o in r.outcomes if o.data_mode == "frozen"]
+    assert frozen and {(o.outcome, o.reason) for o in frozen} == {("needs_baseline", "reuse_missing")}
+    rows = dict(map(tuple, _summary(tmp_path, r.run_id)["health_rows"]))
+    assert rows["Base reuse"].endswith(f"reuse_missing {len(frozen)}")
+
+
+def test_lockstep_slip_is_requeued_once_then_not_run_budget(runs):
+    """3.1: the base rig lags 75 s, then 80 s: one re-queue, then `not_run (budget)`; lockstep_slip is a run-health
+    counter and no finding names it."""
+    out, (r,) = runs("lockstep-slip")
+    outs, finds, _ = stored(out, r.run_id)
+    (ps,) = [o for o in outs if o.surface_id == "monitor.activity.position-statement"]
+    assert (ps.outcome, ps.reason) == ("not_run", "budget")
+    assert not [f for f in finds if f.checkpoint_id == ps.checkpoint_id]
+    assert "lockstep_slip 1" in dict(map(tuple, _summary(out, r.run_id)["health_rows"]))["Lockstep"]
+    assert [s["side"] for s in r.shards] == ["candidate", "base", "both", "both"]
+
+
+def test_run_creation_checks_a_pr_pair_with_the_resolvers_distance(tmp_path):
+    """SD-02, 4.2: a checked-in PR pair whose base is not the merge base is refused (L-BLD-04) unless the run-creation
+    resolver names its distance (`pair_violations(base_commit_distance=)`)."""
+    import shutil
+
+    from sentinel.demo import EXAMPLE, _branch_build_at, _commit, _main_build
+    from sentinel.lint.repo import Repo
+    from sentinel.pipeline.run import pair_violations
+    cfg = tmp_path / "cfg"
+    shutil.copytree(EXAMPLE, cfg)
+    rel, text = _branch_build_at("d5e6f70", 4871, "feature/x", _commit("9a2b3c4"))
+    base = _main_build()
+    (cfg / base[0]).write_text(base[1])
+    (cfg / rel).write_text(text + "build_pair:\n  pair_id: pr-branch-1998.3.0-d5e6f70-vs-main-1998.3.0-2c91ae4\n"
+                           "  run_type: pr\n  candidate: branch-1998.3.0-d5e6f70\n  base: main-1998.3.0-2c91ae4\n"
+                           "  base_rule: merge_base_main\n  created_at: 2026-11-10T10:31:00-05:00\n")
+    repo = Repo.load(cfg)
+    assert {v.rule for v in pair_violations(repo, "branch-1998.3.0-d5e6f70")} == {"L-BLD-04"}
+    assert pair_violations(repo, "branch-1998.3.0-d5e6f70", base_commit_distance=2) == []
+    assert {v.rule for v in pair_violations(repo, "branch-1998.3.0-d5e6f70", base_commit_distance=21)} == {"L-BLD-04"}
+
+
+# -- w3 integration: calibration from the store (3.9, 4.8, 7.13) ------------------------------------------------------
+
+def test_a_pr_run_reads_the_floors_a_calibration_run_wrote_to_the_store(runs):
+    """3.9, 4.8 Threshold source, 7.13: after the weekend Calibration run of the base build, every threshold of PR
+    4823's run is `calibrated` from the store (`StoreCalibration`), no Calibration is requested, and the outcomes are
+    clean-pr's."""
+    out, (r,) = runs("calibrated-floors")
+    outs, _, _ = stored(out, r.run_id)
+    assert sorted(o.outcome for o in outs) == ["identical"] * 4 + ["intended"] * 4
+    with Store(out / "sentinel.db") as store:
+        assert [tuple(x) for x in store.query("SELECT run_type, outcome FROM runs ORDER BY started_at")] == [
+            ("calibration", "complete"), ("pr", "complete")]
+        sources = {x[0] for x in store.query("SELECT json_extract(record_json, '$.threshold_source') FROM "
+                                             "outcome_records WHERE run_id = ?", (r.run_id,))}
+        summary = store.run_summary(r.run_id)
+    assert sources == {"calibrated"} and "calibration_queued" not in summary
+    assert not [row for row in summary.get("health_rows", []) if row[0] == "Calibration"]
+
+
+def test_a_pr_run_without_floors_in_the_store_requests_the_calibration(runs):
+    """L-FPR-04, 12.7 G5, 7.13: with no floors for the run's calibration key in the store the run measures its own
+    A/A floors (the inline Calibration of 1.6) and requests the Calibration run: `calibration_queued` in the summary
+    and a run-health row."""
+    out, (r,) = runs("clean-pr")
+    summary = _summary(out, r.run_id)
+    q = summary["calibration_queued"]
+    assert q["reasons"] == {"no_calibration": 1} and q["calibration_key"].startswith("sha256:")
+    assert q["requested_by"] == r.run_id and len(q["checkpoints"]) == 8
+    rows = dict(map(tuple, summary["health_rows"]))
+    assert rows["Calibration"].startswith("Calibration run requested for key sha256:")

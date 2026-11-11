@@ -36,15 +36,22 @@ Children draw after (on top of) their parent, in order.
 | `text` | `text`, `color`?, `align` (left, right, center), `scale`? | `<name>` = ink box |
 | `button` | `label`, `style` (default, buy, sell, primary) | `<name>`, `<name>.label` |
 | `grid` | `columns`, `rows` (cells are str or {text, color}), `col_widths`?, `row_h` 16, `header_h` 18 | `<name>`, `<name>.header`, `<name>.h<j>`, `<name>.r<i>`, `<name>.r<i>c<j>` |
-| `ladder` | `strip_h` 30, `row_h` 21, `bottom_margin` 8, `viewport_min_h`?, `center_price`, `tick` | `<name>.strip`, `.qty`, `.buy`, `.sell`, `.autosend` (+ `.label`s), `.viewport`, `.row<i>`, `.price<i>` |
+| `ladder` | `strip_h` 30, `row_h` 21, `bottom_margin` 8, `viewport_min_h`?, `center_price`, `tick`, `column_header` false, `header_h` (`row_h`) | `<name>.strip`, `.qty`, `.buy`, `.sell`, `.autosend` (+ `.label`s), `.viewport`, `.row<i>`, `.price<i>`; with `column_header`, `.header`, its labels `.header.bid`, `.header.price`, `.header.ask` and their column slots (`.cell`) |
 | `flexgrid` | `col_widths`, `row_heights`, `header_h` 28, `splitter` 4, `cells`: [{row, col, title, content}] | `<name>`, `<name>.cell<r><c>`, `.cell<r><c>.header` (+ `.label`), `.vsplit<j>`, `.hsplit<i>` |
 | `rect` | `color` | `<name>` |
+| `ring` | `color` (default `focus`) | `<name>`: a 1 px frame, the keyboard focus ring drawn around a control |
 
 Ladder geometry: the strip is at the top of the ladder's rect; the viewport ends `bottom_margin`
 px above the rect's bottom. Without `viewport_min_h` (base build) the viewport fills the space
 below the strip and draws only full rows. With `viewport_min_h` (candidate build) the viewport is
 at least that tall, measured up from its bottom, so it overlaps the strip when the cell is short,
-and the last row may be clipped.
+and the last row may be clipped. With `column_header` the viewport's first `header_h` px (one row by default)
+are the ladder's column header row ("Bid Size" over the bid sizes, "Price" over the prices, "Ask Size" over the ask
+sizes; the Surface Registry's required labels of the two ladder surfaces, 2.7 INV-05) and the price rows start below
+it; the viewport itself keeps its geometry, so the 1.11 overlap is the same 14 px (the header row then draws over the
+lower half of BUY MKT and SELL MKT) and a taller cell still absorbs the recovered space in one extra bottom row.
+The header takes the first row's place: every price row keeps the price, size and highlight it has without the
+header.
 """
 from __future__ import annotations
 
@@ -77,6 +84,7 @@ THEME: dict[str, tuple[int, int, int]] = {
     "last": (70, 70, 40),
     "splitter": (70, 72, 80),
     "cell_header": (44, 46, 54),
+    "focus": (240, 140, 20),
 }
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 SCALE = 0.36
@@ -234,6 +242,10 @@ class _Painter:
         self.record(name, "panel", r, parent, node.get("title"))
         self._children(node, (x + 1, y, w - 2, h - 1), name)
 
+    def _ring(self, node, r, name, parent):
+        self.frame(r, self.color(node.get("color"), "focus"))
+        self.record(name, "focus_ring", r, parent)
+
     def _rect(self, node, r, name, parent):
         self.fill(r, self.color(node.get("color"), "panel"))
         self.record(name, "rect", r, parent)
@@ -304,25 +316,42 @@ class _Painter:
         vp = (x, top, w, bottom - top)
         self.fill(vp, THEME["price"])
         self.record(f"{name}.viewport", "ladder_viewport", vp, parent)
-        n = (bottom - top) // row_h if full_only else -(-(bottom - top) // row_h)
+        head_h = int(node.get("header_h", row_h)) if node.get("column_header") else 0
+        rows_top = top + head_h
+        n = (bottom - rows_top) // row_h if full_only else -(-(bottom - rows_top) // row_h)
         fr = [0.14, 0.17, 0.17, 0.18, 0.17, 0.17]
         cx = [x + int(round(w * sum(fr[:k]))) for k in range(len(fr) + 1)]
         center = float(node.get("center_price", 4500.25))
         tick = float(node.get("tick", 0.25))
-        mid = n // 2
+        lead = 1 if head_h else 0               # the header takes the first row's place; the rows keep theirs
+        mid = (n + lead) // 2
+        if head_h:
+            head = (x, top, w, head_h)          # the header keeps the columns' fills, like a price row
+            self.fill((cx[1], top, cx[3] - cx[1], head_h), THEME["bid"])
+            self.fill((cx[4], top, cx[6] - cx[4], head_h), THEME["ask"])
+            self.fill((x, top + head_h - 1, w, 1), THEME["grid_line"])
+            self.record(f"{name}.header", "ladder_header", head, f"{name}.viewport")
+            for key, (c0, c1), label, align in (("bid", (cx[2], cx[3]), "Bid Size", "right"),
+                                                ("price", (cx[3], cx[4]), "Price", "center"),
+                                                ("ask", (cx[4], cx[5]), "Ask Size", "left")):
+                self.record(f"{name}.header.{key}.cell", "header_slot", (c0, top, c1 - c0, head_h), f"{name}.header")
+                self.record(f"{name}.header.{key}", "label",
+                            self.text(label, (c0, top, c1 - c0, head_h), THEME["dim"], align), f"{name}.header", label)
+            self.rng.integers(1, 60)                # the size the first row's place would have drawn
         for i in range(n):
-            ry = top + i * row_h
+            ry = rows_top + i * row_h
             rh = min(row_h, bottom - ry)
-            price = center + (mid - i) * tick
+            k = i + lead                            # the row's place counting the header
+            price = center + (mid - k) * tick
             self.fill((cx[1], ry, cx[3] - cx[1], rh), THEME["bid"])
             self.fill((cx[4], ry, cx[6] - cx[4], rh), THEME["ask"])
-            self.fill((cx[3], ry, cx[4] - cx[3], rh), THEME["last" if i == mid else "price"])
+            self.fill((cx[3], ry, cx[4] - cx[3], rh), THEME["last" if k == mid else "price"])
             label = f"{price:.2f}"
             self.text(label, (cx[3], ry, cx[4] - cx[3], row_h), THEME["text"], "center")
             size = str(int(self.rng.integers(1, 60)))
-            if i > mid:
+            if k > mid:
                 self.text(size, (cx[2], ry, cx[3] - cx[2], row_h), THEME["text"], "right")
-            elif i < mid:
+            elif k < mid:
                 self.text(size, (cx[4], ry, cx[5] - cx[4], row_h), THEME["text"], "left")
             self.fill((x, ry + row_h - 1, w, 1), THEME["grid_line"])
             self.record(f"{name}.row{i}", "price_row", (x, ry, w, rh), f"{name}.viewport")

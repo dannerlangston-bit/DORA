@@ -320,7 +320,9 @@ def test_app_crash_fails_app_alive_skips_the_ladder_and_resumes_after_a_relaunch
     assert {o.outcome for o in order[:order.index(frozen)]} == {"identical"}
     (crash,) = [f for f in finds if f.kind == "app_crash"]
     assert crash.checkpoint_id == FREEZE_AT and crash.tier == 1
-    shard = next(s for s in orchestrator(out)[0]["shards"] if FREEZE_AT in json.dumps(s) or s["rig"] == "rig-04")
+    with Store(out / "sentinel.db") as store:                      # the shard that captured the frozen checkpoint
+        (sid,) = store.query("SELECT shard_id FROM outcomes WHERE run_id = ? AND checkpoint_id = ?", (r.run_id, FREEZE_AT))
+    shard = next(s for s in orchestrator(out)[0]["shards"] if s["shard_id"] == sid[0])
     controls = [g["control"] for g in shard["gates"]]
     # Orchestrator.relaunch("app_failure"): every gate again (launch, login, paper mode, attestation, ...); paper mode
     # is also asserted before every unit of work (6.4)

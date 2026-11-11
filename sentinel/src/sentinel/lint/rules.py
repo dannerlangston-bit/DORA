@@ -80,13 +80,15 @@ Choices where the spec is ambiguous (reported):
 17. L-FLW-08 on class paper_send_ok (6.7) reads the order from the flow itself, since the 4.7 header
     has no order block: the fields typed into the ticket (`type_fixture`, by the control id: `qty`,
     `price`, `tif`, `order-type`, `symbol`) and the `equals` assertions on the ticket and dialog (by
-    the region id's last segment) before the one Send click (the Order Confirmation's Send by id,
-    OCR text or JAB name). The limit price is a `fixture.prices.<id>.value`, whose `rule` (`last_delayed
+    the region id's last segment) before the one Send click (a control of `dialog.order-confirmation`
+    that is Send by id, OCR text or JAB name; a Send button on another surface is not it). The limit price is a `fixture.prices.<id>.value`, whose `rule` (`last_delayed
     x <factor>` or `last_delayed - <points>`) gives the last price and so the distance: at least
     `distance_pct_equity` percent (default 20) for an equity, `tick_distance_futures` ticks for a
     future (no default: the policy must declare it), other assets refused. The expected Working row
     text is an `equals`, `matches` or `present` assertion after the send whose text names `working`;
-    the cancel step is a click after the send on a cancel control other than Cancel All. With the
+    the cancel step is a click after the send on a cancel control that is neither Cancel All (any label
+    containing "cancel all") nor send-like by id or label (the gateway's SEND_LIKE_RE, so a Cancel/Replace
+    stays a send path). Cancel All for L-FLW-19 is that same substring match. With the
     policy enabled and signed, that Send click and the cancel clicks after it may target `deny: true`
     controls (the single-use token lifts the deny rectangle for one click, and the row's cancel is
     "allowed only in this class"); nothing else is exempt from L-FLW-13. The library holds no more
@@ -103,7 +105,7 @@ Choices where the spec is ambiguous (reported):
     `pattern`, `min` above `max` and `must_advance` off a time field, and a regions file's landmark
     list (unique ids, PNG templates of 16x16 to 400x400, `confidence_min` in (0, 1]) are L-RGN-00
     (L-MSK-03 for the redaction file's landmarks).
-20. L-POP-02 compares the key after folding its spelling (`_chord`: Control or Ctl as Ctrl, Return and
+20. L-POP-02 and L-FLW-07 compare keys after folding their spelling (`_chord`: Control or Ctl as Ctrl, Return and
     numpad or keypad Enter as Enter, Spacebar as Space, modifiers first). L-POP-04 requires `key` on
     `dismiss_key` and `wait_timeout_ms` on `wait`, and refuses `key`, `target` and
     `wait_timeout_ms` on the actions they do not belong to.
@@ -125,14 +127,41 @@ Choices where the spec is ambiguous (reported):
     flags have no pin. Which outcome each value takes (the 12.7 item that reads it, else `rig_spec_mismatch`,
     SD-71) is `sentinel.fingerprint.rig_spec_check`'s. `fingerprint_differences` is the one pair comparison of
     L-FPR-03 and L-FPR-05; a null reaching it raises.
+24. Identifiers (4.1 with SD-33): a repeated top-level id within its record type is the family's `-00` rule
+    (workspace L-WSP-00, fixture L-FIX-00, manifest L-MAN-00, mask L-MSK-00, pair L-BLD-00; mutant names
+    L-MUT-01), naming the first file. Manifest ids and the manifest file name are checked on files of the
+    checkout only (a manifest overlaid from the product branch is judged on its content), and entry ids are
+    unique within one manifest, since a union manifest repeats its PR manifests' entries (4.3). A workspace id
+    equals its directory name and starts `ws.tier-<a|b|c>.` for its tier.
+25. Ids and refs of 4.2 and 4.3 (their schema comments): `pair_id` and an unresolved candidate or base of a
+    checked-in pair are L-BLD-00; a merge base that is not the latest main build built before the candidate,
+    an rc base that is not the latest released build released by then, and `lineage_baseline_set` on a non-rc
+    pair are L-BLD-04. `manifest_id`, the manifest file name, an unresolved candidate or base, a base other
+    than the base of the pair that names the candidate, and an `entry_id` that is not `<ticket key
+    lowercased>-<n>` are L-MAN-00; a `mock_image` outside `manifests/mocks/` is L-MAN-04. `check_pair` takes the
+    resolver's `base_commit_distance` for SD-02's nearest main ancestor (at most 20 commits back).
+26. L-WSP-05 pins 1920x1080 at 100 percent (resolution and scale, which the rule names) before Phase 3, on the
+    workspace and on every configs/allowed.yaml entry: 4.6 says "phase 1: only", 7.1 that further
+    configurations arrive in Phase 3.
+27. L-POP-05 matches seed titles as the Executor matches window titles (`re.search`), over the entries not
+    retired, and also reports an entry's own seed title that its regex misses.
+28. A flows/RENAMES.yaml entry whose `old` is a surface id (no slash) is a surface rename, 2.2.4's rename map:
+    every checkpoint id of the old surface follows it (sentinel.lint.diffmode applies it). Every entry's
+    `build` is a build of builds/ (L-FLW-03).
+29. fixtures/margin_rules.yaml coverage is L-FIX-00: a bracket for (the asset of the flow's first typed
+    `fixture.symbols.<id>`, the golden account's kind) of every flow with an R02 assertion, as the Oracle's
+    evaluation context reads them, and an `initial_margin` for every futures root of a ticket or ladder symbol.
+30. L-SRF-12 (and the 2.6.3 flow side, `requires: [paper_send]`), L-WSP-08 and L-WSP-09, the odd-input corpus,
+    and the calibration-file rules (L-XREF-04, L-XREF-05, L-XREF-11 on calibration/, L-RGN-06) are the check
+    modules flow_classes, corpus and calibration_files; the history rules (removed checkpoint and surface ids,
+    L-XREF-10, L-MSK-04, L-MSK-05), L-MSK-01 against the Central Store and L-MAN-10 are sentinel.lint.diffmode.
 
 Rules checked only in part from files (the rest needs live state, history or a store; reported):
-L-DEP-07 (the 90 days after the first Phase 1 scan), L-FLW-03 (that a removed id was renamed needs
-the previous commit; the rename map itself is checked), L-FLW-13 (the 6.8 Explorer deny list has no
-file), L-RGN-02 (bounds from the last calibration), L-RGN-04 (the zero floor lives in calibration),
+L-FLW-13 (the 6.8 Explorer deny list has no file), L-RGN-02 (bounds from the last calibration: the
+calibration file records no captured bounds), L-RGN-04 (the zero floor lives in calibration),
 L-RGN-08 (the `money_cell: true` without `money_role` half waits for the regions migration, see
-sentinel.lint.checks.money_roles), L-MSK-01 (the decision record is in the Central Store), L-POP-06
-(counts the released builds present in builds/), L-XREF-04 and L-XREF-11 (calibration files), L-XREF-15
+sentinel.lint.checks.money_roles), L-MSK-01 (the decision record is in the Central Store:
+diffmode.store_rules), L-POP-06 (counts the released builds present in builds/), L-XREF-15
 (JAB fields are reported by L-SRF-09).
 
 Public API beyond `lint`: `check_pair` (L-BLD-04 and L-BLD-05 at run creation, 4.2), `panel_share` and
@@ -158,6 +187,7 @@ from .. import checkpoints as cps
 from ..canonical import epoch_id
 from ..canonical import fingerprint_id_of as fingerprint_id
 from ..diff import load_params as load_diff_params
+from ..oddinput import REF_PREFIX as ODD_INPUT_PREFIX
 from ..taxonomy import is_checkpoint_id, is_slug, load as load_taxonomy
 from . import schemas
 from .repo import Doc, Repo
@@ -179,6 +209,9 @@ _RUN_START = "run start only: checked against live state by the Orchestrator bef
 # A rule of the section 4 tables whose check body is not written yet: the lint lists it as pending until a
 # `sentinel.lint.checks` module names it in its RULE_IDS (see run_check_modules).
 _PENDING = "pending: no check body yet; the owning package adds it as a sentinel.lint.checks module"
+# Rules that compare two trees of the repository: the --all lint lists them as skipped; `sentinel lint --changed BASE`
+# (sentinel.lint.diffmode.lint_changed) checks them and drops them from its skipped list.
+_HISTORY = "history: checked by `sentinel lint --changed BASE` (sentinel.lint.diffmode), which reads "
 # Record rules of 4.13 and 4.14: the Run Store refuses the row on write (8.3); a config checkout holds no records.
 _ON_WRITE = "record rule: enforced by the Run Store on write (4.13, 4.14, 8.3), not by the config lint"
 
@@ -201,7 +234,8 @@ RULES: dict[str, Rule] = {r.id: r for r in (
     Rule("L-MAN-08", "error", "feature flag names match ^[a-z0-9_.]+$ and are unique within the entry"),
     Rule("L-MAN-09", "error", "manifest candidate equals the pair's candidate", _RUN_START),
     Rule("L-MAN-10", "error", "new_surface agrees with the base build's registry",
-         "needs the base build's registry commit and the ticket type, which the config files do not hold"),
+         "needs the base build's registry commit and the ticket type: checked by sentinel.lint.diffmode."
+         "lint_manifest_against_base (`sentinel lint --manifest PATH --base-ref REV`, and at run start)"),
     Rule("L-DEP-00", "error", "dependency map reads and validates against schemas/dependency-map.schema.json"),
     Rule("L-DEP-01", "error", "primitive ids unique and PascalCase with source_packages; TBD globs warn in Phase 0, error after"),
     Rule("L-DEP-02", "error", "edge surface exists, is a glob matching a registry id, or is * on a global primitive"),
@@ -276,9 +310,9 @@ RULES: dict[str, Rule] = {r.id: r for r in (
     Rule("L-MSK-02", "error", "expires_at is in the future (CI); at run start the mask is dropped and listed in run health"),
     Rule("L-MSK-03", "error", "masked plus non-identity redacted area per panel class within the mask budget"),
     Rule("L-MSK-04", "warn", "mask growth over 30 days at most 2 percent of a tier-1 checkpoint",
-         "needs the mask history of the last 30 days (git history and the regions table)"),
+         _HISTORY + "the tree of 30 days ago"),
     Rule("L-MSK-05", "error", "a renewal quotes the latest nightly A/A result",
-         "needs the previous version of the mask (git history) and the nightly A/A results"),
+         _HISTORY + "the previous version of the mask and the nightly A/A results"),
     Rule("L-FIX-00", "error", "fixture and allowlist read and validate against their schemas"),
     Rule("L-FIX-01", "error", "account ids match ^D-[0-9A-Z]+$ and appear exactly in the rig's allowlist; no patterns"),
     Rule("L-FIX-02", "error", "one golden account, at most one empty; no cash_floor when sends are enabled"),
@@ -296,14 +330,15 @@ RULES: dict[str, Rule] = {r.id: r for r in (
     Rule("L-POP-02", "error", "dismiss_key is not Enter, Space or Ctrl+Enter"),
     Rule("L-POP-03", "error", "Order Confirmation, Confirm or Send titles are safety kill-switch entries; no click on consent labels"),
     Rule("L-POP-04", "error", "class, click template and target, on_abort, INV-14 routing and taxonomy reasons are consistent"),
-    Rule("L-POP-05", "warn", "no two entries match one title of either entry's seed_titles", _PENDING),
+    Rule("L-POP-05", "warn", "no two entries match one title of either entry's seed_titles"),
     Rule("L-POP-06", "warn", "last_seen_build at most three releases old"),
     Rule("L-MUT-00", "error", "mutant catalog reads and every entry validates against schemas/mutant.schema.json"),
     Rule("L-MUT-01", "error", "mutant ids unique, M01 to M33 equal to 12.5 then M34 on; seed; region_ref exists on the "
          "checkpoint; the file is {schema_version, entries}"),
     Rule("L-MUT-02", "error", "money-cell mutants expect a detecting outcome; only controls expect identical or noise"),
     Rule("L-MUT-03", "error", "every critical checkpoint has at least two behavioral mutants bound to it", _PENDING),
-    Rule("L-MUT-04", "error", "behavioral mutants name a canary flow without confirm-and-send; image mutants do not"),
+    Rule("L-MUT-04", "error", "behavioral mutants name a canary flow, which may hold one order-stage Confirm and Send step "
+         "closed by Delete through the dismiss allowlist and never targets Send (SD-45); image mutants name none"),
     Rule("L-MUT-05", "error", "the six brief classes are bound to tier-1 checkpoints; color_swap expects INV-15"),
     Rule("L-MUT-06", "error", "invariant ids exist in the 2.7 catalog"),
     Rule("L-FPR-00", "error", "fingerprint validates against schemas/fingerprint.schema.json"),
@@ -347,7 +382,7 @@ RULES: dict[str, Rule] = {r.id: r for r in (
     Rule("L-XREF-08", "error", "taxonomy.yaml equals the harness taxonomy generated from the spec"),
     Rule("L-XREF-09", "error", "schemas/*.schema.json regenerate identically from the notation"),
     Rule("L-XREF-10", "error", "changed checkpoint ids, templates or rects carry a rename or recalibrate marker",
-         "needs the pull request's diff and the approved checkpoints"),
+         _HISTORY + "the pull request's base tree and the approved checkpoints"),
     Rule("L-XREF-11", "error", "every checkpoint id matches the 4.1 grammar and names a registered surface; quarantined "
          "flows exist"),
     Rule("L-XREF-12", "error", "every 12.8 starter popup present unless retired; M01 to M33 equal their 12.5 rows; further "
@@ -412,6 +447,12 @@ EXPLORER_BUDGET_6_8 = {"max_actions": 400, "max_minutes": 90, "max_no_change_act
                        "max_usd_per_session": 25, "max_usd_per_week": 500}
 FROZEN_MASK_SEGMENTS = ("clock", "connection-indicator", "caret", "parking")
 CARET_SEGMENT = "caret"                   # allowed on a frozen checkpoint only with keep_focus: true (SD-27, L-RGN-07)
+ORDER_CONFIRMATION = "dialog.order-confirmation"       # the surface whose Send the 6.7 send token lifts
+NOT_A_BUILD = "is not a build of builds/"              # an unresolved ref:build.build_id (L-BLD-00, L-MAN-00)
+EVERY_CHECKPOINT = "*"                                 # an aa_control mutant's checkpoint_id: every bound one (SD-43)
+# 7.1 and L-WSP-05: one display configuration until Phase 3 opens more (1920x1080 at 100 percent)
+PINNED_DISPLAY = {"width": 1920, "height": 1080, "scale_percent": 100}
+MORE_DISPLAYS_PHASE = 3
 MONEY_PANELS = ("order_confirmation", "order_ticket")       # the panels money_role may sit on (SD-28, L-RGN-08)
 # operands of the rule assertion kind: (required, optional) per rule, generated from the 2.8.3 operand table through
 # taxonomy.yaml `rule_operands` (SD-34)
@@ -434,7 +475,7 @@ INV_IDS = tuple(f"INV-{n:02d}" for n in range(1, 16))      # the invariants of 2
 FUTURE_MONTH = re.compile(r"^/(?P<root>[A-Z0-9]+?)(?P<month>[FGHJKMNQUVXZ])(?P<year>[0-9]{2})$")
 MONTH_CODES = "FGHJKMNQUVXZ"              # January to December (4.9 futures month code)
 VAULT_REF = re.compile(r"^vault://[^#]+#.+$")               # 4.1 secrets: vault://<path>#<field>
-# L-POP-02 after chord normalization (`_chord`): Enter, Space and Ctrl+Enter in every spelling
+# L-POP-02 and L-FLW-07 after chord normalization (`_chord`): Enter, Space and Ctrl+Enter in every spelling
 ENTER_KEYS = frozenset({"enter", "space", "ctrl+enter"})
 _KEY_SYNONYMS = {"return": "enter", "numpad_enter": "enter", "numpadenter": "enter", "kp_enter": "enter",
                  "keypad_enter": "enter", "spacebar": "space", "space_bar": "space", "control": "ctrl", "ctl": "ctrl"}
@@ -725,18 +766,28 @@ def _labels(control: dict) -> set[str]:
 
 
 def _is_cancel_all(control: dict) -> bool:
-    """Cancel All by id, OCR text or JAB name (L-FLW-19)."""
-    return control.get("id") == "cancel-all" or "cancel all" in _labels(control)
+    """Cancel All by id, or an OCR text or JAB name that contains "cancel all" ("Cancel All Orders" too; L-FLW-19)."""
+    return control.get("id") == "cancel-all" or any("cancel all" in t for t in _labels(control))
 
 
 def _is_send(control: dict) -> bool:
-    """The Order Confirmation dialog's Send button by id, OCR text or JAB name (6.7)."""
+    """A Send button by id, OCR text or JAB name; the gated send is this button on the Order Confirmation (6.7)."""
     return control.get("id") in ("send", "send-button") or "send" in _labels(control)
 
 
+def _send_like(control: dict) -> bool:
+    """An id or label the gateway treats as a send path (5.4.3 SEND_LIKE_RE: send, submit, replace, flatten, blast,
+    auto); the one pattern, imported from the gateway."""
+    from ..orchestrator.gateway import SEND_LIKE_RE     # lazy: the orchestrator package is large
+
+    return any(SEND_LIKE_RE.search(t) for t in (_s(control.get("id")), *_labels(control)))
+
+
 def _is_cancel(control: dict) -> bool:
-    """A cancel action other than Cancel All: id, OCR text or JAB name naming cancel (6.7 "the row's cancel action")."""
-    return not _is_cancel_all(control) and ("cancel" in _s(control.get("id")) or any("cancel" in t for t in _labels(control)))
+    """The Working row's cancel action (6.7): an id, OCR text or JAB name naming cancel that is neither Cancel All nor
+    send-like (a Cancel/Replace is a replace, a send path)."""
+    named = "cancel" in _s(control.get("id")) or any("cancel" in t for t in _labels(control))
+    return named and not _is_cancel_all(control) and not _send_like(control)
 
 
 _CLICKS = ("click_named", "rclick", "dblclick")
@@ -766,6 +817,13 @@ def _channel(build_id: str) -> str:
 
 def _short_sha(build_id: str) -> str:
     return build_id.rsplit("-", 1)[-1] if isinstance(build_id, str) else ""
+
+
+def surface_rename(entry: Any) -> bool:
+    """A flows/RENAMES.yaml entry that renames a surface rather than one checkpoint: its `old` is a surface id (no
+    slash), and every checkpoint id of that surface follows it (2.2.4, choice 28)."""
+    old = _d(entry).get("old")
+    return isinstance(old, str) and "/" not in old and is_slug(old)
 
 
 def _id_diff(got: set, want: Iterable[str]) -> str:
@@ -814,7 +872,7 @@ _SCHEMA_OF: dict[str, tuple[str, str]] = {      # doc kind -> (schema name, rule
     "palette": ("palette", "L-XREF-30"), "soak": ("soak", "L-XREF-27"),
     "calibration": ("calibration", "L-RGN-00"), "eval_report": ("eval-report", "L-XREF-29"),
 }
-_CATALOGS = {"popups": ("popup#popup", "L-POP-00", "entries"), "mutants": ("mutant#mutant", "L-MUT-00", "mutants")}   # one catalog entry
+_CATALOGS = {"popups": ("popup#popup", "L-POP-00", "entries"), "mutants": ("mutant#mutant", "L-MUT-00", "entries")}   # one catalog entry
 
 
 def _rule_view(repo: Repo) -> Repo:
@@ -1041,7 +1099,7 @@ class _Linter:
     # -- run -------------------------------------------------------------------------------------
 
     def run(self) -> list[Violation]:
-        for check in (self.check_schemas, self.check_builds, self.check_manifests, self.check_depmap,
+        for check in (self.check_schemas, self.check_identifiers, self.check_builds, self.check_manifests, self.check_depmap,
                       self.check_surfaces, self.check_ladders, self.check_workspaces, self.check_flows,
                       self.check_renames, self.check_regions, self.check_masks, self.check_fixtures,
                       self.check_popups, self.check_mutants, self.check_fingerprint_schema, self.check_xref):
@@ -1079,6 +1137,53 @@ class _Linter:
                     if any(isinstance(rect.get(k), int) and not isinstance(rect.get(k), bool) and rect[k] <= 0 for k in ("w", "h")):
                         self.add(rule, doc.rel, "rect w and h are positive sizes", f"regions[{i}].rect")
 
+    # -- 4.1 identifiers (SD-33) -------------------------------------------------------------------
+
+    def _unique(self, rule: str, what: str, found: Iterable[tuple[Any, str, str]]) -> None:
+        """Report every repeat of an id of one record type across the repository, naming the first file (4.1)."""
+        first: dict[Any, str] = {}
+        for rid, file, path in found:
+            if not isinstance(rid, str):
+                continue
+            if rid in first:
+                self.add(rule, file, f"{what} {rid} is also defined in {first[rid]}; ids are unique across the "
+                                     "repository (4.1)", path)
+            first.setdefault(rid, file)
+
+    def _checkout_manifests(self) -> list[Doc]:
+        """The manifests that are files of the checkout. A manifest linted from elsewhere (the product branch's
+        `.sentinel/manifest.yaml` overlaid by `sentinel lint --manifest` or runstart.lint_manifest) is checked on its
+        content, not on its path or against the run's own copy of it (choice 24)."""
+        return [d for d in self.r.of("manifest") if self.r.exists(d.rel)]
+
+    def check_identifiers(self) -> None:
+        """4.1 Common conventions with SD-33: top-level record ids are unique within their record type across the whole
+        repository; a repeat is the family's `-00` rule (choice 24; flow and surface ids keep L-FLW-01 and L-SRF-01,
+        popup names L-POP-01). A workspace id is its directory name and carries its tier: `ws.tier-<a|b|c>.<name>`."""
+        self._unique("L-WSP-00", "workspace id", ((_d(d.data).get("id"), d.rel, "id") for d in self.r.of("workspace")))
+        for doc in self.r.of("workspace"):
+            w = _d(doc.data)
+            wid, tier = w.get("id"), w.get("tier")
+            if not isinstance(wid, str):
+                continue
+            if Path(doc.rel).parent.name != wid:
+                self.add("L-WSP-00", doc.rel, f"workspace id {wid} differs from its directory corpus/workspaces/"
+                                              f"{Path(doc.rel).parent.name}/ (4.1)", "id")
+            if isinstance(tier, str) and not wid.startswith(f"ws.tier-{tier.lower()}."):
+                self.add("L-WSP-00", doc.rel, f"workspace id {wid} does not carry its tier: ws.tier-{tier.lower()}.<name> "
+                                              "(4.6)", "id")
+        self._unique("L-FIX-00", "fixture_id", ((_d(d.data).get("fixture_id"), d.rel, "fixture_id") for d in self.r.of("fixture")))
+        self._unique("L-MAN-00", "manifest_id", ((_d(d.data).get("manifest_id"), d.rel, "manifest_id")
+                                                 for d in self._checkout_manifests()))
+        for d in self.r.of("manifest"):          # a union manifest repeats its PR manifests' entries (4.3): per manifest
+            self._unique("L-MAN-00", "entry_id", ((_d(e).get("entry_id"), d.rel, f"entries[{i}].entry_id")
+                                                  for i, e in enumerate(_l(_d(d.data).get("entries")))))
+        self._unique("L-MSK-00", "mask_id", ((_d(d.data).get("mask_id"), d.rel, "mask_id") for d in self.r.of("mask")))
+        self._unique("L-BLD-00", "pair_id", ((_d(_d(d.data).get("build_pair")).get("pair_id"), d.rel, "build_pair.pair_id")
+                                             for d in self.r.of("build")))
+        f_mut, mutants = self._catalog("mutants", "entries")
+        self._unique("L-MUT-01", "mutant name", ((m.get("name"), f_mut, f"[{i}].name") for i, m in enumerate(mutants)))
+
     # -- 4.2 builds ------------------------------------------------------------------------------
 
     def check_builds(self) -> None:
@@ -1108,12 +1213,66 @@ class _Linter:
                 self.add("L-BLD-06", doc.rel, "released_at is present if and only if channel is released", "build.released_at")
         for rel, p in self.pairs:
             self.out.extend(check_pair(p, self.builds, rel))
+            self._pair_refs(rel, p)
+
+    def _pair_refs(self, rel: str, p: dict) -> None:
+        """A checked-in pair (4.2 schema comments): `pair_id` is `<run_type>-<candidate>-vs-<base>`, candidate and base
+        are builds of builds/ (L-BLD-00 on a miss, choice 1), and a merge base is the previous main build, an rc base
+        the last released build, by `built_at` and `released_at` among builds/ (L-BLD-04; choice 25)."""
+        cand, base, rt = p.get("candidate"), p.get("base"), p.get("run_type")
+        want = f"{rt}-{cand}-vs-{base}"
+        if p.get("pair_id") != want:
+            self.add("L-BLD-00", rel, f"pair_id {p.get('pair_id')} must be {want}", "build_pair.pair_id")
+        for side, bid in (("candidate", cand), ("base", base)):
+            if bid not in self.builds:
+                self.add("L-BLD-00", rel, f"{side} {bid} {NOT_A_BUILD}", f"build_pair.{side}")
+        cb, bt = _d(self.builds.get(cand)), _ts(_d(self.builds.get(cand)).get("built_at"))
+        if not cb or bt is None or base not in self.builds:
+            return
+        if rt == "merge":
+            prev = [(t, bid) for bid, b in self.builds.items() if b.get("channel") == "main" and bid != cand
+                    and (t := _ts(b.get("built_at"))) and t < bt]
+            if prev and max(prev)[1] != base:
+                self.add("L-BLD-04", rel, f"merge base {base} is not the previous main build {max(prev)[1]}", "build_pair.base")
+        if rt == "rc":
+            last = [(t, bid) for bid, b in self.builds.items() if b.get("channel") == "released"
+                    and (t := _ts(b.get("released_at"))) and t <= bt]
+            if last and max(last)[1] != base:
+                self.add("L-BLD-04", rel, f"rc base {base} is not the last released build {max(last)[1]}", "build_pair.base")
 
     # -- 4.3 manifests ---------------------------------------------------------------------------
+
+    def _manifest_refs(self, doc: Doc, m: dict) -> None:
+        """The 4.3 schema comments and the 4.1 layout (choice 25): `manifest_id` is `mf-<candidate>`, the file is
+        `manifests/<candidate>.yaml`, candidate and base are builds of builds/ (L-MAN-00 on a miss, choice 1), the base
+        is the base of the pair that names the candidate, and each `entry_id` is `<ticket key lowercased>-<n>` for one
+        of the entry's tickets. `mock_image` lies under `manifests/mocks/` (L-MAN-04)."""
+        cand, base = m.get("candidate"), m.get("base")
+        if isinstance(cand, str):
+            if m.get("manifest_id") != f"mf-{cand}":
+                self.add("L-MAN-00", doc.rel, f"manifest_id {m.get('manifest_id')} must be mf-{cand}", "manifest_id")
+            if doc.rel != f"manifests/{cand}.yaml" and self.r.exists(doc.rel):
+                self.add("L-MAN-00", doc.rel, f"a manifest is manifests/<candidate build_id>.yaml: manifests/{cand}.yaml")
+        for side, bid in (("candidate", cand), ("base", base)):
+            if bid not in self.builds:
+                self.add("L-MAN-00", doc.rel, f"{side} {bid} {NOT_A_BUILD}", side)
+        pair_base = {p.get("base") for _rel, p in self.pairs if p.get("candidate") == cand and p.get("run_type") != "nightly"}
+        if pair_base and base not in pair_base:
+            self.add("L-MAN-00", doc.rel, f"base {base} is not the base of the pair for {cand} ({', '.join(sorted(map(str, pair_base)))})",
+                     "base")
+        for i, e in enumerate(map(_d, _l(m.get("entries")))):
+            eid, keys = e.get("entry_id"), [t.lower() for t in _l(e.get("tickets")) if isinstance(t, str)]
+            if isinstance(eid, str) and keys and not any(re.fullmatch(re.escape(k) + r"-[0-9]+", eid) for k in keys):
+                self.add("L-MAN-00", doc.rel, f"entry_id {eid} is not <ticket key lowercased>-<n> of {', '.join(keys)}",
+                         f"entries[{i}].entry_id")
+            mock = e.get("mock_image")
+            if isinstance(mock, str) and not mock.startswith("manifests/mocks/"):
+                self.add("L-MAN-04", doc.rel, f"mock_image {mock} is not under manifests/mocks/", f"entries[{i}].mock_image")
 
     def check_manifests(self) -> None:
         for doc in self.r.of("manifest"):
             m = _d(doc.data)
+            self._manifest_refs(doc, m)
             entries = _l(m.get("entries"))
             if not entries and not m.get("empty_reason"):
                 self.add("L-MAN-06", doc.rel, "entries is empty and empty_reason is missing", "entries")
@@ -1209,6 +1368,11 @@ class _Linter:
             lv = _ts(e.get("last_verified"))
             if lv and self.now - lv > timedelta(days=90):
                 self.add("L-DEP-07", f, f"last_verified {e.get('last_verified')} is older than 90 days", f"{at}.last_verified")
+            first_scan = _date(self.depmap.get("first_scan_at"))      # no clock runs while first_scan_at is absent
+            if (first_scan and self.today - first_scan >= timedelta(days=90) and e.get("confirmed_from_source") is not True
+                    and surf != "*" and not _d(p).get("global")):
+                self.add("L-DEP-07", f, f"edge {prim} -> {surf} is unconfirmed 90 days after the first Phase 1 scan "
+                                        f"({first_scan})", f"{at}.confirmed_from_source")
         for sid, s in self.surfaces.items():
             for prim in _l(s.get("primitives")):
                 if prim in self.primitives and not any(e.get("primitive") == prim and sid in self.expand(e.get("surface")) for e in self.edges):
@@ -1414,6 +1578,8 @@ class _Linter:
                 else:
                     self.add("L-WSP-02", f, "tier A entries name their persona", "persona")
             if tier == "B":
+                if w.get("persona") not in personas:          # SD-17: a tier B entry carries its persona tag (2.12)
+                    self.add("L-WSP-02", f, "tier B entries name their persona (SD-17)", "persona")
                 sub = w.get("saved_under_build")
                 if not sub:
                     self.add("L-WSP-03", f, "tier B entries carry saved_under_build", "saved_under_build")
@@ -1429,6 +1595,7 @@ class _Linter:
             dc = _d(w.get("display_config"))
             if {k: dc.get(k) for k in ("width", "height", "scale_percent", "theme", "font_size")} not in allowed:
                 self.add("L-WSP-05", f, "display_config is not listed in configs/allowed.yaml", "display_config")
+            self._pinned_display(f, "display_config", dc)
             panels = {_d(p).get("surface") for p in _l(w.get("active_trader_panels"))}
             for g in _l(w.get("gadgets_present")):
                 if g not in self.surfaces:
@@ -1452,6 +1619,17 @@ class _Linter:
             for p, files in personas.items():
                 if len(files) != 1:
                     self.add("L-WSP-02", "corpus/workspaces", f"persona {p} has {len(files)} tier A entries; exactly one is required")
+        for i, c in enumerate(_l(_d(allowed_doc.data).get("configs") if allowed_doc else [])):
+            self._pinned_display(allowed_doc.rel if allowed_doc else "configs/allowed.yaml", f"configs[{i}]", _d(c))
+
+    def _pinned_display(self, f: str, path: str, dc: dict) -> None:
+        """L-WSP-05 (choice 26): before Phase 3 a display configuration is 1920x1080 at 100 percent, in a workspace
+        and in configs/allowed.yaml alike (4.6 "phase 1: only 1920x1080 at 100 percent"; 7.1: further
+        configurations arrive in Phase 3)."""
+        got = {k: dc.get(k) for k in PINNED_DISPLAY}
+        if self.phase < MORE_DISPLAYS_PHASE and got != PINNED_DISPLAY:
+            self.add("L-WSP-05", f, f"{got['width']}x{got['height']} at {got['scale_percent']} percent; until Phase "
+                                    f"{MORE_DISPLAYS_PHASE} the one display configuration is 1920x1080 at 100 percent", path)
 
     # -- 4.7 flows -------------------------------------------------------------------------------
 
@@ -1571,6 +1749,8 @@ class _Linter:
             if st.get("type") == "type_fixture" and isinstance(st.get("value"), str):
                 if credential_hits(f"value: {st['value']}"):
                     self.add("L-FLW-06", f, "a value literal matches a credential pattern", f"{at}.value")
+            if st.get("type") == "type_fixture" and isinstance(st.get("value_ref"), str):
+                self._typed_ref(f, f"{at}.value_ref", st["value_ref"], fl)
             if st.get("type") == "drag":
                 if not (isinstance(st.get("steps"), int) and st["steps"] >= 10):
                     self.add("L-FLW-09", f, "drag steps is at least 10", f"{at}.steps")
@@ -1600,6 +1780,22 @@ class _Linter:
                 self.add("L-FLW-08", f, "class paper_send_ok needs policy/send_policy.yaml enabled: true with a risk-owner signature", "class")
             self._paper_send_ok(fl, f)
 
+    def _typed_ref(self, f: str, at: str, ref: str, fl: dict) -> None:
+        """A type_fixture `value_ref` (4.7) is a fixture path the flow's fixture resolves (L-FLW-00, choice 5), or an
+        `odd_inputs.<id>`, which sentinel.lint.checks.corpus resolves against corpus/odd-inputs.yaml."""
+        from ..oracle.tables import resolve_ref     # lazy: sentinel.oracle imports this module
+
+        if ref.startswith(ODD_INPUT_PREFIX):
+            return
+        fxid = fl.get("fixture")
+        fdoc = self.fixtures.get(fxid) if isinstance(fxid, str) else None
+        if fdoc is None:
+            return                                  # the missing fixture is L-FLW-00 already
+        try:
+            resolve_ref(_d(fdoc.data), ref)
+        except ValueError as exc:
+            self.add("L-FLW-00", f, f"value_ref does not resolve in the flow's fixture: {exc}", at)
+
     # -- 6.7 gated branch: the paper_send_ok order (L-FLW-08) ----------------------------------------
 
     def _send_policy_on(self) -> bool:
@@ -1608,6 +1804,12 @@ class _Linter:
 
     def _ctl(self, st: dict) -> dict:
         return _d(self.controls.get(_s(st.get("target")), (None, {}))[1])
+
+    def _order_send(self, st: dict) -> bool:
+        """A step that clicks the Order Confirmation dialog's Send: the one click the send token lifts (6.7); a Send
+        button on any other surface is not it."""
+        sid, ctl = self.controls.get(_s(st.get("target")), (None, {}))
+        return sid == ORDER_CONFIRMATION and _is_send(_d(ctl))
 
     def _send_steps(self, fl: dict) -> set[Any]:
         """The steps the gated branch lets touch a denied control (6.7, 5.4): the one Send click after the
@@ -1618,7 +1820,7 @@ class _Linter:
         if stage is None:
             return set()
         clicks = [(k, st) for k, st in enumerate(seq) if k > stage and st.get("type") in _CLICKS]
-        send = next((k for k, st in clicks if _is_send(self._ctl(st))), None)
+        send = next((k for k, st in clicks if self._order_send(st)), None)
         if send is None:
             return set()
         return {seq[send].get("id")} | {st.get("id") for k, st in clicks if k > send and _is_cancel(self._ctl(st))}
@@ -1665,7 +1867,7 @@ class _Linter:
             self.add("L-FLW-08", f, f"paper_send_ok: {message}", path)
 
         stage = next((k for k, st in enumerate(seq) if st.get("order_stage") is True), None)
-        sends = [k for k, st in enumerate(seq) if st.get("type") in _CLICKS and _is_send(self._ctl(st))]
+        sends = [k for k, st in enumerate(seq) if st.get("type") in _CLICKS and self._order_send(st)]
         if stage is None or len(sends) != 1 or sends[0] < stage:
             bad("exactly one Send click, after the order-stage step; the send token lifts the dialog allowlist for one "
                 "click and a second is an attempted send (6.7)", "steps")
@@ -1939,8 +2141,14 @@ class _Linter:
             if st.get("type") == "teardown" and st.get("action") in ("close_dialog", "clear_ticket"):
                 closed = k
                 break
-            keys = [_s(st.get("key")).casefold()] if st.get("type") == "press" else \
-                [_s(x).casefold() for x in _l(st.get("keys"))] if st.get("type") == "key_chord" else []
+            # every spelling folded as L-POP-02 folds it (`_chord`): return, spacebar, numpad enter, Control+Return
+            if st.get("type") == "press":
+                keys = [_chord(_s(st.get("key")))]
+            elif st.get("type") == "key_chord":
+                raw = [_s(x) for x in _l(st.get("keys"))]
+                keys = [_chord("+".join(raw))] + [_chord(x) for x in raw]
+            else:
+                keys = []
             # a type_fixture (or secret) step that commits with Enter presses Enter too (6.2)
             if st.get("type") in ("type_fixture", "secret") and _s(st.get("commit")).casefold() == "enter":
                 keys.append("enter")
@@ -1968,8 +2176,22 @@ class _Linter:
             self.add("L-FLW-10", f, f"max_duration_s {dur} exceeds {limit:g} s (3 x measured p50, 5 minutes until measured; 11.2)", "budget.max_duration_s")
 
     def check_renames(self) -> None:
+        """L-FLW-03 on flows/RENAMES.yaml: each entry's build is a build of builds/; a checkpoint entry's old id is no
+        longer defined and its new id is (or `retired`); a surface entry (choice 28: old and new are surface ids,
+        2.2.4's rename map, which renames every checkpoint of the surface) names an old id the registry no longer
+        has and a new id it has (or `retired`)."""
         for i, x in enumerate(self.renames):
             old, new = x.get("old"), x.get("new")
+            if x.get("build") not in self.builds:
+                self.add("L-FLW-03", self.renames_file, f"build {x.get('build')} {NOT_A_BUILD}", f"renames[{i}].build")
+            if surface_rename(x):
+                if old in self.surfaces:
+                    self.add("L-FLW-03", self.renames_file, f"renamed or retired surface {old} is still registered",
+                             f"renames[{i}].old")
+                if new != "retired" and new not in self.surfaces:
+                    self.add("L-FLW-03", self.renames_file, f"rename target surface {new} is not registered (or 'retired')",
+                             f"renames[{i}].new")
+                continue
             if old in self.defined:
                 self.add("L-FLW-03", self.renames_file, f"renamed or retired id {old} is still defined", f"renames[{i}].old")
             if new != "retired" and new not in self.defined:
@@ -2064,7 +2286,10 @@ class _Linter:
                 self.add(rule, f, f"confidence_min {cm!r} is not in (0, 1]", f"landmarks[{i}].confidence_min")
 
     def _region_rule(self, f: str, at: str, x: dict) -> None:
-        """A region's `rule` block (4.8): its pattern compiles, min <= max, must_advance only on a time field."""
+        """A region's `rule` block (4.8): its pattern compiles, min <= max, must_advance only on a time field, and,
+        when those hold, the Oracle's own parser (`oracle.region_rules.RegionRule.from_dict`) accepts it, so a rule
+        the Oracle cannot evaluate is config_invalid at run start, not an OracleConfigError on every run (4.15)."""
+        found = len(self.out)
         rule = _d(x.get("rule"))
         if isinstance(rule.get("pattern"), str):
             try:
@@ -2076,6 +2301,14 @@ class _Linter:
             self.add("L-RGN-00", f, f"rule min {lo:g} is above max {hi:g}", f"{at}.rule")
         if rule.get("must_advance") is True and rule.get("field") != "time":
             self.add("L-RGN-00", f, f"must_advance is for time fields, not {rule.get('field')}", f"{at}.rule.must_advance")
+        if len(self.out) == found and x.get("type") == "rule" and isinstance(x.get("rule"), dict):
+            from ..oracle.region_rules import CHECKS, RegionRule     # lazy: sentinel.oracle imports this module
+
+            if set(rule) <= set(CHECKS):               # an unknown field is the schema's failure (L-RGN-00) already
+                try:
+                    RegionRule.from_dict(_s(x.get("id")), rule)
+                except (ValueError, TypeError, ArithmeticError) as exc:     # OracleConfigError is a ValueError
+                    self.add("L-RGN-00", f, f"the Oracle refuses this rule: {exc}", f"{at}.rule")
 
     def _money_cell(self, f: str, at: str, x: dict, cid: str, c: CheckpointDef | None) -> None:
         """L-RGN-04: a money cell is never a mask and keeps a zero floor. On a flow checkpoint it is diff or freeze
@@ -2224,6 +2457,53 @@ class _Linter:
                 self.add("L-FIX-05", f, f"order_defaults_profile {fx.get('order_defaults_profile')} is not an order_defaults profile in profiles/", "order_defaults_profile")
             self._fixture_epoch(fx, f, symbols)
             self._fixture_positions(fx, f, accounts, symbols, ids)
+        self._margin_coverage()
+
+    def _margin_coverage(self) -> None:
+        """L-FIX-00 on fixtures/margin_rules.yaml (4.9, 2.8.3 R02; choice 29), so a missing bracket fails CI instead of
+        raising OracleConfigError at run time: every flow with an R02 assertion has a bracket for its symbol's asset
+        class on the fixture's golden account kind (what the Oracle's evaluation context reads: the flow's first
+        `fixture.symbols.<id>` typed value, and the golden account), and every futures root of a fixture symbol with
+        purpose ticket or ladder has an `initial_margin`. Without the file the Oracle's default brackets apply."""
+        from ..oracle.tables import DEFAULT_MARGIN, symbol_asset, symbol_root     # lazy: sentinel.oracle imports this
+
+        doc = self.r.one("margin_rules")
+        f = doc.rel if doc else "fixtures/margin_rules.yaml"
+        if any(v.file == f and v.rule == "L-FIX-00" for v in self.out):
+            return                                  # a file failing its schema is fixed before its coverage is judged
+        if doc is not None:
+            m = _d(doc.data)
+            brackets = {(_d(b).get("asset"), _d(b).get("account")) for b in _l(m.get("brackets"))}
+            initial = set(_d(m.get("initial_margin")))
+        else:
+            brackets = {(b.asset, b.account) for b in DEFAULT_MARGIN.brackets}
+            initial = set(DEFAULT_MARGIN.initial_margin)
+        for fid, fdoc in sorted(self.flows.items()):
+            fl = _d(fdoc.data)
+            r02 = any(_d(a).get("kind") == "rule" and _d(a).get("rule_id") == "R02" for st in self._seq(fl)
+                      for a in _l(st.get("expect")) + _l(st.get("assertions")))
+            fxid = fl.get("fixture")
+            fx = _d(self.fixtures[fxid].data) if r02 and isinstance(fxid, str) and fxid in self.fixtures else None
+            if fx is None:
+                continue
+            ref = next((_s(st.get("value_ref")) for st in self._seq(fl) if st.get("type") == "type_fixture"
+                        and _s(st.get("value_ref")).startswith("fixture.symbols.")), "")
+            sym = next((_s(_d(s).get("symbol")) for s in _l(fx.get("symbols")) if ref == f"fixture.symbols.{_d(s).get('id')}.symbol"), "")
+            account = next((_d(a).get("kind") for a in _l(fx.get("accounts")) if _d(a).get("role") == "golden"), None)
+            if not sym or account is None:
+                continue
+            asset = symbol_asset(sym, fx)
+            if (asset, account) not in brackets:
+                self.add("L-FIX-00", f, f"no R02 bracket for {asset} on a {account} account, which {fid} asserts on {sym}",
+                         "brackets")
+            if asset == "future" and symbol_root(sym) not in initial:
+                self.add("L-FIX-00", f, f"no initial_margin for {symbol_root(sym)}, which {fid} asserts R02 on", "initial_margin")
+        for fdoc in self.fixtures.values():
+            for s in map(_d, _l(_d(fdoc.data).get("symbols"))):
+                root = symbol_root(_s(s.get("symbol")))
+                if s.get("asset") == "future" and set(_l(s.get("purpose"))) & {"ticket", "ladder"} and root not in initial:
+                    self.add("L-FIX-00", f, f"no initial_margin for {root}, a ticket or ladder future of {fdoc.rel}",
+                             "initial_margin")
 
     def _contract_problem(self, symbol: str, roll: date | None) -> str | None:
         """L-FIX-03 on one futures symbol: month code and year present, contract month not before today's month,
@@ -2378,6 +2658,33 @@ class _Linter:
             lt = _ts(_d(self.builds.get(last)).get("released_at")) if last else None
             if lt and sum(1 for t, _ in released if t > lt) > 3:
                 self.add("L-POP-06", f, f"last_seen_build {last} is more than three releases old; flag for removal", f"{at}.last_seen_build")
+        self._seed_titles(f, items)
+
+    def _seed_titles(self, f: str, items: list[dict]) -> None:
+        """L-POP-05 (choice 27): two entries not retired whose `title_regex` both match one title of either entry's
+        `seed_titles`, matched as the Executor matches a window title (`re.search`, orchestrator.popups); an entry's
+        own seed title that its regex does not match is reported under the same rule, since the field is "real
+        window titles the entry must match"."""
+        live = []
+        for i, p in enumerate(items):
+            try:
+                rx = re.compile(_s(p.get("title_regex")))
+            except re.error:
+                continue
+            if p.get("retired") is not True:
+                live.append((i, p, rx))
+        for i, p, rx in live:
+            for t in _l(p.get("seed_titles")):
+                if isinstance(t, str) and not rx.search(t):
+                    self.add("L-POP-05", f, f"seed title {t!r} is not matched by {p.get('popup_id')}'s own title_regex",
+                             f"[{i}].seed_titles")
+        for k, (_i, p, rx) in enumerate(live):
+            for j, q, ry in live[k + 1:]:
+                titles = {t for t in _l(p.get("seed_titles")) + _l(q.get("seed_titles")) if isinstance(t, str)}
+                both = sorted(t for t in titles if rx.search(t) and ry.search(t))
+                if both:
+                    self.add("L-POP-05", f, f"{p.get('popup_id')} and {q.get('popup_id')} both match the seed title "
+                                            f"{both[0]!r}", f"[{j}].title_regex")
 
     def _on_abort(self, f: str, at: str, p: dict, oa: dict) -> None:
         outcome = oa.get("outcome")
@@ -2398,7 +2705,7 @@ class _Linter:
     # -- 4.11 mutants ----------------------------------------------------------------------------
 
     def check_mutants(self) -> None:
-        f, items = self._catalog("mutants", "mutants")
+        f, items = self._catalog("mutants", "entries")
         if not f:
             return
         ids = [m.get("mutant_id") for m in items]
@@ -2417,7 +2724,11 @@ class _Linter:
             elif gen.get("seed") != MUTANT_SEED:
                 self.add("L-MUT-01", f, f"generator seed {gen.get('seed')} is not the catalog seed {MUTANT_SEED}", f"{at}.generator.seed")
             cid = _s(m.get("checkpoint_id"))
-            if m.get("region_ref") not in self.region_map(cid):
+            if cid == EVERY_CHECKPOINT:             # SD-43, 4.11: "*" binds every bound checkpoint, aa_control only
+                if cls != "aa_control":
+                    self.add("L-MUT-01", f, f'checkpoint_id "*" binds every checkpoint only on an aa_control entry, '
+                                            f"not {cls}", f"{at}.checkpoint_id")
+            elif m.get("region_ref") not in self.region_map(cid):
                 self.add("L-MUT-01", f, f"region_ref {m.get('region_ref')} is not in regions/{cid}.yaml", f"{at}.region_ref")
             exp = _d(m.get("expected"))
             outs = set(_l(exp.get("outcomes")))
@@ -2436,11 +2747,13 @@ class _Linter:
                 fdoc = self.flows.get(_s(flow))
                 if fdoc is None or _d(fdoc.data).get("class") != "canary":
                     self.add("L-MUT-04", f, f"behavioral mutant {mid} needs a canary_flow of class canary (got {flow})", f"{at}.canary_flow")
-                elif any(_d(st).get("order_stage") is True or any(
-                        _s(_d(st).get(k)).endswith(".confirm-and-send") or self._confirm_and_send(_d(st).get(k)) for k in TARGET_FIELDS)
-                        for _sec, st in self._all_steps(fdoc.data)):
-                    # same predicate as L-FLW-07 (id or OCR text), and any order-stage step (S-22)
-                    self.add("L-MUT-04", f, f"canary flow {flow} targets confirm-and-send", f"{at}.canary_flow")
+                else:
+                    # SD-45: the one Confirm and Send click a canary flow may hold is its order-stage step; that step,
+                    # its Delete closure and "never Send" are sentinel.lint.checks.mutants'
+                    for _sec, st in self._all_steps(fdoc.data):
+                        if st.get("order_stage") is not True and any(self._confirm_and_send(st.get(k)) for k in TARGET_FIELDS):
+                            self.add("L-MUT-04", f, f"step {st.get('id')} of canary flow {flow} clicks Confirm and Send "
+                                                    "outside its order-stage step (SD-45)", f"{at}.canary_flow")
             elif mode == "image" and "canary_flow" in m:
                 self.add("L-MUT-04", f, f"image mutant {mid} carries no canary_flow", f"{at}.canary_flow")
             if cls == "color_swap" and not ("invariant_violation" in outs and exp.get("invariant_id") == "INV-15"):
@@ -2516,19 +2829,24 @@ class _Linter:
             refs.append((doc.rel, "checkpoint_id", _d(doc.data).get("checkpoint_id", cid)))
         for doc in self.r.of("mask"):
             refs.append((doc.rel, "checkpoint_id", _d(doc.data).get("checkpoint_id")))
-        f_mut, mutants = self._catalog("mutants", "mutants")
+        f_mut, mutants = self._catalog("mutants", "entries")
         for i, m in enumerate(mutants):
-            refs.append((f_mut, f"[{i}].checkpoint_id", m.get("checkpoint_id")))
             cid = m.get("checkpoint_id")
+            if cid == EVERY_CHECKPOINT and m.get("class") == "aa_control":     # accepted by L-XREF-04 and L-XREF-11
+                continue
+            refs.append((f_mut, f"[{i}].checkpoint_id", cid))
             if cid not in self.defined and cid not in self.retired:
                 self.add("L-XREF-04", f_mut, f"checkpoint {cid} is defined by no flow or census and is not retired", f"[{i}].checkpoint_id")
         for i, x in enumerate(self.renames):
+            if surface_rename(x):                       # surface ids, not checkpoint ids (choice 28)
+                continue
             refs.append((self.renames_file, f"renames[{i}].old", x.get("old")))
             if x.get("new") != "retired":
                 refs.append((self.renames_file, f"renames[{i}].new", x.get("new")))
         q = self.r.one("quarantine")
         for i, x in enumerate(map(_d, _l(_d(q.data).get("records") if q else []))):
-            refs.append((q.rel if q else "", f"records[{i}].checkpoint", x.get("checkpoint")))
+            if "checkpoint" in x:               # a flow record names a flow (sentinel.lint.checks.quarantine), not an id
+                refs.append((q.rel if q else "", f"records[{i}].checkpoint", x.get("checkpoint")))
         for cid, doc in self.regions.items():
             if cid not in self.defined and cid not in self.retired:
                 self.add("L-XREF-04", doc.rel, f"checkpoint {cid} is defined by no flow or census and is not retired")
@@ -2567,7 +2885,7 @@ class _Linter:
             got = {p.get("popup_id") for p in pops}
             if not set(POP_IDS_12_8) <= got:          # SD-95: later ids extend the table (L-POP-01 checks them)
                 self.add("L-XREF-12", _f, "popup ids differ from POP-01 to POP-22 of 12.8: " + _id_diff(got, POP_IDS_12_8))
-        f_mut, mutants = self._catalog("mutants", "mutants")
+        f_mut, mutants = self._catalog("mutants", "entries")
         if not f_mut:
             self.add("L-XREF-12", "canaries/mutants.yaml", "canaries/mutants.yaml is missing")
         else:
@@ -2670,6 +2988,13 @@ def lint_repo(repo: Repo, phase: int = 0, today: date | None = None,
     return LintReport(sorted(set(linter.out)), skipped, sorted(set(linter.expired)))
 
 
+def checkpoint_definitions(repo: Repo) -> tuple[dict[str, CheckpointDef], frozenset[str]]:
+    """The checkpoint ids the repository defines (census, sweeps, splits and flow steps, as the lint and the scope
+    enumerate them, choice 22) and the ids flows/RENAMES.yaml retires: what L-XREF-04 accepts. For check modules."""
+    linter = _Linter(repo, 0, date.today(), None)
+    return linter.defined, frozenset(x for x in linter.retired if isinstance(x, str))
+
+
 def lint(root: str | Path, phase: int = 0, today: date | None = None) -> LintReport:
     """Load the sentinel-config checkout at `root` and lint it."""
     return lint_repo(Repo.load(root), phase, today)
@@ -2687,13 +3012,23 @@ PAIR_RULES = {
 }
 
 
-def check_pair(pair: Any, builds: Mapping[str, Any], file: str = "build_pair") -> list[Violation]:
+MAX_BASE_COMMIT_DISTANCE = 20       # 4.2 L-BLD-04 with SD-02: the nearest main ancestor at most 20 commits back
+
+
+def check_pair(pair: Any, builds: Mapping[str, Any], file: str = "build_pair", *,
+               base_commit_distance: int | None = None) -> list[Violation]:
     """L-BLD-04 and L-BLD-05 on one build pair record, the check run at run creation (4.2): a pair with any
     violation is refused, the run is never queued, and the requester gets the rule ids.
 
     `pair` is the 4.2 `build_pair` (run_type, candidate, base, base_rule, lineage_baseline_set); `builds` maps a
     build id to its 4.2 `build` record (channel, commit_sha, merge_base_sha). A build absent from `builds` is read
-    by its id's channel prefix. The config lint runs the same check on every `builds/*.yaml` pair."""
+    by its id's channel prefix. The config lint runs the same check on every `builds/*.yaml` pair.
+
+    PR base (SD-02): the base's commit is the candidate's merge base with main, or the nearest main ancestor of it
+    with a build record at most 20 commits back. Ancestry is not in the files: the run-creation resolver that walked
+    the main history passes `base_commit_distance` (0 for the merge base itself, recorded in run health); without it
+    the base must be the merge base. A distance above 20 is refused (the run is `aborted_harness (reason:
+    base_build_missing)` before any capture). `lineage_baseline_set` is rc only."""
     p = _d(pair)
     out: list[Violation] = []
 
@@ -2714,12 +3049,19 @@ def check_pair(pair: Any, builds: Mapping[str, Any], file: str = "build_pair") -
         if rt == "pr":
             mb = _s(_d(builds.get(cand)).get("merge_base_sha"))
             base_sha = _s(_d(builds.get(base)).get("commit_sha"))
+            is_mb = (base_sha == mb) if base_sha else mb.startswith(_short_sha(base))
             if not mb:
                 add("L-BLD-04", f"candidate {cand} has no merge_base_sha in builds/", "build_pair.candidate")
-            elif (base_sha and base_sha != mb) or (not base_sha and not mb.startswith(_short_sha(base))):
-                add("L-BLD-04", f"base {base} is not the candidate's merge base {mb[:7]}", "build_pair.base")
+            elif base_commit_distance is not None and not 0 <= base_commit_distance <= MAX_BASE_COMMIT_DISTANCE:
+                add("L-BLD-04", f"base {base} is {base_commit_distance} commits behind the merge base {mb[:7]}; at most "
+                                f"{MAX_BASE_COMMIT_DISTANCE} (base_build_missing)", "build_pair.base")
+            elif not is_mb and not base_commit_distance:
+                add("L-BLD-04", f"base {base} is not the candidate's merge base {mb[:7]}, and no base_commit_distance "
+                                "names it as the nearest main ancestor with a build record", "build_pair.base")
         if rt == "rc" and not p.get("lineage_baseline_set"):
             add("L-BLD-04", "rc pairs carry lineage_baseline_set", "build_pair.lineage_baseline_set")
+    if rt != "rc" and p.get("lineage_baseline_set"):
+        add("L-BLD-04", f"lineage_baseline_set is for rc pairs only, not {rt}", "build_pair.lineage_baseline_set")
     if cand == base and rule != "same_build":
         add("L-BLD-05", f"candidate equals base ({cand}) without base_rule same_build", "build_pair")
     return out

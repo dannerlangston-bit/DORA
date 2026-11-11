@@ -1,0 +1,41 @@
+{
+  "$id": "sentinel:schemas/process-allowlist.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "app_tree": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "harness": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "image_id": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "windows_baseline": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "image_id",
+    "harness",
+    "app_tree",
+    "windows_baseline"
+  ],
+  "title": "process-allowlist (process_allowlist)",
+  "type": "object"
+}

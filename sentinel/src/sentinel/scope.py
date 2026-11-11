@@ -66,7 +66,7 @@ from dataclasses import dataclass, field, replace
 from typing import Iterable, Iterator, Mapping, Sequence
 
 from .records import DATA_MODES, PERSONAS, CheckpointOutcome, Finding
-from .taxonomy import is_checkpoint_id
+from .taxonomy import SWEEP_HOSTS, is_checkpoint_id
 
 SMOKE_CAP = 40                                   # 2.2.4, L-SRF-15
 STATIC_MAX_DEPTH = 6                             # 2.10.2
@@ -808,6 +808,8 @@ def _sweep_items(ctx: _Ctx, s: Surface) -> list[PlanItem]:
     protected = s.id in ctx.protected_surfaces
     out = []
     for host in s.hosts:
+        if host not in SWEEP_HOSTS:          # SD-05: tab and sidebar hosts are swept through their splitters only
+            continue
         for (wd, ht) in sizes:
             cid = f"sweep/{s.id}/{host}/{wd}x{ht}"
             cp = ctx.checkpoint(cid, s, "sweep", w, s.data_mode, size_step=(("host", host), ("w", wd), ("h", ht)))

@@ -61,3 +61,56 @@ def test_calibration_filename_drops_the_prefix():
     for bad in ("9a3f" + "0" * 60, "sha256:9a3f...c1e2", "sha256:" + "A" * 64, "md5:" + "0" * 64):
         with pytest.raises(ValueError):
             C.calibration_filename(bad)
+
+
+RENDER_MATCH = {
+    "build_id": "branch-1998.3.0-7be42d0", "jre_release": {"sha256": "sha256:" + "1" * 64, "java_version": "17.0.12"},
+    "vmoptions_hash": "sha256:" + "2" * 64, "java2d_pipeline": {"pinned": "software", "confirmed": "software"},
+    "windows_build": {"current_build": "26100", "ubr": "2314"}, "display": {"width": 1920, "height": 1080, "dpi": 96},
+    "cleartype": {"smoothing": True}, "gpu": {"name": "Hyper-V Video", "driver_version": "10.0"},
+    "os_theme": {"apps_light": False}, "app_theme": {"scheme": "dark", "font_size": "medium"},
+    "workspace_hash": {"ws.tier-a.active-trader": "sha256:" + "3" * 64}, "settings_profile_hash": "sha256:" + "4" * 64,
+    "time_zone": {"os": "Eastern Standard Time"}, "keyboard": {"layout": "0x0409", "locale": "en-US"},
+    "data_epoch": {"epoch_id": "sha256:" + "5" * 64, "data_mode": "backend_fixture"}, "input_desktop": "Default",
+    "harness": {"version": "1.4.2", "ocr_engine": "tesseract-5.3.4", "capture_lib": "mss-9.0.1",
+                "settle_params_sha256": "sha256:" + "6" * 64, "diff_engine_params_sha256": "sha256:" + "7" * 64,
+                "redaction_version": "r3", "config_commit": "c41a0f2"},
+    "render_probe_hash": "e3b0c44298fc1c14",
+}
+
+
+def test_calibration_key_hashes_the_rendering_fields_only():
+    """4.12 Calibration key, SD-69: a new epoch, corpus file, build, OCR engine or config commit keeps the key."""
+    key = C.calibration_key(RENDER_MATCH)
+    subset = {f: RENDER_MATCH[f] for f in C.CALIBRATION_KEY_FIELDS}
+    subset["harness"] = {k: RENDER_MATCH["harness"][k] for k in C.CALIBRATION_KEY_HARNESS}
+    assert key == C.sha256_id(subset) and key != C.fingerprint_id(RENDER_MATCH)
+    for name, value in (("build_id", "main-1998.2.0-4f1c9a2"), ("data_epoch", {"epoch_id": "sha256:" + "9" * 64}),
+                        ("workspace_hash", {}), ("keyboard", {"layout": "0x0407"}), ("settings_profile_hash", "x")):
+        assert C.calibration_key({**RENDER_MATCH, name: value}) == key, name
+    for sub in ("ocr_engine", "config_commit", "redaction_version"):
+        assert C.calibration_key({**RENDER_MATCH, "harness": {**RENDER_MATCH["harness"], sub: "changed"}}) == key
+    for name, value in (("render_probe_hash", "ffffffffffffffff"), ("app_theme", {"scheme": "light"}),
+                        ("java2d_pipeline", {"pinned": "d3d", "confirmed": "d3d"})):
+        assert C.calibration_key({**RENDER_MATCH, name: value}) != key, name
+    assert C.calibration_key({**RENDER_MATCH, "harness": {**RENDER_MATCH["harness"], "capture_lib": "mss-10"}}) != key
+    assert C.calibration_key_of({"match": RENDER_MATCH}) == key
+
+
+def test_calibration_key_refuses_a_partial_match():
+    with pytest.raises(ValueError, match="gpu"):
+        C.calibration_key({k: v for k, v in RENDER_MATCH.items() if k != "gpu"})
+    with pytest.raises(ValueError, match="harness.capture_lib"):
+        C.calibration_key({**RENDER_MATCH, "harness": {"version": "1"}})
+    with pytest.raises(ValueError):
+        C.calibration_key_of({"match": None})
+
+
+def test_the_calibration_file_is_named_by_the_calibration_key(tmp_path):
+    """SD-36 with SD-69: calibration/<hex>.yaml, hex the calibration key, never the fingerprint id."""
+    from sentinel.diff.calibration import CalibrationFile
+    key = C.calibration_key(RENDER_MATCH)
+    path = CalibrationFile(key, "run-cal-1").save(tmp_path)
+    assert path.name == C.calibration_filename(key) == key[len("sha256:"):] + ".yaml"
+    assert CalibrationFile.load(tmp_path, key) is not None
+    assert CalibrationFile.load(tmp_path, C.fingerprint_id(RENDER_MATCH)) is None

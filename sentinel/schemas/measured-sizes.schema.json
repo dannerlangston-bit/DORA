@@ -1,0 +1,59 @@
+{
+  "$id": "sentinel:schemas/measured-sizes.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "measured_on_run": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "sizes": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "h": {
+            "type": "integer"
+          },
+          "host": {
+            "enum": [
+              "flexgrid",
+              "detached",
+              "dialog"
+            ]
+          },
+          "surface": {
+            "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+            "type": "string"
+          },
+          "w": {
+            "type": "integer"
+          },
+          "workspace": {
+            "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "surface",
+          "workspace",
+          "host",
+          "w",
+          "h"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "measured_on_run",
+    "sizes"
+  ],
+  "title": "measured-sizes (measured_sizes)",
+  "type": "object"
+}

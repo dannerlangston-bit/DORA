@@ -1,0 +1,151 @@
+{
+  "$defs": {
+    "entry": {
+      "additionalProperties": false,
+      "properties": {
+        "changed_paths": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "declared_surfaces": {
+          "items": {
+            "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "entry_id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "expected_visual": {
+          "type": "string"
+        },
+        "feature_flags": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "scope": {
+                "enum": [
+                  "build",
+                  "login"
+                ]
+              },
+              "state": {
+                "enum": [
+                  "on",
+                  "off"
+                ]
+              }
+            },
+            "required": [
+              "name",
+              "state",
+              "scope"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "mock_image": {
+          "pattern": "^(?![/\\\\])(?!.*\\.\\.)[^\\\\]+$",
+          "type": "string"
+        },
+        "must_be_observed": {
+          "default": true,
+          "type": "boolean"
+        },
+        "new_surface": {
+          "default": false,
+          "type": "boolean"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "tickets": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "touched_primitives": {
+          "items": {
+            "pattern": "^[A-Z][A-Za-z0-9]*$",
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "entry_id",
+        "tickets",
+        "summary",
+        "declared_surfaces",
+        "touched_primitives",
+        "expected_visual",
+        "feature_flags"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "sentinel:schemas/manifest.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approved_by": {
+      "type": "string"
+    },
+    "author": {
+      "type": "string"
+    },
+    "base": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "candidate": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "empty_reason": {
+      "type": "string"
+    },
+    "entries": {
+      "items": {
+        "$ref": "#/$defs/entry"
+      },
+      "type": "array"
+    },
+    "manifest_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "source": {
+      "enum": [
+        "ticket_export",
+        "release_notes",
+        "manual",
+        "union"
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "manifest_id",
+    "candidate",
+    "base",
+    "source",
+    "author",
+    "entries"
+  ],
+  "title": "manifest (manifest)",
+  "type": "object"
+}

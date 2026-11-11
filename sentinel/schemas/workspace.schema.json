@@ -1,0 +1,222 @@
+{
+  "$id": "sentinel:schemas/workspace.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "account_role": {
+      "default": "golden",
+      "enum": [
+        "golden",
+        "empty"
+      ]
+    },
+    "active_trader_panels": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "panel_id": {
+            "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+            "type": "string"
+          },
+          "surface": {
+            "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "panel_id",
+          "surface"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "display_config": {
+      "additionalProperties": false,
+      "properties": {
+        "font_size": {
+          "enum": [
+            "small",
+            "medium",
+            "large"
+          ]
+        },
+        "height": {
+          "type": "integer"
+        },
+        "scale_percent": {
+          "type": "integer"
+        },
+        "theme": {
+          "enum": [
+            "dark",
+            "light"
+          ]
+        },
+        "width": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "width",
+        "height",
+        "scale_percent",
+        "theme",
+        "font_size"
+      ],
+      "type": "object"
+    },
+    "file": {
+      "pattern": "^(?![/\\\\])(?!.*\\.\\.)[^\\\\]+$",
+      "type": "string"
+    },
+    "file_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "gadgets_present": {
+      "items": {
+        "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "link_groups": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "color": {
+            "type": "string"
+          },
+          "symbol_ref": {
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "color",
+          "symbol_ref"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "notes": {
+      "type": "string"
+    },
+    "owner": {
+      "type": "string"
+    },
+    "persona": {
+      "enum": [
+        "active_trader",
+        "options_trader",
+        "futures_trader",
+        "swing_trader",
+        "beginner"
+      ]
+    },
+    "saved_under_build": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "size_sweep_cells": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "cell_id": {
+            "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+            "type": "string"
+          },
+          "hosts": {
+            "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "cell_id",
+          "hosts"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "tabs": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "tier": {
+      "enum": [
+        "A",
+        "B",
+        "C"
+      ]
+    },
+    "windows": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "rect": {
+            "additionalProperties": false,
+            "properties": {
+              "h": {
+                "type": "integer"
+              },
+              "w": {
+                "type": "integer"
+              },
+              "x": {
+                "type": "integer"
+              },
+              "y": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "w",
+              "h"
+            ],
+            "type": "object"
+          },
+          "title_regex": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title_regex",
+          "rect"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "id",
+    "tier",
+    "file",
+    "file_sha256",
+    "display_config",
+    "tabs",
+    "windows",
+    "link_groups",
+    "gadgets_present",
+    "active_trader_panels",
+    "owner"
+  ],
+  "title": "workspace (workspace)",
+  "type": "object"
+}

@@ -1,0 +1,144 @@
+{
+  "$defs": {
+    "branch_choice": {
+      "additionalProperties": false,
+      "properties": {
+        "branch": {
+          "enum": [
+            "A",
+            "B",
+            "undecided"
+          ]
+        },
+        "deadline": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "type": "string"
+        },
+        "decided_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "type": "string"
+        },
+        "decided_by": {
+          "type": "string"
+        },
+        "title_regex": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "branch"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "sentinel:schemas/branches.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "aa_floor": {
+      "$ref": "#/$defs/branch_choice"
+    },
+    "batch_api": {
+      "default": "undecided",
+      "enum": [
+        "on",
+        "off",
+        "undecided"
+      ]
+    },
+    "computer_use": {
+      "$ref": "#/$defs/branch_choice"
+    },
+    "data_fixture": {
+      "$ref": "#/$defs/branch_choice"
+    },
+    "jab": {
+      "$ref": "#/$defs/branch_choice"
+    },
+    "login_mfa": {
+      "$ref": "#/$defs/branch_choice"
+    },
+    "pinned_install": {
+      "$ref": "#/$defs/branch_choice"
+    },
+    "reviewer": {
+      "additionalProperties": false,
+      "properties": {
+        "model_id": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "safety": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "item": {
+            "type": "integer"
+          },
+          "note": {
+            "type": "string"
+          },
+          "observed": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "read_on_build": {
+            "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+            "type": "string"
+          },
+          "result": {
+            "enum": [
+              "confirmed",
+              "different",
+              "undecided"
+            ]
+          }
+        },
+        "required": [
+          "item",
+          "result"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "session_rule": {
+      "$ref": "#/$defs/branch_choice"
+    },
+    "version_read": {
+      "additionalProperties": false,
+      "properties": {
+        "about_regex": {
+          "type": "string"
+        },
+        "title_regex": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "jab",
+    "data_fixture",
+    "login_mfa",
+    "pinned_install",
+    "aa_floor",
+    "session_rule",
+    "computer_use",
+    "reviewer",
+    "version_read",
+    "safety"
+  ],
+  "title": "branches (branches)",
+  "type": "object"
+}

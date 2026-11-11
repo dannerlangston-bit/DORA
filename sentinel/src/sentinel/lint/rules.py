@@ -23,8 +23,8 @@ Choices where the spec is ambiguous (reported):
 5. L-FLW-11 resolves an assertion's region against the nearest preceding checkpoint; a step before
    the first checkpoint resolves against the first one, a teardown step against any checkpoint of
    the flow, and a `*_since_previous_step` kind also against its `since_step` checkpoint (the 4.7
-   worked examples need all three). Rule operand lists: RULE_OPERANDS below (2.8.3 names only R01's
-   and R02's operands, through the 4.7 examples).
+   worked examples need all three). Rule operand lists: RULE_OPERANDS below, generated from the
+   2.8.3 operand table (SD-34).
 6. L-FLW-10 checks `max_duration_s` against 5 minutes unless a measured p50 is passed in; measured
    p50s live in the Run Store, not in the files.
 7. L-MUT-05 ("each appear at least once per tier-1 checkpoint") cannot hold for every tier-1
@@ -72,12 +72,15 @@ the Central Store), L-POP-06 (counts the released builds present in builds/), L-
 from __future__ import annotations
 
 import hashlib
+import importlib
 import itertools
+import pkgutil
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from types import ModuleType
+from typing import Any, Callable, Iterable
 
 from PIL import Image
 
@@ -101,6 +104,11 @@ class Rule:
 
 
 _RUN_START = "run start only: checked against live state by the Orchestrator before gate provisioned (4.1)"
+# A rule of the section 4 tables whose check body is not written yet: the lint lists it as pending until a
+# `sentinel.lint.checks` module names it in its RULE_IDS (see run_check_modules).
+_PENDING = "pending: no check body yet; the owning package adds it as a sentinel.lint.checks module"
+# Record rules of 4.13 and 4.14: the Run Store refuses the row on write (8.3); a config checkout holds no records.
+_ON_WRITE = "record rule: enforced by the Run Store on write (4.13, 4.14, 8.3), not by the config lint"
 
 RULES: dict[str, Rule] = {r.id: r for r in (
     Rule("L-BLD-00", "error", "build file reads and validates against schemas/build.schema.json"),
@@ -143,11 +151,11 @@ RULES: dict[str, Rule] = {r.id: r for r in (
     Rule("L-SRF-09", "error", "control ids unique; jab only when phase0/branches.yaml says JAB is branch A"),
     Rule("L-SRF-10", "error", "census.workspaces non-empty and existing when enabled; dimension values are slugs"),
     Rule("L-SRF-11", "error", "parent exists without a cycle; invariant exceptions carry owner, reason and a future expiry"),
-    Rule("L-SRF-12", "error", "surfaces reached only after a sent order carry paper_send",
-         "which surfaces are reachable only after a sent order is product knowledge the files do not record"),
+    Rule("L-SRF-12", "error", "surfaces with reached_after_send: true carry paper_send in entitlements", _PENDING),
     Rule("L-SRF-13", "error", "splitter hosts are in hosts; fractions in the 2.5.2 set, 0.00 and 1.00 only when collapsible"),
     Rule("L-SRF-14", "error", "every surface is hosted by at least one tier A workspace"),
     Rule("L-SRF-15", "error", "at most 40 surfaces carry smoke: true"),
+    Rule("L-SRF-16", "error", "critical: true requires tier: 1", _PENDING),
     Rule("L-WSP-00", "error", "workspace entry reads and validates against schemas/workspace.schema.json"),
     Rule("L-WSP-01", "error", "workspace file exists and its hash equals file_sha256"),
     Rule("L-WSP-02", "error", "tier A: exactly one entry per persona; persona required"),
@@ -156,6 +164,9 @@ RULES: dict[str, Rule] = {r.id: r for r in (
     Rule("L-WSP-05", "error", "display_config is listed in configs/allowed.yaml"),
     Rule("L-WSP-06", "error", "gadgets and panels exist; every Active Trader gadget is in active_trader_panels"),
     Rule("L-WSP-07", "error", "link_groups.symbol_ref exists in the fixture the run uses"),
+    Rule("L-WSP-08", "error", "tier A and tier C entries list no streaming: true surface in gadgets_present", _PENDING),
+    Rule("L-WSP-09", "warn", "corpus shape of 2.3: one tier C entry, four to eight tier B with two on the previous "
+         "release (error from Phase 3)", _PENDING),
     Rule("L-FLW-00", "error", "flow file reads and validates against schemas/flow.schema.json"),
     Rule("L-FLW-01", "error", "flow_id unique; step ids unique; first step and last teardown step reset_input_state"),
     Rule("L-FLW-02", "error", "targets and surface ids exist; checkpoints carry surface_id, target_window, data_mode"),
@@ -180,11 +191,13 @@ RULES: dict[str, Rule] = {r.id: r for r in (
     Rule("L-RGN-01", "error", "region ids unique; file path equals checkpoint_id; a flow or census defines the checkpoint"),
     Rule("L-RGN-02", "error", "regions of different kinds do not overlap, except a mask inside another region"),
     Rule("L-RGN-03", "error", "rule iff type rule; mask_ref iff type mask with an existing mask; fixture_dependency iff freeze"),
-    Rule("L-RGN-04", "error", "money cells are diff or freeze, never floor-excepted, and asserted on their checkpoint"),
+    Rule("L-RGN-04", "error", "money cells are never mask or floor-excepted; on a flow checkpoint diff or freeze and "
+         "asserted, on a census checkpoint a rule region"),
     Rule("L-RGN-05", "error", "floor_exception carries its human fields and a future expiry, on diff regions only"),
-    Rule("L-RGN-06", "warn", "no non-zero calibration floor on a frozen checkpoint",
-         "reads calibration/<fingerprint_id>.yaml, which the Calibration Service exports (3.9, 8.3); not read by this lint"),
+    Rule("L-RGN-06", "warn", "no non-zero calibration floor on a frozen checkpoint (calibration/<hex>.yaml)", _PENDING),
     Rule("L-RGN-07", "error", "masks on frozen checkpoints only on the clock, connection indicator, caret or parking rectangle"),
+    Rule("L-RGN-08", "error", "money_cell iff money_role; money_role only on order_confirmation and order_ticket panels",
+         _PENDING),
     Rule("L-MSK-00", "error", "mask record reads and validates against schemas/mask.schema.json"),
     Rule("L-MSK-01", "error", "created_by human (the decision_ref lives in the Central Store)"),
     Rule("L-MSK-02", "error", "expires_at is in the future (CI)"),
@@ -205,18 +218,18 @@ RULES: dict[str, Rule] = {r.id: r for r in (
     Rule("L-FIX-09", "warn", "golden positions cover the golden list of 7.6 (error from Phase 2)"),
     Rule("L-FIX-10", "error", "the empty account has no positions and no working orders"),
     Rule("L-POP-00", "error", "popup catalog reads and every entry validates against schemas/popup.schema.json"),
-    Rule("L-POP-01", "error", "popup_id matches ^POP-[0-9]{2,}$, unique, in 12.8; name unique; title_regex compiles"),
+    Rule("L-POP-01", "error", "popup_id matches ^POP-[0-9]{2,}$, unique, further ids in sequence; name unique; title_regex "
+         "compiles; retired needs retired_reason; the file is {schema_version, entries}"),
     Rule("L-POP-02", "error", "dismiss_key is not Enter, Space or Ctrl+Enter"),
     Rule("L-POP-03", "error", "Order Confirmation, Confirm or Send titles are safety kill-switch entries; no click on consent labels"),
     Rule("L-POP-04", "error", "class, click template and target, on_abort, INV-14 routing and taxonomy reasons are consistent"),
-    Rule("L-POP-05", "warn", "no two entries match the same seeded title",
-         "the seeded title list has no path in the 4.1 layout"),
+    Rule("L-POP-05", "warn", "no two entries match one title of either entry's seed_titles", _PENDING),
     Rule("L-POP-06", "warn", "last_seen_build at most three releases old"),
     Rule("L-MUT-00", "error", "mutant catalog reads and every entry validates against schemas/mutant.schema.json"),
-    Rule("L-MUT-01", "error", "mutant ids M01 to M33, unique; seed 20260101; region_ref exists on the checkpoint"),
+    Rule("L-MUT-01", "error", "mutant ids unique, M01 to M33 equal to 12.5 then M34 on; seed; region_ref exists on the "
+         "checkpoint; the file is {schema_version, entries}"),
     Rule("L-MUT-02", "error", "money-cell mutants expect a detecting outcome; only controls expect identical or noise"),
-    Rule("L-MUT-03", "warn", "20 to 30 mutants per tier-1 checkpoint with an approved baseline",
-         "needs the approved baseline set (Central Store)"),
+    Rule("L-MUT-03", "error", "every critical checkpoint has at least two behavioral mutants bound to it", _PENDING),
     Rule("L-MUT-04", "error", "behavioral mutants name a canary flow without confirm-and-send; image mutants do not"),
     Rule("L-MUT-05", "error", "the six brief classes are bound to tier-1 checkpoints; color_swap expects INV-15"),
     Rule("L-MUT-06", "error", "invariant ids exist in the 2.7 catalog"),
@@ -224,27 +237,75 @@ RULES: dict[str, Rule] = {r.id: r for r in (
     Rule("L-FPR-01", "error", "fingerprint field set equals 7.4 plus render_probe_hash; match non-null; id recomputes"),
     Rule("L-FPR-02", "error", "match equals the rig specification of 7.1", _RUN_START + "; see lint_fingerprint_rig_spec"),
     Rule("L-FPR-03", "error", "candidate and base match apart from build_id", _RUN_START + "; see lint_fingerprint_pair"),
-    Rule("L-FPR-04", "error", "a calibration file exists for fingerprint_id", _RUN_START + " (uncalibrated, never not_comparable)"),
+    Rule("L-FPR-04", "error", "a calibration exists for the fingerprint's calibration key (4.12)",
+         _RUN_START + " (uncalibrated, never not_comparable)"),
     Rule("L-FPR-05", "error", "render_probe_hash equal between sides", _RUN_START + "; see lint_fingerprint_pair"),
+    Rule("L-OUT-01", "error", "outcome, status, reason, gate, finding kind and triage_state values are taxonomy.yaml's",
+         _ON_WRITE),
+    Rule("L-OUT-02", "error", "the required fields of the record's outcome are present", _ON_WRITE),
+    Rule("L-OUT-03", "error", "no reviewer classification and no decision on invariant_violation or assertion_failed",
+         _ON_WRITE),
+    Rule("L-OUT-04", "error", "synthetic records are excluded from metrics and baseline promotion", _ON_WRITE),
+    Rule("L-OUT-05", "error", "one checkpoint_outcome per (run_id, checkpoint_id); synthetic outcomes kept apart",
+         _ON_WRITE),
+    Rule("L-OUT-06", "error", "a record carries the current session's paper_assertion of an allowlisted account",
+         _ON_WRITE),
+    Rule("L-OUT-07", "error", "every scoped checkpoint of a finished run has exactly one record", _ON_WRITE),
+    Rule("L-DEC-01", "error", "decided_by is a human login of the roster, the PR author or the Jira resolver", _ON_WRITE),
+    Rule("L-DEC-02", "error", "ticket present at write for mark_intended, fixed_in_build and a defect reject_baseline",
+         _ON_WRITE),
+    Rule("L-DEC-03", "error", "category from taxonomy.yaml; phash 16 hex; hamming_tolerance within 8 (6 on tier 1); bbox_q4 "
+         "with the exact fallback", _ON_WRITE),
+    Rule("L-DEC-04", "error", "no noise, mask or floor exception on a money cell; no mask over the panel budget", _ON_WRITE),
+    Rule("L-DEC-05", "error", "approve_baseline only from a complete, non-synthetic, non-PR run; not by a tier-1 author",
+         _ON_WRITE),
+    Rule("L-DEC-06", "error", "two-person rule for a PR author's tier-1 or tier-2 mark_intended", _ON_WRITE),
+    Rule("L-DEC-07", "error", "a waiver of invariant_violation or assertion_failed expires within 30 days", _ON_WRITE),
+    Rule("L-DEC-08", "error", "fixed_in_build names a newer build; the finding closes or reopens on later runs", _ON_WRITE),
     Rule("L-XREF-01", "warn", "every surface is reached by a census workspace or a flow checkpoint"),
     Rule("L-XREF-02", "error", "every tier-1 surface has a flow with assertions and a regions file with a money cell"),
     Rule("L-XREF-03", "error", "masked_live checkpoints have a rule or mask region; frozen ones no must_change_within_s"),
-    Rule("L-XREF-04", "error", "checkpoint ids referenced by regions files and mutants are defined or retired"),
-    Rule("L-XREF-05", "warn", "tier-1 checkpoints have mutants and calibration",
-         "needs the approved baselines and calibration/<fingerprint_id>.yaml (Calibration Service)"),
+    Rule("L-XREF-04", "error", "checkpoint ids referenced by regions files, mutants and calibration files are defined or "
+         "retired"),
+    Rule("L-XREF-05", "warn", "critical checkpoints have behavioral mutants; tier-1 checkpoints a calibration for the "
+         "canonical calibration key (error after the first Calibration run)", _PENDING),
     Rule("L-XREF-06", "error", "map and registry agree; manifests reference existing surfaces and primitives"),
     Rule("L-XREF-07", "error", "no file contains a credential; vault references only"),
     Rule("L-XREF-08", "error", "taxonomy.yaml equals the harness taxonomy generated from the spec"),
     Rule("L-XREF-09", "error", "schemas/*.schema.json regenerate identically from the notation"),
     Rule("L-XREF-10", "error", "changed checkpoint ids, templates or rects carry a rename or recalibrate marker",
          "needs the pull request's diff and the approved checkpoints"),
-    Rule("L-XREF-11", "error", "every checkpoint id matches the 4.1 grammar and names a registered surface"),
-    Rule("L-XREF-12", "error", "popup ids equal POP-01..POP-22 of 12.8; mutant ids, classes and money_cell equal 12.5"),
-    Rule("L-XREF-13", "error", "deny controls and Explorer deny-list surfaces exist and are named by the nightly test",
-         "the 6.8 deny list and the denied-action test have no path in the 4.1 layout"),
+    Rule("L-XREF-11", "error", "every checkpoint id matches the 4.1 grammar and names a registered surface; quarantined "
+         "flows exist"),
+    Rule("L-XREF-12", "error", "every 12.8 starter popup present unless retired; M01 to M33 equal their 12.5 rows; further "
+         "ids in sequence"),
+    Rule("L-XREF-13", "error", "deny controls and policy/explorer_deny_list.yaml targets exist, detect, and are named by "
+         "the nightly test", _PENDING),
     Rule("L-XREF-14", "error", "policy/explorer_budget.yaml equals 6.8 unless the Explorer owner approved"),
     Rule("L-XREF-15", "error", "phase0/branches.yaml names one branch per unknown; dependent files agree"),
     Rule("L-XREF-16", "error", "run manifest carries the signed authorization reference", _RUN_START),
+    Rule("L-XREF-17", "error", "gateway/default_order_hotkeys.yaml exists; chords parse and do not repeat", _PENDING),
+    Rule("L-XREF-18", "error", "gateway/dismiss_allowlist.yaml labels are exact, never send-like; Edit only when observed",
+         _PENDING),
+    Rule("L-XREF-19", "error", "policy/egress_allowlist.yaml: exact hosts with 6.10 purposes, signed, covering the model "
+         "and reporting hosts", _PENDING),
+    Rule("L-XREF-20", "error", "the authorization in force: document and record, hash, three signatures, accounts, rigs, "
+         "endpoint, rate caps, send branch", _PENDING),
+    Rule("L-XREF-21", "error", "policy/reporting.yaml: dated mode history, Jira keys, the four Slack channels, auto-file "
+         "approval", _PENDING),
+    Rule("L-XREF-22", "error", "policy/budgets.yaml within 11.4 unless approved; Explorer caps equal explorer_budget.yaml",
+         _PENDING),
+    Rule("L-XREF-23", "error", "policy/release_gate.yaml: unique trains, business days at least 1, RC cut before GA minus N",
+         _PENDING),
+    Rule("L-XREF-24", "error", "schedule/windows.yaml defines the four named windows; requires_window names one", _PENDING),
+    Rule("L-XREF-25", "error", "ops/credential_rotation.yaml covers every allowlisted login; ended rotations name their "
+         "validating run", _PENDING),
+    Rule("L-XREF-26", "error", "CODEOWNERS routes flows, registry and every 4.16 file to its owner", _PENDING),
+    Rule("L-XREF-27", "error", "soak.yaml has one budget per soak metric, none looser than 10.11 unless approved", _PENDING),
+    Rule("L-XREF-28", "error", "rig/thinkorswim.vmoptions.template carries the heap, crash and Java2D flags", _PENDING),
+    Rule("L-XREF-29", "error", "the reviewer version tuple in force has a passing eval report", _PENDING),
+    Rule("L-XREF-30", "error", "registry invariants blocks name existing controls; a palette exists for every declared theme",
+         _PENDING),
 )}
 
 # -- spec constants ---------------------------------------------------------------------------------
@@ -278,19 +339,10 @@ EXPLORER_BUDGET_6_8 = {"max_actions": 400, "max_minutes": 90, "max_no_change_act
                        "max_usd_per_session": 25, "max_usd_per_week": 500}
 MASK_BUDGET = {"order_confirmation": 0.10, "order_ticket": 0.10, "position_statement": 0.10, "account_info": 0.05}
 FROZEN_MASK_SEGMENTS = ("clock", "connection-indicator", "caret", "parking")
-# operands of the rule assertion kind (2.8.3): required, optional (choice 5)
+# operands of the rule assertion kind: (required, optional) per rule, generated from the 2.8.3 operand table through
+# taxonomy.yaml `rule_operands` (SD-34)
 RULE_OPERANDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
-    "R01": (frozenset({"qty", "price", "multiplier", "total"}), frozenset()),
-    "R02": (frozenset({"bp_effect", "notional"}), frozenset()),
-    "R03": (frozenset({"bid", "mark", "ask"}), frozenset({"last", "low", "high"})),
-    "R04": (frozenset({"count", "selector"}), frozenset()),
-    "R05": (frozenset({"delta"}), frozenset({"gamma", "vega", "theta"})),
-    "R06": (frozenset({"call", "put", "strike", "underlying"}), frozenset({"rate", "dte"})),
-    "R07": (frozenset({"dte", "expiration"}), frozenset()),
-    "R08": (frozenset({"pl_open", "mark", "trade_price", "qty", "multiplier"}), frozenset()),
-    "R09": (frozenset({"export_total", "screen_total"}), frozenset()),
-    "R10": (frozenset({"value"}), frozenset()),
-}
+    rule: load_taxonomy().rule_operands(rule) for rule in load_taxonomy().data["rule_operands"]}
 JIRA = re.compile(r"^[A-Z][A-Z0-9]+-[0-9]+$")
 FLAG = re.compile(r"^[a-z0-9_.]+$")
 PASCAL = re.compile(r"^[A-Z][A-Za-z0-9]*$")
@@ -485,7 +537,7 @@ _SCHEMA_OF: dict[str, tuple[str, str]] = {      # doc kind -> (schema name, rule
     "explorer_budget": ("explorer-budget", "L-XREF-14"), "branches": ("branches", "L-XREF-15"),
     "quarantine": ("quarantine", "L-XREF-11"),
 }
-_CATALOGS = {"popups": ("popup", "L-POP-00", "popups"), "mutants": ("mutant", "L-MUT-00", "mutants")}
+_CATALOGS = {"popups": ("popup#popup", "L-POP-00", "popups"), "mutants": ("mutant#mutant", "L-MUT-00", "mutants")}   # one catalog entry
 
 
 def _rule_view(repo: Repo) -> Repo:
@@ -573,7 +625,8 @@ class _Linter:
             m = _d(doc.data)
             self.masks.setdefault((_s(m.get("checkpoint_id")), _s(m.get("mask_id"))), doc)
         b = r.one("branches")
-        self.branches = _d(b.data) if b else {}
+        # 4.16: each unknown is a branch_choice whose `branch` is A, B or undecided; the rules read that letter
+        self.branches = {k: (v.get("branch") if isinstance(v, dict) else v) for k, v in _d(b.data if b else {}).items()}
         sp = r.one("send_policy")
         self.send_policy = _d(sp.data) if sp else {}
         eb = r.one("explorer_budget")
@@ -1940,12 +1993,56 @@ class _Linter:
 
 # -- public API ------------------------------------------------------------------------------------
 
+class LintPluginError(RuntimeError):
+    """A sentinel.lint.checks module breaks the plug-in contract of sentinel/lint/checks/__init__.py."""
+
+
+def check_modules() -> list[ModuleType]:
+    """Every rule module of `sentinel.lint.checks`, by name; each names its RULES rows in RULE_IDS and exposes
+    `check(repo, add, phase, today)`."""
+    from . import checks
+    mods = []
+    for info in sorted(pkgutil.iter_modules(checks.__path__), key=lambda i: i.name):
+        if info.name.startswith("_"):
+            continue
+        mod = importlib.import_module(f"{checks.__name__}.{info.name}")
+        ids = getattr(mod, "RULE_IDS", None)
+        if not isinstance(ids, tuple) or not ids or not callable(getattr(mod, "check", None)):
+            raise LintPluginError(f"{mod.__name__} needs a non-empty RULE_IDS tuple and a check function")
+        unknown = [r for r in ids if r not in RULES]
+        if unknown:
+            raise LintPluginError(f"{mod.__name__} names {unknown}, which are not rows of RULES (4.15)")
+        mods.append(mod)
+    return mods
+
+
+def run_check_modules(repo: Repo, add: Callable[..., None], phase: int, today: date) -> frozenset[str]:
+    """Run every check module against `repo`; returns the rule ids they implement."""
+    implemented: set[str] = set()
+    for mod in check_modules():
+        own = frozenset(mod.RULE_IDS)
+
+        def scoped(rule: str, file: str, message: str, path: str = "", severity: str | None = None,
+                   _own: frozenset[str] = own, _name: str = mod.__name__) -> None:
+            if rule not in _own:
+                raise LintPluginError(f"{_name} reported {rule}, which its RULE_IDS do not name")
+            add(rule, file, message, path, severity)
+
+        mod.check(repo, scoped, phase, today)
+        implemented |= own
+    return frozenset(implemented)
+
+
 def lint_repo(repo: Repo, phase: int = 0, today: date | None = None,
               flow_p50_s: dict[str, float] | None = None) -> LintReport:
-    """Lint a loaded repository (4.1, 4.15). `flow_p50_s` gives measured flow p50s for L-FLW-10."""
+    """Lint a loaded repository (4.1, 4.15). `flow_p50_s` gives measured flow p50s for L-FLW-10. The rule modules
+    of sentinel.lint.checks run after the built-in rules; a pending row a module implements is not skipped."""
     linter = _Linter(repo, phase, today or date.today(), flow_p50_s)
-    skipped = {rid: r.skipped for rid, r in RULES.items() if r.skipped}
-    return LintReport(linter.run(), skipped)
+    linter.run()
+    implemented = run_check_modules(linter.r, linter.add, linter.phase, linter.today)
+    skipped = {rid: r.skipped for rid, r in RULES.items()
+               if r.skipped and not (r.skipped == _PENDING and rid in implemented)}
+    return LintReport(sorted(set(linter.out)), skipped)
 
 
 def lint(root: str | Path, phase: int = 0, today: date | None = None) -> LintReport:

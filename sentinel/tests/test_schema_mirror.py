@@ -17,7 +17,8 @@ SPEC = Path(__file__).resolve().parents[2] / "sentinel-spec" / "sections" / "08-
 _LITERAL_LIST = re.compile(r"\(('(?:[^']|'')*'(?:,'(?:[^']|'')*')*)\)")
 _LITERAL = re.compile(r"'(?:[^']|'')*'")
 _KEY = re.compile(r"^CREATE (?:UNIQUE )?(TABLE|INDEX|TRIGGER|VIEW) (\w+)")
-_SEED_ROW = re.compile(r"\(('(?:[^']|'')*'),('(?:[^']|'')*'),([01]),(NULL|'(?:[^']|'')*'),('(?:[^']|'')*')\)")
+_Q = r"('(?:[^']|'')*')"
+_SEED_ROW = re.compile(rf"\(\s*{_Q}\s*,\s*{_Q}\s*,\s*([01])\s*,\s*(NULL|{_Q[1:-1]})\s*,\s*{_Q}\s*\)")
 _INHERIT = re.compile(r"SELECT '(\w+)',reason,parametric,detail_means,'([\d.]+)' FROM outcome_reasons "
                       r"WHERE outcome = '(\w+)'")
 
@@ -128,7 +129,7 @@ def spec_seed(blocks: list[str]) -> set[tuple]:
         for s in statements(b):
             n = normalize(s)
             if n.startswith("INSERT INTO outcome_reasons") and "VALUES" in n:
-                for m in _SEED_ROW.finditer(n):
+                for m in _SEED_ROW.finditer(strip_comments(s)):   # literals as written: normalize() drops spaces in them
                     r = tuple(_lit(v) for v in m.groups())
                     rows.setdefault((r[0], r[1]), r)
             elif n.startswith("INSERT OR IGNORE INTO outcome_reasons"):
@@ -165,16 +166,9 @@ def test_the_mirror_check_sees_a_taxonomy_change():
 
 
 def test_8_3_seed_mirrors_the_taxonomy_seed():
-    """08-seed-metadata: the (outcome, reason, parametric) rows always; owner_section and detail_means too once
-    taxonomy.yaml carries `reason_metadata`. SD-54's aborted_harness bounds_source_unavailable is in 8.3 already and
-    waits for the regenerated taxonomy.yaml."""
+    """08-seed-metadata: every (outcome, reason, parametric, detail_means, owner_section) row of the 8.3 seed equals
+    `store.seed_rows` of taxonomy.yaml, whose `reason_metadata` is generated from that seed (SD-78 included)."""
     t = load()
-    spec = spec_seed(spec_sql())
-    code = set(seed_rows(t))
-    pending = set()
-    if "bounds_source_unavailable" not in t.data["reasons"]["aborted_harness"]:
-        pending = {r for r in spec if r[:2] == ("aborted_harness", "bounds_source_unavailable")}
-    if t.data.get("reason_metadata"):
-        assert spec - pending == code
-    else:
-        assert {r[:3] for r in spec - pending} == {r[:3] for r in code}
+    assert t.data.get("reason_metadata")
+    assert spec_seed(spec_sql()) == set(seed_rows(t))
+    assert ("not_comparable", "fingerprint_mismatch", 0) in {r[:3] for r in seed_rows(t)}

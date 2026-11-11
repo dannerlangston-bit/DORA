@@ -1,0 +1,82 @@
+{
+  "$defs": {
+    "allowed_config": {
+      "additionalProperties": false,
+      "properties": {
+        "font_size": {
+          "enum": [
+            "small",
+            "medium",
+            "large"
+          ]
+        },
+        "height": {
+          "type": "integer"
+        },
+        "id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "scale_percent": {
+          "type": "integer"
+        },
+        "theme": {
+          "enum": [
+            "dark",
+            "light"
+          ]
+        },
+        "width": {
+          "type": "integer"
+        },
+        "work_area": {
+          "additionalProperties": false,
+          "properties": {
+            "h": {
+              "type": "integer"
+            },
+            "w": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "w",
+            "h"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "id",
+        "width",
+        "height",
+        "scale_percent",
+        "theme",
+        "font_size",
+        "work_area"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "sentinel:schemas/configs-allowed.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "configs": {
+      "items": {
+        "$ref": "#/$defs/allowed_config"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "configs"
+  ],
+  "title": "configs-allowed (configs_allowed)",
+  "type": "object"
+}

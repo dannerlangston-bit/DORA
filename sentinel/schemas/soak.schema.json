@@ -1,0 +1,140 @@
+{
+  "$id": "sentinel:schemas/soak.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "budgets": {
+      "additionalProperties": false,
+      "properties": {
+        "freezes": {
+          "additionalProperties": false,
+          "properties": {
+            "max": {
+              "default": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "gdi_objects": {
+          "additionalProperties": false,
+          "properties": {
+            "max": {
+              "default": 9000,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "growth_slope": {
+          "additionalProperties": false,
+          "properties": {
+            "mb_per_h_max": {
+              "default": 60,
+              "type": "number"
+            },
+            "window_h": {
+              "default": 3,
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "handles": {
+          "additionalProperties": false,
+          "properties": {
+            "within_pct": {
+              "default": 20,
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "heap": {
+          "additionalProperties": false,
+          "properties": {
+            "pct_of_xmx_max": {
+              "default": 80,
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "relaunches": {
+          "additionalProperties": false,
+          "properties": {
+            "max": {
+              "default": 0,
+              "type": "integer"
+            }
+          },
+          "type": "object"
+        },
+        "render_latency": {
+          "additionalProperties": false,
+          "properties": {
+            "tick_window_s": {
+              "default": 2,
+              "type": "integer"
+            },
+            "windows_pct_min": {
+              "default": 99,
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "threads": {
+          "additionalProperties": false,
+          "properties": {
+            "within_pct": {
+              "default": 20,
+              "type": "number"
+            }
+          },
+          "type": "object"
+        },
+        "working_set": {
+          "additionalProperties": false,
+          "properties": {
+            "growth_mb_max": {
+              "default": 1536,
+              "type": "number"
+            },
+            "growth_pct_max": {
+              "default": 25,
+              "type": "number"
+            }
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "working_set",
+        "growth_slope",
+        "gdi_objects",
+        "handles",
+        "threads",
+        "heap",
+        "freezes",
+        "relaunches",
+        "render_latency"
+      ],
+      "type": "object"
+    },
+    "calibrated_from": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "budgets"
+  ],
+  "title": "soak (soak)",
+  "type": "object"
+}

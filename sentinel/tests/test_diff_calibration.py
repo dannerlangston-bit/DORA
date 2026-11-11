@@ -141,17 +141,18 @@ def test_lookup_cases_and_round_trip(tmp_path, noisy_calibration):
     zero = CheckpointCalibration(CID, "frozen")
     for rid in ("rgn.watchlist.grid", "_rest", "*"):
         zero.floors[rid], zero.thresholds[rid] = RegionFloors(), derive_threshold(RegionFloors())
-    cf = CalibrationFile("sha256:fp2", "run-cal-2", {CID: zero})
+    key2, key3 = "sha256:" + "2" * 64, "sha256:" + "3" * 64      # calibration keys (4.12)
+    cf = CalibrationFile(key2, "run-cal-2", {CID: zero})
     assert cf.lookup(CID, "rgn.new-region") == (UNCALIBRATED, "uncalibrated")     # added since calibration
     assert cf.lookup("census/other/ws.a", "_rest") == (UNCALIBRATED, "uncalibrated")
     path = cf.save(tmp_path)
-    back = CalibrationFile.load(tmp_path, "sha256:fp2")
+    back = CalibrationFile.load(tmp_path, key2)
     assert back.complete and back.lookup(CID, "rgn.watchlist.grid") == cf.lookup(CID, "rgn.watchlist.grid")
-    assert path.name == "sha256_fp2.yaml"
-    assert CalibrationFile.load(tmp_path, "sha256:none") is None
-    noisy = CalibrationFile("sha256:fp3", "run-cal-3", {CID: noisy_calibration})
+    assert path.name == "2" * 64 + ".yaml"                      # calibration/<hex>.yaml (SD-36, SD-69)
+    assert CalibrationFile.load(tmp_path, "sha256:" + "0" * 64) is None
+    noisy = CalibrationFile(key3, "run-cal-3", {CID: noisy_calibration})
     noisy.save(tmp_path)
-    again = CalibrationFile.load(tmp_path, "sha256:fp3")
+    again = CalibrationFile.load(tmp_path, key3)
     assert not again.complete and again.checkpoints[CID].floors["rgn.watchlist.grid"].changed_px == 6
 
 

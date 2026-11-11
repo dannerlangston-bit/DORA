@@ -1,0 +1,127 @@
+{
+  "$id": "sentinel:schemas/reporting.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "auto_file": {
+      "additionalProperties": false,
+      "properties": {
+        "tier1": {
+          "default": false,
+          "type": "boolean"
+        },
+        "tier2": {
+          "default": false,
+          "type": "boolean"
+        },
+        "tier3": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "check_mode_history": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "by": {
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "informational",
+              "blocking"
+            ]
+          },
+          "since": {
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "since",
+          "by"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "email": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "jira": {
+      "additionalProperties": false,
+      "properties": {
+        "harness_project": {
+          "type": "string"
+        },
+        "product_project": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "product_project",
+        "harness_project"
+      ],
+      "type": "object"
+    },
+    "paging": {
+      "additionalProperties": false,
+      "properties": {
+        "escalation_policy": {
+          "type": "string"
+        },
+        "service": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "service"
+      ],
+      "type": "object"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "slack": {
+      "additionalProperties": false,
+      "properties": {
+        "on_call": {
+          "type": "string"
+        },
+        "release": {
+          "type": "string"
+        },
+        "safety": {
+          "type": "string"
+        },
+        "triage": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "on_call",
+        "triage",
+        "release",
+        "safety"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "check_mode_history",
+    "jira",
+    "slack",
+    "paging",
+    "auto_file"
+  ],
+  "title": "reporting (reporting)",
+  "type": "object"
+}

@@ -1,13 +1,19 @@
 """Never-send guard: slow half, fast half, flag watcher, drop accounting and thresholds (6.2, 5.4.2 to 5.4.8)."""
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from sentinel.orchestrator import alerts
-from sentinel.orchestrator.gateway import (VK_ESCAPE, VK_F1, VK_RETURN, VK_SPACE, VK_TAB, Action, Chord, DenyRect,
-                                           DropLedger, Flag, FlagWatcher, GatewayDrop, GatewayError, GatewayState,
-                                           GATEWAY_REASONS, InputEvent, Rect, SafetyContext, SlowDecision,
-                                           agent_flag_abort, drain, hook_decide, refusal, slow_half)
+from sentinel.orchestrator.budgets import ShardBudgets
+from sentinel.orchestrator.gateway import (DISMISS_ALLOWLIST, HOOK_STATES, PAPER_ASSERTION_CURRENT_S, VK_ESCAPE, VK_F1,
+                                           VK_RETURN, VK_SPACE, VK_TAB, Action, Chord, DenyRect, DropLedger, Flag,
+                                           FlagWatcher, GatewayDrop, GatewayError, GatewayState, GATEWAY_REASONS,
+                                           InputEvent, Rect, SafetyContext, SlowDecision, agent_flag_abort, drain,
+                                           hook_decide, recovery_admits, refusal, slow_half)
+from sentinel.orchestrator.identity import TIMER_S
+from sentinel.orchestrator.ports import SessionSafety
 from sentinel.orchestrator.simrig import CONFIRM_POINT, DELETE_POINT, SEND_RECT, SimulatedRig
 
 T = 100.0
@@ -470,3 +476,150 @@ def test_gateway_drops_carry_only_4_13_codes():
         SlowDecision(True, "no_token")                     # a hook code, never a slow-half refusal
     assert {"never_tokenize", "dialog_allowlist", "deny_profile", "guarded_key_refused", "hook_host_dead"} <= \
         GATEWAY_REASONS
+    with pytest.raises(ValueError):
+        SlowDecision(False, send_ok=True)                  # send_ok rides only on a dialog_ok click (6.7)
+
+
+# -- session safety for Confirm and Send (choice 9, SD-57) -------------------------------------------------
+NOW = 1000.0
+
+
+def session(stage: str = "a3_a9", age: float | None = 1.0, kicked: bool = False) -> SessionSafety:
+    return SessionSafety(stage, None if age is None else NOW - age, "sha-empty", kicked)
+
+
+def confirm(**kw) -> Action:
+    return click("Confirm and Send", point=CONFIRM_POINT, order_stage_step=True, **kw)
+
+
+def test_confirm_and_send_reads_the_session_safety_the_orchestrator_sets():
+    ok = slow_half(confirm(), SafetyContext(flag=Flag.SET, session=session(), now=NOW))
+    assert not ok.refused and ok.dialog_ok
+    failed_attestation = SafetyContext(session=session("none"), now=NOW)          # attest() failed or never ran
+    after_kill = SafetyContext(session=SessionSafety(), now=NOW)                 # cleared on kill_tree or relaunch
+    stale = SafetyContext(session=session(age=PAPER_ASSERTION_CURRENT_S + 0.1), now=NOW)
+    for ctx in (failed_attestation, after_kill, stale, SafetyContext(session=session(kicked=True), now=NOW),
+                SafetyContext(session=session(), now=None), SafetyContext(session=session(age=None), now=NOW)):
+        s = slow_half(confirm(), ctx)
+        assert (s.reason, s.attempted_send) == ("deny_profile", False), ctx
+    # with a session the legacy booleans are not read
+    assert slow_half(confirm(), SafetyContext(session=session("none"), now=NOW, attestation_passed=True,
+                                              paper_assertion_current=True)).refused
+
+
+def test_the_a9_click_needs_a3_to_a8_and_every_later_click_a3_to_a9():
+    staged = SafetyContext(session=session("a3_a8"), now=NOW)
+    assert slow_half(confirm(), staged).reason == "deny_profile"
+    assert not slow_half(confirm(a9_check=True), staged).refused
+    assert slow_half(confirm(a9_check=True), SafetyContext(session=session("none"), now=NOW)).refused
+
+
+def test_paper_assertion_currency_is_the_two_minute_timer_of_6_4():
+    assert PAPER_ASSERTION_CURRENT_S == TIMER_S
+    edge = SafetyContext(session=session(age=PAPER_ASSERTION_CURRENT_S), now=NOW)
+    assert edge.assertion_current() and not slow_half(confirm(), edge).refused
+    assert not SafetyContext(session=session(age=-1.0), now=NOW).assertion_current()   # a stamp from the future
+
+
+# -- the dismiss allowlist (choice 10, 6.13 item 10) ---------------------------------------------------------
+def test_an_empty_dismiss_allowlist_refuses_confirm_and_send_and_tokens_no_dialog_click():
+    empty = SafetyContext(flag=Flag.SET, session=session(), now=NOW, dismiss_allowlist=frozenset())
+    s = slow_half(confirm(), empty)
+    assert (s.reason, s.attempted_send) == ("deny_profile", False) and "dismiss allowlist" in s.detail
+    in_dialog = replace(empty, order_dialog_present=True, deny_rects=(SEND,))
+    s = slow_half(click("Delete", point=DELETE_POINT), in_dialog)
+    assert s.reason == "dialog_allowlist" and s.unknown_dialog and not s.dialog_ok
+
+
+def test_edit_is_an_unknown_dialog_label_unless_pinned():
+    ctx = SafetyContext(flag=Flag.SET, order_dialog_present=True, deny_rects=(SEND,))
+    assert DISMISS_ALLOWLIST == frozenset({"Delete"})
+    s = slow_half(click("Edit"), ctx)
+    assert s.reason == "dialog_allowlist" and s.unknown_dialog
+    assert not slow_half(click("Edit"), replace(ctx, dismiss_allowlist=frozenset({"Delete", "Edit"}))).refused
+
+
+def test_confirm_and_send_is_never_a_deny_rectangle():
+    g = armed(Flag.SET)
+    with pytest.raises(GatewayError):
+        g.write_deny_rects([DenyRect(Rect(1490, 890, 130, 24), "Confirm and Send")])
+    assert g.deny_rects == []
+
+
+# -- recovery-only arm and disarm (choice 12) --------------------------------------------------------------
+def test_recovery_only_arm_tokens_the_login_and_the_recovery_teardown_actions_only():
+    rec = SafetyContext(recovery_only=True)
+    assert slow_half(click("Watchlist"), rec).reason == "deny_profile"
+    assert slow_half(Action("press", keys=(VK_TAB,)), rec).reason == "deny_profile"
+    assert not slow_half(click("Log In", flow_class="login"), rec).refused
+    assert not slow_half(Action("secret", keys=(ord("A"),), flow_class="login"), rec).refused
+    assert not slow_half(click("Cancel All", teardown_action="cancel_all"), rec).refused
+    assert not slow_half(click("Working Orders", teardown_action="working_orders_check"), rec).refused
+    assert slow_half(click("Cancel All", flow_class="login"), rec).reason == "deny_profile"   # rules still apply
+    s = slow_half(click("Send", teardown_action="cancel_all"), rec)
+    assert s.reason == "never_tokenize" and s.attempted_send
+    assert slow_half(click("Log In", profile="agent", flow_class="login"), rec).reason == "deny_profile"
+    assert recovery_admits(click("x", teardown_action="positions_flat_check"))
+    assert not recovery_admits(click("x", teardown_action="close_dialog"))
+
+
+@pytest.mark.parametrize("phase,reason", [("between_runs", "not_armed"), ("kill_switch", "deny_all"),
+                                          ("recovery", "no_token"), ("running", "no_token")])
+def test_hook_states_per_phase(phase, reason):
+    g = armed()
+    g.armed, g.deny_all = HOOK_STATES[phase]
+    assert hook_decide(g, ev("button_down", 5, 5), T).reason == reason
+
+
+# -- the rest of the flow after a gateway block (choice 13) ---------------------------------------------------
+def rest(res) -> list[tuple[str, str | None]]:
+    return [(o.outcome.outcome, o.outcome.reason) for o in res.outcomes if o.selector == "rest_of_flow"]
+
+
+def test_a_non_send_refusal_ends_the_flow_and_its_later_checkpoints_are_not_run():
+    res = DropLedger().record(GatewayDrop("deny_profile", "refused", "integrity"), unit="flow.t", step_id="s03")
+    assert res.step == "blocked_by_gateway" and res.has("end_flow") and res.run is None
+    assert rest(res) == [("not_run", "step_failed:s03")]
+    loose = DropLedger().record(GatewayDrop("dialog_allowlist", "refused", "safety", unknown_dialog=True),
+                                unit="flow.t", step_id="s04")
+    assert rest(loose) == [("not_run", "step_failed:s04")]
+    ledger = DropLedger()
+    for _ in range(2):
+        ledger.record(GatewayDrop("deny_profile", "refused", "integrity"), unit="flow.q", step_id="s01")
+    third = ledger.record(GatewayDrop("deny_profile", "refused", "integrity"), unit="flow.q", step_id="s02")
+    assert third.step == "failed" and rest(third) == [("not_run", "step_failed:s02")]
+
+
+def test_an_own_token_drop_after_the_retry_marks_its_checkpoint_hook_lost_and_the_rest_not_run():
+    d = GatewayDrop("token_expired", "dropped", "integrity", own_token=True)
+    ledger = DropLedger()
+    assert rest(ledger.record(d, unit="f", step_id="s05")) == []                  # the single retry first
+    again = ledger.record(d, unit="f", step_id="s05", retried=True)
+    assert (again.checkpoint.outcome, again.checkpoint.reason) == ("harness_error", "hook_lost")
+    assert rest(again) == [("not_run", "step_failed:s05")]
+
+
+def test_aborting_and_session_results_carry_no_rest_of_flow():
+    send = DropLedger().record(GatewayDrop("deny_rect", "dropped", "safety"), unit="f", step_id="s06")
+    assert send.run_reason == "attempted_send" and rest(send) == []                # the run's unreached outcome
+    agent = DropLedger().record(GatewayDrop("deny_profile", "refused", "integrity", "agent"), unit="f", step_id="s1")
+    assert agent.has("end_session") and rest(agent) == []
+    explorer = DropLedger().record(GatewayDrop("deny_profile", "refused", "integrity", "explorer"), unit="e")
+    assert rest(explorer) == []
+
+
+# -- a dead hook host goes to the Watchdog (choice 14) -------------------------------------------------------
+def test_a_hook_host_dead_refusal_restarts_the_hook_host_once_then_ends_the_run():
+    ledger, budgets = DropLedger(), ShardBudgets()
+    dead = refusal(slow_half(click("Splitter"), SafetyContext(hook_alive=False)))
+    first = ledger.record(dead, unit="flow.h", step_id="s02", budgets=budgets)
+    assert first.step == "blocked_by_gateway" and first.step_reason == "hook_host_dead" and first.run is None
+    for act in ("deny_all", "kill_tree", "restart_hook_host", "relaunch", "resume_next_flow"):
+        assert first.has(act), act
+    assert (first.checkpoint.outcome, first.checkpoint.reason) == ("harness_error", "hook_lost")
+    assert rest(first) == [("not_run", "step_failed:s02")]
+    second = ledger.record(dead, unit="flow.h", step_id="s07", budgets=budgets)
+    assert (second.run_status, second.run_reason) == ("aborted_harness", "hook_lost") and second.has("kill_tree")
+    assert ledger.run_count == 0                                                   # never counted (choice 3)
+    with pytest.raises(ValueError):
+        DropLedger().record(dead, unit="flow.h", step_id="s02")

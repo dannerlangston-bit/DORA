@@ -1,0 +1,20 @@
+schema_version: 1
+id: ws.tier-b.dense-charts
+tier: B
+persona: swing_trader
+file: corpus/workspaces/ws.tier-b.dense-charts/workspace.sentinel-dense-charts
+file_sha256: "sha256:9fb9d09309e3caecdca50dc2c16c8f57921c4cd7599ac1d3357a943d0b10e044"
+saved_under_build: released-1998.1.0-8b2d4f6      # the previous release: the migration flow loads it on the candidate (2.3)
+display_config: {width: 1920, height: 1080, scale_percent: 100, theme: dark, font_size: medium}
+tabs: [Monitor, Trade, Analyze, Scan, MarketWatch, Charts, Tools]   # placeholder until Phase 0 reads the pinned build's tab bar (4.6)
+windows:
+  - {title_regex: "thinkorswim", rect: {x: 0, y: 0, w: 1920, h: 1040}}
+link_groups:
+  - {color: red, symbol_ref: aapl}
+gadgets_present:
+  - charts.flexible-grid.chart-cell
+  - charts.flexible-grid.level2-cell
+  - monitor.activity.position-statement
+active_trader_panels: []
+owner: tos-trade-ui
+notes: Tier B power-user layout (2.3) with a dense Flexible Grid of charts and Level II beside the Position Statement.

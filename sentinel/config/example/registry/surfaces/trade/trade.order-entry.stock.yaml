@@ -25,6 +25,8 @@ controls:
   - {id: qty-field, template: registry/templates/trade/qty-field.png, ocr_text: Qty}
   - {id: price-field, template: registry/templates/trade/price-field.png, ocr_text: Price}
   - {id: confirm-and-send, jab: {name: Confirm and Send, role: push button}, template: registry/templates/trade/confirm-and-send.png, ocr_text: "Confirm and Send", required: true}
+invariants:
+  focus_order: [qty-field, price-field, confirm-and-send]   # INV-13: the Tab order the ticket flows walk
 settle: {max_wait_ms: 8000}
 census:
   enabled: true

@@ -6,3 +6,4 @@ landmarks:
 regions:
   - {id: rgn.ladder.viewport, type: diff, landmark: lm.ladder-header, rect: {dx: 0, dy: 22, w: 300, h: 250}}
   - {id: rgn.ladder.order-strip, type: diff, landmark: lm.ladder-header, rect: {dx: 0, dy: 276, w: 300, h: 40}}
+  - {id: rgn.ladder.buy-mkt, type: diff, landmark: lm.ladder-header, rect: {dx: 60, dy: 280, w: 80, h: 24}}   # inside the strip (M08, M29)

@@ -2,17 +2,23 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pytest
 import yaml
 
+from sentinel.checkpoints import SweepStep
+from sentinel.lint import Repo
+from sentinel.lint.rules import _Linter
 from sentinel.records import Finding
 from sentinel.scope import (
-    BUDGET_S, KIND_ORDER, LADDER_S, Attribution, BaseReuse, DependencyIndex, DependencyMap, Edge, Flow, Manifest,
-    PrRunSummary, Registry, Rig, ScopeConfigError, SoakPlan, StoredBase, Surface, Workspace, class_matches,
-    classes_in, compute_scope, merge_run_findings,
+    KIND_ORDER, LADDER_S, NIGHTLY_RIG5_WORK_S, Attribution, BaseReuse, DependencyIndex, DependencyMap, Edge, Flow,
+    LadderDef, Manifest, PlanItem, PlannedCheckpoint, PrRunSummary, Registry, Rig, ScopeConfigError, SoakPlan,
+    Splitter, StoredBase, Surface, Workspace, capture_time, class_matches, classes_in, compute_scope, load_ladders,
+    measured_sizes, merge_run_findings, plan_calibration, plan_nightly, work_area,
 )
+from sentinel.shards import SESSION_STARTUP_S
 from sentinel.taxonomy import is_checkpoint_id
 
 FIX = Path(__file__).parent / "fixtures" / "scope"
@@ -260,7 +266,9 @@ def test_class_matching_and_classes_in():
 
 def test_merge_scope(inputs):
     plan = full(inputs, "merge", map_scan_failed=True)
-    assert plan.budget_s == BUDGET_S["merge"] == 3 * 3600
+    assert plan.budget_s == capture_time("merge") == 3 * 3600 - 10 * 60          # before session startups (SD-03)
+    for rig, b in plan.rig_budget_s.items():                                     # each rig's own startups come off
+        assert b == capture_time("merge", sum(s.sessions for s in plan.shards if rig in s.rigs))
     tier_a = ["ws.tier-a.active-trader", "ws.tier-a.beginner", "ws.tier-a.futures-trader", "ws.tier-a.options-trader",
               "ws.tier-a.swing-trader"]
     assert ids(plan, "dialog.order-confirmation", "census") == [f"census/dialog.order-confirmation/{w}" for w in tier_a]
@@ -425,3 +433,285 @@ def test_merge_and_rc_never_lack_a_manifest(inputs):
     assert full(inputs, "merge", manifest=empty).declared == frozenset()
     with pytest.raises(ScopeConfigError, match="never lack a manifest"):
         full(inputs, "rc", manifest=None)
+
+
+# -- lint and scope enumerate the same census ids (review lint-oracle:3) ---------------------------
+
+EXAMPLE = Path(__file__).resolve().parents[1] / "config" / "example"
+
+
+def _example_scope(run_type: str, **kw):
+    repo = Repo.load(EXAMPLE)
+    registry = Registry.from_entries(d.data for d in repo.of("surface"))
+    union = Manifest.union([], candidate="main-1998.3.0-9a0b1c2", base="main-1998.3.0-2c91ae4", author="orchestrator")
+    args = dict(run_id=f"run-2026-11-10-{run_type}-0001", workspaces=[Workspace.from_dict(d.data) for d in repo.of("workspace")],
+                flows=[Flow.from_dict(d.data) for d in repo.of("flow")], entitlements=("margin", "ira"), rigs=RIGS)
+    args.update(kw)
+    plan = compute_scope(run_type, union, DependencyMap.from_dict(repo.one("dependency_map").data), registry, **args)
+    return plan, _Linter(repo, 0, date(2026, 11, 10), None)
+
+
+@pytest.mark.parametrize("run_type", ["merge", "rc"])
+def test_merge_and_rc_census_ids_are_the_ids_the_lint_defines(run_type):
+    """A merge or RC census visit of a hosting workspace that `census.workspaces` does not list (2.11 `s hosted_by w`)
+    is a checkpoint the lint defines too, so L-XREF-03 asks its masked_live visits for a rule or mask region and
+    L-RGN-01 accepts their regions files (review lint-oracle:3)."""
+    plan, linter = _example_scope(run_type)
+    census = [cp for cp in plan.planned if cp.test_kind == "census"]
+    assert "census/monitor.activity.position-statement/ws.tier-a.futures-trader" in {cp.checkpoint_id for cp in census}
+    assert [cp.checkpoint_id for cp in census if cp.checkpoint_id not in linter.defined] == []
+    for cp in census:
+        if cp.data_mode == "masked_live":
+            assert linter._has_rule_or_mask(cp.checkpoint_id), cp.checkpoint_id
+
+
+def test_a_corpus_size_is_swept_only_on_the_host_it_was_measured_on():
+    """corpus/measured_sizes.yaml names a host per size (4.16); the lint defines the step on that host only, and so
+    does the scope (review lint-oracle:3, SD-06)."""
+    plan, linter = _example_scope("rc", corpus_sizes={LADDER: [SweepStep(700, 500, host="detached")]})
+    planned = set(ids(plan, LADDER, "sweep"))
+    assert f"sweep/{LADDER}/detached/700x500" in planned and f"sweep/{LADDER}/flexgrid/700x500" not in planned
+    assert f"sweep/{LADDER}/flexgrid/320x300" in planned                      # the ladder itself is on every host
+
+
+# -- budget B (2.11, 11.2, SD-03) ------------------------------------------------------------------
+
+def test_capture_time_is_the_wall_budget_less_the_report_margin_and_session_startups():
+    assert capture_time("pr") == 45 * 60 - 600
+    assert capture_time("pr", 2) == 45 * 60 - 600 - 2 * 240                      # a frozen shard without reuse: 8 min
+    assert capture_time("merge", [True, False]) == 3 * 3600 - 600 - 480 - 240    # one session with a fixture reset
+    with pytest.raises(ValueError):
+        capture_time("calibration")
+
+
+def test_each_rig_cuts_against_its_own_capture_time_and_its_load_counts_startups(inputs):
+    plan = pr(inputs)
+    assert plan.budget_s == capture_time("pr")
+    for rig in plan.by_rig:
+        sessions = sum(s.sessions for s in plan.shards if rig in s.rigs)
+        assert plan.rig_budget_s[rig] == capture_time("pr", sessions)
+        work = plan.rig_load_s[rig] - sessions * SESSION_STARTUP_S
+        assert work <= plan.rig_budget_s[rig]
+    tight = pr(inputs, budget_s=60)                                               # B given: every rig gets it
+    assert set(tight.rig_budget_s.values()) == {60.0} and tight.projected_overrun_s
+
+
+def test_flow_durations_default_by_tier(inputs):
+    flows = [replace(f, tier=t, flow_id=f"{f.flow_id}.t{t}") for f in inputs["flows"][:1] for t in (1, 2, 3)]
+    plan = full(inputs, "rc", flows=flows)
+    est = {it.item_id[-2:]: it.estimated_s for it in plan.items if it.kind == "flow"}
+    assert est == {"t1": 90.0, "t2": 75.0, "t3": 60.0}                           # 11.1 PA-06
+    timed = full(inputs, "rc", flows=flows, durations={flows[1].flow_id: 33.0})
+    assert {it.estimated_s for it in timed.items if it.item_id == flows[1].flow_id} == {33.0}
+
+
+# -- sweeps: override, streaming, charts, corpus sizes, RC tier 3 (2.5.2, 2.5.3, SD-04, SD-06, SD-17) -------------
+
+LADDERS = load_ladders(yaml.safe_load((Path(__file__).resolve().parents[1] / "config" / "example" / "registry"
+                                       / "ladders.yaml").read_text()))
+
+
+def _with(inputs: dict, sid: str, **kw) -> Registry:
+    return Registry.from_entries([replace(s, **kw) if s.id == sid else s for s in inputs["registry"]])
+
+
+def test_surface_from_dict_reads_the_override_streaming_and_parent_fields():
+    s = Surface.from_dict({"id": "x.y", "tier": 2, "size_ladder": "ladder-s", "ladder_reason": "clamps below 400 px",
+                           "streaming": True, "parent": "x"})
+    assert (s.size_ladder, s.ladder_reason, s.streaming, s.parent) == ("ladder-s", "clamps below 400 px", True, "x")
+
+
+def test_size_ladder_override_replaces_the_tier_ladder(inputs):
+    plan = full(inputs, "rc", registry=_with(inputs, CHART, size_ladder="ladder-s", ladder_reason="r"), ladders=LADDERS)
+    assert ids(plan, CHART, "sweep") == [f"sweep/{CHART}/flexgrid/{w}x{h}" for w, h in LADDER_S]   # Ladder S in RC
+    narrow = {**LADDERS, "ladder-narrow": LadderDef("ladder-narrow", "S", ((640, 480, "grid"), ("MAXW", 360, "grid")))}
+    plan = full(inputs, "merge", registry=_with(inputs, CHART, size_ladder="ladder-narrow"), ladders=narrow)
+    assert ids(plan, CHART, "sweep") == [f"sweep/{CHART}/flexgrid/640x480", f"sweep/{CHART}/flexgrid/1904x360"]
+    tier3 = _with(inputs, CHART, size_ladder="ladder-narrow", tier=3)
+    assert ids(full(inputs, "merge", registry=tier3, ladders=narrow), CHART, "sweep") == []   # 2.5.3 still decides when
+    with pytest.raises(ScopeConfigError, match="L-SRF-03"):
+        full(inputs, "merge", registry=_with(inputs, CHART, size_ladder="ladder-gone"), ladders=LADDERS)
+
+
+def test_ladder_f_from_the_ladders_file_takes_the_corpus_sizes_before_the_ascending_pass():
+    lad = LADDERS["ladder-f"]
+    steps = lad.sweep_steps((1904, 1000), (SweepStep(512, 384, host="flexgrid"),))
+    sizes = [(st.w, st.h, st.ascending, st.host) for st in steps]
+    assert sizes[36:41] == [(240, 160, False, None), (240, 1000, False, None), (1904, 160, False, None),
+                            (1904, 1000, False, None), (512, 384, False, "flexgrid")]
+    assert sizes[41:] == [(w, 480, True, None) for w in (320, 400, 480, 640, 800, 960)]
+
+
+def test_a_streaming_surface_plans_no_sweep_and_its_sweeps_are_not_run_scope(inputs):
+    plan = full(inputs, "merge", registry=_with(inputs, CHART, streaming=True))
+    assert ids(plan, CHART, "sweep") == [] and ids(plan, CHART, "census")       # still visited by the census
+    cut = sorted(c.checkpoint.checkpoint_id for c in plan.cuts if c.surface_id == CHART and c.reason == "scope"
+                 and c.checkpoint and c.checkpoint.test_kind == "sweep")
+    assert cut == sorted(f"sweep/{CHART}/flexgrid/{w}x{h}" for w, h in LADDER_S)
+    assert plan.chart_sweeps_not_run == 0
+
+
+def test_chart_sweeps_run_frozen_and_are_not_run_scope_without_frozen_data(inputs):
+    live = _with(inputs, CHART, data_mode="masked_live")
+    plan = full(inputs, "merge", registry=live)
+    assert {cp.data_mode for cp in plan.planned if cp.surface_id == CHART and cp.test_kind == "sweep"} == {"frozen"}
+    assert {cp.data_mode for cp in plan.planned if cp.surface_id == CHART and cp.test_kind == "census"} == {"masked_live"}
+    branch_b = full(inputs, "merge", registry=live, frozen_available=False)
+    assert ids(branch_b, CHART, "sweep") == [] and branch_b.chart_sweeps_not_run == 12
+    assert len([c for c in branch_b.cuts if c.reason == "scope" and c.checkpoint
+                and c.checkpoint.checkpoint_id.startswith(f"sweep/{CHART}/")]) == 12
+    assert ids(branch_b, AT_CELL, "sweep")                                       # not a chart: still swept
+    assert any(line.startswith("chart sweeps not run (scope): 12 checkpoints") for line in branch_b.health_lines())
+
+
+def test_ladder_f_corpus_sizes_missing_print_in_run_health(inputs):
+    sizes = measured_sizes({"measured_on_run": "run-x", "sizes": [
+        {"surface": CHART, "workspace": "ws.tier-a.swing-trader", "host": "flexgrid", "w": 512, "h": 384}]})
+    plan = full(inputs, "rc", corpus_sizes=sizes, max_client=work_area({"configs": [{"id": "c", "work_area": {"w": 1904, "h": 1000}}]}))
+    assert f"sweep/{CHART}/flexgrid/512x384" in ids(plan, CHART, "sweep")
+    assert CHART not in plan.corpus_sizes_missing and {AT_CELL, L2_CELL, TS_CELL, LADDER} <= set(plan.corpus_sizes_missing)
+    assert "tools.thinklog" not in plan.corpus_sizes_missing                       # tier 3: Ladder S in RC
+    assert any("corpus/measured_sizes.yaml lists no size for" in line for line in plan.health_lines())
+    assert work_area(None) is None
+
+
+def test_rc_sweeps_tier_3_splitters_on_the_short_set(inputs):
+    reg = _with(inputs, "tools.thinklog", splitters=(Splitter("log-split", "tab"),))
+    assert [s.rsplit("/", 1)[1] for s in ids(full(inputs, "rc", registry=reg), "tools.thinklog", "split")] == [
+        "0.15", "0.50", "0.85"]                                                  # SD-04
+    assert ids(full(inputs, "merge", registry=reg), "tools.thinklog", "split") == []   # tier 3: RC only
+
+
+def test_sweeps_count_toward_the_primary_persona(inputs):
+    harness = [replace(w, persona="beginner") if w.tier == "C" else w for w in inputs["workspaces"]]
+    plan = pr(inputs, workspaces=harness)
+    assert {cp.persona for cp in plan.planned if cp.test_kind == "sweep" and cp.surface_id == AT_CELL} == {"active_trader"}
+
+
+# -- order and shards (2.11 order_and_cut, 11.3, SD-14) --------------------------------------------
+
+def test_declared_surfaces_come_first_within_a_tier(inputs):
+    plan = pr(inputs)
+    keys = [(it.tier, not it.declared, KIND_ORDER[it.kind]) for it in plan.items]
+    assert keys == sorted(keys)
+    tier2 = [it.checkpoints[0].surface_id for it in plan.items if it.tier == 2]
+    assert tier2[0] == CHART and all(it.declared for it in plan.items if it.checkpoints[0].surface_id == CHART)
+    for group in {(it.tier, it.declared) for it in plan.items}:              # census items grouped by workspace
+        seq = [it.checkpoints[0].workspace_id for it in plan.items if it.kind == "census" and (it.tier, it.declared) == group]
+        runs = [w for i, w in enumerate(seq) if i == 0 or seq[i - 1] != w]
+        assert len(runs) == len(set(runs)), seq
+
+
+def test_the_census_of_one_tab_and_data_mode_lands_in_one_shard(inputs):
+    plan = full(inputs, "merge")
+    by_key: dict[str, set] = {}
+    for it in plan.items:
+        if it.kind == "census":
+            by_key.setdefault(it.shard_key, set()).add(it.rigs)
+    assert by_key and all(len(r) == 1 for r in by_key.values())
+    assert {"census:charts:frozen", "census:trade:frozen", "census:trade:masked_live", "census:monitor:masked_live"} <= set(by_key)
+    assert inputs["registry"].tab("dialog.order-confirmation") == "dialog"
+    nested = Registry.from_entries([Surface("trade", 1, kind="tab"), Surface("trade.x", 1, parent="trade"),
+                                    Surface("dialog.y", 1, kind="dialog", parent="trade.x")])
+    assert nested.tab("dialog.y") == "trade"                                     # a dialog joins its tab's shard
+
+
+def test_flows_sharing_a_state_scope_or_a_fixture_share_a_shard(inputs):
+    f1, f2, f3 = inputs["flows"]
+    plan = full(inputs, "rc")
+    key = {it.item_id: it.shard_key for it in plan.items if it.kind == "flow"}
+    assert key[f1.flow_id] == key[f2.flow_id] != key[f3.flow_id]                 # fx.rig-01 pins two; fx.rig-02 alone
+    scoped = [replace(f1, state_scope="watchlists"), f2, replace(f3, state_scope="watchlists")]
+    plan = full(inputs, "rc", flows=scoped)
+    items = {it.item_id: it for it in plan.items if it.kind == "flow"}
+    assert len({it.shard_key for it in items.values()}) == 1
+    frozen = {it.rigs for it in items.values() if it.data_mode == "frozen"}
+    assert len(frozen) <= 1
+
+
+def test_a_flow_checkpoint_step_overrides_the_surface_tier(inputs):
+    doc = _yaml("flows.yaml")[0]
+    doc["steps"] = [dict(s, tier=2) if s.get("type") == "checkpoint" else s for s in doc["steps"]]
+    plan = full(inputs, "rc", flows=[Flow.from_dict(doc)])
+    assert {cp.tier for cp in plan.planned if cp.flow_id == doc["flow_id"]} == {2}
+
+
+# -- the Nightly A/A pass and Calibration runs (10.6, 11.2, 3.9) -----------------------------------
+
+NIGHT_RIGS = [Rig("rig-4", "fp-9e1f03"), Rig("rig-5", "fp-9e1f03")]
+
+
+def nightly(inputs: dict, day: date, **kw):
+    return plan_nightly(inputs["registry"], day, NIGHT_RIGS, workspaces=inputs["workspaces"], flows=inputs["flows"],
+                        entitlements=E, **kw)
+
+
+def test_nightly_covers_tier_1_every_night_and_the_rest_in_five_nights(inputs):
+    days = [date(2026, 11, 10 + i) for i in range(5)]
+    plans = [nightly(inputs, d) for d in days]
+    tier1 = [{cp.checkpoint_id for cp in p.aa_checkpoints if cp.tier == 1} for p in plans]
+    assert tier1[0] and all(t == tier1[0] for t in tier1)
+    rest = [{cp.checkpoint_id for cp in p.aa_checkpoints if cp.tier != 1} for p in plans]
+    assert sorted(p.rotation_slice for p in plans) == [0, 1, 2, 3, 4]
+    assert all(not (a & b) for i, a in enumerate(rest) for b in rest[i + 1:])    # one fifth per night
+    week = nightly(inputs, days[0])
+    every = {cp.checkpoint_id for p in plans for cp in p.aa_checkpoints}
+    universe = full(inputs, "merge")
+    assert {cp.checkpoint_id for cp in universe.planned if cp.test_kind != "flow"} <= every
+    assert nightly(inputs, days[0] + timedelta(days=5)).rotation_slice == week.rotation_slice
+
+
+def test_nightly_captures_each_checkpoint_twice_in_one_session_on_one_rig(inputs):
+    plan = nightly(inputs, date(2026, 11, 10))
+    assert all(len(it.rigs) == 1 for it in plan.items)
+    assert {s.data_mode for s in plan.shards} == {"any"} and all(s.sessions == 1 for s in plan.shards)
+    rig5 = sum(s for _, s in NIGHTLY_RIG5_WORK_S)
+    assert plan.canary_rig == "rig-5" and rig5 == 50 * 60
+    per_side = {r: sum(it.estimated_s for it in plan.by_rig[r]) for r in plan.by_rig}
+    assert plan.rig_load_s["rig-4"] >= 2 * per_side["rig-4"] + SESSION_STARTUP_S
+    assert plan.rig_load_s["rig-5"] >= 2 * per_side["rig-5"] + rig5
+    assert plan.fits
+    weekend = nightly(inputs, date(2026, 11, 13), aa_pass=False)                 # the A/A pass pauses (1.6)
+    assert weekend.items == [] and weekend.rig_load_s["rig-5"] == rig5 + SESSION_STARTUP_S
+
+
+def _items(n: int, per_side: float, tier: int = 1) -> list[PlanItem]:
+    out = []
+    for i in range(n):
+        cid = f"census/area.s{i:03d}/ws.tier-a.active-trader"
+        cp = PlannedCheckpoint(cid, f"area.s{i:03d}", "census", tier, "ws.tier-a.active-trader", "active_trader", "frozen")
+        out.append(PlanItem(cid, "census", tier, [cp], "frozen", f"census:k{i % 40}:frozen", False, per_side, i))
+    return out
+
+
+def test_weekend_calibration_keeps_every_pass_of_a_checkpoint_on_one_rig_and_fits_before_saturday_11_10():
+    rigs = [Rig(f"rig-{i}", "fp") for i in range(1, 5)]
+    items = _items(200, 180.0)                                                   # 600 min per side, measured
+    plan = plan_calibration(items, rigs, "weekend", day=date(2026, 11, 13))
+    assert plan.passes == (5, 1) and all(len(it.rigs) == 1 for it in plan.items)
+    assert all(it.rigs == () for it in items)                                    # the scope's items are not touched
+    assert max(plan.ends(r.id)[0] for r in rigs) <= datetime(2026, 11, 14, 11, 10)
+    assert plan.starts == (datetime(2026, 11, 13, 22, 15), datetime(2026, 11, 14, 22, 15))
+    assert (plan.start_deadline, plan.deadline) == (datetime(2026, 11, 14, 2, 0), datetime(2026, 11, 15, 17, 0))
+    for r in rigs:
+        night1, night2 = plan.night_load_s[r.id]
+        per_side = sum(it.estimated_s for it in plan.by_rig[r.id])
+        assert night1 == 5 * per_side + SESSION_STARTUP_S and night2 == per_side + SESSION_STARTUP_S
+    assert plan.fits and plan.uncalibrated == ()
+    with pytest.raises(ValueError, match="Friday"):
+        plan_calibration(items, rigs, "weekend", day=date(2026, 11, 12))
+
+
+def test_emergency_calibration_is_tier_1_only_on_rigs_1_to_3_by_06_00(inputs):
+    rc = full(inputs, "rc")
+    plan = plan_calibration(rc, [Rig(f"rig-{i}", "fp-9e1f03") for i in range(1, 5)], "emergency", day=date(2026, 11, 10))
+    assert plan.passes == (5,) and set(plan.by_rig) == {"rig-1", "rig-2", "rig-3"}
+    assert all(any(cp.tier == 1 for cp in it.checkpoints) for it in plan.items)
+    left = set(plan.uncalibrated)
+    assert left and left == {cp.checkpoint_id for it in rc.items if not any(c.tier == 1 for c in it.checkpoints)
+                             for cp in it.checkpoints}                            # tiers 2 and 3 stay uncalibrated
+    assert (plan.deadline, plan.start_deadline) == (datetime(2026, 11, 11, 6, 0), datetime(2026, 11, 11, 1, 0))
+    assert plan.fits
+    big = plan_calibration(_items(300, 300.0), [Rig(f"rig-{i}", "fp") for i in range(1, 4)], "emergency",
+                           day=date(2026, 11, 10))
+    assert not big.fits                                                          # 25 h of passes cannot end by 06:00

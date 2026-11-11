@@ -10,8 +10,13 @@ reason verbatim.
 
 Choices where the spec is ambiguous (each is reported to the coordinator):
 
-1. Outcome records carry no login, so outcomes arrive grouped by the entitlement profile of the
-   login that produced them (`outcomes` maps profile id to records).
+1. Profiles (2.12 columns, 12.4, 2.13 B04): one per account kind of the run's fixture, phase 1 paperMoney margin
+   and paperMoney IRA (`fixture_profiles`), each with its kind as an entitlement plus the login-wide ones (paper_send
+   once `paper_send_ok` is approved, 2.6.3). A checkpoint counts toward the profile of the account it ran on: its
+   outcome record's `profile_id` (4.13), which the producer takes from the account role (a flow's `account_role`, a
+   census or sweep's workspace `account_role`, SD-75) through `profile_for_role`. `build_matrix` takes the records
+   grouped by profile id, or a flat list grouped by their `profile_id` (a record without one counts toward the first
+   profile).
 2. When a cell has no checkpoint, the quarantine and budget branches of the cell function read
    the scope plan's cut list (`sentinel.scope.Cut`), persona-aware: a cut checkpoint counts for its
    persona's cell, a surface-level cut for every persona.
@@ -32,6 +37,9 @@ Choices where the spec is ambiguous (each is reported to the coordinator):
    and 11a give it for a zero or below-floor diff. A covered entry with none of these is
    `intended_change_not_observed` when `must_be_observed` is true, as is one whose 3.12 task C
    answer is `not_visible` or `unsure`.
+7. The B01 count (2.13, 9.2 "N order-lifecycle surfaces not run (entitlement)"): the registry surfaces that need
+   `paper_send`, by their own `entitlements` or as a checkpoint surface of a flow that `requires: [paper_send]`, while
+   no profile carries `paper_send` (`order_lifecycle_not_run`).
 """
 from __future__ import annotations
 
@@ -40,7 +48,7 @@ from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
 from .records import PERSONAS, CheckpointOutcome, Finding
-from .scope import Cut, Manifest, Registry, Surface
+from .scope import Cut, Flow, Manifest, Registry, Surface
 
 USABLE_WORST_FIRST = ("invariant_violation", "assertion_failed", "needs_baseline", "collateral",
                       "needs_human", "intended", "noise", "identical")          # the 1.10 precedence
@@ -52,6 +60,8 @@ QUARANTINE_CEILING = 0.02
 OBSERVED_OUTCOMES = frozenset({"intended", "collateral", "needs_human"})
 BELOW_FLOOR_NEEDS_HUMAN = frozenset({"oracle_unreadable", "bounds_unreadable", "rescued_capture"})   # 3.11 9a, 11a
 UNOBSERVED_VISIBILITY = frozenset({"not_visible", "unsure"})
+PAPER_SEND = "paper_send"                         # 2.6.3: the entitlement a sent order needs
+ACCOUNT_KINDS = ("margin", "ira")                 # 4.9 account.kind, each an entitlement of 4.5
 
 
 @dataclass(frozen=True)
@@ -59,6 +69,30 @@ class Profile:
     """An entitlement profile: one login's entitlements (2.12 columns; phase 1 margin and IRA)."""
     id: str
     entitlements: frozenset[str]
+
+
+def fixture_profiles(fixture: Mapping, extra: Iterable[str] = ()) -> tuple[Profile, ...]:
+    """The matrix columns of a run (choice 1): one profile per account kind of the fixture (4.9 `accounts`), in the
+    order the accounts list them, each entitled to its kind and to `extra`, the login-wide entitlements."""
+    login = frozenset(extra)
+    kinds = dict.fromkeys(str(a.get("kind")) for a in fixture.get("accounts") or () if a.get("kind") in ACCOUNT_KINDS)
+    return tuple(Profile(k, frozenset({k}) | login) for k in kinds)
+
+
+def profile_for_role(fixture: Mapping, role: str) -> str | None:
+    """The profile id (account kind) of the fixture account with this role (`golden` or `empty`, 4.9), the
+    `profile_id` an outcome record of a checkpoint run on that account carries (choice 1)."""
+    return next((str(a["kind"]) for a in fixture.get("accounts") or () if a.get("role") == role and a.get("kind")), None)
+
+
+def order_lifecycle_not_run(registry: Registry, flows: Iterable[Flow], profiles: Sequence[Profile]) -> tuple[str, ...]:
+    """B01 (2.13, 9.2): the order-lifecycle surfaces not run (entitlement) in this run, choice 7; empty once a profile
+    carries `paper_send`."""
+    if any(PAPER_SEND in p.entitlements for p in profiles):
+        return ()
+    need = {s.id for s in registry if PAPER_SEND in s.entitlements}
+    need |= {c.surface_id for f in flows if PAPER_SEND in f.requires for c in f.checkpoints if c.surface_id in registry}
+    return tuple(sorted(need))
 
 
 @dataclass(frozen=True)
@@ -209,16 +243,30 @@ def cell_state(surface: Surface, persona: str, profile: Profile, checkpoints: Se
                 needs_baseline=sum(o.outcome == "needs_baseline" for o in usable))
 
 
+def by_profile(outcomes: Iterable[CheckpointOutcome], profiles: Sequence[Profile]) -> dict[str, list[CheckpointOutcome]]:
+    """Outcome records grouped by their `profile_id` (4.13); a record without one, or with an id that is not a column
+    of this run, counts toward the first profile (choice 1)."""
+    ids = {p.id for p in profiles}
+    out: dict[str, list[CheckpointOutcome]] = {p.id: [] for p in profiles}
+    for o in outcomes:
+        out[o.profile_id if o.profile_id in ids else profiles[0].id].append(o)
+    return out
+
+
 def build_matrix(run_id: str, registry: Registry, profiles: Sequence[Profile],
-                 outcomes: Mapping[str, Iterable[CheckpointOutcome]], cuts: Iterable[Cut] = (),
-                 personas: Sequence[str] = PERSONAS) -> CoverageMatrix:
+                 outcomes: Mapping[str, Iterable[CheckpointOutcome]] | Iterable[CheckpointOutcome],
+                 cuts: Iterable[Cut] = (), personas: Sequence[str] = PERSONAS) -> CoverageMatrix:
     """The coverage matrix of a run from its planned scope (cuts) and its outcome records (2.12).
 
-    `outcomes` maps each profile id to the outcome records its login produced; `cuts` is
-    `ScopePlan.cuts`. An `unregistered_surface` record adds a synthetic row, tier 1 until
-    classified (2.2.3), whose cells are all `not_registered`.
+    `outcomes` maps each profile id to the outcome records its login produced, or is a flat list grouped by each
+    record's `profile_id` (`by_profile`); `cuts` is `ScopePlan.cuts`. An `unregistered_surface` record adds a
+    synthetic row, tier 1 until classified (2.2.3), whose cells are all `not_registered`.
     """
+    if not profiles:
+        raise ValueError("a coverage matrix needs at least one entitlement profile (2.12)")
     cuts = list(cuts)
+    if not isinstance(outcomes, Mapping):
+        outcomes = by_profile(outcomes, profiles)
     grouped: dict[tuple[str, str, str], list[CheckpointOutcome]] = defaultdict(list)
     synthetic: set[str] = set()
     for prof_id, records in outcomes.items():

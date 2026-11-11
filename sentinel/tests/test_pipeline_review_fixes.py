@@ -157,7 +157,11 @@ def test_a_failed_post_run_check_after_a_safety_abort_keeps_aborted_safety_and_r
     check = summary["post_run_check"]
     assert check["report_withheld"] is True and check["failures"][0].startswith("L-OUT-07: 1 scoped checkpoint")
     assert [(o.outcome, o.reason, o.gate) for o in filled] == [("env_error", "paper_mode_mismatch", "running")]
-    assert "L-OUT-07" in (tmp_path / "pr-comment.md").read_text()
+    text = (tmp_path / "pr-comment.md").read_text()
+    assert "L-OUT-07" in text
+    # the withheld block still carries the safety abort's lines (6.6, 9.2): trigger, gate, proof and incident
+    assert "Trigger: paper_mode_mismatch" in text and "Gate: running" in text
+    assert "Post-run proof: PROVEN: no orders sent" in text and "Incident: " in text
     assert json.loads((tmp_path / "commit-status.json").read_text())["state"] == "error"
 
 

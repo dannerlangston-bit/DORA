@@ -116,3 +116,43 @@ def test_node_finds_named_nodes_and_rejects_bad_build():
         synth.node(layout, "nope")
     with pytest.raises(ValueError):
         synth.active_trader_cell_layout(build="other")
+
+
+def _with_header(build: str, size=(480, 360)) -> synth.Screen:
+    layout = synth.active_trader_cell_layout(size, build)
+    synth.node(layout, "ladder")["column_header"] = True
+    return synth.render(layout, size)
+
+
+def test_a_ladder_column_header_draws_the_required_labels_over_their_columns():
+    """07-inv05, 2.7 INV-05: the ladder surfaces require "Bid Size" and "Ask Size"; the header row is the viewport's
+    first row, so the viewport keeps the 1.11 geometry and the price rows start below it."""
+    s = _with_header("base")
+    assert s.get("ladder.viewport").bbox == (0, 58, 480, 294)
+    assert s.get("ladder.header").bbox == (0, 58, 480, 21) and s.get("ladder.header").parent == "ladder.viewport"
+    labels = {k: s.get(f"ladder.header.{k}") for k in ("bid", "price", "ask")}
+    assert [d.text for d in labels.values()] == ["Bid Size", "Price", "Ask Size"]
+    for k, d in labels.items():
+        slot = s.get(f"ladder.header.{k}.cell").bbox
+        x, y, w, h = d.bbox
+        assert slot[0] <= x and x + w <= slot[0] + slot[2] and 58 <= y and y + h <= 79
+    rows = [c for c in s.components if c.kind == "price_row"]
+    assert rows[0].bbox[1] == 79 and len(rows) == 13 and all(r.bbox[3] == 21 for r in rows)
+    assert not any(c.name.startswith("ladder.header") for c in synth.worked_example("base").components)
+
+
+def test_on_the_candidate_the_column_header_draws_over_the_buttons_lower_half():
+    s = _with_header("candidate")
+    assert _rect_overlap_y(s.get("ladder.strip").bbox, s.get("ladder.viewport").bbox) == 14
+    head = s.get("ladder.header").bbox
+    for button in ("ladder.buy", "ladder.sell"):
+        b = s.get(button).bbox
+        assert head[1] <= b[1] + b[3] // 2 and _rect_overlap_y(head, b) >= b[3] // 2
+
+
+def test_a_ring_is_a_one_pixel_focus_frame():
+    s = synth.render({"type": "window", "children": [{"type": "ring", "name": "focus", "rect": [10, 10, 20, 8]}]},
+                     (40, 30))
+    assert s.get("focus").kind == "focus_ring" and s.get("focus").bbox == (10, 10, 20, 8)
+    assert (s.image[10, 10:30] == synth.THEME["focus"]).all() and (s.image[17, 10:30] == synth.THEME["focus"]).all()
+    assert (s.image[13, 15] == synth.THEME["bg"]).all()

@@ -4,5 +4,6 @@ landmarks:
   - {id: lm.ladder-header, template: regions/landmarks/lm.ladder-header.png, confidence_min: 0.92}
 regions:
   - {id: rgn.ladder.column-header, type: diff, landmark: lm.ladder-header, rect: {dx: 0, dy: 22, w: 300, h: 18}}
+  - {id: rgn.ladder.header-ask, type: diff, landmark: lm.ladder-header, rect: {dx: 200, dy: 22, w: 50, h: 18}}   # the Ask Size slot (M11)
   - {id: rgn.ladder.viewport, type: diff, landmark: lm.ladder-header, rect: {dx: 0, dy: 42, w: 300, h: 260}}
   - {id: rgn.ladder.qty, type: diff, landmark: lm.ladder-header, rect: {dx: 0, dy: 306, w: 60, h: 20}}

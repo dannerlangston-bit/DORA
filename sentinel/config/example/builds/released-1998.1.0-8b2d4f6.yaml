@@ -1,0 +1,14 @@
+# The previous release: the RC run's base and the build two tier B workspaces were saved under (2.3, 4.6).
+schema_version: 1
+build:
+  build_id: released-1998.1.0-8b2d4f6
+  channel: released
+  version_string: "1998.1.0"
+  commit_sha: 8b2d4f6a0c3e5b7d9f1a2c4e6b8d0f3a5c7e9b1d
+  pipeline_run_id: "tos-desktop/8702"
+  artifact:
+    uri: artifactory://tos-desktop/released/8b2d4f6/thinkorswim-win64.zip
+    sha256: "sha256:9d2a6c1e5b8f3d7a0c4e9b2f6a1d5c8e3b7f0a4d9c2e6b1f5a8d3c7e0b4f9a61"
+  install_method: artifact
+  built_at: 2026-10-12T20:00:00-04:00
+  released_at: 2026-10-19T06:00:00-04:00

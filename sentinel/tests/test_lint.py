@@ -31,9 +31,14 @@ def test_every_example_file_is_read():
     repo = Repo.load(EXAMPLE)
     for p in EXAMPLE.rglob("*.yaml"):
         rel = p.relative_to(EXAMPLE).as_posix()
-        assert rel in repo.docs, rel
+        assert rel in repo.docs or rel in READ_BY_A_CHECK_MODULE, rel
     missing = {kind for kind, _ in LAYOUT} - {d.kind for d in repo.docs.values()} - {"taxonomy"}
     assert missing <= EXAMPLE_PENDING, sorted(missing - EXAMPLE_PENDING)
+
+
+# 4.1 files a check module reads from disk until lint/repo.py LAYOUT lists them (none left: corpus/odd-inputs.yaml is
+# the layout's kind odd_inputs)
+READ_BY_A_CHECK_MODULE: frozenset[str] = frozenset()
 
 
 # 4.16 kinds the example does not hold yet; the build packages that own each file add it (shrink this set as they land)
@@ -46,8 +51,10 @@ EXAMPLE_PENDING = frozenset({
 
 def test_skipped_rules_carry_reasons():
     report = lint(EXAMPLE, today=TODAY)
-    for rid in ("L-MAN-09", "L-MAN-10", "L-SRF-12", "L-FIX-08", "L-XREF-10", "L-XREF-16", "L-FPR-02"):
+    for rid in ("L-MAN-09", "L-MAN-10", "L-FIX-08", "L-XREF-10", "L-XREF-16", "L-FPR-02"):
         assert report.skipped[rid]
+    for rid in ("L-MSK-04", "L-MSK-05", "L-XREF-10"):            # checked by `sentinel lint --changed BASE`
+        assert report.skipped[rid].startswith("history:"), rid
     implemented = {i for m in R.check_modules() for i in m.RULE_IDS}   # pending rows a checks module now implements
     assert set(report.skipped) == {rid for rid, r in RULES.items() if r.skipped and rid not in implemented}
     assert all(r.severity in ("error", "warn") for r in RULES.values())

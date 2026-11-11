@@ -82,7 +82,8 @@ def test_a_check_module_reports_and_unpends_its_rules(plugin_dir):
     ''')
     report = lint(EXAMPLE, today=TODAY)
     assert [v.rule for v in report.violations] == ["L-SRF-16"]
-    assert "L-SRF-16" not in report.skipped and "L-WSP-08" in report.skipped
+    unnamed = {rid for rid in NEW_ROWS} - {i for m in R.check_modules() for i in m.RULE_IDS}   # rows still pending
+    assert "L-SRF-16" not in report.skipped and all(rid in report.skipped for rid in unnamed)
     assert "L-FPR-02" in report.skipped                    # a run-start rule stays skipped whoever names it
 
 

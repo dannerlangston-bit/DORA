@@ -30,6 +30,16 @@ and its calibration):
   run is `aborted_safety (reason: kill_switch)` and the proof reads PROVEN: no orders sent (6.6).
 - `redaction-miss`: the candidate echoes an account id outside the redaction anchors; the redaction stage masks it
   and stores a tier-1 `redaction_miss` finding; the check still passes (3.6, 6.10).
+- `base-distance`: the PR's merge base has no main build; the base is the nearest main build two commits back and
+  the PR merged in between counts as declared (3.1, SD-02).
+- `base-missing`: no main build at the merge base or on its 20 nearest ancestors; the run is `aborted_harness
+  (reason: base_build_missing)` before any capture, re-queued once, with the merge base rebuild requested (4.2).
+- `base-reuse`: a merge run captures the new main build; the next PR run on that base reuses its frozen captures
+  instead of capturing the base again (3.1, 7.9).
+- `lockstep-slip`: the masked_live pair's base rig captures the Position Statement 75 s, then 80 s, after the
+  candidate rig; it is re-queued once, then `not_run (reason: budget)` with `lockstep_slip` in run health (3.1).
+- `calibrated-floors`: a weekend Calibration run writes the base build's floors to the store; the PR run on that
+  base reads them (`StoreCalibration`) instead of measuring its own and requests no Calibration (3.9, 7.13).
 
 `sentinel demo all` runs every scenario, prints one line each and writes `DIR/index.html`, a page that
 links each scenario's report, PR comment, summary and alerts with what to check.
@@ -48,7 +58,7 @@ import html
 import shutil
 import sys
 from dataclasses import replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -57,6 +67,7 @@ import cv2
 import yaml
 
 from . import synth
+from .pairs import MainCommit
 from .pipeline.orchestration import RigScript
 from .pipeline.reviewer import SIMULATED_MODEL_ID
 from .pipeline.run import (DEFAULT_TODAY, NOT_SIMULATED, NightlyScenario, PairRefused, RunResult, Scenario,
@@ -68,7 +79,7 @@ EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "example"
 SCENARIOS = ("flexgrid-ladder", "clean-pr", "backend-only", "ui-no-manifest", "nightly-canary", "decision-inheritance",
              "wrong-number", "paper-mode-mismatch", "attempted-send", "app-crash", "config-invalid", "expired-mask",
              "operator-stop", "redaction-miss", "popups", "fingerprint-mismatch", "clamped-gadget", "fixed-reopens",
-             "occluded-capture")
+             "occluded-capture", "base-distance", "base-missing", "base-reuse", "lockstep-slip", "calibrated-floors")
 AT = "charts.flexible-grid.active-trader-cell"
 LADDER = "trade.active-trader.ladder"
 STOCK_FLOW = "flow.trade.order-ticket.stock.limit"
@@ -344,6 +355,107 @@ def mask_expiry(config_dir: Path) -> date:
     return min(dates)
 
 
+def _branch_build_at(sha7: str, pr: int, branch: str, merge_base_sha: str) -> tuple[str, str]:
+    """A branch build whose merge base is `merge_base_sha` and whose record carries no build pair: run creation
+    resolves the base (3.1, `pairs.resolve_base`)."""
+    bid = f"branch-1998.3.0-{sha7}"
+    text = f"""schema_version: 1
+build:
+  build_id: {bid}
+  channel: branch
+  version_string: "1998.3.0"
+  commit_sha: {_commit(sha7)}
+  branch: {branch}
+  merge_base_sha: {merge_base_sha}
+  pipeline_run_id: "tos-desktop/pr-{pr}/1"
+  artifact:
+    uri: artifactory://tos-desktop/branch/{sha7}/thinkorswim-win64.zip
+    sha256: "sha256:{hashlib.sha256(bid.encode()).hexdigest()}"
+  install_method: artifact
+  built_at: 2026-11-10T10:24:00-05:00
+"""
+    return f"builds/{bid}.yaml", text
+
+
+L2_SRC = "desktop/charts/src/main/java/com/tos/desktop/charts/grid/level2cell/Level2SizeRenderer.java"
+MERGED_4823 = "branch-1998.3.0-a41c7e9"           # PR 4823's candidate build: its manifest's file name
+
+
+def _manifest_4871(candidate: str) -> str:
+    return f"""schema_version: 1
+manifest_id: mf-{candidate}
+candidate: {candidate}
+base: {BASE_ID}
+source: manual
+author: tnguyen
+entries:
+  - entry_id: tos-48305-1
+    tickets: [TOS-48305]
+    summary: Level II size column shows lots
+    declared_surfaces: [charts.flexible-grid.level2-cell]
+    touched_primitives: []
+    changed_paths:
+      - "desktop/charts/src/main/java/**/level2cell/Level2SizeRenderer.java"
+    expected_visual: >
+      The Level II cell's size column shows lots instead of shares. Nothing else in the cell moves.
+    feature_flags: []
+    must_be_observed: true
+"""
+
+
+def base_distance_scenario(today: date) -> Scenario:
+    """PR 4871: branched from main at a commit CI never built. The base is the nearest main build, two commits back
+    (SD-02, 3.1); PR 4823 merged in between, so its chart header change is on the candidate and its manifest counts
+    as declared for the run."""
+    sha7, cand = "d5e6f70", "branch-1998.3.0-d5e6f70"
+    m0, m1 = _commit("9a2b3c4"), _commit("8f1e2d3")
+    overlay = dict([_main_build(), _branch_build_at(sha7, 4871, "feature/TOS-48711-l2-lots", m0),
+                    _branch_build("a41c7e9", 4823, "feature/TOS-48211-chart-period")])
+    overlay[f"manifests/{MERGED_4823}.yaml"] = clean_scenario(today).overlay[f"manifests/{MERGED_4823}.yaml"]
+    overlay[f"manifests/{cand}.yaml"] = _manifest_4871(cand)
+    return Scenario("base-distance", f"run-{today.isoformat()}-pr-4871-01",
+                    SimBuild(cand, frozenset({"level2-size-column", "chart-header-period"})), SimBuild(BASE_ID),
+                    pr=4871, author="tnguyen", overlay=overlay, changed_paths=(L2_SRC,), depends_on={},
+                    main_history=(MainCommit(m0), MainCommit(m1, (MERGED_4823,)), MainCommit(_commit("2c91ae4"))))
+
+
+def base_missing_scenario(today: date) -> Scenario:
+    """PR 4872: CI was down; no main build record at its merge base or on the 20 main commits before it (3.1)."""
+    sha7, cand = "e7f8091", "branch-1998.3.0-e7f8091"
+    history = tuple(_commit(f"c0de{i:03x}") for i in range(21))
+    overlay = dict([_main_build(), _branch_build_at(sha7, 4872, "fix/TOS-48720-l2-tooltip", history[0])])
+    return Scenario("base-missing", f"run-{today.isoformat()}-pr-4872-01", SimBuild(cand), SimBuild(BASE_ID),
+                    pr=4872, author="tnguyen", overlay=overlay, changed_paths=(L2_SRC,), depends_on={},
+                    main_history=history)
+
+
+PREV_MAIN = "1b2c3d4"
+
+
+def _reuse_overlay(today: date) -> dict[str, str]:
+    """One config tree for the merge run and the PR run after it, so their fingerprints and region registry versions
+    agree (7.4, 7.9): PR 4823's files, the main build and the main build before it."""
+    return dict(clean_scenario(today).overlay, **dict([_main_build(PREV_MAIN)]))
+
+
+def base_reuse_scenarios(today: date) -> tuple[Scenario, Scenario]:
+    """The merge run that captured main 2c91ae4 (merged against the previous main build), then PR 4823's run on that
+    base, which reuses the merge run's frozen captures (3.1, 7.4)."""
+    merge = Scenario("base-reuse", f"run-{today.isoformat()}-merge-0912", SimBuild(BASE_ID),
+                     SimBuild(f"main-1998.3.0-{PREV_MAIN}"), run_type="merge", pr=None, author="orchestrator",
+                     overlay=_reuse_overlay(today), clock="09:12:00")
+    pr = replace(clean_scenario(today), name="base-reuse", run_id=f"run-{today.isoformat()}-pr-4823-11",
+                 overlay=_reuse_overlay(today))
+    return merge, pr
+
+
+def lockstep_slip_scenario(today: date) -> Scenario:
+    """PR 4823 again; the masked_live pair's base rig captures the Position Statement 75 s, then 80 s, after the
+    candidate rig (3.1)."""
+    return replace(clean_scenario(today), name="lockstep-slip", run_id=f"run-{today.isoformat()}-pr-4823-12",
+                   rig=RigScript(lockstep_slip_s=((PS_CENSUS, (75.0, 80.0)),)))
+
+
 # The single-PR-run scenarios by name, for `sentinel review` (the Reviewer items of one run)
 PR_SCENARIOS: dict[str, Callable[[date], Scenario]] = {
     "flexgrid-ladder": lambda d: flexgrid_scenario(d), "clean-pr": lambda d: clean_scenario(d),
@@ -353,6 +465,8 @@ PR_SCENARIOS: dict[str, Callable[[date], Scenario]] = {
     "redaction-miss": lambda d: redaction_miss_scenario(d),
     "popups": lambda d: popups_scenario(d), "fingerprint-mismatch": lambda d: fingerprint_mismatch_scenario(d),
     "clamped-gadget": lambda d: clamped_gadget_scenario(d), "occluded-capture": lambda d: occluded_scenario(d),
+    "base-distance": base_distance_scenario, "base-missing": base_missing_scenario,
+    "lockstep-slip": lockstep_slip_scenario,
 }
 
 S03_CHECKPOINT = f"flow/trade.order-entry.stock/{STOCK_FLOW}/s03"
@@ -406,6 +520,21 @@ ticket: TOS-48344
 decision_ref: dec-000830
 """
     return {S07: text, S07_MASK: mask}
+
+
+ORDER_FLOW = "flows/tier-1/flow.trade.order-ticket.stock.limit.yaml"
+R02_LINE = ("      - {id: R02, kind: rule, rule_id: R02, inputs: {bp_effect: rgn.confirm.bp-effect, "
+            "notional: rgn.confirm.cost}}\n")
+
+
+def blind_night_overlay(config_dir: Path) -> dict[str, str]:
+    """Night 2 of nightly-canary: `blind_overlay` plus the s07 step's R02 assertion dropped from the order flow (the
+    rule that reads the Buying Power Effect cell). The Oracle reads the mutant's pixels, so with R02 in force it still
+    catches M04 under the pasted mask (10.3); only with both edits does M04 end identical."""
+    text = (config_dir / ORDER_FLOW).read_text(encoding="utf-8")
+    if R02_LINE not in text:
+        raise ValueError(f"{ORDER_FLOW} does not carry the example's R02 line")
+    return dict(blind_overlay(config_dir), **{ORDER_FLOW: text.replace(R02_LINE, "")})
 
 
 # ------------------------------------------------------------------------------------------------
@@ -668,15 +797,15 @@ def demo_nightly_canary(out: Path, today: date = DEFAULT_TODAY, config: Path = E
                                         "blank_field", "outside_parent", "window_offscreen")}
     n1 = run_nightly(config, NightlyScenario("nightly-canary", f"run-{yesterday.isoformat()}-nightly-01", main,
                                              overlay=overlay), out, yesterday, history)
-    blind = dict(overlay, **blind_overlay(Path(config)))
+    blind = dict(overlay, **blind_night_overlay(Path(config)))
     n2 = run_nightly(config, NightlyScenario("nightly-canary", f"run-{today.isoformat()}-nightly-02", main,
                                              overlay=blind), out, today, history)
-    rep = n2.canary["report"]
+    rep = n2.canary["detector"]                  # system_state.detector_state as night 2 left it (canary.persist)
     pr = run_pipeline(config, replace(clean_scenario(today, seq=1, clock="10:31:00"),
-                                      overlay=dict(clean_scenario(today).overlay, **blind_overlay(Path(config))),
+                                      overlay=dict(clean_scenario(today).overlay, **blind_night_overlay(Path(config))),
                                       canary=n2.canary["health"], detector_banner=rep.banner), out, today,
                       **_rev(reviewer))
-    (out / "morning-report.txt").write_text((rep.banner or "Detector state ok.") + "\n", encoding="utf-8")
+    (out / "morning-report.txt").write_text("\n".join(n2.canary["morning"]) + "\n", encoding="utf-8")
     shutil.copyfile(out / f"nightly-report-{n2.run_id}.html", out / "nightly-report.html")
     s1, s2 = n1.canary["health"], n2.canary["health"]
     story = [
@@ -687,21 +816,29 @@ def demo_nightly_canary(out: Path, today: date = DEFAULT_TODAY, config: Path = E
         f"Night 1 ({n1.run_id}): money-cell mutants {s1['money_detected']} of {s1['money_total']} detected, other "
         f"{s1['other_detected']} of {s1['other_total']}; detector state {s1['detector_state']}.",
         "",
-        f"Night 2 ({n2.run_id}): someone 'tidied' the Order Confirmation regions file. The Buying Power Effect",
-        "region lost its money_cell flag and the dialog's clock mask was pasted with that cell's offset. Config lint",
-        "passes (the mask's id says clock, and lint knows money cells only by their flag), and the Diff Engine's",
-        "money-cell guard cannot see a flag that is gone. The canary catalog still knows M04 is a money-cell",
+        f"Night 2 ({n2.run_id}): someone 'tidied' the Order Confirmation regions file and its flow. The Buying",
+        "Power Effect region lost its money_cell flag, the dialog's clock mask was pasted with that cell's offset,",
+        "and the step's R02 assertion (the rule that reads that cell) was dropped. Config lint passes (the mask's id",
+        "says clock, and lint knows money cells only by their flag), the Diff Engine's money-cell guard cannot see",
+        "a flag that is gone, and no Oracle assertion reads the cell any more (with R02 in force the Oracle, which",
+        "reads the mutant's pixels, would still catch it). The canary catalog still knows M04 is a money-cell",
         "mutant: the swapped digit lands under the mask, the checkpoint reads identical, and M04 is missed.",
         f"Result: money-cell mutants {s2['money_detected']} of {s2['money_total']}; detector state "
         f"{s2['detector_state']}; the synthetic outcome row of the miss is harness_error (reason: detector_blind);",
         "the morning banner names the mask that absorbed it. The Nightly run itself stays complete.",
         "",
+        f"Each night also runs the A/A pass (10.6): the {len(n1.canary['aa'].rows)} checkpoints plan_nightly selects",
+        "(every tier-1 item and a rotating fifth of the rest) are captured twice in one session and diffed; they are",
+        "the run's real outcome rows (all identical here). The store holds no Calibration floors for the rig's",
+        "rendering key, so the pairs are diffed at threshold 0 and an emergency Calibration run is queued; the",
+        "morning report says so. The night also refreshes the flake statistics and checks every quarantine trigger.",
+        "",
         f"The next PR run ({pr.run_id}, the clean-pr change) carries the DETECTOR BLIND banner at the top of its",
         "comment and report until a Nightly run passes; pr-comment.md, report.html and commit-status.json are",
         "those of that PR run. nightly-report.html and morning-report.txt are night 2's.",
         "",
-        f"Mutants simulated: {', '.join(n2.canary['simulated'])}. Not simulated (listed with the reason in",
-        "canary-results-*.json): " + ", ".join(sorted(NOT_SIMULATED)) + ".",
+        f"Mutants simulated: {', '.join(n2.canary['simulated'])} (the whole catalog: each renders on the simulated",
+        "app and is read from its pixels). Not simulated: " + (", ".join(sorted(NOT_SIMULATED)) or "none") + ".",
     ]
     _write_summary(out, "Scenario nightly-canary: the detector proves it can see, then goes blind", story,
                    [n1, n2, pr], ["Morning banner of night 2:", "", rep.banner or "(none)"])
@@ -997,6 +1134,126 @@ def demo_occluded_capture(out: Path, today: date = DEFAULT_TODAY, config: Path =
     return [r]
 
 
+def demo_base_distance(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                       ) -> list[RunResult]:
+    r = run_pipeline(config, base_distance_scenario(today), out, today, **_rev(reviewer))
+    story = [
+        "PR 4871 changes the Level II size column. It branched from main at a commit CI never built, and the commit",
+        "before that has no build either; the nearest main build is two commits back (main@2c91ae4). That build is",
+        "the base (SD-02, 3.1) and Run health says it is 2 commits before the merge base.",
+        "",
+        "PR 4823 (the chart cell header period) was merged between that base and the merge base, so the candidate",
+        "has its change and the base does not. Its manifest counts as declared for this run (must_be_observed: false):",
+        "the chart cell differences are intended against entry tos-48211-1, not collateral. The Level II cell is",
+        "intended against PR 4871's own entry.",
+    ]
+    _write_summary(out, "Scenario base-distance: the base is the nearest main build, two commits back", story, [r],
+                   _safety_lines(r))
+    return [r]
+
+
+def demo_base_missing(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                      ) -> list[RunResult]:
+    r = run_pipeline(config, base_missing_scenario(today), out, today, **_rev(reviewer))
+    story = [
+        "PR 4872's merge base and the 20 main commits before it have no build record. Run creation finds no base",
+        "(3.1, 4.2), so the run ends aborted_harness (base_build_missing) at provisioned before any rig is touched.",
+        "The abort block says why, that the merge base is to be built, and that the run is re-queued once; the proof",
+        "reads PROVEN: no session established and alerts.json has the P1 harness page.",
+    ]
+    _write_summary(out, "Scenario base-missing: no base build within 20 commits", story, [r])
+    return [r]
+
+
+def demo_base_reuse(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                    ) -> list[RunResult]:
+    merge, pr = base_reuse_scenarios(today)
+    m = run_pipeline(config, merge, out, today, **_rev(reviewer))
+    r = run_pipeline(config, pr, out, today, **_rev(reviewer))
+    story = [
+        "At 09:12 the merge run compares main@2c91ae4 with the main build before it: every tier A census, the sweeps",
+        "and the tier-1 flows (2.11). Its frozen captures of main@2c91ae4 are stored with their reuse key (fingerprint,",
+        "data epoch, fixture hash and the golden account's seeding time, 7.9).",
+        "",
+        "PR 4823's run then uses main@2c91ae4 as its base. Every frozen checkpoint's key matches, so the base side is",
+        "read from the merge run's stored capture instead of being captured again (3.1): each outcome names the merge",
+        "run as its base source, Run health counts base_reused, and the masked_live Position Statement is captured on",
+        "both builds as always. The outcomes are the same as clean-pr's.",
+        "",
+        "Simulation limit: the synthetic app draws the Level II and Time & Sales cells at one size, so the merge run's",
+        "sweeps of those two cells fail size_reached at their first step and the rest of each ladder is not run.",
+    ]
+    _write_summary(out, "Scenario base-reuse: a PR run reuses the merge run's base captures", story, [m, r],
+                   _safety_lines(r))
+    return [m, r]
+
+
+def demo_lockstep_slip(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                       ) -> list[RunResult]:
+    r = run_pipeline(config, lockstep_slip_scenario(today), out, today, **_rev(reviewer))
+    story = [
+        "PR 4823's run. The Position Statement is masked_live, so it runs on two rigs in lockstep: the base build on",
+        "rig-02 and the candidate on rig-01, each in its own shard. Both rigs must capture it within 60 s of each",
+        "other (3.1). The base rig captures it 75 s late: the pair is re-queued once at the end of the shard. It slips",
+        "again (80 s): the checkpoint is not_run (budget), and Run health counts lockstep_slip 1. A slip is a counter,",
+        "never a finding.",
+    ]
+    _write_summary(out, "Scenario lockstep-slip: a masked_live pair that cannot stay in step", story, [r],
+                   _safety_lines(r))
+    return [r]
+
+
+def calibrate_base(config: Path, sc: Scenario, out: Path, run_id: str) -> Any:
+    """A Calibration run (3.9, 11.2) of `sc`'s base build over the checkpoints `sc`'s PR run plans, on the simulated
+    rigs (`calibration_run.SimRigs`), into `out/sentinel.db`: the floors that run then reads from the store. The
+    config tree is the PR run's own, so both read the same regions, masks and calibration key."""
+    from .calibration_run import CalibrationPlan, CalibrationShard, SimRigs, _register, items_for, run_calibration
+    from .pipeline.config import SentinelConfig, materialize
+    from .pipeline.run import RIGS
+    from .scope import DependencyIndex, Manifest, Rig, classes_in, compute_scope
+    cfg = SentinelConfig.load(materialize(config, sc.overlay, out / "config" / run_id))
+    mdoc = cfg.manifests.get(sc.candidate.build_id)
+    scope = compute_scope("pr", Manifest.from_dict(mdoc) if mdoc else None, cfg.dep_map, cfg.registry,
+                          DependencyIndex.from_depends_on(sc.depends_on) if sc.depends_on is not None else None,
+                          classes_in(sc.changed_paths), run_id=run_id, workspaces=cfg.workspaces, flows=cfg.flows,
+                          entitlements=cfg.entitlements, rigs=[Rig(r, "fp") for r in RIGS],
+                          candidate_build_id=sc.candidate.build_id)
+    shards = tuple(CalibrationShard(rig, items_for(cfg, [cp for it in scope.items if it.rigs and it.rigs[0] == rig
+                                                         for cp in it.checkpoints]))
+                   for rig in RIGS if any(it.rigs and it.rigs[0] == rig for it in scope.items))
+    start = datetime(2026, 11, 7, 3, 15, tzinfo=timezone.utc)                     # Friday 22:15 New York
+    plan = CalibrationPlan(run_id, sc.base.build_id, shards, start, start + timedelta(hours=42, minutes=45),
+                           start + timedelta(hours=21, minutes=45))
+    out.mkdir(parents=True, exist_ok=True)
+    with Store(out / "sentinel.db") as store:
+        _register(store, cfg, plan)
+        return run_calibration(cfg, SimRigs(cfg, SimBuild(plan.build_id), plan), store, plan, out_dir=out)
+
+
+def calibrated_floors_scenario(today: date) -> Scenario:
+    """PR 4823's run after a weekend Calibration run of its base build (3.9, 7.13)."""
+    return replace(clean_scenario(today), name="calibrated-floors", run_id=f"run-{today.isoformat()}-pr-4823-13")
+
+
+def demo_calibrated_floors(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                           ) -> list[RunResult]:
+    sc = calibrated_floors_scenario(today)
+    cal = calibrate_base(Path(config), sc, out, "cal-2026-11-06")
+    r = run_pipeline(config, sc, out, today, **_rev(reviewer))
+    story = [
+        "The weekend Calibration run (cal-2026-11-06) captured main@2c91ae4 five times in one session and once in a",
+        "fresh session on the simulated rigs, measured each region's noise floor and wrote the floors to the store",
+        f"under the rendering's calibration key ({cal.outcome.status}, {len(cal.calibrations)} checkpoints).",
+        "",
+        "PR 4823's run reads those floors from the store (4.8 Threshold source, 7.13): each region's threshold is",
+        "the calibrated one, valid under the live regions, masks and redaction version, so the run measures no A/A",
+        "floors of its own and requests no Calibration run. The outcomes are the same as clean-pr's.",
+    ]
+    _write_summary(out, "Scenario calibrated-floors: a PR run reading the store's floors", story, [r],
+                   _safety_lines(r))
+    return [r]
+
+
 def demo_fixed_reopens(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
                        ) -> list[RunResult]:
     from .pipeline.config import SentinelConfig, materialize
@@ -1045,6 +1302,8 @@ DEMOS: dict[str, Callable[..., list[RunResult]]] = {
     "operator-stop": demo_operator_stop, "redaction-miss": demo_redaction_miss, "popups": demo_popups,
     "fingerprint-mismatch": demo_fingerprint_mismatch, "clamped-gadget": demo_clamped_gadget,
     "fixed-reopens": demo_fixed_reopens, "occluded-capture": demo_occluded_capture,
+    "base-distance": demo_base_distance, "base-missing": demo_base_missing, "base-reuse": demo_base_reuse,
+    "lockstep-slip": demo_lockstep_slip, "calibrated-floors": demo_calibrated_floors,
 }
 
 # One sentence per scenario for out/index.html: what it demonstrates, and what a tester should check.
@@ -1113,6 +1372,23 @@ INDEX = {
     "occluded-capture": ("A program outside thinkorswim covers the screen while two checkpoints are captured (3.4).",
                          "those checkpoints are env_error (occluded) naming notepad.exe, one hardening finding and one "
                          "alert for the program, and the rest of the run is compared."),
+    "base-distance": ("The PR's merge base has no main build; the base is the nearest main build two commits back "
+                      "(3.1, SD-02).",
+                      "Run health names the base as 2 commits before the merge base, and the chart cell change of the "
+                      "PR merged in between is intended, not collateral."),
+    "base-missing": ("No main build at the merge base or on its 20 nearest ancestors (3.1, 4.2).",
+                     "the run is aborted_harness (base_build_missing) at provisioned, nothing was captured, the abort "
+                     "block names the rebuild and the single re-queue, and alerts.json has the P1 harness page."),
+    "base-reuse": ("A merge run captures main; the next PR run on that base reuses its frozen captures (3.1, 7.9).",
+                   "the PR run's frozen outcomes name the merge run as base source, Run health counts base_reused, "
+                   "and the outcomes match clean-pr's."),
+    "lockstep-slip": ("The masked_live pair's base rig lags the candidate rig by more than 60 s, twice (3.1).",
+                      "the Position Statement is not_run (budget) after one re-queue, Run health counts lockstep_slip "
+                      "1, and no finding is written for it."),
+    "calibrated-floors": ("A weekend Calibration run writes the base build's floors; the PR run reads them from "
+                          "the store (3.9, 7.13).",
+                          "every threshold of the PR run is calibrated from the store, no Calibration is requested "
+                          "in Run health, and the outcomes match clean-pr's."),
     "expired-mask": ("An expired mask stops applying at run start and the run goes on (4.1, 4.8).",
                      "the run is complete, Run health lists \"mask expired: msk.ps.last-update-01\" and the store "
                      "holds a mask_expired finding."),

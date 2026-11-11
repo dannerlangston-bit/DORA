@@ -1,0 +1,19 @@
+schema_version: 1
+id: ws.tier-b.options-sidebar
+tier: B
+persona: options_trader
+file: corpus/workspaces/ws.tier-b.options-sidebar/workspace.sentinel-options-sidebar
+file_sha256: "sha256:9a3f744826675123d8c549ad29f9583084c03b4999e6ecda256388abdf000203"
+saved_under_build: released-1998.1.0-8b2d4f6      # the previous release: the migration flow loads it on the candidate (2.3)
+display_config: {width: 1920, height: 1080, scale_percent: 100, theme: dark, font_size: medium}
+tabs: [Monitor, Trade, Analyze, Scan, MarketWatch, Charts, Tools]   # placeholder until Phase 0 reads the pinned build's tab bar (4.6)
+windows:
+  - {title_regex: "thinkorswim", rect: {x: 0, y: 0, w: 1920, h: 1040}}
+link_groups:
+  - {color: green, symbol_ref: aapl}
+gadgets_present:
+  - trade.order-entry.stock
+  - monitor.activity.position-statement
+active_trader_panels: []
+owner: tos-trade-ui
+notes: Tier B power-user layout (2.3) with a dense sidebar and custom Position Statement columns.

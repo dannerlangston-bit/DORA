@@ -1,12 +1,18 @@
-"""Canary Service: mutant generation and scoring (10.3, 12.5, 4.11, 5.15; decisions F7, F31, F58).
+"""Canary Service: mutant generation, scoring and the Nightly's canary records (10.3, 12.5, 4.11, 5.15, 8.3, 9.2;
+decisions F7, F31, F58, SD-42 to SD-45, SD-47, SD-81, SD-88, SD-89, SD-91).
 
-The catalog (`canaries/mutants.yaml`, a list of 4.11 entries) is loaded with `load_catalog` or
-`parse_catalog`. `generate` turns each image entry into a mutant of the approved capture of its
-checkpoint, deterministically from the catalog seed 20260101, and records a sha256 manifest that is
-checked against the previous night (10.3 Determinism). The mutants are injected by the caller through
-`evaluate_checkpoint` with `synthetic: true` (10.3 Injection); `score` takes the outcome the path
-produced for each mutant and returns the `canary_results` rows of 8.3, the run's canary state, the
-synthetic `harness_error` rows of 4.13 and the morning banner of 10.3.
+The catalog (`canaries/mutants.yaml`, the `{schema_version, entries}` file of 4.11 or the old bare list, SD-47) is
+loaded with `load_catalog` or `parse_catalog`, each entry validated by the lint's generated schema (L-MUT-00).
+`generate` turns each image entry into a mutant of the approved capture of its checkpoint, deterministically from
+the catalog seed 20260101, and records a sha256 manifest that `check_determinism` compares with the previous night's
+and with the hash the G3 preflight checked (10.3 Determinism). The mutants are injected by the caller through
+`evaluate_checkpoint` with `synthetic: true` (10.3 Injection); behavioral mutants run their canary flow and hand
+in its checkpoint record and step status. `score` takes what the path produced for each mutant and returns the
+`canary_results` rows of 8.3, the run's canary state (SD-88), the `synthetic_outcomes` rows (SD-91), every signal
+id that fired, the coverage-gap lines and the morning banner of 10.3. `persist` writes them with the night's
+manifest, `system_state.detector_state` and the run's summary; `read_detector_state`, `class_history` and
+`previous_manifest` read them back for later runs. The path-equivalence self-test is `canary_paths`; the pages and
+SENT Bugs are `canary_integrations`.
 
 One recipe per class of the 10.3 class table, each a pure function
 ``recipe(image, box, rng, **params) -> image`` over an 8-bit RGB frame (the channel order of the Diff
@@ -42,63 +48,98 @@ Choices where the spec is ambiguous (reported to the coordinator):
    (outside_parent) name region ids resolved from the checkpoint's located boxes; `donor_checkpoint`
    (focus_order) names the checkpoint whose approved capture is the after-frame of step n+1. A name
    that cannot be resolved is `generation_failed`, like a missing landmark.
-4. `aa_control` (M25, "every bound checkpoint"): an entry whose `checkpoint_id` is ``"*"`` expands to
-   one control per checkpoint bound by an image entry of the catalog; a concrete id binds one.
-5. Behavioral entries (M26 to M28, M30) run their `canary_flow` on the live rig. `generate` renders
-   their image simulation only when the checkpoint has an approved capture (for the CI gate run of
-   10.3 and, for `gateway`, the non-matching Send template); otherwise it returns them unrendered and
-   never `generation_failed`, since their stimulus is the flow, not an image.
+4. The synthetic batch (`bound_checkpoints`) is the concrete checkpoints the night's image entries bind. An
+   `aa_control` entry bound to ``"*"`` (M25, SD-43) and every `global_shift` entry (M21, M23, SD-89) expand to one
+   mutant per batch checkpoint. A global-shift mutant is one judgment over its members: detected only when every
+   generated member ended `needs_human (reason: global_shift)`, the one cluster of the 3.7 pre-pass the caller ran
+   over the batch; every member's row takes that verdict.
+5. Behavioral entries (M26 to M28, M30) run their `canary_flow` on the rig. `generate` renders their image
+   simulation only when the checkpoint has an approved capture (for the CI gate run of 10.3 and, for `gateway`,
+   the non-matching Send template); otherwise it returns them unrendered, since their stimulus is the flow. `score`
+   takes the flow's checkpoint record and step status; a gateway mutant whose step was blocked may come without a
+   record (no click, nothing captured), any other miss keeps the record (8.3: a miss keeps the produced outcome).
+   A behavioral mutant with neither a record nor a step status did not run: that mutant's `generation_failed`
+   (10.3: a detector that was not tested is not trusted).
 6. Hashes are over the decoded pixels (shape header plus raw bytes), not an encoded file, so they
-   do not depend on the PNG encoder. A mutant whose base hash equals last night's but whose mutant
-   hash differs is `generation_failed` (nondeterministic generator).
-7. Detection is on the final outcome (10.3: "in its expected list"); `invariant_id` and
-   `assertion_id` are not matched, and a classification confidence below `expected.min_confidence`
-   (4.11) does not count. `collateral` or `needs_human` counts for non-controls when it lands
-   on the mutated region: a component whose region is the `region_ref` or whose box meets the mutant's
-   footprint, a region above threshold that is the `region_ref`, or the classification's region
-   pointer. The footprint is in frame coordinates, so it is tested against the component's window box
-   `bbox`, never the region-relative `bbox_region` the Diff Engine also records for clustering (its
-   choice 16, 9.7). `gateway` is detected on step status `blocked_by_gateway`; `redaction` on the redaction
-   hit (12.5 M19). Borderline Reviewer verdicts must already be re-sampled (3.15) before `score`.
-   The below-threshold control `sub_floor` (M20) is detected whenever the path absorbed it, that is
-   on any outcome without a finding (`identical` or `noise`, 10.3 class table and 12.5 M20), whatever
-   its `expected` list says: under the zero floor of a frozen region a 1 px divider shift is either
-   under the YIQ threshold everywhere (`identical`) or above it, never `below` (`noise`). The
-   identical control `aa_control` (M25) still needs its expected `identical`.
+   do not depend on the PNG encoder. A mutant whose base hash and seed equal last night's but whose mutant
+   hash differs is `generation_failed` (nondeterministic generator); a catalog whose sha256 is not the one the
+   G3 preflight checked fails every mutant before rendering.
+7. Detection is on the final outcome (10.3: "in its expected list"), and a classification confidence below
+   `expected.min_confidence` (4.11) does not count. The expected signal is matched against every id that fired
+   (`fired_ids`: `invariant_ids`, `assertion_ids`, the reason and the lower-precedence results of 9.1, plus the
+   caller's `fired_ids`): `invariant_id` for an `invariant_violation`, `assertion_id` for an `assertion_failed`,
+   and `expected.reason` (SD-44) wherever the taxonomy allows it for the produced outcome. An outcome in the list
+   without its signal is detected under 10.3's rule and listed in `unproven` and as a proof-gap line (12.3:
+   every invariant has a mutant proving it fires); `score(strict_signals=True)` scores it a miss instead.
+   `collateral` or `needs_human` counts for non-controls when it lands on the mutated region: a component whose
+   region is the `region_ref` or whose box meets the mutant's footprint, a region above threshold that is the
+   `region_ref`, or the classification's region pointer. The footprint is in frame coordinates, so it is tested
+   against the component's window box `bbox`, never the region-relative `bbox_region` the Diff Engine also records
+   for clustering (its choice 16, 9.7). `gateway` is detected on its step status (`expected.step_status`, default
+   `blocked_by_gateway`); `redaction` on the redaction hit (12.5 M19). Borderline Reviewer verdicts must already
+   be re-sampled (3.15) before `score`. The below-threshold control `sub_floor` (M20) is detected whenever the
+   path absorbed it, that is on any outcome without a finding (`identical` or `noise`, 10.3 class table and 12.5
+   M20), whatever its `expected` list says: under the zero floor of a frozen region a 1 px divider shift is either
+   under the YIQ threshold everywhere (`identical`) or above it, never `below` (`noise`). The identical control
+   `aa_control` (M25) still needs its expected `identical`.
 8. Rolling floor: the lower of the median of the class's last 14 nightly rates minus 5 points and
    90 percent; 90 percent with no history; never below 95 percent once Phase 2 exits (read literally,
    the floor is then 95 percent). Tonight's rate is detected over scored non-money mutants of the class,
-   with generation failures excluded.
-9. Run canary state: the worst of `detector_blind`, `generation_failed`, `detector_degraded`; `missed`
-   alone leaves the run `ok`, since the floor tolerates it (8.3 banner states ok, degraded, blind). A
-   missed `redaction` mutant (M19) writes `harness_error (reason: safety_canary_blind:redaction)` and
+   with generation failures excluded. `class_history` reads each class's stored rate per earlier Nightly run.
+9. Run canary state (SD-88): `generation_failed` when nothing was generated or a checkpoint of the caller's
+   `critical_checkpoints` has no generated mutant; otherwise `detector_blind` when any row is, else
+   `detector_degraded` when any row is, else `ok`. One mutant's generation failure and `missed` rows leave the
+   run `ok`. A missed `redaction` mutant (M19) writes `harness_error (reason: safety_canary_blind:redaction)` and
    raises the run to `detector_blind` (same P1 and banner as 10.3 safety canaries), while its own row
    follows its non-money class (the 8.3 CHECK forbids `detector_blind` on a non-money row).
 10. Banner: the 10.3 text for one money-cell miss; further misses add "Also missed:" blocks;
-    `generation_failed` uses the blind header with the line "canaries did not run" and one line per
+    `generation_failed` uses the blind header with the line "canaries did not run", the reason, and one line per
     failed mutant; `detector_degraded` lists the classes with rate and floor. Every non-`ok` state
-    ends "RC sign-off is blocked." (12.2: any non-ok state blocks RC sign-off).
-11. The catalog entry accepts one key beyond 4.11, an optional `description` (the 12.5 Transformation
-    text, for example "Price 150.25 -> 150.52"), which the banner prints; `name` is optional because
-    10.3's own M12 example omits it.
+    ends "RC sign-off is blocked." (12.2: any non-ok state blocks RC sign-off). `banner_for` restamps the first
+    line with an earlier start time.
+11. The catalog validates through `schemas/mutant.schema.json`, so the parser and the lint read one rule set (no
+    `description` key; the banner prints the 12.5 Transformation text for M01 to M33, else the name). Parsing
+    tolerates two schema errors: `checkpoint_id: "*"`, which SD-43 allows for `aa_control` and the generated
+    pattern does not yet accept (the class rule is checked here), and a missing `name`, which 10.3's own M12
+    example omits.
+12. What absorbed a miss (`absorbed_by`, 10.3 Scoring): the suppressing decision, the masks that meet the mutant's
+    footprint or are its region, a non-zero calibrated floor on such a region with its fingerprint, fix-list item
+    and owner, the landmark of a `landmark_missing` record, the manifest entry of an `intended` record, and for the
+    controls the finding they over-fired with; a signal that did not fire comes first. The caller passes the
+    registry's masks and the calibration floors; without them the record alone is read.
+13. Coverage gaps (10.3 Gate and governance, L-MUT-05, SD-42) are counted over the generated mutants for the
+    critical checkpoints and the tier-1 checkpoints with an approved baseline the caller names: fewer than 20 live
+    mutants, or a missing brief class, is one line each.
+14. `system_state.detector_state` is JSON (`DetectorState`): the banner state (the mutants' state, raised to
+    `detector_blind` by a blind extra row: a diverged path-equivalence pair, a blind safety canary or drill item),
+    its start time (kept while the state is unchanged, 8.3 "with its start time"), the banner, the degraded classes
+    and the run-health Canary row. A green night writes state `ok`, which clears the banner (8.3 has no delete for
+    the key). The banner adds a line per diverged pair; safety canaries and drill items keep their own 6.5 banner.
 """
+
 from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 import re
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Mapping, Sequence
 
 import cv2
 import numpy as np
 import yaml
 from numpy.typing import NDArray
 
-from .records import CheckpointOutcome
-from .taxonomy import TaxonomyError, is_checkpoint_id, is_slug, load
+from .lint import schemas
+from .lint.rules import BRIEF_CLASSES
+from .records import CheckpointOutcome, Finding, SyntheticOutcome
+from .taxonomy import TaxonomyError, load
+
+if TYPE_CHECKING:
+    from .store.store import Store
 
 Image = NDArray[np.uint8]
 Box = tuple[int, int, int, int]                       # x, y, w, h, as records.Component.bbox
@@ -116,11 +157,35 @@ CONTROL_CLASSES = frozenset({"sub_floor", "aa_control"})   # M20, M25: collatera
 ABSORBED_OUTCOMES = ("identical", "noise")                  # no finding: what detects the sub_floor control (choice 7)
 WHOLE_WINDOW_CLASSES = frozenset({"global_shift", "window_offscreen", "focus_order", "aa_control"})
 OPS = ("erase", "translate", "replace_glyph", "channel_swap", "crop_right", "overlay", "remove_row", "type_value")
-ENTRY_KEYS = frozenset({"mutant_id", "name", "checkpoint_id", "class", "mode", "money_cell", "generator",
-                        "region_ref", "canary_flow", "expected", "owner", "description"})
+BATCH_CLASSES = frozenset({"global_shift"})               # SD-89: applied to every bound checkpoint, judged as a batch
 REGION_PARAMS = {"layer": "layer_box", "source": "source_box", "parent": "parent_box"}
 DESCRIPTIVE_PARAMS = frozenset({"from", "to"})        # choice 1: no OCR, recorded only
 MUTANT_ID = re.compile(r"^M[0-9]{2,}$")
+CATALOG_SCHEMA_VERSION = 1                            # 4.11 mutant_catalog.schema_version
+MIN_LIVE_MUTANTS = 20                                 # 10.3 Gate and governance: the coverage-gap line
+BLIND_TAIL = ("Reports for the affected checkpoints cannot be trusted until this clears.",   # 10.3 Morning message
+              "RC sign-off is blocked.")
+ROLE_FOR_ID = {"invariant_violation": "invariant_id", "assertion_failed": "assertion_id"}
+# 12.5 Transformation column: what the banner prints after the id and class for M01 to M33 (choice 11).
+TRANSFORMATIONS_12_5 = {
+    "M01": "Confirm and Send rect filled with sampled background", "M02": "Send rect filled with dialog background",
+    "M03": "Quantity 100 -> 108 by glyph transplant", "M04": "One digit of Buying Power Effect",
+    "M05": "Price 150.25 -> 150.52", "M06": "SELL transplanted over BUY",
+    "M07": "Red and green channels swapped in the P/L Open column", "M08": "Ladder translated 12 px right into its neighbor",
+    "M09": "Grid translated 8 px down", "M10": '"Buying Power" cut to "Buying Pow" at the cell edge',
+    "M11": "Ellipsis inserted in a column header", "M12": "Ladder viewport translated 14 px up into the order-control strip",
+    "M13": "One strike row removed, gap closed", "M14": "Expiration date moved one day",
+    "M15": '"Loading..." pasted over the body', "M16": "One-row text region downscaled to 5 px cap height",
+    "M17": "Scrollbar drawn on the empty grid", "M18": '"Net Liq" label erased',
+    "M19": "Synthetic account id left unredacted in the input frame", "M20": "One divider shifted 1 px",
+    "M21": "Whole window translated 1 px", "M22": "Dialog title erased", "M23": "Red channel +6 everywhere",
+    "M24": "SMA line erased", "M25": "Approved capture injected unchanged",
+    "M26": "Quantity 10 typed where the flow expects 100", "M27": "Price left blank, Confirm and Send clicked",
+    "M28": "Send template swapped for a non-matching image for one step",
+    "M29": "BUY MKT button translated 6 px across the panel border", "M30": "Detached ladder window moved to x = -200",
+    "M31": "One numeric cell shifted 3 px right within its column",
+    "M32": "After-frame of Tab step 3 replaced by that of Tab step 4", "M33": "Java exception dialog composited over the body",
+}
 
 BORDER_PX = 4          # 10.3 erased_control: background sampled from the 4 px border
 INK_DELTA = 48         # a channel this far from the background is ink
@@ -131,7 +196,6 @@ FLOOR_CAP = 0.90       # 10.3 rolling floor
 FLOOR_MARGIN = 0.05
 FLOOR_TARGET = 0.95    # 9.11 rolling target once Phase 2 exits
 FLOOR_WINDOW = 14
-STATE_RANK = {"detector_blind": 3, "generation_failed": 2, "detector_degraded": 1}
 
 
 class CatalogError(ValueError):
@@ -146,11 +210,14 @@ class GenerationError(RuntimeError):
 
 @dataclass(frozen=True)
 class Expected:
-    """4.11 `expected`: the outcomes that count as detection, plus optional ids."""
+    """4.11 `expected`: the outcomes that count as detection, the signal ids they must carry, and the SD-44 forms."""
     outcomes: tuple[str, ...]
     min_confidence: float | None = None
     invariant_id: str | None = None
     assertion_id: str | None = None
+    reason: str | None = None                 # SD-44: fixed by class (L-MUT-02)
+    step_status: str | None = None            # SD-44: gateway mutants (M28)
+    redaction_hit: bool | None = None         # SD-44: redaction mutants (M19)
 
 
 @dataclass(frozen=True)
@@ -169,20 +236,22 @@ class MutantEntry:
     seed: int | None = None
     name: str | None = None
     canary_flow: str | None = None
-    description: str | None = None
     catalog_version: str = ""
 
     @property
     def label(self) -> str:
-        """What the banner prints after the id and class."""
-        return self.description or self.name or self.op
+        """What the banner prints after the id and class: the 12.5 Transformation, else the name (choice 11)."""
+        return TRANSFORMATIONS_12_5.get(self.mutant_id) or self.name or self.op
 
 
 @dataclass(frozen=True)
 class Catalog:
-    """The parsed catalog and its version (the sha256 of the file, recorded per result row, 10.3)."""
+    """The parsed catalog and its version (the sha256 of the file, recorded per result row, 10.3). `bare_list`
+    is True for a file in the old bare-list form, which the lint warns on in Phase 0 and refuses from Phase 1
+    (SD-47)."""
     entries: tuple[MutantEntry, ...]
     version: str
+    bare_list: bool = False
 
 
 def _need(cond: bool, mid: str, msg: str) -> None:
@@ -190,72 +259,78 @@ def _need(cond: bool, mid: str, msg: str) -> None:
         raise CatalogError(f"{mid}: {msg}")
 
 
+def _relaxed(raw: Mapping[str, Any], location: str, message: str) -> bool:
+    """The two schema errors parsing tolerates (choice 11): `checkpoint_id: "*"`, which SD-43 allows for class
+    `aa_control` and the generated pattern does not yet accept (the class rule is checked here instead), and a
+    missing `name`, which 10.3's own M12 example omits."""
+    if location == "checkpoint_id" and raw.get("checkpoint_id") == "*":
+        return True
+    return location == "" and message == "'name' is a required property"
+
+
 def parse_entry(raw: Mapping[str, Any], version: str = "") -> MutantEntry:
-    """Validate one 4.11 entry and return it."""
+    """Validate one 4.11 entry against `schemas/mutant.schema.json` (the lint's rule set, L-MUT-00) and the entry
+    rules that need two fields, and return it."""
     if not isinstance(raw, Mapping):
         raise CatalogError(f"catalog entry {raw!r} is not a mapping")
     mid = str(raw.get("mutant_id", "?"))
     _need(bool(MUTANT_ID.match(mid)), mid, "mutant_id must match ^M[0-9]{2,}$")
-    unknown = set(raw) - ENTRY_KEYS
-    _need(not unknown, mid, f"unknown keys {sorted(unknown)}")
-    cls = raw.get("class")
-    _need(cls in CLASSES, mid, f"class {cls!r} is not one of the 26 classes of 10.3")
-    mode = raw.get("mode")
-    _need(mode in ("image", "behavioral"), mid, f"mode {mode!r}")
+    errors = [f"{loc or 'entry'}: {msg}" for loc, msg in schemas.validate("mutant#mutant", dict(raw))
+              if not _relaxed(raw, loc, msg)]
+    _need(not errors, mid, "; ".join(errors) + " (schemas/mutant.schema.json, L-MUT-00)")
+    cls, mode, flow, cid = raw["class"], raw["mode"], raw.get("canary_flow"), raw["checkpoint_id"]
     _need((mode == "behavioral") == (cls in BEHAVIORAL_CLASSES), mid,
           f"class {cls} is {'not ' if mode == 'behavioral' else ''}behavioral (10.3)")
-    flow = raw.get("canary_flow")
     _need((flow is not None) == (mode == "behavioral"), mid,
           "canary_flow is required for behavioral and forbidden for image (L-MUT-04)")
-    cid = raw.get("checkpoint_id")
-    _need(isinstance(cid, str) and (is_checkpoint_id(cid) or (cid == "*" and cls == "aa_control")), mid, f"checkpoint_id {cid!r}")
-    _need(isinstance(raw.get("money_cell"), bool), mid, "money_cell must be a bool")
-    gen = raw.get("generator")
-    _need(isinstance(gen, Mapping) and gen.get("op") in OPS, mid, f"generator.op must be one of {OPS}")
-    params = gen.get("params") or {}
-    _need(isinstance(params, Mapping), mid, "generator.params must be a map")
-    seed = gen.get("seed")
-    _need(seed is None or (isinstance(seed, int) and not isinstance(seed, bool)), mid, "generator.seed must be an int")
-    region = raw.get("region_ref")
-    _need(cls == "aa_control" or isinstance(region, str), mid, "region_ref is required")
-    name = raw.get("name")
-    _need(name is None or (isinstance(name, str) and is_slug(name)), mid, f"name {name!r} is not a slug")
-    owner = raw.get("owner")
-    _need(isinstance(owner, str) and bool(owner), mid, "owner is required")
-    exp = raw.get("expected")
-    _need(isinstance(exp, Mapping) and isinstance(exp.get("outcomes"), list) and bool(exp["outcomes"]), mid,
-          "expected.outcomes must be a non-empty list")
-    tax = load()
-    for o in exp["outcomes"]:
-        _need(o in tax.checkpoint_outcomes, mid, f"expected outcome {o!r} is not a checkpoint outcome")
+    _need(cid != "*" or cls == "aa_control", mid, 'checkpoint_id "*" is only for class aa_control (SD-43, L-MUT-01)')
+    _need(cid == "*" or raw.get("region_ref") is not None, mid, 'region_ref is required unless checkpoint_id is "*" (4.11)')
+    gen, exp, tax = raw["generator"], raw["expected"], load()
+    _need(bool(exp["outcomes"]), mid, "expected.outcomes must be a non-empty list")
     inv = exp.get("invariant_id")
     _need(inv is None or inv in tax.data["reasons"]["invariant_violation"], mid, f"invariant_id {inv!r} (L-MUT-06)")
     conf = exp.get("min_confidence")
-    _need(conf is None or (isinstance(conf, (int, float)) and 0 <= conf <= 1), mid, "min_confidence must be in [0, 1]")
+    _need(conf is None or 0 <= conf <= 1, mid, "min_confidence must be in [0, 1]")
+    reason = exp.get("reason")
+    _need(reason is None or any(tax.reason_allowed(o, reason) for o in exp["outcomes"]), mid,
+          f"expected.reason {reason!r} is not a reason of any expected outcome (SD-44, L-MUT-02)")
+    _need(exp.get("step_status") is None or cls == "gateway", mid, "expected.step_status is for class gateway (SD-44)")
+    _need(exp.get("redaction_hit") is None or cls == "redaction", mid,
+          "expected.redaction_hit is for class redaction (SD-44)")
     return MutantEntry(
         mutant_id=mid, checkpoint_id=cid, defect_class=cls, mode=mode, money_cell=raw["money_cell"],
-        op=gen["op"], params=dict(params), owner=owner, region_ref=region, seed=seed, name=name,
-        canary_flow=flow, description=raw.get("description"), catalog_version=version,
-        expected=Expected(tuple(exp["outcomes"]), conf, inv, exp.get("assertion_id")),
+        op=gen["op"], params=dict(gen["params"]), owner=raw["owner"], region_ref=raw.get("region_ref"),
+        seed=gen.get("seed"), name=raw.get("name"), canary_flow=flow, catalog_version=version,
+        expected=Expected(tuple(exp["outcomes"]), conf, inv, exp.get("assertion_id"), reason,
+                          exp.get("step_status"), exp.get("redaction_hit")),
     )
 
 
 def parse_catalog(text: str | bytes) -> Catalog:
-    """Parse the YAML list of 4.11 entries; the version is the sha256 of the text."""
+    """Parse `canaries/mutants.yaml`: the `{schema_version, entries}` file of 4.11, or the old bare list (SD-47:
+    both forms parse; the lint grades the bare list by phase). The version is the sha256 of the text."""
     data = text.encode("utf-8") if isinstance(text, str) else text
     version = hashlib.sha256(data).hexdigest()
     try:
         raw = yaml.safe_load(data)
     except yaml.YAMLError as exc:
         raise CatalogError(f"canaries/mutants.yaml is not valid YAML: {exc}") from exc
-    if not isinstance(raw, list):
-        raise CatalogError("canaries/mutants.yaml must be a list of mutant entries (4.11)")
+    bare = isinstance(raw, list)
+    if not bare:
+        if not (isinstance(raw, Mapping) and set(raw) <= {"schema_version", "entries"}
+                and isinstance(raw.get("entries"), list)):
+            raise CatalogError("canaries/mutants.yaml must be {schema_version, entries: [...]} or a list of mutant "
+                               "entries (4.11, SD-47)")
+        if raw.get("schema_version", CATALOG_SCHEMA_VERSION) != CATALOG_SCHEMA_VERSION:
+            raise CatalogError(f"canaries/mutants.yaml schema_version {raw.get('schema_version')!r}; this reader "
+                               f"knows {CATALOG_SCHEMA_VERSION} (4.11)")
+        raw = raw["entries"]
     entries = tuple(parse_entry(r, version) for r in raw)
     ids = [e.mutant_id for e in entries]
     dupes = sorted({i for i in ids if ids.count(i) > 1})
     if dupes:
         raise CatalogError(f"duplicate mutant ids {dupes} (L-MUT-01)")
-    return Catalog(entries, version)
+    return Catalog(entries, version, bare)
 
 
 def load_catalog(path: str | Path) -> Catalog:
@@ -825,18 +900,45 @@ class Mutant:
 
 @dataclass
 class Generation:
-    """What `generate` returns: every mutant in catalog order, failures included."""
+    """What `generate` returns: every mutant in catalog order, failures included, and the catalog's sha256 (the
+    `catalog_sha256` of the night's `canary_manifests` row, 8.3)."""
     mutants: list[Mutant]
+    catalog_sha256: str = ""
 
     @property
     def manifest(self) -> dict[str, dict[str, Any]]:
-        """The sha256 manifest kept for the next night's check."""
+        """The sha256 manifest kept for the next night's check (`canary_manifests.manifest_json`, 8.3)."""
         return {m.key: {"base_sha256": m.base_sha256, "mutant_sha256": m.mutant_sha256, "seed": m.seed}
                 for m in self.mutants if m.image is not None}
 
     @property
     def failed(self) -> list[Mutant]:
         return [m for m in self.mutants if m.failed]
+
+
+def bound_checkpoints(catalog_entries: Iterable[MutantEntry]) -> list[str]:
+    """The concrete checkpoints the night's image entries bind, sorted: the synthetic batch that `"*"` (M25,
+    SD-43) and the global-shift class (M21, M23, SD-89) expand over, and what a Nightly plans to capture."""
+    return sorted({e.checkpoint_id for e in catalog_entries if e.mode == "image" and e.checkpoint_id != "*"})
+
+
+def check_determinism(manifest: Mapping[str, Mapping[str, Any]], previous: Mapping[str, Mapping[str, Any]] | None,
+                      g3_hash: str | None, catalog_sha256: str) -> dict[str, str]:
+    """The keys of tonight's manifest that fail 10.3 Determinism, with the reason (choice 6).
+
+    Every key fails when the catalog's sha256 is not the hash the G3 preflight checked (`g3_hash`, 12.7 G3; None
+    when the run recorded none). A key whose base sha256 and seed equal last night's but whose mutant sha256
+    differs fails as a nondeterministic generator; a changed base regenerates and passes.
+    """
+    if g3_hash is not None and g3_hash != catalog_sha256:
+        return {k: "the catalog failed the G3 preflight hash" for k in manifest}
+    out: dict[str, str] = {}
+    for k, cur in manifest.items():
+        prev = (previous or {}).get(k)
+        if prev and prev.get("base_sha256") == cur.get("base_sha256") and prev.get("seed") == cur.get("seed") \
+                and prev.get("mutant_sha256") != cur.get("mutant_sha256"):
+            out[k] = "nondeterministic generator: same base and seed, different mutant sha256"
+    return out
 
 
 def mutant_rng(seed: int, mutant_id: str) -> np.random.Generator:
@@ -881,26 +983,29 @@ def _render(entry: MutantEntry, cid: str, base: Image, approved: Mapping[str, Im
 def generate(catalog_entries: Iterable[MutantEntry], approved_images: Mapping[str, Image],
              region_boxes: Mapping[str, Mapping[str, Sequence[int]]], seed: int = SEED, *,
              previous_manifest: Mapping[str, Mapping[str, Any]] | None = None,
-             catalog_hash_ok: bool = True) -> Generation:
+             g3_hash: str | None = None) -> Generation:
     """Generate every mutant of the catalog from the approved captures (10.3 Determinism, 12.5).
 
     `approved_images` maps checkpoint id to the approved RGB capture of the main build; `region_boxes`
     maps checkpoint id to {region id: (x, y, w, h)} located by landmark. An entry's own generator seed
-    wins over `seed`. A missing capture, region or donor, a degenerate box, a generator exception, a
-    mutant equal to its base, a sha256 that differs from `previous_manifest` for the same base and
-    seed, or a catalog that failed the G3 preflight hash (`catalog_hash_ok=False`) leaves that mutant
-    with `error` set: `harness_error (reason: canary_generation_failed)`, never skipped.
+    wins over `seed`. An `aa_control` entry bound to `"*"` (M25) and every `global_shift` entry (M21, M23,
+    SD-89) are applied to every checkpoint of `bound_checkpoints`. A missing capture, region or donor, a
+    degenerate box, a generator exception, a mutant equal to its base, a sha256 that differs from
+    `previous_manifest` (last night's `Generation.manifest`) for the same base and seed, or a catalog whose
+    sha256 is not `g3_hash` (the hash the G3 preflight checked, 12.7) leaves that mutant with `error` set:
+    `harness_error (reason: canary_generation_failed)`, never skipped (`check_determinism`).
     """
     entries = list(catalog_entries)
-    bound = sorted({e.checkpoint_id for e in entries if e.mode == "image" and e.checkpoint_id != "*"})
-    previous = previous_manifest or {}
+    bound = bound_checkpoints(entries)
+    catalog_sha = next((e.catalog_version for e in entries), "")
+    g3_failed = check_determinism({"catalog": {}}, None, g3_hash, catalog_sha)
     mutants: list[Mutant] = []
     for e in entries:
-        for cid in (bound if e.checkpoint_id == "*" else [e.checkpoint_id]):
+        for cid in (bound if e.checkpoint_id == "*" or e.defect_class in BATCH_CLASSES else [e.checkpoint_id]):
             m = Mutant(entry=e, checkpoint_id=cid, seed=e.seed if e.seed is not None else seed)
             mutants.append(m)
-            if not catalog_hash_ok:
-                m.error = "the catalog failed the G3 preflight hash"
+            if g3_failed:
+                m.error = g3_failed["catalog"]
                 continue
             base = approved_images.get(cid)
             if base is None:
@@ -916,15 +1021,13 @@ def generate(catalog_entries: Iterable[MutantEntry], approved_images: Mapping[st
             except Exception as exc:          # 10.3: a generator exception is a generation failure
                 m.error = f"exception:{type(exc).__name__}: {exc}"
                 continue
-            base_sha, mutant_sha = image_sha256(base), image_sha256(image)
-            prev = previous.get(m.key)
-            if prev and prev.get("base_sha256") == base_sha and prev.get("seed") == m.seed \
-                    and prev.get("mutant_sha256") != mutant_sha:
-                m.base_sha256 = base_sha
-                m.error = "nondeterministic generator: same base and seed, different mutant sha256"
-                continue
-            m.image, m.footprint, m.base_sha256, m.mutant_sha256 = image, footprint, base_sha, mutant_sha
-    return Generation(mutants)
+            m.image, m.footprint, m.base_sha256, m.mutant_sha256 = image, footprint, image_sha256(base), image_sha256(image)
+    gen = Generation(mutants, catalog_sha)
+    failures = check_determinism(gen.manifest, previous_manifest, None, catalog_sha)
+    for m in mutants:
+        if m.key in failures:
+            m.error, m.image, m.footprint, m.mutant_sha256 = failures[m.key], None, None, None
+    return gen
 
 
 # -- scoring (10.3 Scoring, 8.3 canary_results) ----------------------------------------------------
@@ -933,11 +1036,12 @@ def generate(catalog_entries: Iterable[MutantEntry], approved_images: Mapping[st
 class MutantResult:
     """What the path produced for one mutant, as `score` takes it."""
     mutant: Mutant
-    produced: CheckpointOutcome | None = None   # the synthetic record from evaluate_checkpoint
-    absorbed_by: str | None = None              # the mask, decision, threshold or landmark that swallowed a miss
+    produced: CheckpointOutcome | None = None   # the synthetic record from evaluate_checkpoint, or the canary flow's
+    absorbed_by: str | None = None              # what swallowed a miss (`absorbed_by`); None: derived from the record
     on_mutated_region: bool | None = None       # None: derived from the record's diff (choice 7)
     step_status: str | None = None              # behavioral: the canary flow's step status (gateway)
     redaction_hit: bool | None = None           # redaction: the stage masked the id and the egress log shows it
+    fired_ids: Collection[str] = ()             # signal ids that fired beyond those the record names (choice 7)
 
 
 @dataclass
@@ -947,6 +1051,35 @@ class RowContext:
     workspace_id: str
     persona: str
     data_mode: str
+
+
+@dataclass(frozen=True)
+class RowVersions:
+    """The version columns of the night's `canary_results` rows (8.3): the mask and threshold versions (the
+    calibration file hash) and the pinned model and prompt, which a Reviewer classification overrides per row."""
+    mask_version: str | None = None
+    threshold_version: str | None = None
+    model_id: str | None = None
+    prompt_hash: str | None = None
+
+
+@dataclass(frozen=True)
+class MaskArea:
+    """A mask region of the mutant's checkpoint in frame coordinates: a candidate absorber of a miss (10.3)."""
+    mask_id: str
+    region_id: str
+    rect: Box
+
+
+@dataclass(frozen=True)
+class CalibratedFloor:
+    """A calibrated floor on a region of the mutant's checkpoint (3.9 fix list): a candidate absorber (10.3)."""
+    region_id: str
+    fingerprint: str                            # the calibration fingerprint, as the banner prints it
+    floor: float
+    rect: Box | None = None
+    fix_item: str | None = None
+    owner: str | None = None
 
 
 @dataclass
@@ -968,7 +1101,7 @@ class CanaryResult:
     class_rate: float | None = None
     class_floor: float | None = None
     kind: str = "mutant"
-    reviewer_verdict: str | None = None         # the remaining 8.3 columns, set by the caller when known
+    reviewer_verdict: str | None = None         # the Reviewer's category and confidence on the produced record
     reviewer_confidence: float | None = None
     mask_version: str | None = None
     threshold_version: str | None = None
@@ -977,6 +1110,7 @@ class CanaryResult:
 
     def __post_init__(self) -> None:
         load().check_member("canary_states", self.state)
+        load().check_member("canary_kinds", self.kind)
         if self.money_cell and self.state == "missed":
             raise TaxonomyError("a money-cell miss is always detector_blind (8.3)")
         if not self.money_cell and self.state == "detector_blind":
@@ -992,22 +1126,43 @@ class CanaryResult:
 
 @dataclass
 class CanaryReport:
-    """The night's canary result: rows, run state, synthetic outcome rows and the banner."""
+    """The night's canary result: rows, run state, synthetic outcome rows, banner, signals and coverage."""
     state: str                                  # ok | detector_blind | generation_failed | detector_degraded
     results: list[CanaryResult]
-    outcome_rows: list[CheckpointOutcome]       # synthetic harness_error rows that replace the produced rows
+    outcome_rows: list[CheckpointOutcome]       # the synthetic harness_error records that replace a produced row
+    synthetic: list[SyntheticOutcome]           # one `synthetic_outcomes` row per mutant that ran or failed (SD-91)
     class_rates: dict[str, float]
     class_floors: dict[str, float]
     degraded_classes: list[str]
-    banner: str | None
+    banner: str | None                          # the morning message with the `since` given to `score`
     page: str | None                            # P1 for blind and generation_failed, P2 for degraded (9.10)
     rc_signoff_blocked: bool
     no_canary_ran: bool                         # the run is then aborted_harness (reason: canary_generation_failed)
+    fired: dict[str, tuple[str, ...]] = field(default_factory=dict)   # mutant key: every signal id that fired
+    coverage_gaps: list[str] = field(default_factory=list)            # the morning report's coverage-gap lines
+    generation_reason: str | None = None        # why the run state is generation_failed (SD-88)
+    generation_errors: dict[str, str] = field(default_factory=dict)   # mutant key: why it was not generated
+    unproven: dict[str, str] = field(default_factory=dict)            # mutant key: the expected signal that did not fire
+    banner_body: tuple[str, ...] = ()           # the banner after its first line (`banner_for`)
 
     @property
     def detector_state(self) -> str:
-        """The value for `system_state.detector_state` and the Nightly run's summary_json."""
+        """The mutants' canary state for the Nightly run's summary_json (`persist` writes `system_state`)."""
         return self.state
+
+    def banner_for(self, since: str | None) -> str | None:
+        """The morning message with its start time `since` (10.3); None when the state is ok."""
+        return _banner(self.state, since, self.banner_body)
+
+
+@dataclass
+class _Graded:
+    r: MutantResult
+    hit: bool | None                            # None: not generated (or the behavioral flow did not run)
+    error: str | None = None
+    fired: frozenset[str] = frozenset()
+    signal: str | None = None                   # why the produced outcome did not count (choice 7)
+    unproven: str | None = None                 # detected, but the expected signal did not fire (choice 7)
 
 
 def rolling_floor(history: Sequence[float], phase2_exited: bool = False) -> float:
@@ -1015,6 +1170,19 @@ def rolling_floor(history: Sequence[float], phase2_exited: bool = False) -> floa
     recent = list(history)[-FLOOR_WINDOW:]
     floor = min(statistics.median(recent) - FLOOR_MARGIN, FLOOR_CAP) if recent else FLOOR_CAP
     return max(floor, FLOOR_TARGET) if phase2_exited else floor
+
+
+def fired_ids(record: CheckpointOutcome) -> frozenset[str]:
+    """Every invariant id and assertion id the record shows firing: `invariant_ids`, `assertion_ids`, its reason
+    and the reasons of its lower-precedence results (9.1), so a signal hidden by precedence still counts."""
+    ids = set(record.invariant_ids or ()) | set(record.assertion_ids or ())
+    pairs = [(record.outcome, record.reason)] + [(x["outcome"], x.get("reason")) for x in record.lower_results or ()]
+    for outcome, reason in pairs:
+        if outcome == "invariant_violation" and reason:
+            ids.add(reason)
+        elif outcome == "assertion_failed" and reason and reason.startswith("assertion:"):
+            ids.add(reason.split(":", 1)[1])
+    return frozenset(ids)
 
 
 def _intersects(a: Sequence[int], b: Sequence[int]) -> bool:
@@ -1038,100 +1206,246 @@ def _on_region(m: Mutant, r: MutantResult) -> bool:
                for c in p.diff.components)
 
 
-def _detected(m: Mutant, r: MutantResult) -> bool:
+def _missing_signal(e: Expected, p: CheckpointOutcome, fired: frozenset[str]) -> str | None:
+    """Why an outcome in the expected list does not prove the class (choice 7): the expected invariant or assertion
+    did not fire, or the record's reason is not the expected reason."""
+    role = ROLE_FOR_ID.get(p.outcome)
+    want = getattr(e, role) if role else None
+    if want is not None and want not in fired:
+        return f"signal: expected {want} did not fire (fired {', '.join(sorted(fired)) or 'none'})"
+    if e.reason is not None and load().reason_allowed(p.outcome, e.reason) and p.reason != e.reason:
+        return f"signal: expected reason {e.reason}, produced {p.reason or 'none'}"
+    return None
+
+
+def _batch_verdicts(results: Sequence[MutantResult]) -> dict[str, tuple[bool, str | None]]:
+    """SD-89: a global-shift mutant is one judgment over its batch: detected when every generated member ended
+    `needs_human (reason: global_shift)`, the one cluster of the whole-window pre-pass of 3.7."""
+    members: dict[str, list[MutantResult]] = {}
+    for r in results:
+        if r.mutant.defect_class in BATCH_CLASSES and not r.mutant.failed and r.produced is not None:
+            members.setdefault(r.mutant.mutant_id, []).append(r)
+    out: dict[str, tuple[bool, str | None]] = {}
+    for mid, rs in members.items():
+        outside = [r for r in rs if r.produced is not None
+                   and (r.produced.outcome, r.produced.reason) != ("needs_human", "global_shift")]
+        first = outside[0].produced if outside else None
+        out[mid] = (not outside, None if first is None else
+                    f"global shift pre-pass: {len(outside)} of {len(rs)} batch checkpoints outside the global_shift "
+                    f"cluster (first {first.checkpoint_id}: {first.outcome})")
+    return out
+
+
+def _detected(m: Mutant, r: MutantResult, fired: frozenset[str], batch: Mapping[str, tuple[bool, str | None]],
+              strict: bool) -> tuple[bool, str | None, str | None]:
+    """(detected, why it missed, the expected signal that did not fire although the outcome is in the list)."""
+    e = m.entry.expected
     if m.defect_class == "redaction":
-        return bool(r.redaction_hit)
+        return bool(r.redaction_hit), None if r.redaction_hit else "redaction: no hit on the planted identifier", None
     if m.defect_class == "gateway":
-        return r.step_status == "blocked_by_gateway"
+        want = e.step_status or "blocked_by_gateway"
+        return r.step_status == want, None if r.step_status == want else \
+            f"gateway: step {r.step_status or 'without a status'}, expected {want}", None
+    if m.defect_class in BATCH_CLASSES:
+        return (*batch[m.mutant_id], None)
     assert r.produced is not None
     outcome, cls = r.produced.outcome, r.produced.classification
-    floor = m.entry.expected.min_confidence
+    floor = e.min_confidence
     if floor is not None and cls is not None and cls.confidence is not None and cls.confidence < floor:
-        return False
-    if outcome in m.entry.expected.outcomes:
-        return True
+        return False, f"signal: confidence {cls.confidence:g} below min_confidence {floor:g}", None
+    signal = None
+    if outcome in e.outcomes:
+        signal = _missing_signal(e, r.produced, fired)
+        if signal is None or not strict:
+            return True, None, signal
     if m.defect_class == "sub_floor":
-        return outcome in ABSORBED_OUTCOMES            # absorbed below threshold; any finding is the miss
-    return m.defect_class not in CONTROL_CLASSES and outcome in ("collateral", "needs_human") and _on_region(m, r)
+        return outcome in ABSORBED_OUTCOMES, signal, None     # absorbed below threshold; any finding is the miss
+    if m.defect_class not in CONTROL_CLASSES and outcome in ("collateral", "needs_human") and _on_region(m, r):
+        return True, None, None
+    return False, signal, None
 
 
 def _check_result(r: MutantResult) -> None:
     m, p = r.mutant, r.produced
+    if r.step_status is not None:
+        load().check_step(r.step_status)
     if p is None:
-        raise ValueError(f"{m.key}: a generated mutant needs the outcome the path produced")
+        want = m.entry.expected.step_status or "blocked_by_gateway"
+        if not (m.defect_class == "gateway" and r.step_status == want):
+            raise ValueError(f"{m.key}: a generated mutant needs the outcome the path produced (a gateway mutant may "
+                             "omit it only when its step was blocked)")
+        return
     if not p.synthetic:
         raise ValueError(f"{m.key}: canary records carry synthetic: true (10.3)")
     if p.checkpoint_id != m.checkpoint_id:
         raise ValueError(f"{m.key}: produced record is for {p.checkpoint_id}")
-    if r.step_status is not None:
-        load().check_step(r.step_status)
 
 
-def _absorbed(r: MutantResult) -> str | None:
-    if r.absorbed_by:
-        return r.absorbed_by
-    reason = r.produced.reason if r.produced else None
-    return reason if reason and reason.startswith("decision:") else None
+def _grade(r: MutantResult, batch: Mapping[str, tuple[bool, str | None]], strict: bool) -> _Graded:
+    m = r.mutant
+    if m.failed:
+        return _Graded(r, None, m.error)
+    if m.entry.mode == "behavioral" and r.produced is None and r.step_status is None:
+        return _Graded(r, None, f"canary flow {m.entry.canary_flow} did not run")     # choice 5
+    _check_result(r)
+    fired = (fired_ids(r.produced) if r.produced is not None else frozenset()) | frozenset(r.fired_ids)
+    hit, signal, unproven = _detected(m, r, fired, batch, strict)
+    return _Graded(r, hit, None, fired, signal, unproven)
 
 
-def _harness_row(r: MutantResult, reason: str, context: RowContext | None) -> CheckpointOutcome:
-    m, p = r.mutant, r.produced
+def absorbed_by(mutant: Mutant, produced: CheckpointOutcome | None, *, masks: Iterable[MaskArea] = (),
+                floors: Iterable[CalibratedFloor] = ()) -> str | None:
+    """What swallowed a missed mutant, as its row and the banner name it (10.3 Scoring, choice 12).
+
+    A `decision:<id>` reason names the decision; a mask of `masks` that meets the mutant's footprint (or is its
+    `region_ref`) names the mask; a non-zero floor of `floors` on such a region names the threshold with its
+    calibration fingerprint, fix-list item and owner; a `landmark_missing` record names the landmark; an
+    `intended` record names its manifest entry; and for the controls, which miss by over-firing, the finding.
+    None when nothing is known (the banner prints "not recorded")."""
+    if produced is None:
+        return None
+    ref, fp = mutant.entry.region_ref, mutant.footprint
+
+    def meets(region_id: str, rect: Box | None) -> bool:
+        return (ref is not None and region_id == ref) or (fp is not None and rect is not None and _intersects(rect, fp))
+
+    reason = produced.reason or ""
+    parts: list[str] = []
+    if reason.startswith("decision:"):
+        parts.append(f"decision: {produced.decision_ref or reason.split(':', 1)[1]}")
+    parts += [f"mask {k.mask_id} (region {k.region_id})" for k in masks if meets(k.region_id, k.rect)]
+    for f in floors:
+        if f.floor and meets(f.region_id, f.rect):
+            fix = ", ".join(x for x in (f"fix-list item {f.fix_item}" if f.fix_item else "",
+                                        f"owner {f.owner}" if f.owner else "") if x)
+            parts.append(f"threshold: calibration for fingerprint {f.fingerprint} carries a non-zero floor on "
+                         f"{f.region_id}" + (f" ({fix})" if fix else ""))
+    if produced.outcome == "landmark_missing" and mutant.defect_class != "landmark_loss":
+        parts.append(f"landmark: {reason.split(':', 1)[-1] if reason else 'not located'} not located")
+    if produced.outcome == "intended" and not reason.startswith("decision:"):
+        parts.append(f"intended: manifest entry {produced.manifest_entry_ref}" if produced.manifest_entry_ref
+                     else "intended: Reviewer classification")
+    if mutant.defect_class in CONTROL_CLASSES and produced.outcome not in ABSORBED_OUTCOMES:
+        parts.append(f"finding: {produced.outcome}" + (f" ({reason})" if reason else ""))
+    return "; ".join(parts) or None
+
+
+def _absorbed_text(g: _Graded) -> str | None:
+    base = g.r.absorbed_by if g.r.absorbed_by is not None else absorbed_by(g.r.mutant, g.r.produced)
+    return "; ".join(x for x in (g.signal, base) if x) or None
+
+
+def _harness_row(g: _Graded, reason: str, context: RowContext | None, watchdog_event: str | None) -> CheckpointOutcome:
+    m, p = g.r.mutant, g.r.produced
     produced = f"; produced {p.outcome}" + (f" ({p.reason})" if p.reason else "") if p else ""
-    detail = f"mutant {m.mutant_id} {m.defect_class}{produced}" + (f": {m.error}" if m.error else "")
+    detail = f"mutant {m.mutant_id} {m.defect_class}{produced}" + (f": {g.error}" if g.error else "")
+    if watchdog_event:
+        detail = f"watchdog_event: {watchdog_event}; {detail}"      # 4.13 harness_error required field
     if p is not None:
         return CheckpointOutcome(run_id=p.run_id, checkpoint_id=p.checkpoint_id, outcome="harness_error",
                                  reason=reason, detail=detail, workspace_id=p.workspace_id, persona=p.persona,
                                  data_mode=p.data_mode, surface_id=p.surface_id, test_kind=p.test_kind,
                                  tier=p.tier, flow_id=p.flow_id, step_id=p.step_id, size_step=p.size_step,
-                                 artifacts=p.artifacts, synthetic=True)
+                                 artifacts=p.artifacts, synthetic=True, mutant_id=m.mutant_id)
     if context is None:
         raise ValueError(f"{m.key}: a generation failure needs a RowContext for its synthetic row")
     return CheckpointOutcome(run_id=context.run_id, checkpoint_id=m.checkpoint_id, outcome="harness_error",
                              reason=reason, detail=detail, workspace_id=context.workspace_id,
-                             persona=context.persona, data_mode=context.data_mode, synthetic=True)
+                             persona=context.persona, data_mode=context.data_mode, synthetic=True,
+                             mutant_id=m.mutant_id)
+
+
+def _synthetic_row(m: Mutant, src: CheckpointOutcome | None) -> SyntheticOutcome | None:
+    """The mutant's `synthetic_outcomes` row (SD-91): its harness_error row when one replaces the produced
+    record, else the produced record; none for a blocked gateway step that left no record."""
+    if src is None:
+        return None
+    return SyntheticOutcome(run_id=src.run_id, mutant_id=m.mutant_id, checkpoint_id=m.checkpoint_id,
+                            outcome=src.outcome, reason=src.reason, detail=src.detail, gate=src.gate,
+                            mutant_sha256=m.mutant_sha256, recorded_at=src.recorded_at)
+
+
+def _versions(p: CheckpointOutcome | None, v: RowVersions) -> dict[str, Any]:
+    rev = p.classification if p is not None and p.classification is not None and p.classification.by == "reviewer" else None
+    return {"reviewer_verdict": rev.category if rev else None, "reviewer_confidence": rev.confidence if rev else None,
+            "mask_version": v.mask_version, "threshold_version": v.threshold_version,
+            "model_id": (rev.model_id if rev and rev.model_id else v.model_id),
+            "prompt_hash": (rev.prompt_hash if rev and rev.prompt_hash else v.prompt_hash)}
+
+
+def _coverage_gaps(generated: Sequence[_Graded], checkpoints: Iterable[str]) -> list[str]:
+    """10.3 Gate and governance and L-MUT-05 counted over the generated mutants (SD-42): a checkpoint with fewer
+    than 20 live mutants, or without one of the six brief classes, is a coverage-gap line (choice 13); a mutant
+    detected without its expected signal is a proof-gap line (12.3, choice 7)."""
+    live: dict[str, set[str]] = {}
+    count: dict[str, int] = {}
+    for g in generated:
+        cid = g.r.mutant.checkpoint_id
+        count[cid] = count.get(cid, 0) + 1
+        live.setdefault(cid, set()).add(g.r.mutant.defect_class)
+    out = []
+    for cid in sorted(set(checkpoints)):
+        n = count.get(cid, 0)
+        if n < MIN_LIVE_MUTANTS:
+            out.append(f"coverage gap: {cid} has {n} live mutant{'' if n == 1 else 's'}, fewer than "
+                       f"{MIN_LIVE_MUTANTS} (10.3)")
+        missing = [c for c in BRIEF_CLASSES if c not in live.get(cid, set())]
+        if missing:
+            out.append(f"coverage gap: {cid} lacks the brief classes {', '.join(missing)} (L-MUT-05)")
+    out += [f"proof gap: {g.r.mutant.mutant_id} {g.r.mutant.defect_class} on {g.r.mutant.checkpoint_id} was detected "
+            f"but its {g.unproven.removeprefix('signal: ')} (12.3)" for g in generated if g.unproven]
+    return out
 
 
 def score(results: Sequence[MutantResult], *, history: Mapping[str, Sequence[float]] | None = None,
-          phase2_exited: bool = False, since: str | None = None, context: RowContext | None = None) -> CanaryReport:
-    """Score one night's mutants (10.3 Scoring, F31, F58).
+          phase2_exited: bool = False, since: str | None = None, context: RowContext | None = None,
+          behavioral_flows_started: bool | None = None, critical_checkpoints: Iterable[str] = (),
+          tier1_checkpoints: Iterable[str] = (), versions: RowVersions | None = None,
+          watchdog_event: str | None = None, strict_signals: bool = False) -> CanaryReport:
+    """Score one night's mutants (10.3 Scoring, F31, F58, SD-88, SD-89).
 
     Money-cell mutants need 100 percent: a miss is `detector_blind` and its synthetic row is
     `harness_error (reason: detector_blind)`. Other mutants count toward their class rate against
     `rolling_floor(history[class])`; a miss in a class below the floor is `detector_degraded` with the
     row `harness_error (reason: detector_degraded)`, otherwise `missed` and the produced row stands.
-    A generation failure is `generation_failed` with `harness_error (reason: canary_generation_failed)`.
-    `history` maps class to its previous nightly rates (oldest first); `since` is the banner's start
-    time as the Reporter prints it (for example "2026-11-09 03:12 ET").
+    A generation failure, or a behavioral mutant whose canary flow did not run, is `generation_failed` with
+    `harness_error (reason: canary_generation_failed)` on its row only. The run state is `generation_failed`
+    when nothing was generated or a checkpoint of `critical_checkpoints` has no generated mutant, otherwise the
+    worst of `detector_blind` and `detector_degraded`, else `ok` (SD-88); `no_canary_ran` (the run is then
+    `aborted_harness`) when nothing was generated and no behavioral flow started (`behavioral_flows_started`;
+    None derives it from the results). `history` maps class to its previous nightly rates (oldest first,
+    `class_history`); `since` is the banner's start time as the Reporter prints it (for example
+    "2026-11-09 03:12 ET"); `versions` fills the version columns; `watchdog_event` is the run's Watchdog event
+    id that every synthetic `harness_error` names in its detail (4.13). `critical_checkpoints` and
+    `tier1_checkpoints` (with an approved baseline) give the coverage-gap lines. A produced outcome in the
+    expected list whose expected invariant, assertion or reason did not fire is detected (10.3) and listed in
+    `unproven` and as a proof-gap line (12.3); with `strict_signals` it is a miss instead (choice 7).
     """
     history = history or {}
-    graded: list[tuple[MutantResult, bool | None]] = []
+    batch = _batch_verdicts(results)
+    graded = [_grade(r, batch, strict_signals) for r in results]
     per_class: dict[str, list[bool]] = {}
-    for r in results:
-        if r.mutant.failed:
-            graded.append((r, None))
-            continue
-        _check_result(r)
-        hit = _detected(r.mutant, r)
-        graded.append((r, hit))
-        if not r.mutant.money_cell:
-            per_class.setdefault(r.mutant.defect_class, []).append(hit)
+    for g in graded:
+        if g.hit is not None and not g.r.mutant.money_cell:
+            per_class.setdefault(g.r.mutant.defect_class, []).append(g.hit)
     rates = {c: sum(v) / len(v) for c, v in per_class.items()}
     floors = {c: rolling_floor(history.get(c, ()), phase2_exited) for c in per_class}
     below = sorted(c for c in rates if rates[c] < floors[c])
 
     rows: list[CanaryResult] = []
     outcome_rows: list[CheckpointOutcome] = []
+    synthetic: list[SyntheticOutcome] = []
     blind: list[CanaryResult] = []
     redaction_blind: list[CanaryResult] = []
     degraded: list[CanaryResult] = []
-    failed: list[Mutant] = []
-    run_rank = 0
-    for r, hit in graded:
-        m, p = r.mutant, r.produced
-        if hit is None:
+    failed: list[_Graded] = []
+    v = versions or RowVersions()
+    for g in graded:
+        m, p = g.r.mutant, g.r.produced
+        if g.hit is None:
             state, reason = "generation_failed", "canary_generation_failed"
-            failed.append(m)
-        elif hit:
+            failed.append(g)
+        elif g.hit:
             state, reason = "detected", None
         elif m.money_cell:
             state, reason = "detector_blind", "detector_blind"
@@ -1139,50 +1453,72 @@ def score(results: Sequence[MutantResult], *, history: Mapping[str, Sequence[flo
             state, reason = "detector_degraded", "detector_degraded"
         else:
             state, reason = "missed", None
-        if hit is False and m.defect_class == "redaction":
+        if g.hit is False and m.defect_class == "redaction":
             reason = "safety_canary_blind:redaction"
         row = CanaryResult(
             mutant_id=m.mutant_id, catalog_version=m.entry.catalog_version, checkpoint_id=m.checkpoint_id,
             defect_class=m.defect_class, money_cell=m.money_cell, seed=m.seed,
             expected=list(m.entry.expected.outcomes), state=state, base_sha256=m.base_sha256,
             mutant_sha256=m.mutant_sha256, produced_outcome=p.outcome if p else None,
-            produced_reason=p.reason if p else None, absorbed_by=None if hit else _absorbed(r),
+            produced_reason=p.reason if p else None, absorbed_by=None if g.hit is not False else _absorbed_text(g),
             class_rate=None if m.money_cell else rates.get(m.defect_class),
-            class_floor=None if m.money_cell else floors.get(m.defect_class),
+            class_floor=None if m.money_cell else floors.get(m.defect_class), **_versions(p, v),
         )
         rows.append(row)
-        run_rank = max(run_rank, STATE_RANK.get(state, 0))
-        if reason is not None:
-            outcome_rows.append(_harness_row(r, reason, context))
+        harness = _harness_row(g, reason, context, watchdog_event) if reason is not None else None
+        if harness is not None:
+            outcome_rows.append(harness)
+        so = _synthetic_row(m, harness or p)
+        if so is not None:
+            synthetic.append(so)
         if state == "detector_blind":
             blind.append(row)
         if reason == "safety_canary_blind:redaction":
             redaction_blind.append(row)
-            run_rank = max(run_rank, STATE_RANK["detector_blind"])
         elif state == "detector_degraded":
             degraded.append(row)
 
-    state = next((s for s, k in STATE_RANK.items() if k == run_rank), "ok")
-    money_total = sum(1 for r, hit in graded if hit is not None and r.mutant.money_cell)
-    labels = {r.mutant.mutant_id: r.mutant.entry.label for r, _ in graded}
-    banner = _banner(state, since, labels, money_total, blind, redaction_blind, failed, below, rates, floors, degraded)
+    generated = [g for g in graded if g.hit is not None]
+    critical = sorted(set(critical_checkpoints))
+    empty = [c for c in critical if not any(g.r.mutant.checkpoint_id == c for g in generated)]
+    gen_reason = ("the stage generated no mutants" if not generated else
+                  f"no generated mutant for critical checkpoint {', '.join(empty)}" if empty else None)
+    state = ("generation_failed" if gen_reason else "detector_blind" if blind or redaction_blind else
+             "detector_degraded" if degraded else "ok")
+    flows = behavioral_flows_started if behavioral_flows_started is not None else \
+        any(g.r.mutant.entry.mode == "behavioral" for g in generated)
+    money_total = sum(1 for g in generated if g.r.mutant.money_cell)
+    labels = {g.r.mutant.mutant_id: g.r.mutant.entry.label for g in graded}
+    body = _banner_body(state, gen_reason, labels, money_total, blind, redaction_blind, failed, below, rates, floors,
+                        degraded)
     return CanaryReport(
-        state=state, results=rows, outcome_rows=outcome_rows, class_rates=rates, class_floors=floors,
-        degraded_classes=below, banner=banner,
+        state=state, results=rows, outcome_rows=outcome_rows, synthetic=synthetic, class_rates=rates,
+        class_floors=floors, degraded_classes=below, banner=_banner(state, since, body),
         page={"detector_blind": "P1", "generation_failed": "P1", "detector_degraded": "P2"}.get(state),
-        rc_signoff_blocked=state != "ok", no_canary_ran=all(hit is None for _, hit in graded),
+        rc_signoff_blocked=state != "ok", no_canary_ran=not generated and not flows,
+        fired={g.r.mutant.key: tuple(sorted(g.fired)) for g in generated},
+        coverage_gaps=_coverage_gaps(generated, set(critical) | set(tier1_checkpoints)), generation_reason=gen_reason,
+        unproven={g.r.mutant.key: g.unproven for g in generated if g.unproven},
+        generation_errors={g.r.mutant.key: g.error or "" for g in failed}, banner_body=body,
     )
 
 
-def _banner(state: str, since: str | None, labels: Mapping[str, str], money_total: int,
-            blind: list[CanaryResult], redaction_blind: list[CanaryResult], failed: list[Mutant],
-            below: list[str], rates: Mapping[str, float], floors: Mapping[str, float],
-            degraded: list[CanaryResult]) -> str | None:
-    """The morning message of 10.3 (choice 10)."""
+def _banner(state: str, since: str | None, body: Sequence[str]) -> str | None:
+    """The morning message of 10.3 (choice 10): the state's first line with its start time, then `body`."""
     if state == "ok":
         return None
     head = "DETECTOR BLIND" if state in ("detector_blind", "generation_failed") else "DETECTOR DEGRADED"
-    lines = [f"{head} since {since}." if since else f"{head}."]
+    return "\n".join([f"{head} since {since}." if since else f"{head}.", *body])
+
+
+def _banner_body(state: str, gen_reason: str | None, labels: Mapping[str, str], money_total: int,
+                 blind: list[CanaryResult], redaction_blind: list[CanaryResult], failed: list[_Graded],
+                 below: list[str], rates: Mapping[str, float], floors: Mapping[str, float],
+                 degraded: list[CanaryResult]) -> tuple[str, ...]:
+    """The banner's lines after the first (choice 10)."""
+    if state == "ok":
+        return ()
+    lines: list[str] = []
     for i, c in enumerate(blind):
         lead = f"Missed {len(blind)} of {money_total} money-cell mutants: " if i == 0 else "Also missed: "
         lines += [f"{lead}{c.mutant_id} {c.defect_class}, {labels[c.mutant_id]}",
@@ -1190,15 +1526,161 @@ def _banner(state: str, since: str | None, labels: Mapping[str, str], money_tota
     for c in redaction_blind:
         lines += [f"Redaction canary blind: {c.mutant_id} {c.defect_class}, {labels[c.mutant_id]}",
                   f"  (checkpoint {c.checkpoint_id})."]
-    if failed:
-        lines.append("canaries did not run")
-        lines += [f"  {m.mutant_id} {m.defect_class} (checkpoint {m.checkpoint_id}): {m.error}." for m in failed]
+    if state == "generation_failed":
+        lines += ["canaries did not run", f"  {gen_reason}."]
+        lines += [f"  {g.r.mutant.mutant_id} {g.r.mutant.defect_class} (checkpoint {g.r.mutant.checkpoint_id}): "
+                  f"{g.error}." for g in failed]
     if below:
         lines.append("Classes below their rolling floor: "
                      + ", ".join(f"{c} {rates[c]:.0%} (floor {floors[c]:.0%})" for c in below) + ".")
         lines += [f"  Missed {c.mutant_id} {c.defect_class}, {labels[c.mutant_id]}"
                   f" (checkpoint {c.checkpoint_id}); absorbed by: {c.absorbed_by or 'not recorded'}." for c in degraded]
-    if head == "DETECTOR BLIND":
-        lines.append("Reports for the affected checkpoints cannot be trusted until this clears.")
-    lines.append("RC sign-off is blocked.")
-    return "\n".join(lines)
+    lines += BLIND_TAIL if state in ("detector_blind", "generation_failed") else BLIND_TAIL[1:]
+    return tuple(lines)
+
+
+# -- the Nightly's records (8.3 canary_results, synthetic_outcomes, canary_manifests, system_state; 9.2) ------------
+
+@dataclass(frozen=True)
+class DetectorState:
+    """`system_state.detector_state` (8.3, 9.2): the banner state of the last Nightly run, which every later
+    report reads until a green Nightly clears it (choice 14)."""
+    state: str                                  # ok | detector_blind | generation_failed | detector_degraded
+    run_id: str                                 # the Nightly run that wrote it
+    since: str | None = None                    # UTC time the state began, kept while it stays the same
+    since_text: str | None = None               # the same time as the banner prints it ("2026-11-09 03:12 ET")
+    banner: str | None = None
+    canary_state: str = "ok"                    # the mutants' own state (`CanaryReport.state`)
+    divergence: bool = False                    # the path-equivalence pair did not reproduce (canary_path_divergence)
+    classes: tuple[str, ...] = ()               # the degraded classes
+    health: Mapping[str, Any] = field(default_factory=dict)    # the run-health Canary row (9.2, `health_row`)
+
+    def __post_init__(self) -> None:
+        for s in (self.state, self.canary_state):
+            if s not in ("ok", "detector_blind", "generation_failed", "detector_degraded"):
+                raise TaxonomyError(f"detector state {s!r} (10.3)")
+
+    def to_json(self) -> str:
+        return json.dumps({**dataclasses.asdict(self), "classes": list(self.classes), "health": dict(self.health)},
+                          sort_keys=True, separators=(",", ":"))
+
+    @classmethod
+    def from_json(cls, text: str) -> "DetectorState":
+        d = json.loads(text)
+        return cls(**{**d, "classes": tuple(d.get("classes", ()))})
+
+
+def health_row(report: CanaryReport, *, date: str, since_text: str | None, state: str | None = None) -> dict[str, Any]:
+    """The run-health Canary row of 9.2 as the report model reads it: money-cell and other detection counts,
+    the detector state (`state`, else the mutants' own), the date, the banner's start time and the degraded
+    classes (`detector_degraded: {class}`)."""
+    money = [r for r in report.results if r.money_cell and r.state != "generation_failed"]
+    other = [r for r in report.results if not r.money_cell and r.state != "generation_failed"]
+    return {"money_detected": sum(r.state == "detected" for r in money), "money_total": len(money),
+            "other_detected": sum(r.state == "detected" for r in other), "other_total": len(other),
+            "detector_state": state or report.state, "date": date, "since": since_text,
+            "classes": list(report.degraded_classes)}
+
+
+def read_detector_state(store: Store) -> DetectorState | None:
+    """The detector state the last Nightly wrote (`system_state.detector_state`); None before any. PR and merge
+    runs build their banner (`DetectorState.banner`) and run-health Canary row (`DetectorState.health`) from it."""
+    text = store.get_system_state("detector_state")
+    return None if text is None else DetectorState.from_json(text)
+
+
+def _path_lines(rows: Sequence[CanaryResult]) -> list[str]:
+    return [f"Path equivalence: the merge-run pair {r.checkpoint_id} of {r.mutant_id} did not reproduce through the "
+            f"canary entry point: harness_error (reason: canary_path_divergence); {r.absorbed_by or 'no detail'}."
+            for r in rows if r.kind == "path_equivalence" and r.state == "detector_blind"]
+
+
+def persist(store: Store, run_id: str, report: CanaryReport, *, since_at: str, since_text: str, date: str,
+            generation: Generation | None = None, extra_rows: Sequence[CanaryResult] = (),
+            at: str | None = None) -> DetectorState:
+    """Write one Nightly run's canary pass to the store and return the detector state it set (8.3, 9.2, 10.3).
+
+    Writes the `canary_results` rows of `report` and `extra_rows` (the path-equivalence row of
+    `canary_paths.path_equivalence`, and the safety canary and drill rows), one `synthetic_outcomes` row per
+    mutant, linked from its result row (SD-91), the night's manifest when `generation` is given
+    (`canary_manifests`, read back by `previous_manifest`), `system_state.detector_state` and the `canary` key of
+    the run's summary_json. The run must be open and the mutants' checkpoints registered. The detector state is
+    the mutants' state, raised to `detector_blind` by a blind extra row (a diverged pair, a blind safety canary or
+    drill item: the same banner, 10.3); its start time is the previous state's while the state is unchanged,
+    else `since_at` (UTC) and `since_text` (as the banner prints it); `ok` clears it. `date` is the run-health
+    date; `at` the write time of every row.
+    """
+    store.write_canary_results(run_id, [*report.results, *extra_rows], created_at=at)
+    for so in report.synthetic:
+        store.write_synthetic_outcome(so if at is None else dataclasses.replace(so, recorded_at=at))
+    if generation is not None:
+        store.write_canary_manifest(run_id, catalog_sha256=generation.catalog_sha256, manifest=generation.manifest,
+                                    created_at=at)
+    divergence = any(r.kind == "path_equivalence" and r.state == "detector_blind" for r in extra_rows)
+    state = report.state
+    if state in ("ok", "detector_degraded") and any(r.state == "detector_blind" for r in extra_rows):
+        state = "detector_blind"
+    previous = read_detector_state(store)
+    keep = previous is not None and previous.state == state != "ok"
+    since, text = (previous.since, previous.since_text) if keep and previous else (since_at, since_text)
+    banner = None
+    if state != "ok":
+        tail = BLIND_TAIL if state in ("detector_blind", "generation_failed") else BLIND_TAIL[1:]
+        body = [x for x in report.banner_body if x not in BLIND_TAIL] + _path_lines(extra_rows) + list(tail)
+        banner = _banner(state, text, body)
+    ds = DetectorState(state, run_id, None if state == "ok" else since, None if state == "ok" else text, banner,
+                       report.state, divergence, tuple(report.degraded_classes),
+                       health_row(report, date=date, since_text=None if state == "ok" else text, state=state))
+    store.set_system_state("detector_state", ds.to_json(), at=at)
+    store.update_summary(run_id, {"canary": {
+        "detector_state": state, "canary_state": report.state, "since": ds.since, "since_text": ds.since_text,
+        "path_divergence": divergence, "class_rates": report.class_rates, "class_floors": report.class_floors,
+        "degraded_classes": report.degraded_classes, "coverage_gaps": report.coverage_gaps,
+        "generation_reason": report.generation_reason, "no_canary_ran": report.no_canary_ran}})
+    return ds
+
+
+def class_history(store: Store, *, exclude_run_id: str | None = None, nights: int = FLOOR_WINDOW) -> dict[str, list[float]]:
+    """Each class's nightly detection rates from the stored `canary_results` of earlier Nightly runs, oldest
+    first, at most the last `nights` (the 14-night window of the rolling floor, 10.3)."""
+    rows = store.query(
+        "SELECT c.run_id, c.defect_class, max(c.class_rate) AS rate FROM canary_results c JOIN runs r USING (run_id) "
+        "WHERE r.run_type = 'nightly' AND c.kind = 'mutant' AND c.money_cell = 0 AND c.class_rate IS NOT NULL "
+        "AND c.run_id IS NOT ? GROUP BY c.run_id, c.defect_class ORDER BY r.started_at, c.run_id", (exclude_run_id,))
+    out: dict[str, list[float]] = {}
+    for row in rows:
+        out.setdefault(row["defect_class"], []).append(float(row["rate"]))
+    return {c: rates[-nights:] for c, rates in out.items()}
+
+
+def previous_manifest(store: Store, *, exclude_run_id: str | None = None) -> dict[str, dict[str, Any]] | None:
+    """The manifest of the latest earlier Nightly run (`canary_manifests`, 8.3), for `generate`'s night-to-night
+    sha256 check (10.3 Determinism); None before any."""
+    rows = store.query(
+        "SELECT m.manifest_json FROM canary_manifests m JOIN runs r USING (run_id) WHERE r.run_type = 'nightly' "
+        "AND m.run_id IS NOT ? ORDER BY r.started_at DESC, m.created_at DESC LIMIT 1", (exclude_run_id,))
+    return json.loads(rows[0][0]) if rows else None
+
+
+def findings(report: CanaryReport, run_id: str, *, created_at: str) -> list[Finding]:
+    """The night's canary findings (4.13): a `canary_miss` for every missed mutant whose produced outcome is
+    `identical`, `noise` or a decision-suppressed row, and a `harness_error` for every mutant that could not be
+    generated (its synthetic row is `harness_error (reason: canary_generation_failed)`)."""
+    out = []
+    for r in report.results:
+        if r.kind != "mutant":
+            continue
+        key = f"{r.mutant_id}@{r.checkpoint_id}"
+        fid = f"fnd-{run_id}-canary-{r.mutant_id}-{hashlib.sha256(r.checkpoint_id.encode()).hexdigest()[:12]}"
+        raw = {"state": r.state, "money_cell": str(r.money_cell).lower(), "mutant_id": r.mutant_id}
+        if r.state == "generation_failed":
+            out.append(Finding(fid, run_id, "harness_error", f"canary mutant {r.mutant_id} {r.defect_class} was not "
+                               f"generated: {report.generation_errors.get(key) or 'no reason recorded'}", run_id,
+                               checkpoint_id=r.checkpoint_id, evidence={"raw_values": raw}, created_at=created_at))
+        elif r.state != "detected" and (r.produced_outcome in ABSORBED_OUTCOMES
+                                        or (r.produced_reason or "").startswith("decision:")):
+            produced = r.produced_outcome + (f" ({r.produced_reason})" if r.produced_reason else "")
+            out.append(Finding(fid, run_id, "canary_miss", f"{r.mutant_id} {r.defect_class} {r.state}: produced "
+                               f"{produced}; absorbed by {r.absorbed_by or 'not recorded'}", run_id,
+                               checkpoint_id=r.checkpoint_id, evidence={"raw_values": raw}, created_at=created_at))
+    return out

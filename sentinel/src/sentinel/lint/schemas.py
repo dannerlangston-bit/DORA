@@ -1098,7 +1098,7 @@ _OVERRIDES: dict[str, dict] = {
     "build.merge_base_sha": {"type": "string", "pattern": SHA40},
     "regions_file.checkpoint_id": _CHECKPOINT,
     "mask.checkpoint_id": _CHECKPOINT,
-    "mutant.checkpoint_id": _CHECKPOINT,
+    "mutant.checkpoint_id": {"anyOf": [_CHECKPOINT, {"const": "*"}]},     # SD-43: "*" binds every checkpoint (aa_control)
     "checkpoint_step.checkpoint_id": _CHECKPOINT,
     "step_common.id": {"type": "string", "pattern": STEP_ID},
     "assertion.id": _LOCAL,

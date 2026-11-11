@@ -11,6 +11,12 @@ The run-start lint (`lint.runstart.lint_at_run_start`) leaves every manifest out
 their file name (`manifests/<candidate build id>.yaml`, the copy made at run creation), never by a field read from
 them. A surface's `invariant_exceptions` (4.5) reach the Invariant Checker through `rules`; the run drops the
 ones expired at run start (`invariants.active_exceptions`, L-SRF-11).
+
+The scope inputs of 2.11 are read here too: Q from `quarantine.yaml` (`scope.quarantine_ids`, the 4.16 record keys
+`checkpoint` and `flow`), the named ladders (`registry/ladders.yaml`), Ladder F's measured corpus sizes
+(`corpus/measured_sizes.yaml`), MAXW x MAXH (`configs/allowed.yaml` `work_area`) and the coverage matrix's entitlement
+profiles, one per fixture account kind (`coverage.fixture_profiles`, 2.12), with `paper_send` on every profile when
+the send policy is gated (6.7).
 """
 from __future__ import annotations
 
@@ -23,9 +29,11 @@ from typing import Any, Mapping
 
 from .. import invariants as inv
 from ..canary import Catalog, parse_catalog
+from ..coverage import Profile, fixture_profiles
 from ..diff.regions import MaskRecord
 from ..lint.repo import Repo
-from ..scope import DependencyMap, Flow, Registry, Workspace
+from ..scope import (DependencyMap, Flow, LadderDef, Registry, Workspace, load_ladders, measured_sizes,
+                     quarantine_ids, work_area)
 
 
 def materialize(config_dir: str | Path, overlay: Mapping[str, str | bytes], dest: str | Path) -> Path:
@@ -76,6 +84,10 @@ class SentinelConfig:
     send_policy: str
     fixture: dict = field(default_factory=dict)
     send_policy_ref: str = "OPEN"                 # the risk owner decision of policy/send_policy.yaml (6.6, 8.3)
+    ladders: dict[str, LadderDef] = field(default_factory=dict)          # registry/ladders.yaml (2.5.2)
+    corpus_sizes: dict[str, tuple] = field(default_factory=dict)         # corpus/measured_sizes.yaml (SD-06)
+    max_client: tuple[int, int] | None = None                            # configs/allowed.yaml work_area (2.5.2)
+    profiles: tuple[Profile, ...] = ()                                   # the 2.12 matrix columns
 
     @classmethod
     def load(cls, root: str | Path) -> "SentinelConfig":
@@ -86,9 +98,13 @@ class SentinelConfig:
         kinds = {a.get("kind") for a in fixture.get("accounts", [])}
         quarantine = repo.one("quarantine")
         # 10.5, 4.16 quarantine_record: each record names exactly one of `checkpoint` and `flow`
-        q = frozenset(r.get("checkpoint") or r.get("flow") for r in ((quarantine.data or {}).get("records") or [])
-                      ) if quarantine else frozenset()
+        q = quarantine_ids(quarantine.data if quarantine is not None and isinstance(quarantine.data, dict) else None)
         send = repo.one("send_policy")
+        policy = "no_sends" if not ((send.data or {}).get("enabled") if send else False) else "gated"
+
+        def data(kind: str) -> Any:
+            doc = repo.one(kind)
+            return doc.data if doc is not None and isinstance(doc.data, dict) else None
         mutants = Path(root) / "canaries" / "mutants.yaml"
         return cls(
             root=Path(root), repo=repo, registry=Registry.from_entries(surfaces.values()),
@@ -101,9 +117,11 @@ class SentinelConfig:
             surfaces=surfaces, builds={d.data["build"]["build_id"]: d.data for d in repo.of("build")},
             catalog=parse_catalog(mutants.read_bytes()) if mutants.exists() else None,
             entitlements=frozenset("margin" if k == "margin" else k for k in kinds if k),
-            quarantine=frozenset(x for x in q if x),
-            send_policy="no_sends" if not ((send.data or {}).get("enabled") if send else False) else "gated",
-            fixture=fixture, send_policy_ref=str((send.data or {}).get("decision") or "OPEN") if send else "OPEN")
+            quarantine=q, send_policy=policy,
+            fixture=fixture, send_policy_ref=str((send.data or {}).get("decision") or "OPEN") if send else "OPEN",
+            ladders=load_ladders(data("ladders")), corpus_sizes=measured_sizes(data("measured_sizes")),
+            max_client=work_area(data("configs_allowed")),
+            profiles=fixture_profiles(fixture, extra=("paper_send",) if policy == "gated" else ()))
 
     # -- helpers ---------------------------------------------------------------------------
     def regions_doc(self, checkpoint_id: str, surface_id: str, kind: str, host: str | None) -> dict | None:

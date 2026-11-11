@@ -55,3 +55,30 @@ def test_sentinel_lint_code_routes_to_the_gateway_lint(tmp_path, capsys):
     assert main(["lint", "--code", str(tmp_path / "nothing")]) == 2       # no src/ folder: a usage error
     assert main(["lint", str(tmp_path / "nothing")]) == 2                 # without --code it is the config lint
     assert "is not a directory" in capsys.readouterr().err
+
+
+EXAMPLE = Path(__file__).resolve().parents[1] / "config" / "example"
+
+
+def test_the_help_names_calibrate_depmap_and_every_lint_mode(capsys):
+    assert main(["--help"]) == 0
+    out = capsys.readouterr().out
+    for usage in ("sentinel calibrate <config-dir> PLAN.json --out DIR", "sentinel depmap --jdeps FILE",
+                  "--changed BASE", "--manifest PATH", "--config-commit SHA", "--file FLOW"):
+        assert usage in out
+
+
+def test_sentinel_depmap_routes_to_the_dependency_scan(tmp_path, capsys):
+    """`sentinel depmap` is `depscan.main` (2.10.1): a scan that cannot be read keeps the committed map and writes
+    the scan_failed status the next merge run reads."""
+    from sentinel.depscan import last_scan_failed
+    status = tmp_path / "status.json"
+    assert main(["depmap", "--jdeps", str(tmp_path / "missing.txt"), "--config", str(EXAMPLE), "--build", "b-1",
+                 "--now", "2026-11-10T03:10:00-05:00", "--status", str(status)]) == 2
+    assert last_scan_failed(status) and "scan failed" in capsys.readouterr().err
+
+
+def test_sentinel_calibrate_routes_to_the_calibration_run(tmp_path, capsys):
+    """`sentinel calibrate` is `calibration_run.main` (3.9): a missing plan file is a usage error."""
+    assert main(["calibrate", str(EXAMPLE), str(tmp_path / "missing.json"), "--out", str(tmp_path / "out")]) == 2
+    assert "not found" in capsys.readouterr().err

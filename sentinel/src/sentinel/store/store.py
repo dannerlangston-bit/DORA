@@ -2226,10 +2226,37 @@ class Store:
                 post_screenshot=r["post_hash"], click_crop=r["click_crop_sha256"], action=r["action"]))
         return out
 
+    def login_rate_events(self, login_alias: str, since: str, order_steps: Iterable[tuple[str, str]] = (), *,
+                          exclude_run: str | None = None) -> tuple[list[datetime], list[datetime]]:
+        """The 6.4 rate-cap history of one login since `since` (ISO 8601), to seed `orchestrator.budgets.RateCounters`
+        across runs: (its logins: the start of every shard session on a rig of the login, plus each relaunch, re-login
+        and recovery login event; its staged orders: the step rows of `order_steps`, the flows' order-stage steps as
+        (flow id, step id)). `exclude_run` leaves out the run being set up, whose sessions its Orchestrators count
+        themselves. Times are aware UTC datetimes, oldest first."""
+        start = datetime.fromisoformat(utc(since) or since)
+        shards = ("SELECT s.shard_id FROM shards s JOIN rigs g ON g.rig_id = s.rig_id WHERE g.login_alias = ? "
+                  "AND s.run_id IS NOT ?")
+
+        def at(text: str | None) -> datetime | None:
+            return datetime.fromisoformat(utc(text) or "") if text else None
+        key = (login_alias, exclude_run)
+        logins = [at(r[0]) for r in self._conn.execute(f"SELECT started_at FROM shards WHERE shard_id IN ({shards})",
+                                                         key)]
+        logins += [at(r[0]) for r in self._conn.execute(
+            f"SELECT wall_at FROM step_events WHERE shard_id IN ({shards}) AND action IN ('relaunch', 'relogin', "
+            "'recovery_login')", key)]
+        steps = set(order_steps)
+        orders = [at(r["wall_at"]) for r in self._conn.execute(
+            f"SELECT wall_at, flow_id, step_id FROM step_events WHERE shard_id IN ({shards}) "
+            "AND step_outcome IS NOT NULL", key) if (r["flow_id"], r["step_id"]) in steps]
+        return (sorted(t for t in logins if t is not None and t >= start),
+                sorted(t for t in orders if t is not None and t >= start))
+
     def gateway_drops(self, run_id: str) -> int:
-        """Gateway drops in a run: `step_events` rows the hook dropped or the slow half refused (9.11, 8.3)."""
-        return self._one("SELECT count(*) FROM step_events WHERE run_id = ? AND gate_decision IN ('dropped','refused')",
-                         (run_id,))[0]
+        """Gateway drops in a run: the drainer's `gateway_decision` rows the hook dropped or the slow half refused (9.11,
+        8.3); an emitter action row or a step outcome row carrying a copy of the decision is not counted again."""
+        return self._one("SELECT count(*) FROM step_events WHERE run_id = ? AND action = 'gateway_decision' "
+                         "AND gate_decision IN ('dropped','refused')", (run_id,))[0]
 
     def _finding(self, r: sqlite3.Row) -> Finding:
         return Finding(finding_id=r["natural_key"], run_id=r["run_id"], kind=r["kind"], description=r["description"],

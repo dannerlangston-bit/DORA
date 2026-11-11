@@ -7,14 +7,17 @@ on which ids exist. Every rule that decides whether an id exists is applied in t
 - census visits (2.11): a PR run visits a surface in the workspaces of its `census.workspaces`; the merge pass
   visits the tier A workspaces and the RC pass the tier A and B workspaces that host the surface
   (`gadgets_present`), list it in `census.workspaces`, or any of them for a global surface (kinds tab, subtab, menu,
-  settings_page and dialog, scope choice 3): `pass_visits`.
+  settings_page and dialog, scope choice 3): `pass_visits`. `census_workspaces` is the union of every workspace a
+  census of any run type can visit, so the lint defines exactly the ids the scope plans (L-RGN-01, L-XREF-03,
+  L-SRF-08 then see every planned census checkpoint).
 - census ids (2.4, 4.5 `census.dimensions`): `census/<surface>/<workspace>`. A tier-1 surface that declares
   `census.dimensions` repeats over the cross product of the declared values, in tier A workspaces only, with the
   dimension segment `/<dim>=<value>[,<dim>=<value>]` (dimensions and values in declared order); in every other
   workspace, and for every other surface, the plain id.
 - sweep (2.5.1, 2.5.2): `sweep/<surface>/<host>/<w>x<h>`; only the flexgrid, detached and dialog hosts take
   w x h sizes (tab and sidebar hosts are swept through their splitters only); a step of Ladder F's ascending pass
-  takes the suffix `-asc`.
+  takes the suffix `-asc`. A corpus size of `corpus/measured_sizes.yaml` (SD-06) is measured on one host and is a
+  step of that host only (`SweepStep.host`).
 - split (2.5.2): `split/<surface>/<splitter>/<fraction>` with two decimals; the short or full fraction set,
   narrowed by the splitter's `fractions`, with 0.00 and 1.00 only when `collapsible`.
 - flow (4.7): `flow/<surface_id>/<flow_id>/<step id>`.
@@ -23,11 +26,6 @@ Choices where the spec is ambiguous (reported):
 
 - The cross product "is visited in tier-1 workspaces only" (2.2) is read as the tier A canonical workspaces of 2.3,
   as the scope computation already had it (scope choice 4).
-- `surface_checkpoints`, the lint's definition (L-RGN-01: "a flow or census entry references the checkpoint"),
-  takes the census workspaces of the surface's own `census.workspaces`. The merge and RC passes also visit hosting
-  tier A and B workspaces the entry does not list (`pass_visits`); defining those ids too would require a regions
-  file with a rule or mask region for every such masked_live visit (L-SRF-08, L-XREF-03), which the example lacks
-  for the Position Statement in two tier A workspaces.
 """
 from __future__ import annotations
 
@@ -67,6 +65,19 @@ def pass_visits(surface_id: str, kind: object, listed: Iterable[str], workspace_
     """A merge or RC census pass visits the surface in this workspace (2.11): the workspace hosts it, the surface
     lists the workspace in `census.workspaces`, or the surface is global."""
     return surface_id in set(gadgets_present) or workspace_id in set(listed) or kind in GLOBAL_KINDS
+
+
+def census_workspaces(surface: Mapping[str, object], workspaces: Mapping[str, Mapping[str, object]]) -> list[str]:
+    """Every workspace a census of any run type visits the surface in (2.11): its own `census.workspaces` (the PR
+    visits), then each tier A or B corpus workspace a merge or RC pass visits (`pass_visits`), in corpus order."""
+    census = _map(surface.get("census"))
+    listed = [w for w in _list(census.get("workspaces")) if isinstance(w, str)]
+    pass_tiers = {t for tiers in PASS_TIERS.values() for t in tiers}
+    visited = [wid for wid, w in workspaces.items()
+               if str(_map(w).get("tier")) in pass_tiers
+               and pass_visits(str(surface.get("id")), surface.get("kind"), listed, wid,
+                               [g for g in _list(_map(w).get("gadgets_present")) if isinstance(g, str)])]
+    return list(dict.fromkeys(listed + visited))
 
 
 def sweep_hosts(hosts: Iterable[object]) -> tuple[str, ...]:
@@ -122,14 +133,15 @@ def surface_checkpoints(surface: Mapping[str, object], workspaces: Mapping[str, 
     """Every census, sweep and split checkpoint id one registry entry (4.5) can produce in any run type, as
     (checkpoint id, kind), in definition order and without duplicates.
 
-    `workspaces` maps a corpus workspace id to its entry (`tier`); a census workspace absent from it is visited with
-    the plain id. `steps` is the union of the ladders' steps and the surface's corpus sizes."""
+    `workspaces` maps a corpus workspace id to its entry (`tier`, `gadgets_present`); the census ids are those of
+    every workspace `census_workspaces` names, and a listed workspace absent from the corpus is visited with the plain
+    id. `steps` is the union of the ladders' steps and the surface's corpus sizes."""
     sid = str(surface.get("id"))
     out: dict[str, str] = {}
     census = _map(surface.get("census"))
     if census.get("enabled", True):
         dims = {str(k): _list(v) for k, v in _map(census.get("dimensions")).items()}
-        for ws in (w for w in _list(census.get("workspaces")) if isinstance(w, str)):
+        for ws in census_workspaces(surface, workspaces):
             for cid in census_ids(sid, ws, surface_tier=surface.get("tier"),
                                   workspace_tier=_map(workspaces.get(ws)).get("tier"), dimensions=dims):
                 out.setdefault(cid, CENSUS)

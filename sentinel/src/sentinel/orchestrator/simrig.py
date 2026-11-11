@@ -253,6 +253,7 @@ class SimScenario:
     stage2: dict[str, Any] = field(default_factory=dict)    # Stage2Reads fields that differ from a clean read
     foreign_foreground: str | None = None            # a foreign program's window title in the foreground (7.8)
     secret_ref: str = "login.password"               # the LOGIN flow's secret step vault_ref (4.7)
+    base_install_fails: str | None = None            # why the base build cannot be installed (4.2), or None
 
 
 class SimulatedRig(Rig):
@@ -340,6 +341,11 @@ class SimulatedRig(Rig):
             if not h6.passed:
                 detail["H6"] = h6.detail or "the redaction self-test failed"
         return PreflightReport(items, detail)
+
+    def install_base(self, build_id: str) -> str | None:
+        """Install the pair's base build on the rig (4.2): None when it installed, else why it could not be."""
+        self._log(f"install_base {build_id}")
+        return self.s.base_install_fails
 
     def launch(self) -> LaunchObservation:
         self._log("launch")

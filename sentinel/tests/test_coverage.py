@@ -7,12 +7,14 @@ import pytest
 import yaml
 
 from sentinel.coverage import (
-    QUARANTINE_CEILING, Cell, Profile, QuarantineShare, build_matrix, cell_state, manifest_coverage,
+    QUARANTINE_CEILING, Cell, Profile, QuarantineShare, build_matrix, cell_state, fixture_profiles, manifest_coverage,
+    order_lifecycle_not_run, profile_for_role,
 )
+from sentinel.lint import Repo
 from sentinel.records import PERSONAS, CheckpointOutcome, DiffSummary, RegionDiff
 from sentinel.scope import (
-    Cut, DependencyIndex, DependencyMap, Flow, Manifest, PlannedCheckpoint, Registry, Rig, Surface, Workspace,
-    compute_scope,
+    Cut, DependencyIndex, DependencyMap, Flow, FlowCheckpoint, Manifest, PlannedCheckpoint, Registry, Rig, Surface,
+    Workspace, compute_scope,
 )
 
 FIX = Path(__file__).parent / "fixtures" / "scope"
@@ -195,3 +197,59 @@ def test_manifest_coverage_table():
 def test_cell_requires_one_state():
     c = Cell("x.y", "beginner", MARGIN.id, 3, "not_run", reason="scope")
     assert c.to_row(RUN)["not_run_reason"] == "scope" and c.to_row(RUN)["worst_outcome"] is None
+
+
+# -- entitlement profiles (2.12 columns, 2.13 B01 and B04) ----------------------------------------
+
+EXAMPLE = Path(__file__).resolve().parents[1] / "config" / "example"
+
+
+def _example():
+    repo = Repo.load(EXAMPLE)
+    return (repo.one("fixture").data, Registry.from_entries(d.data for d in repo.of("surface")),
+            [Flow.from_dict(d.data) for d in repo.of("flow")])
+
+
+def test_the_example_fixture_yields_a_margin_and_an_ira_profile():
+    fixture, registry, _ = _example()
+    profiles = fixture_profiles(fixture)
+    assert profiles == (Profile("margin", frozenset({"margin"})), Profile("ira", frozenset({"ira"})))
+    assert fixture_profiles(fixture, extra=["paper_send"])[1].entitlements == {"ira", "paper_send"}
+    assert (profile_for_role(fixture, "golden"), profile_for_role(fixture, "empty")) == ("margin", "ira")
+    matrix = build_matrix(RUN, registry, profiles, [])
+    assert len(matrix.cells) == len(list(registry)) * len(PERSONAS) * 2 == len(matrix.to_rows())
+
+
+def test_a_margin_only_surface_is_not_run_entitlement_in_the_ira_column():
+    """Outcomes count toward the profile of the account they ran on (4.13 `profile_id`); a surface that needs margin
+    has no checkpoint under the IRA profile, so its whole row there is not_run (entitlement) (2.12)."""
+    fixture, registry, _ = _example()
+    profiles = fixture_profiles(fixture)
+    ladder = "trade.active-trader.ladder"
+    on_margin = CheckpointOutcome(run_id=RUN, checkpoint_id=f"census/{ladder}/ws.tier-a.active-trader",
+                                  outcome="identical", workspace_id="ws.tier-a.active-trader", persona="active_trader",
+                                  data_mode="frozen", surface_id=ladder, profile_id="margin")
+    untagged = CheckpointOutcome(run_id=RUN, checkpoint_id=f"census/{CHART}/ws.tier-a.swing-trader", outcome="identical",
+                                 workspace_id="ws.tier-a.swing-trader", persona="swing_trader", data_mode="frozen",
+                                 surface_id=CHART)
+    matrix = build_matrix(RUN, registry, profiles, [on_margin, untagged])
+    assert matrix.cell(ladder, "active_trader", "margin").display == "identical (1)"
+    assert matrix.cell(ladder, "active_trader", "ira").display == "not_run (entitlement)"
+    assert {matrix.cell(ladder, p, "ira").reason for p in PERSONAS} == {"entitlement"}
+    assert matrix.cell(CHART, "swing_trader", "margin").state == "covered"     # no profile_id: the first column
+    assert matrix.cell(CHART, "swing_trader", "ira").display == "not_run (scope)"   # entitled, not run there
+
+
+def test_the_order_lifecycle_count_names_paper_send_surfaces_until_a_profile_carries_it():
+    fixture, registry, flows = _example()
+    profiles = fixture_profiles(fixture)
+    assert order_lifecycle_not_run(registry, flows, profiles) == ()      # the example has no order-lifecycle surface
+    filled = Surface("monitor.activity.filled-orders", 1, entitlements=frozenset({"margin", "paper_send"}))
+    sending = Flow("flow.trade.order-ticket.stock.fill", 1, "swing_trader", "ws.tier-a.swing-trader",
+                   ("dialog.order-confirmation",), (FlowCheckpoint("flow/dialog.order-confirmation/x/s1",
+                                                                   "dialog.order-confirmation", "s1", "frozen"),),
+                   requires=frozenset({"paper_send"}))
+    reg = Registry.from_entries(list(registry) + [filled])
+    assert order_lifecycle_not_run(reg, flows + [sending], profiles) == (
+        "dialog.order-confirmation", "monitor.activity.filled-orders")
+    assert order_lifecycle_not_run(reg, flows + [sending], fixture_profiles(fixture, ["paper_send"])) == ()

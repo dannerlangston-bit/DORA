@@ -117,6 +117,11 @@ def test_events_round_trip_with_their_own_mono_ms(store):
     assert store.step_events(RUN) == [click, chord]
     with pytest.raises(ImportConflict):
         store.write_events([ev(mono_ms=1)])
+    # 9.11: drops are the drainer's gateway_decision rows; the emitter's own key_chord row carries a copy of the
+    # decision and is not counted again (w2 wiring item 2)
+    assert store.gateway_drops(RUN) == 0
+    store.write_events([ev(seq=3, action="gateway_decision", keys="ctrl+t", mono_ms=4301, gate_decision="dropped",
+                           gate_reason="no_token", gate_class="safety")])
     assert store.gateway_drops(RUN) == 1
 
 

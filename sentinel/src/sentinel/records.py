@@ -68,7 +68,7 @@ EGRESS_PURPOSES = ("review", "batch_review", "agent_step", "explorer_step", "pr_
                    "preflight", "model_check")
 EGRESS_STATUSES = ("sent", "refused", "failed")
 OUTBOX_KINDS = ("pr_comment", "commit_status", "jira_create", "jira_comment", "jira_transition", "slack", "page",
-                "digest", "manifest_pr", "mask_pr")
+                "digest", "manifest_pr", "mask_pr", "quarantine_pr")   # quarantine_pr: the quarantine.yaml PR (10.5)
 OUTBOX_STATES = ("queued", "sent", "failed", "abandoned")
 SEVERITIES = ("S1", "S2", "S3")                                 # 6.12
 MODEL_COMPONENTS = ("reviewer", "agent_rescue", "explorer")     # 11.4: every model call of a run, per component

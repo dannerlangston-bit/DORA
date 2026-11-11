@@ -22,6 +22,8 @@ anti_anchors: [Loading, "N/A"]
 labels: [Qty, "Trade Price", Mark, "P/L Open"]
 controls:
   - {id: section-toggle, template: registry/templates/monitor/position-statement-toggle.png, ocr_text: "Position Statement", required: true}
+invariants:
+  signed_columns: ["P/L Open"]       # INV-15: sign and color agree (palettes/dark.yaml)
 settle: {max_wait_ms: 8000}
 census:
   enabled: true

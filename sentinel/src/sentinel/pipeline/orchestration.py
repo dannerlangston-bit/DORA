@@ -125,6 +125,10 @@ class RigScript:
     foreign_foreground: str | None = None             # a foreign program's window in the foreground (7.8)
     login: tuple[tuple[str, Any], ...] = ()           # LoginObservation fields of the first login (7.7)
     dpi_awareness: str | None = None                  # the harness's DPI awareness when not Per-Monitor-V2 (H3)
+    # masked_live lockstep (3.1): checkpoint id -> how many seconds the pair's base rig captured after the candidate
+    # rig, one value per execution of the checkpoint (over 60 s is a slip)
+    lockstep_slip_s: tuple[tuple[str, tuple[float, ...]], ...] = ()
+    base_install_fails: str | None = None            # the base build cannot be installed on any rig (4.2): why
 
 
 class ShardSink:
@@ -222,7 +226,8 @@ def shard_setup(cfg: SentinelConfig, *, run_id: str, run_type: str, shard_id: st
                            accounts=states, login=LoginObservation(**dict(script.login)),
                            dpi_awareness=script.dpi_awareness or "PER_MONITOR_AWARE_V2",
                            foreign_foreground=script.foreign_foreground, titles=catalog_titles(cfg),
-                           rig_id=rig_id or rig, kill_root=kill_root, dismiss_allowlist=SIM_DISMISS_LABELS)
+                           rig_id=rig_id or rig, kill_root=kill_root, dismiss_allowlist=SIM_DISMISS_LABELS,
+                           base_install_fails=script.base_install_fails)
     return ctx, scenario
 
 

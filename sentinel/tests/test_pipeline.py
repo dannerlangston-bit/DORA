@@ -2,6 +2,7 @@
 smoke flows the scope plans (sentinel.pipeline)."""
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import date
 
@@ -12,6 +13,7 @@ from sentinel.demo import EXAMPLE, clean_scenario, config_invalid_scenario
 from sentinel.diff.settle import settle
 from sentinel.evaluation import settle_spec_for
 from sentinel.pipeline.config import SentinelConfig
+from sentinel.pipeline.orchestration import RigScript
 from sentinel.pipeline.reviewer import (SIMULATED_MODEL_ID, ModelReviewerAdapter, ReviewRequest, SimulatedReviewer,
                                         to_review, validate)
 from sentinel.pipeline.run import PairRefused, run_pipeline
@@ -243,6 +245,16 @@ def test_a_quarantine_record_in_the_schema_shape_cuts_its_checkpoint(tmp_path):
     r = run_pipeline(EXAMPLE, sc, tmp_path / "out", today=TODAY)
     (o,) = [o for o in r.outcomes if o.checkpoint_id == cid]
     assert (o.outcome, o.reason) == ("not_run", "quarantine")
+    # 10.5: the run-start mirror puts the record into flake_stats; the next run's config no longer names it, so the
+    # mirror releases it, and with no Calibration run showing the exit rule the release is a run-health line
+    with Store(tmp_path / "out" / "sentinel.db") as s:
+        assert [tuple(x) for x in s.query("SELECT checkpoint_id, quarantined, quarantine_ticket_ref FROM flake_stats")
+                ] == [(cid, 1, "TOS-4410")]
+    r2 = run_pipeline(EXAMPLE, clean_scenario(TODAY, seq=2, clock="12:00:00"), tmp_path / "out", today=TODAY)
+    with Store(tmp_path / "out" / "sentinel.db") as s:
+        assert s.query("SELECT quarantined FROM flake_stats WHERE checkpoint_id = ?", (cid,))[0][0] == 0
+        rows = json.loads(s.query("SELECT summary_json FROM runs WHERE run_id = ?", (r2.run_id,))[0][0])["health_rows"]
+    assert ["Quarantine exits without evidence", cid] in rows
 
 
 def test_a_scope_config_error_names_its_own_rule():
@@ -265,3 +277,178 @@ def test_case_b_adds_the_smoke_flows_only_when_the_change_scope_is_empty(cfg):
     a = compute_scope("pr", None, dep_index=DependencyIndex({}),
                       changed_classes=("com.tos.desktop.charts.grid.level2cell.Level2SizeRenderer",), **common)
     assert a.manifest_state == "no_manifest_ui" and S07 not in a.planned_ids
+
+
+def test_a_rule_region_the_oracle_cannot_build_is_a_harness_error_not_a_crash(tmp_path, monkeypatch):
+    """lint-oracle:4 (2.7, 2.8.2): the Invariant Checker's rule regions are built inside the OracleConfigError guard;
+    a rule region the Oracle cannot evaluate makes the checkpoint `harness_error (exception:OracleConfigError)`."""
+    from datetime import datetime, timezone
+
+    import sentinel.pipeline.run as pipeline_run
+    from sentinel.demo import BASE_ID, PS_CENSUS
+    from sentinel.oracle.tables import OracleConfigError
+    from sentinel.pipeline.config import materialize
+
+    def broken(reg, placed):
+        raise OracleConfigError("rgn.ps.mark: a rule the Oracle cannot evaluate")
+
+    monkeypatch.setattr(pipeline_run, "invariant_rule_regions", broken)
+    cfg = SentinelConfig.load(materialize(EXAMPLE, {}, tmp_path / "cfg"))
+    cp = pipeline_run.planned_for(cfg, PS_CENSUS)
+    run = pipeline_run._Run(cfg, "run-rule-guard", "pr", SimBuild(BASE_ID), SimBuild(BASE_ID),
+                            datetime(2026, 11, 10, 15, 31, tzinfo=timezone.utc), None, None, lambda s: "undeclared")
+    base, cand = run.capture(cp, "base"), run.capture(cp, "candidate")
+    ev = pipeline_run.evaluate(run, cp, base, cand, x="undeclared", primitive=None, entry_ref=None,
+                               recapture=lambda: cand)
+    assert (ev.classified.outcome, ev.classified.reason) == ("harness_error", "exception:OracleConfigError")
+
+
+# -- w3 integration: scope, shards, lockstep, coverage profiles, the map patch ---------------------------------------
+
+PS_CENSUS = "census/monitor.activity.position-statement/ws.tier-a.active-trader"
+
+
+def _summary(out, run_id):
+    with Store(out / "sentinel.db") as s:
+        return json.loads(s.query("SELECT summary_json FROM runs WHERE run_id = ?", (run_id,))[0][0])
+
+
+def test_the_shards_follow_the_scope_plan_and_each_rig_of_a_lockstep_pair_gets_one(tmp_path):
+    """11.3, SD-14: the run's shards are `plan.shards`; the masked_live pair (rig-01, rig-02) is two shards, the
+    candidate side running the pair's checkpoints and the base side standing in lockstep through every gate, its own
+    paper-mode assertions before each unit and its own post-run proof."""
+    from sentinel.pipeline.run import shard_specs
+    r = run_pipeline(EXAMPLE, clean_scenario(TODAY), tmp_path, today=TODAY)
+    assert [(s["rig"], s["side"]) for s in r.shards] == [("rig-01", "candidate"), ("rig-02", "base"),
+                                                         ("rig-03", "both"), ("rig-04", "both")]
+    specs = shard_specs(r.run_id, r.plan)
+    (cand,), (base,) = ([s for s in specs if s[4] == side] for side in ("candidate", "base"))
+    assert [cp.checkpoint_id for cp in cand[3]] == [cp.checkpoint_id for cp in base[3]] == [PS_CENSUS]
+    assert base[5] == cand[0]                               # the base side names its candidate side
+    with Store(tmp_path / "sentinel.db") as s:
+        sides = dict(s.query("SELECT shard_id, sides FROM shards WHERE run_id = ?", (r.run_id,)))
+        proofs = {p.shard_id: p for p in s.post_run_proofs(r.run_id)}
+    assert sides[cand[0]] == "candidate" and sides[base[0]] == "base" and len(proofs) == 4
+    assert proofs[base[0]].paper_mode_assertions > 1        # asserted at the gate and before the pair's unit (6.4)
+
+
+def test_a_lockstep_slip_is_requeued_once_and_a_second_slip_is_not_run_budget(tmp_path):
+    """3.1: the pair's base rig captured 75 s after the candidate rig: the checkpoint re-runs once at the end of the
+    shard and is compared; slipping again is `not_run (reason: budget)`, counted as lockstep_slip in run health."""
+    once = replace(clean_scenario(TODAY), rig=RigScript(lockstep_slip_s=((PS_CENSUS, (75.0,)),)))
+    r1 = run_pipeline(EXAMPLE, once, tmp_path / "once", today=TODAY)
+    (o,) = [o for o in r1.outcomes if o.checkpoint_id == PS_CENSUS]
+    assert o.outcome == "identical" and r1.status == "complete"
+    rows = dict(map(tuple, _summary(tmp_path / "once", r1.run_id)["health_rows"]))
+    assert rows["Lockstep"].startswith("lockstep_slip 0; 1 pairs re-queued once")
+    twice = replace(clean_scenario(TODAY), rig=RigScript(lockstep_slip_s=((PS_CENSUS, (75.0, 80.0)),)))
+    r2 = run_pipeline(EXAMPLE, twice, tmp_path / "twice", today=TODAY)
+    (o,) = [o for o in r2.outcomes if o.checkpoint_id == PS_CENSUS]
+    assert (o.outcome, o.reason, o.detail) == ("not_run", "budget", "lockstep_slip: 80 s apart twice")
+    rows = dict(map(tuple, _summary(tmp_path / "twice", r2.run_id)["health_rows"]))
+    assert rows["Lockstep"].startswith(f"lockstep_slip 1 ({PS_CENSUS}: not_run, budget)")
+
+
+def test_each_record_counts_in_the_entitlement_profile_of_its_account(tmp_path):
+    """2.12, SD-75: a flow runs on its `account_role` (empty: the IRA account), a census visit on the golden margin
+    account; each record's `profile_id` is that account's kind, the matrix has one column per kind, and with no
+    profile carrying paper_send the order-lifecycle surfaces are counted not_run (entitlement) (B01, 2.13)."""
+    from sentinel.demo import wrong_number_scenario
+    r = run_pipeline(EXAMPLE, wrong_number_scenario(TODAY), tmp_path, today=TODAY)
+    assert {o.profile_id for o in r.outcomes if o.test_kind == "flow"} == {"ira"}
+    assert {o.profile_id for o in r.outcomes if o.test_kind == "census"} == {"margin"}
+    from sentinel.coverage import order_lifecycle_not_run
+    cfg = SentinelConfig.load(EXAMPLE)
+    cov = _summary(tmp_path, r.run_id)["coverage"]
+    assert cov["matrix"]["profiles"] == 2 and [p.id for p in cfg.profiles] == ["margin", "ira"]
+    assert cov["scope"]["order_surfaces_entitlement"] == len(order_lifecycle_not_run(cfg.registry, cfg.flows,
+                                                                                      cfg.profiles))
+
+
+def test_a_pr_run_writes_its_proposed_map_edges_as_the_map_prs_patch(tmp_path):
+    """2.10.2, 4.4: a changed primitive class that reaches the Position Statement through the candidate's dependency
+    index, with no map edge, is a proposed edge; the run writes the map PR's patch (`depscan.map_update(...).patch()`)
+    into its output and the scope line names the file."""
+    from sentinel.demo import GRID_SRC
+    sc = replace(clean_scenario(TODAY), changed_paths=(f"{GRID_SRC}/FlexibleGridCell.java",),
+                 depends_on={"com.tos.desktop.monitor.positions.PositionTable": ("com.tos.desktop.ui.grid.FlexibleGridCell",)})
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    name = f"dependency-map-patch-{r.run_id}.json"
+    patch = json.loads((tmp_path / name).read_text())
+    assert patch["build"] == sc.candidate.build_id
+    assert [e["surface"] for e in patch["add"]] == ["monitor.activity.position-statement"]
+    assert _summary(tmp_path, r.run_id)["coverage"]["scope"]["map_patch"] == name
+    assert f"proposed map edges in {name}" in (tmp_path / "pr-comment.md").read_text()
+
+
+def test_the_scope_takes_the_measured_durations_and_its_health_lines_reach_run_health(tmp_path):
+    """2.11, 11.1: `Scenario.durations` (the 30-day per-side p50 by id) feeds `compute_scope`; a smoke census that
+    takes 50 minutes cannot be cut, so its rigs overrun their capture budget and the scope's run-health line
+    (`ScopePlan.health_lines`) names each of them."""
+    sc = replace(clean_scenario(TODAY), durations={PS_CENSUS: 3000.0})
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    assert r.plan.projected_overrun_s and set(r.plan.projected_overrun_s) <= {"rig-01", "rig-02"}
+    scope_rows = [t for k, t in _summary(tmp_path, r.run_id)["health_rows"] if k == "Scope"]
+    assert scope_rows == r.plan.health_lines() and all(t.startswith("projected overrun on rig-0") for t in scope_rows)
+
+
+def test_a_flow_unit_asserts_paper_mode_against_the_account_of_its_role(tmp_path):
+    """SD-75, 6.3 A2: the Executor passes the flow's `account_role` account to `flow_boundary` and `step_boundary`; a
+    flow on the golden account is asserted, and its records stamped, with the golden account, while the census
+    visits keep the run's fixture (empty) account."""
+    from sentinel.demo import wrong_number_scenario
+    from sentinel.orchestrator.identity import account_id_sha256
+    rel = "flows/tier-1/flow.trade.active-trader.read-back.yaml"
+    text = (EXAMPLE / rel).read_text().replace("\nclass: ", "\naccount_role: golden\nclass: ", 1)
+    sc = wrong_number_scenario(TODAY)
+    sc = replace(sc, overlay=dict(sc.overlay, **{rel: text}))
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    cfg = SentinelConfig.load(EXAMPLE)
+    golden, empty = (next(str(a["account_id"]) for a in cfg.fixture["accounts"] if a["role"] == role)
+                     for role in ("golden", "empty"))
+    flow = [o for o in r.outcomes if o.flow_id == "flow.trade.active-trader.read-back" and o.paper_assertion]
+    census = [o for o in r.outcomes if o.test_kind == "census" and o.paper_assertion]
+    assert flow and {o.paper_assertion["account_id_sha256"] for o in flow} == {account_id_sha256(golden)}
+    assert census and {o.paper_assertion["account_id_sha256"] for o in census} == {account_id_sha256(empty)}
+    assert {o.profile_id for o in flow} == {"margin"}         # the golden account is the margin account (2.12)
+
+
+def test_the_logins_rate_counters_are_seeded_with_its_last_24_hours_from_the_store(tmp_path, monkeypatch):
+    """6.4 rate caps across runs: each shard's `RateCounters` start with the login's logins and staged orders of the
+    last 24 hours (`Store.login_rate_events`), so a second run on the same logins counts the first run's sessions."""
+    import sentinel.pipeline.run as pipeline_run
+    from sentinel.orchestrator.budgets import RateCounters
+    seeded: list[list] = []                                         # each shard's logins as seeded
+
+    class Recording(RateCounters):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            seeded.append(list(self.logins))
+
+    monkeypatch.setattr(pipeline_run, "RateCounters", Recording)
+    run_pipeline(EXAMPLE, clean_scenario(TODAY), tmp_path, today=TODAY)
+    assert seeded and all(not logins for logins in seeded)          # a fresh store: nothing before this run
+    seeded.clear()
+    run_pipeline(EXAMPLE, clean_scenario(TODAY, seq=2, clock="11:30:00"), tmp_path, today=TODAY)
+    assert seeded and all(len(logins) >= 1 for logins in seeded)    # the first run's session on each login
+    with Store(tmp_path / "sentinel.db") as s:
+        from sentinel.pipeline.orchestration import login_alias
+        logins, orders = s.login_rate_events(login_alias("rig-01"), "2026-11-09T16:00:00+00:00")
+        assert len(logins) >= 2 and orders == []                      # both runs' sessions; no order-stage steps
+        assert s.login_rate_events(login_alias("rig-01"), "2026-11-11T00:00:00+00:00") == ([], [])
+
+
+def test_a_pr_run_takes_the_detector_banner_and_canary_row_from_the_last_nightlys_state(tmp_path):
+    """10.3, 9.2: PR runs build the DETECTOR banner and the Canary run-health row from `system_state.detector_state`
+    (`canary.read_detector_state`), which the last Nightly wrote; the scenario passes neither."""
+    from sentinel.canary import DetectorState
+    banner = "DETECTOR BLIND since 2026-11-10 03:12 ET: money-cell canary M04 was not detected"
+    health = {"money_detected": 3, "money_total": 4, "other_detected": 10, "other_total": 10,
+              "detector_state": "detector_blind", "date": "2026-11-10", "since": "2026-11-10 03:12 ET"}
+    state = DetectorState("detector_blind", "run-2026-11-10-nightly-02", "2026-11-10T08:12:00+00:00",
+                          "2026-11-10 03:12 ET", banner, "detector_blind", health=health)
+    with Store(tmp_path / "sentinel.db") as s:
+        s.set_system_state("detector_state", state.to_json())
+    r = run_pipeline(EXAMPLE, clean_scenario(TODAY), tmp_path, today=TODAY)
+    assert "DETECTOR BLIND" in r.comment and banner.split(":")[0] in r.comment
+    assert _summary(tmp_path, r.run_id)["health"]["canary"]["detector_state"] == "detector_blind"

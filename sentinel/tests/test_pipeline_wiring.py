@@ -332,17 +332,19 @@ def test_records_carry_the_build_pair_their_ids_and_what_the_run_measured(tmp_pa
 
 
 def test_the_summary_carries_the_full_matrix_and_g2_passes(tmp_path):
-    """1.4 G2, 2.12: the summary's coverage holds one cell per surface x persona x profile and its dimensions; the
-    post-run check (`store.checks.post_run_check`) passes before the report is written."""
+    """1.4 G2, 2.12: the summary's coverage holds one cell per surface x persona x profile and its dimensions (one
+    entitlement profile per fixture account kind, `coverage.fixture_profiles`: margin and IRA); the post-run check
+    (`store.checks.post_run_check`) passes before the report is written."""
     from sentinel.records import PERSONAS
     from sentinel.store.checks import post_run_check
     sc = clean_scenario(TODAY)
     run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
     with Store(tmp_path / "sentinel.db") as store:
         cov = store.run_summary(sc.run_id)["coverage"]
-        assert post_run_check(store, sc.run_id, cov["matrix"]["surfaces"], len(PERSONAS), 1) == []
-    assert cov["matrix"] == {"surfaces": 8, "personas": len(PERSONAS), "profiles": 1}
-    assert len(cov["cells"]) == 8 * len(PERSONAS)
+        assert post_run_check(store, sc.run_id, cov["matrix"]["surfaces"], len(PERSONAS), 2) == []
+    assert cov["matrix"] == {"surfaces": 8, "personas": len(PERSONAS), "profiles": 2}
+    assert len(cov["cells"]) == 8 * len(PERSONAS) * 2
+    assert {c["entitlement"] for c in cov["cells"]} == {"margin", "ira"}
 
 
 def test_a_failed_post_run_check_ends_the_run_and_withholds_the_report(tmp_path, monkeypatch):

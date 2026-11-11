@@ -9,6 +9,7 @@ regions:
   - {id: rgn.confirm.title, type: diff, landmark: lm.order-confirmation-title, panel: order_confirmation, rect: {dx: 0, dy: 0, w: 200, h: 20}}
   - {id: rgn.confirm.side, type: diff, landmark: lm.order-confirmation-title, panel: order_confirmation, rect: {dx: 24, dy: 48, w: 60, h: 20}}
   - {id: rgn.confirm.qty, type: diff, landmark: lm.order-confirmation-title, panel: order_confirmation, rect: {dx: 90, dy: 48, w: 48, h: 20}, money_cell: true, money_role: qty}
+  - {id: rgn.confirm.side-reverse, type: diff, landmark: lm.order-confirmation-title, panel: order_confirmation, rect: {dx: 400, dy: 72, w: 60, h: 20}}   # SELL, the side toggle's other side (M06)
   - {id: rgn.confirm.symbol, type: diff, landmark: lm.order-confirmation-title, panel: order_confirmation, rect: {dx: 144, dy: 48, w: 110, h: 20}}
   - {id: rgn.confirm.price, type: diff, landmark: lm.order-confirmation-title, panel: order_confirmation, rect: {dx: 260, dy: 48, w: 90, h: 20}, money_cell: true, money_role: price}
   - {id: rgn.confirm.cost, type: diff, landmark: lm.order-confirmation-title, panel: order_confirmation, rect: {dx: 24, dy: 96, w: 200, h: 20}}

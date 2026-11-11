@@ -13,20 +13,28 @@ fingerprint's `harness` field (7.4).
   failed read, the tree killed, `env_error (gate: paper_mode_asserted, reason: identity_unreadable)` on
   every scoped checkpoint, run `complete_with_env_errors`, P2 to the on-call channel and the login owner
   (P1 on repeat); the second consecutive unreadable result on one login blocks it and opens a
-  maintenance task for the LOGIN flow.
+  maintenance task for the LOGIN flow. A timer read deferred past five minutes takes the same path
+  (`deferral_unreadable`, 6.4 Schedule).
+- The paper-asserted stamp (6.4 Schedule, 4.13 `paper_assertion`): `{account_id_sha256, mode, asserted_at}` of
+  the latest passing assertion; a capture is released only under a stamp from the current session
+  (`stamp_current`).
 
 Choices (reported): the live id pattern is the 6.13 item 5 assumption, eight digits then `SCHW`,
 configurable; the OCR floor is pinned at calibration (default 90); a readable second read after an
 unreadable first one is judged on its own and lifts the deny-all (`rearm`) when it passes, since identity
 is then known; A2's "still different" failure is `env_error (gate: fixture_verified, reason: gate)` on every
-scoped checkpoint of the shard (the gate's own check, no finer code).
+scoped checkpoint of the shard (the gate's own check, no finer code). The stamp's `account_id_sha256` is the
+4.13 `sha256` notation (`sha256:` plus the hex digest of the selector text, the 4.13 worked example) and its
+`mode` is `paperMoney`, the only mode an allowlisted identity has; the control results keep the bare hex digest
+in their evidence as before. A stamp is current when it was asserted at or after the session's login.
 """
 from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -43,6 +51,7 @@ READ_GAP_S = 1.0                                # two reads 1 s apart
 TIMER_S = 120.0                                 # the two-minute timer
 DEFERRAL_MAX_S = 300.0                          # a deferral past five minutes takes the unreadable path
 SEND_FRAME_MAX_S = 0.5                          # a frame no older than 500 ms before a paper_send_ok send
+PAPER_MODE = "paperMoney"                       # the stamp's mode (4.13 worked example)
 
 
 @dataclass(frozen=True)
@@ -104,14 +113,25 @@ def judge_identity(reads: Sequence[SelectorRead], allowlist: Allowlist, *, floor
     second = reads[1]
     if readable(second, floor):
         return _judge(second, allowlist, live_re, rearm=True)
+    return _unreadable("selector unreadable on two reads 1 s apart", [r.crop_sha256 for r in reads[:2]],
+                       unreadable_streak)
+
+
+def deferral_unreadable(*, deferred_s: float, unreadable_streak: int = 0) -> ControlResult:
+    """A timer assertion deferred (main frame not foreground, or a modal up) past five minutes takes the unreadable
+    path (6.4 Schedule): deny-all, the tree killed, `env_error (gate: paper_mode_asserted, reason:
+    identity_unreadable)`, run `complete_with_env_errors`."""
+    return _unreadable(f"paper-mode assertion deferred {deferred_s:.0f} s, past five minutes", [], unreadable_streak)
+
+
+def _unreadable(detail: str, crops: list[str | None], unreadable_streak: int) -> ControlResult:
     blocked = unreadable_streak + 1 >= 2
     acts = ("deny_all", "kill_tree") + (("block_login", "maintenance_task") if blocked else ())
     return ControlResult(
         "paper_mode", False, GATE, run=RunVerdict("complete_with_env_errors"),
         unreached=Outcome("env_error", "identity_unreadable", GATE),
         alert=alerts.env_error(repeat=unreadable_streak >= 1, notified=("login_owner",)), actions=acts,
-        detail="selector unreadable on two reads 1 s apart" + ("; login blocked" if blocked else ""),
-        evidence={"crops": [r.crop_sha256 for r in reads[:2]]})
+        detail=detail + ("; login blocked" if blocked else ""), evidence={"crops": crops})
 
 
 def _judge(r: SelectorRead, allowlist: Allowlist, live_re: re.Pattern[str], *, rearm: bool) -> ControlResult:
@@ -169,3 +189,30 @@ def assertion_due(now: float, last_asserted: float, *, boundary: bool = False, m
 def send_frame_fresh(frame_mono_ts: float, now: float) -> bool:
     """A `paper_send_ok` send needs a paper assertion in a frame no older than 500 ms (6.4, 6.7)."""
     return 0 <= now - frame_mono_ts <= SEND_FRAME_MAX_S
+
+
+# -- the paper-asserted stamp (6.4 Schedule, 4.13 paper_assertion) --------------------------------------------
+def account_id_sha256(text: str) -> str:
+    """The 4.13 `sha256` notation of an account id: `sha256:` plus the hex digest of its UTF-8 text."""
+    return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+
+
+def paper_stamp(account_id: str, asserted_at: datetime) -> dict[str, str]:
+    """The stamp `{account_id_sha256, mode, asserted_at}` of a passing assertion of `account_id` (6.4); its shape is
+    the one `records.CheckpointOutcome.paper_assertion` accepts."""
+    if asserted_at.tzinfo is None:
+        raise ValueError("asserted_at must be an aware time (4.13 ts)")
+    return {"account_id_sha256": account_id_sha256(account_id), "mode": PAPER_MODE,
+            "asserted_at": asserted_at.isoformat()}
+
+
+def stamp_current(stamp: Mapping[str, str] | None, session_started_at: datetime | None) -> bool:
+    """True when `stamp` is a paper-asserted stamp of the session that logged in at `session_started_at`: Capture
+    releases no frame to the Reviewer, the agent or a report without one (6.4 Schedule)."""
+    if not stamp or session_started_at is None or stamp.get("mode") != PAPER_MODE:
+        return False
+    try:
+        asserted = datetime.fromisoformat(stamp["asserted_at"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return asserted.tzinfo is not None and asserted >= session_started_at

@@ -180,18 +180,17 @@ def kill_switch(trigger: str, *, gate: str, running_flow: str | None = None,
     reason = OWN_REASON.get(trigger, "kill_switch")
     run, un = safety_abort_outcome(gate, reason, detail=f"trigger {trigger}")
     acts = ["deny_all", "kill_tree", "recovery_login", "revert_snapshot", "disable_rig"]
+    ev: dict = {"trigger": trigger}
     if running_flow:
         acts.insert(1, "quarantine_flow")
     if trigger == "live_identity":
         acts.remove("recovery_login")                   # SD-64: no recovery login on a login blocked for live_identity
         acts.append("block_login")
-    ev: dict = {"trigger": trigger}
+        ev["blocked_reason"] = "live_identity"
     asked = ""
     if request is not None:
         ev["request"] = asdict(request)
         asked = f" (requested by {request.requested_by} via {request.channel}: {request.reason})"
-    if trigger == "live_identity":
-        ev["blocked_reason"] = "live_identity"
     return ControlResult("kill_switch", False, gate, run=run, unreached=un, alert=alerts.safety_abort(),
                          actions=tuple(acts), incident="S1" if trigger in ("new_order_row", "live_identity") else None,
                          detail=f"kill switch: {trigger}{asked}" + (f"; flow {running_flow} quarantined" if running_flow

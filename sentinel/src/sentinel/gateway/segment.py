@@ -54,7 +54,9 @@ Choices where the spec is silent or ambiguous (reported):
 5. The ring keeps a record for every drop and for every event that matched a token (5.4.4: "every consumed
    token writes a compact record"), the probe included; allowed moves with no token write nothing. A record's
    `origin` is what the hook can tell from the injected flag and the emitter's tag (`emitter`,
-   `foreign_process`, `drill`, `console`), so the drainer can name `untokened_injected` and the drill tag.
+   `foreign_process`, `drill`, `console`), so the drainer can name `untokened_injected` and the drill tag. A
+   control record (event type `control`: the hook host's own `hook_reinstalled` log, aux 1 when the reinstall
+   worked) has origin 0 and no injected flag.
 """
 from __future__ import annotations
 

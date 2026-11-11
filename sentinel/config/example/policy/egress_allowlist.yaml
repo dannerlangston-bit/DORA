@@ -1,0 +1,14 @@
+# The signed egress allowlist of 6.10 (schema in 4.16): the only hosts the harness HTTP client may reach,
+# each with the egress_log purposes it may be reached for. Anything else is refused before connecting,
+# logged `refused` and raised as a harness_error finding. Owner: the system owner; signed by the security
+# contact. Exact host names only (L-XREF-19).
+schema_version: 1
+hosts:
+  - {host: api.anthropic.com, port: 443, purposes: [review, batch_review, model_check, preflight]}   # the approved model endpoint (3.12)
+  - {host: jira.example.internal, port: 443, purposes: [jira, preflight]}
+  - {host: slack.com, port: 443, purposes: [slack, digest]}
+  - {host: scm.example.internal, port: 443, purposes: [pr_comment, preflight]}       # PR comments and commit status (9.2)
+  - {host: sentinel-store.example.internal, port: 443, purposes: [preflight]}        # the Central Store (N7)
+signed_by: security-contact
+signed_at: "2026-11-01T15:00:00Z"
+signature: "pgp:7be42d05f1c9a2e3"

@@ -1728,32 +1728,45 @@ class _Linter:
         steps = [("steps", _d(x)) for x in _l(fl.get("steps"))] + [("teardown", _d(x)) for x in _l(fl.get("teardown"))]
         cps = [k for k, (_sec, st) in enumerate(steps) if st.get("type") == "checkpoint"]
         cp_by_id = {steps[k][1].get("id"): k for k in cps}
+        fdoc = self.fixtures.get(fl.get("fixture"))
+        fixture = _d(fdoc.data if fdoc else None)
         all_regions: set[str] = set()
         for k in cps:
             all_regions |= self._cp_regions(steps[k][1]) or set()
+        owned: dict[Any, list[tuple[str, Any]]] = {}       # checkpoint step -> (location, assertion id) it decides
         for k, (sec, st) in enumerate(steps):
             groups: list[tuple[str, list, set[str] | None, int]] = []
             if st.get("type") == "checkpoint":
                 groups.append((f"{sec}[{st.get('id')}].expect", _l(st.get("expect")), self._cp_regions(st), k))
+                owner: int | None = k
             else:
                 items = _l(st.get("assertions")) if st.get("type") == "assert" else [st["verify"]] if isinstance(st.get("verify"), dict) else []
                 if not items:
                     continue
+                before = [c for c in cps if c < k]
+                after = [c for c in cps if c > k]
+                pick = before[-1] if before else after[0] if after else None
+                owner = cps[-1] if sec == "teardown" and cps else pick
                 if sec == "teardown":
                     base = all_regions
                 else:
-                    before = [c for c in cps if c < k]
-                    after = [c for c in cps if c > k]
-                    pick = before[-1] if before else after[0] if after else None
                     base = self._cp_regions(steps[pick][1]) if pick is not None else set()
                 groups.append((f"{sec}[{st.get('id')}]", items, base, k))
             for at, items, base, pos in groups:
                 for a in map(_d, items):
-                    self._assertion(f, at, a, base, pos, steps, cp_by_id)
+                    self._assertion(f, at, a, base, pos, steps, cp_by_id, fixture)
+                    owned.setdefault(owner, []).append((f"{at}[{a.get('id')}]", a.get("id")))
+        for owner, entries in owned.items():
+            ids = [aid for _loc, aid in entries]
+            cp = steps[owner][1].get("id") if owner is not None else None
+            for loc, aid in entries:
+                if ids.count(aid) > 1:
+                    self.add("L-FLW-11", f, f"assertion id {aid} is not unique among the assertions of checkpoint {cp}", f"{loc}.id")
 
     def _assertion(self, f: str, at: str, a: dict, base: set[str] | None, pos: int,
-                   steps: list[tuple[str, dict]], cp_by_id: dict[Any, int]) -> None:
+                   steps: list[tuple[str, dict]], cp_by_id: dict[Any, int], fixture: dict) -> None:
         loc = f"{at}[{a.get('id')}]"
+        found = len(self.out)
         allowed = set(base or set())
         since = a.get("since_step")
         if a.get("kind") in ("changed_since_previous_step", "unchanged_since_previous_step") or since is not None:
@@ -1773,13 +1786,62 @@ class _Linter:
             if rid not in RULE_OPERANDS:
                 self.add("L-FLW-11", f, f"rule_id {rid} is not one of R01 to R10 (2.8.3)", f"{loc}.rule_id")
                 return
-            req, opt = RULE_OPERANDS[rid]
-            inputs = _d(a.get("inputs"))
-            if not req <= set(inputs) or not set(inputs) <= req | opt:
-                self.add("L-FLW-11", f, f"inputs of {rid} must be {sorted(req)}" + (f" plus optional {sorted(opt)}" if opt else ""), f"{loc}.inputs")
-            for name, v in inputs.items():
-                if isinstance(v, str) and v not in allowed:
+            self._rule_inputs(f, loc, rid, _d(a.get("inputs")), allowed)
+        self._oracle_accepts(f, loc, a, fixture, len(self.out) == found)
+
+    def _rule_inputs(self, f: str, loc: str, rid: str, inputs: dict, allowed: set[str]) -> None:
+        """L-FLW-11 against the 2.8.3 operand table (SD-34): the required operands, no others, each a declared
+        region or, where its type allows, a literal number (whole for an integer); grouped operands all or none."""
+        req, opt = RULE_OPERANDS[rid]
+        if not req <= set(inputs) or not set(inputs) <= req | opt:
+            self.add("L-FLW-11", f, f"inputs of {rid} must be {sorted(req)}" + (f" plus optional {sorted(opt)}" if opt else ""), f"{loc}.inputs")
+        for group in RULE_OPERAND_GROUPS.get(rid, ()):
+            if group & set(inputs) and not group <= set(inputs):
+                self.add("L-FLW-11", f, f"operands {sorted(group)} of {rid} are given all together or not at all", f"{loc}.inputs")
+        for name, v in inputs.items():
+            typ = RULE_OPERAND_TYPES.get(rid, {}).get(name)
+            if isinstance(v, str):
+                if v not in allowed:
                     self.add("L-FLW-11", f, f"operand {name} region {v} is not declared on the checkpoint", f"{loc}.inputs.{name}")
+            elif _num(v) is None:
+                self.add("L-FLW-11", f, f"operand {name} is neither a region nor a number", f"{loc}.inputs.{name}")
+            elif typ is not None and typ not in LITERAL_OPERAND_TYPES:
+                self.add("L-FLW-11", f, f"operand {name} is {typ}; bind it to a region, a literal cannot stand for it", f"{loc}.inputs.{name}")
+            elif typ == "integer" and not float(v).is_integer():
+                self.add("L-FLW-11", f, f"operand {name} is an integer, not {v}", f"{loc}.inputs.{name}")
+
+    def _oracle_accepts(self, f: str, loc: str, a: dict, fixture: dict, clean: bool) -> None:
+        """2.8.3, 4.7: an assertion the lint accepts is one the Oracle evaluates. The Oracle's own parser
+        (`oracle.assertions.Assertion.from_dict`) refusing it is L-FLW-11 for a rule (when the operand checks above
+        found nothing) and L-FLW-00 for a field-shape problem of any other kind; a `pattern` that does not compile, a
+        `value_ref` the flow's fixture does not resolve and an `expected` that is not a value of its `format` are
+        L-FLW-00 too (choice 5)."""
+        from ..oracle.assertions import Assertion           # lazy: sentinel.oracle imports this module
+        from ..oracle.tables import resolve_ref
+        from ..oracle.values import FormatError, coerce
+
+        rule = a.get("kind") == "rule"
+        try:
+            Assertion.from_dict(a)
+        except (ValueError, TypeError, AttributeError, ArithmeticError) as exc:     # OracleConfigError is a ValueError
+            if clean or not rule:
+                self.add("L-FLW-11" if rule else "L-FLW-00", f, f"the Oracle refuses this assertion: {exc}", loc)
+            return
+        if isinstance(a.get("pattern"), str):
+            try:
+                re.compile(a["pattern"])
+            except re.error as exc:
+                self.add("L-FLW-00", f, f"pattern {a['pattern']!r} does not compile: {exc}", f"{loc}.pattern")
+        if isinstance(a.get("value_ref"), str):
+            try:
+                resolve_ref(fixture, a["value_ref"])
+            except ValueError as exc:
+                self.add("L-FLW-00", f, f"value_ref does not resolve in the flow's fixture: {exc}", f"{loc}.value_ref")
+        if a.get("kind") in ("equals", "within_tol") and a.get("format") and a.get("expected") is not None:
+            try:
+                coerce(_s(a.get("format")), a.get("expected"))
+            except FormatError as exc:
+                self.add("L-FLW-00", f, f"expected {a.get('expected')!r} is not a valid {a.get('format')}: {exc}", f"{loc}.expected")
 
     def _confirm_and_send(self, target: Any) -> bool:
         """A target that resolves to Confirm and Send: control id `confirm-and-send`, or OCR text or JAB name

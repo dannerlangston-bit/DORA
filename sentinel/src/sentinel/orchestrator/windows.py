@@ -32,8 +32,12 @@ Choices where the spec is ambiguous or silent (reported):
    an enumeration hit on a draft regex still sets the flag, since a hit can only raise it. The consequence that
    matters before Phase 0, an empty dismiss allowlist, is `gateway_config.load_dismiss_allowlist`'s.
 3. The foreground window the detector captures is the topmost enumerated window that has bounds (lowest
-   `z_order`); without one the whole grab is searched, which can only add matches. An order window without
-   bounds is searched over the whole grab for the same reason.
+   `z_order`) when it is a frame or a dialog (`SunAwtFrame`, `SunAwtDialog`). When the topmost is anything else
+   the foreground window is not known: a heavyweight Swing tooltip, menu or combo popup is an owned `SunAwtWindow`,
+   above its owner in z-order but never activated, so the foreground window (the main frame with a docked ticket)
+   lies under it; a window of another class is not known to be the app's. Then, and without a window that has
+   bounds, the whole grab is searched, which can only add matches. An order window without bounds is searched over
+   the whole grab for the same reason.
 4. Templates are matched in grayscale (`TM_CCOEFF_NORMED`), every match at or above the floor, so two Active
    Trader panels with an Auto Send each give two rectangles. Source 1 searches order windows at full scale with
    the same 0.90 floor, since 5.4.6 gives no other.
@@ -57,6 +61,7 @@ import numpy as np
 from .gateway import CONFIRM_AND_SEND, DenyRect, Flag, FlagWatcher, GatewayError, GatewayState, Rect
 
 AWT_CLASSES = frozenset({"SunAwtFrame", "SunAwtDialog", "SunAwtWindow"})        # 5.4.6 source 1
+FOREGROUND_CLASSES = frozenset({"SunAwtFrame", "SunAwtDialog"})                  # choice 3
 SEND_CONTROL_LABELS = ("Send", "Auto Send", "Flatten", "Blast All", "Replace")   # the never-tokenize controls
 TEMPLATE_LABELS = SEND_CONTROL_LABELS + ("Confirm and Send",)                    # what the detector may match
 DETECTOR_FLOOR = 0.90
@@ -240,10 +245,11 @@ def detect_ticket(frame: Any, area: tuple[int, int, int, int] | None, templates:
 
 
 def _foreground(windows: Sequence[Any]) -> tuple[int, int, int, int] | None:
-    """The topmost enumerated window with bounds (choice 3)."""
+    """The detector's area (choice 3): the bounds of the topmost enumerated window with bounds when it is a frame or
+    a dialog; None (the whole grab) when there is no such window or the topmost is a popup or of another class."""
     framed = [w for w in windows if w.visible and getattr(w, "rect", None) is not None]
     ranked = sorted(framed, key=lambda w: z if (z := getattr(w, "z_order", None)) is not None else 1 << 30)
-    return ranked[0].rect if ranked else None
+    return ranked[0].rect if ranked and ranked[0].cls in FOREGROUND_CLASSES else None
 
 
 def _merge(rects: Iterable[DenyRect]) -> tuple[DenyRect, ...]:

@@ -169,6 +169,22 @@ def test_a_failed_enumeration_keeps_the_dialog_age():
     assert w.classes.dialog_open_s(T0 + 31) == pytest.approx(31.0)
 
 
+def test_a_popup_above_the_main_frame_never_hides_the_docked_ticket_from_the_detector():
+    """Choice 3 (5.4.6 source 2): a heavyweight tooltip, menu or combo popup (a SunAwtWindow owned by the main frame,
+    so above it, but never activated) is not the foreground window; the detector then searches the whole grab, so
+    the docked ticket keeps the flag set and its send-like controls stay deny rectangles."""
+    tip = win(9, "", "SunAwtWindow", rect=(600, 380, 120, 20), z_order=0, owner_hwnd=1)
+    w = WindowWatcher(TITLES)
+    polls = [[MAIN_WIN]] * 2 + [[tip, MAIN_WIN]] * 3
+    assert [w.poll(wins, frame(T0 + i / 2), TEMPLATES, now=T0 + i / 2)[0] for i, wins in enumerate(polls)] == [
+        Flag.SET] * 5
+    docked_send = (SendTemplate("Send", MAIN.crop("ticket.send")),)
+    for wins in ([MAIN_WIN], [tip, MAIN_WIN]):
+        assert [d.label for d in WindowWatcher(TITLES).poll(wins, frame(), docked_send, now=T0)[1]] == ["Send"]
+    native = win(8, "Save As", "#32770", rect=(600, 300, 200, 100), z_order=0)   # another class: not known either
+    assert WindowWatcher(TITLES).poll([native, MAIN_WIN], frame(), TEMPLATES, now=T0)[0] == Flag.SET
+
+
 def test_unread_titles_leave_the_flag_to_the_detector():
     w = WindowWatcher(TitleSets())                                   # Phase 0 has not read the titles (choice 2)
     assert w.poll([MAIN_WIN, DIALOG_WIN], frame(ticket=False), TEMPLATES, now=T0)[0] == Flag.UNKNOWN   # first poll

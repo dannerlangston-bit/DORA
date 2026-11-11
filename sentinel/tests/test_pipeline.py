@@ -231,6 +231,20 @@ def test_registry_invariant_exceptions_reach_the_checker_and_expired_ones_drop(t
                                         "run_health": "invariant exception expired: INV-04"}
 
 
+def test_a_quarantine_record_in_the_schema_shape_cuts_its_checkpoint(tmp_path):
+    """10.5, 4.16 `quarantine_record`: a record names its checkpoint under `checkpoint` (or its flow under `flow`),
+    and the scope cuts that checkpoint to `not_run (quarantine)` (2.11 common_filters)."""
+    from sentinel.pipeline.config import materialize
+    cid = "census/monitor.activity.position-statement/ws.tier-a.active-trader"
+    text = ("schema_version: 1\nrecords:\n"
+            f"  - {{checkpoint: {cid}, owner: tos-monitor-ui, ticket: TOS-4410, entered: 2026-11-02, reason: flake}}\n")
+    assert SentinelConfig.load(materialize(EXAMPLE, {"quarantine.yaml": text}, tmp_path / "cfg")).quarantine == {cid}
+    sc = replace(clean_scenario(TODAY), overlay=dict(clean_scenario(TODAY).overlay, **{"quarantine.yaml": text}))
+    r = run_pipeline(EXAMPLE, sc, tmp_path / "out", today=TODAY)
+    (o,) = [o for o in r.outcomes if o.checkpoint_id == cid]
+    assert (o.outcome, o.reason) == ("not_run", "quarantine")
+
+
 def test_a_scope_config_error_names_its_own_rule():
     """SD-01: a ScopeConfigError carries the rule its message names (the smoke cap is L-SRF-15, not L-SRF-10)."""
     from sentinel.scope import ScopeConfigError

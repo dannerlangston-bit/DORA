@@ -85,7 +85,8 @@ class SentinelConfig:
         fixture = (repo.one("fixture").data if repo.one("fixture") else {}) or {}
         kinds = {a.get("kind") for a in fixture.get("accounts", [])}
         quarantine = repo.one("quarantine")
-        q = frozenset(r.get("checkpoint_id") or r.get("flow_id") for r in ((quarantine.data or {}).get("records") or [])
+        # 10.5, 4.16 quarantine_record: each record names exactly one of `checkpoint` and `flow`
+        q = frozenset(r.get("checkpoint") or r.get("flow") for r in ((quarantine.data or {}).get("records") or [])
                       ) if quarantine else frozenset()
         send = repo.one("send_policy")
         mutants = Path(root) / "canaries" / "mutants.yaml"

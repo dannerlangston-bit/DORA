@@ -3,6 +3,7 @@ scenarios that exercise them end to end (sentinel.pipeline, sentinel.demo). No t
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -25,6 +26,7 @@ from sentinel.pipeline.sim import SimApp, SimBuild
 from sentinel.records import CheckpointOutcome
 from sentinel.reviewer import ModelResponse, ReviewerConfig, ReviewerJob, TransportError, Usage
 from sentinel.store import Store
+from sentinel.store import safety as S
 from sentinel.taxonomy import load
 
 S03 = f"flow/trade.order-entry.stock/{STOCK_FLOW}/s03"
@@ -213,7 +215,12 @@ def test_paper_mode_mismatch_aborts_safety_before_any_capture(runs):
     text = (out / "pr-comment.md").read_text()
     assert "**Abort**" in text and "Trigger: live_identity" in text and "Gate: paper_mode_asserted" in text
     assert "No run starts on rigs rig-01, rig-02, rig-03 and rig-04 until the incident closes." in text
-    assert "Incident: S1" in text and "**Unexpected (" not in text and r.commit_status["state"] == "error"
+    # the abort block names the S1 incident row store.safety opened (6.12), the status line too
+    with Store(out / "sentinel.db") as store:
+        ids = {str(i.incident_id) for i in S.incidents(store, run_id=r.run_id) if i.severity == "S1"}
+    assert ids and re.search(r"Incident: (\d+)", text).group(1) in ids
+    assert "**Unexpected (" not in text and r.commit_status["state"] == "error"
+    assert r.commit_status["description"].startswith("aborted_safety: incident ")
     s1 = [a for a in alerts(out) if a["incident"] == "S1"]
     assert s1 and all(a["priority"] == "P1" and a["rule"] == "safety:aborted_safety" and "harness_on_call" in a["paged"]
                       for a in s1)
@@ -288,7 +295,7 @@ def test_an_order_that_got_out_is_orders_sent_and_the_run_stays_aborted_safety(t
     assert (run.status, run.reason, run.last_gate) == ("aborted_safety", "undeclared_order_row", "teardown")
     text = (tmp_path / "pr-comment.md").read_text()
     assert "Trigger: undeclared_order_row" in text and f"Post-run proof: {line}" in text
-    assert "An order reached the account: login " in text and "Incident: S1" in text
+    assert "An order reached the account: login " in text and re.search(r"Incident: \d+", text)
     safety_row = next(row for row in text.splitlines() if row.startswith("| Safety |"))
     assert f"Cancel All verified, proof {line}; shard " in safety_row and "; an order reached the account" in safety_row
     assert "UNPROVEN" not in text and r.commit_status["state"] == "error"

@@ -57,6 +57,10 @@ Choices where the spec is ambiguous (each is reported to the coordinator):
     `invariant_violation`, `assertion_failed`, `needs_human`, `landmark_missing`.
 11. Finding ids are `fnd-<run_id>-scope-<nnn>` and `fnd-<run_id>-merge-<nnn>`; gap details go in
     `evidence.raw_values` (4.13 carries no reason on a finding).
+12. Attribution of a surface the static step reaches through its own roots (no primitive owns the changed
+    class): 4.13 requires a `collateral` record to name a primitive, so the attribution names the surface's
+    hosting primitive, the first non-global primitive whose Dependency Map edge reaches the surface (the Level II
+    cell's FlexibleGrid); none when the map routes no primitive to it.
 """
 from __future__ import annotations
 
@@ -965,6 +969,9 @@ def _attribution(registry: Registry, dep_map: DependencyMap, manifest: Manifest 
     if impact:
         for sid, path in impact.paths.items():
             prims = sorted(dep_map.owning_primitives(path[0]))
+            if not prims:      # choice 12: reached through the surface's own roots; its hosting primitive on the map
+                prims = sorted(p for p, d in dep_map.primitives.items()
+                               if not d.is_global and sid in dep_map.surfaces_of(p, registry))
             p = prims[0] if prims else None
             entry = manifest.entry_touching(p) if manifest and p else None
             out.setdefault(sid, Attribution(p, entry.entry_id if entry else None))

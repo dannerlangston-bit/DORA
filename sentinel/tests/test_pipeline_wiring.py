@@ -100,13 +100,14 @@ def test_a_dead_hook_host_fails_the_step_closed_and_relaunches_on_its_own_budget
     monkeypatch.setattr(SimulatedRig, "_send_input", send_input)
     sc = backend_scenario(TODAY)
     r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
-    assert died and r.status == "complete"
+    assert died and r.status == "complete" and not r.notes[0].startswith("report withheld")
     with Store(tmp_path / "sentinel.db") as store:
         outs = store.outcomes(sc.run_id)
         relaunch = store.query("SELECT reason FROM step_events WHERE run_id = ? AND action = 'relaunch'", (sc.run_id,))
         refused = store.query("SELECT gate_reason FROM step_events WHERE run_id = ? AND gate_decision = 'refused'",
                               (sc.run_id,))
     assert any(o.outcome == "not_run" and (o.reason or "").startswith("step_failed:") for o in outs)
+    assert all("watchdog_event: wd-" in (o.detail or "") for o in outs if o.outcome == "harness_error")
     assert [x["reason"].split(";")[0] for x in relaunch] == ["cause hook_host"]
     assert [x["gate_reason"] for x in refused] == ["hook_host_dead"]
     assert any(a["control"] == "watchdog" and a["rule"] == "harness_error" for a in r.alerts)
@@ -249,7 +250,8 @@ def test_a_redaction_landmark_on_one_side_only_stores_nothing(tmp_path, monkeypa
     def redact(base, cand, anchors, ocr, theme, *, sweep=None, context=None, params=None):
         if context is not None and context.checkpoint_id == target:
             return RedactionResult("redaction-x", None, None, terminal=Terminal(
-                "landmark_missing", "redaction_landmark:lm.position-statement-header", side="candidate"))
+                "landmark_missing", "redaction_landmark:lm.position-statement-header", side="candidate",
+                detail="base score 0.990/0.400, candidate score 0.310/0.290"))
         return real(base, cand, anchors, ocr, theme, sweep=sweep, context=context, params=params)
 
     monkeypatch.setattr(pr, "redact_pair", redact)
@@ -305,3 +307,94 @@ def test_the_nightly_redaction_canary_m19_is_detected(tmp_path):
                                              overlay=dict([_main_build()]), mutants=("M19",)), tmp_path)
     (res,) = n.canary["report"].results
     assert (res.mutant_id, res.state) == ("M19", "detected") and "M19" not in NOT_SIMULATED
+
+
+# -- store integrity (4.13, 8.3, 1.4 G2) ----------------------------------------------------------------------------
+
+def test_records_carry_the_build_pair_their_ids_and_what_the_run_measured(tmp_path):
+    """8.3: the build pair is registered before the run row (`register_pair`) and every record carries its id, an
+    `oc-<run>-<seq>` outcome id, the entitlement profile, and for a capture its rig, settle time, changed pixels and
+    masked share; the store runs strict (L-OUT-02): every record the pipeline writes is complete."""
+    sc = clean_scenario(TODAY)
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    with Store(tmp_path / "sentinel.db") as store:
+        (pair,) = store.query("SELECT pair_id, pair_kind, candidate_build_id FROM build_pairs")
+        run_pair = store.query("SELECT pair_id FROM runs WHERE run_id = ?", (sc.run_id,))[0][0]
+        outs = store.outcomes(sc.run_id)
+        assert all(store.record_errors(o) == [] for o in outs)
+    assert (pair["pair_kind"], pair["candidate_build_id"], run_pair) == ("pr", sc.candidate.build_id, pair["pair_id"])
+    assert all(o.pair_id == str(pair["pair_id"]) and o.outcome_id.startswith(f"oc-{sc.run_id}-") for o in outs)
+    assert len({o.outcome_id for o in outs}) == len(outs) and {o.profile_id for o in outs} == {"margin"}
+    captured = [o for o in outs if o.artifacts]
+    assert all(o.cand_rig_id and o.base_rig_id == o.cand_rig_id and o.settle_ms and o.masked_pct is not None
+               for o in captured)
+    assert any(o.diff_pixels for o in captured if o.outcome == "intended") and r.status == "complete"
+
+
+def test_the_summary_carries_the_full_matrix_and_g2_passes(tmp_path):
+    """1.4 G2, 2.12: the summary's coverage holds one cell per surface x persona x profile and its dimensions; the
+    post-run check (`store.checks.post_run_check`) passes before the report is written."""
+    from sentinel.records import PERSONAS
+    from sentinel.store.checks import post_run_check
+    sc = clean_scenario(TODAY)
+    run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    with Store(tmp_path / "sentinel.db") as store:
+        cov = store.run_summary(sc.run_id)["coverage"]
+        assert post_run_check(store, sc.run_id, cov["matrix"]["surfaces"], len(PERSONAS), 1) == []
+    assert cov["matrix"] == {"surfaces": 8, "personas": len(PERSONAS), "profiles": 1}
+    assert len(cov["cells"]) == 8 * len(PERSONAS)
+
+
+def test_a_failed_post_run_check_ends_the_run_and_withholds_the_report(tmp_path, monkeypatch):
+    """4.13 L-OUT-07, 1.4 G2: a post-run check failure ends the run `aborted_harness (reason:
+    taxonomy_check_failed)` with the report withheld: the comment is the abort block alone."""
+    import sentinel.pipeline.run as pr
+    monkeypatch.setattr(pr, "post_run_check", lambda store, run_id, *a, **k: ["G2 matrix: 39 cells, expected 40"])
+    sc = clean_scenario(TODAY)
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    assert (r.status, r.reason) == ("aborted_harness", "taxonomy_check_failed")
+    text = (tmp_path / "pr-comment.md").read_text()
+    assert "G2 matrix: 39 cells, expected 40" in text and "**Unexpected (" not in text
+    with Store(tmp_path / "sentinel.db") as store:
+        assert store.run_summary(sc.run_id)["post_run_check"]["report_withheld"] is True
+
+
+# -- safety persistence (6.4 to 6.12) -------------------------------------------------------------------------------
+
+def test_a_safety_abort_persists_its_incident_block_and_disable_and_the_next_run_is_refused(tmp_path):
+    """6.4, 6.6, 6.12: `apply_safety_actions` persists the live-identity abort: an S1 incident per rig (its id in
+    the abort block and the commit status), the blocked login and the disabled rig; a later run finds no rig it may
+    use (`refuse_blocked`) and is never created."""
+    import pytest
+    from sentinel.demo import paper_mode_scenario
+    from sentinel.pipeline.run import RigsRefused
+    from sentinel.store import safety as S
+    sc = paper_mode_scenario(TODAY)
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    assert (r.status, r.reason) == ("aborted_safety", "live_identity")
+    with Store(tmp_path / "sentinel.db") as store:
+        incidents = S.incidents(store, run_id=sc.run_id)
+        blocked = store.query("SELECT login_alias, blocked_reason FROM logins WHERE blocked_at IS NOT NULL")
+    assert incidents and {i.severity for i in incidents} == {"S1"}
+    assert {b["blocked_reason"] for b in blocked} == {"live_identity"} and len(blocked) == 4
+    first = min(i.incident_id for i in incidents)
+    assert f"Incident: {first}" in r.comment or any(f"Incident: {i.incident_id}" in r.comment for i in incidents)
+    nxt = clean_scenario(TODAY, seq=2, clock="12:00:00")
+    with pytest.raises(RigsRefused):
+        run_pipeline(EXAMPLE, nxt, tmp_path, today=TODAY)
+    with Store(tmp_path / "sentinel.db") as store:
+        assert store.run_outcome(nxt.run_id) is None
+
+
+def test_a_quarantined_flow_is_cut_from_the_next_runs_scope(tmp_path):
+    """6.6, 10.5: an open safety quarantine on a flow (here the attempted-send scenario's) makes that flow
+    `not_run (reason: quarantine)` in the next run on the store (`quarantined_flow`)."""
+    from sentinel.demo import STOCK_FLOW, attempted_send_scenario, backend_scenario
+    from sentinel.store import safety as S
+    a = run_pipeline(EXAMPLE, attempted_send_scenario(TODAY), tmp_path, today=TODAY)
+    assert a.status == "aborted_safety"
+    with Store(tmp_path / "sentinel.db") as store:
+        assert [q.target for q in S.open_quarantines(store) if q.target_kind == "flow"] == [STOCK_FLOW]
+    b = run_pipeline(EXAMPLE, backend_scenario(TODAY), tmp_path, today=TODAY)
+    stock = [o for o in b.outcomes if o.flow_id == STOCK_FLOW]
+    assert stock and {(o.outcome, o.reason) for o in stock} == {("not_run", "quarantine")}

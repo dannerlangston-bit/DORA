@@ -57,7 +57,8 @@ def is_artifact_hash(sha: str | None) -> bool:
 
 @dataclass(frozen=True)
 class Urls:
-    """Report UI URL scheme of 9.3 (`/runs/<run>`, `/a/<sha256>`, `/cp/<finding>`, `/act/...`)."""
+    """Report UI URL scheme of 9.3 (`/runs/<run>`, `/a/<sha256>`, `/cp/<finding>`, `/act/...`), plus the manifest
+    template page `/docs/manifest-template` (the path is this module's choice; 9.3 shows none)."""
 
     base: str
     run_id: str
@@ -72,6 +73,11 @@ class Urls:
     @property
     def matrix(self) -> str:
         return f"{self.report}/coverage"
+
+    @property
+    def manifest_template(self) -> str:
+        """The change manifest template page (4.3, 2.10.2) of the report UI."""
+        return f"{self.base}/docs/manifest-template"
 
     def anchor(self, name: str) -> str:
         return f"{self.report}#{self._q(name)}"

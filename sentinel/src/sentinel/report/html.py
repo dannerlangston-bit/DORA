@@ -2,7 +2,9 @@
 
 The page carries the run detail of 9.5 for a PR run: provenance, the PR comment content
 (Unexpected and Intended with base and candidate crops side by side at 1:1 and a heatmap,
-Suppressed, Coverage with the surface x persona matrix of 2.12, Run health) and the run
+Suppressed, Coverage with the surface x persona matrix of 2.12, Run health), the Safety proof
+section of 9.4 item 8 (each ORDER SAFETY PROOF block, the last Nightly's fire drill and safety
+canary rows, open incidents and overdue postmortems), the Alerts panel of 9.5 and the run
 history. It is built from the same `RunReport` as the PR comment, so the two never disagree.
 
 - Standard library only for the HTML; Pillow (already a dependency) reads image sizes and, when
@@ -28,7 +30,7 @@ from PIL import ImageChops
 
 from ..records import CheckpointOutcome, Decision, Finding, RunOutcome, StepOutcome
 from .inline import Code, Image, Line, Link, Text, is_artifact_hash
-from .model import FIELD_EVIDENCE, Evidence, ReportContext, RunReport, build_report
+from .model import FIELD_EVIDENCE, G2_WITHHELD, Evidence, ReportContext, RunReport, SafetyRows, build_report
 
 _MEDIA = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
           ".gif": "image/gif"}
@@ -189,14 +191,14 @@ def _matrix(report: RunReport) -> str:
 
     A cell never reads "passed"; a surface without a checkpoint for a persona says so.
     """
-    cells = report.coverage_cells
+    cells = report.coverage_cells                     # `model.coverage_cell` form
     grid: dict[tuple[str, str], tuple[str, str]] = {}
     if cells:
         for c in cells:
-            if c.get("state") == "covered":
-                grid[(c["surface"], c["persona"])] = (f"{c.get('worst', 'identical')} ({c.get('n', 0)})", "")
-            elif c.get("state") == "not_run":
-                grid[(c["surface"], c["persona"])] = (f"not_run ({c.get('reason', 'scope')})", "cell-notrun")
+            if c["state"] == "covered":
+                grid[(c["surface"], c["persona"])] = (f"{c['worst'] or 'identical'} ({c['n']})", "")
+            elif c["state"] == "not_run":
+                grid[(c["surface"], c["persona"])] = (f"not_run ({c['reason'] or 'scope'})", "cell-notrun")
             else:
                 grid[(c["surface"], c["persona"])] = ("not_registered", "cell-notrun")
     else:
@@ -276,6 +278,12 @@ def render_run_report_html(report: RunReport, *, objects_dir: str | os.PathLike 
             parts.append(f'<section id="intended"><h2>Intended ({report.n_intended})</h2>')
             if report.manifest_line:
                 parts.append(f"<p>{_inline(report.manifest_line)}</p>")
+            if report.manifest_lint_lead:             # 4.3: the lint output of a manifest treated as missing
+                parts.append(f"<p>{_inline(report.manifest_lint_lead)}</p><ul>"
+                             + "".join(f"<li>{_inline(x)}</li>" for x in report.manifest_lint) + "</ul>")
+            for line in (report.manifest_template, report.empty_reason_line):
+                if line:
+                    parts.append(f"<p>{_inline(line)}</p>")
             parts += [_article(it.header, it.fields, images) for it in report.intended]
             for line in (report.reconciliation, report.needs_baseline_line):
                 if line:
@@ -292,7 +300,11 @@ def render_run_report_html(report: RunReport, *, objects_dir: str | os.PathLike 
                         if rows else '<p class="muted">0 findings matched an earlier decision.</p>') + "</section>")
         cov_rows = [[_e(c) for c in row] for row in report.coverage_rows]
         not_run = f"<p>{_inline(report.not_run_line)}</p>" if report.not_run_line else ""   # checkpoints (9.2)
-        if cov_rows:
+        if report.g2_failures:                        # 1.4 G2: a matrix whose cells do not sum is never published
+            lis = "".join(f"<li>{_e(f)}</li>" for f in report.g2_failures)
+            parts.append(f'<section id="coverage"><h2>Coverage</h2><p class="bad">{_e(G2_WITHHELD)}</p><ul>{lis}</ul>'
+                         f"{not_run}</section>")
+        elif cov_rows:
             parts.append('<section id="coverage"><h2>Coverage</h2>'
                          + _table(["Tier", "Registered", "In scope", "Covered", "Not compared", "not_run"], cov_rows)
                          + not_run + f"<p>{_inline(report.scope_line)}</p><h3>Coverage matrix</h3>{_matrix(report)}"
@@ -302,6 +314,13 @@ def render_run_report_html(report: RunReport, *, objects_dir: str | os.PathLike 
                          '</section>')
         parts.append('<section id="health"><h2>Run health</h2>'
                      + _table(["Item", "Value"], [[_e(k), _inline(v)] for k, v in report.health_rows]) + "</section>")
+        if report.safety_proof:                       # 9.4 item 8 Safety proof
+            blocks = "".join(f"<h3>{_e(title)}</h3><ul>" + "".join(f"<li>{_inline(x)}</li>" for x in lines) + "</ul>"
+                             for title, lines in report.safety_proof)
+            parts.append(f'<section id="safety"><h2>Safety proof</h2>{blocks}</section>')
+        if report.alerts:                             # 9.5 run detail: the Alerts panel
+            lis = "".join(f"<li>{_inline(x)}</li>" for x in report.alerts)
+            parts.append(f'<section id="alerts"><h2>Alerts ({len(report.alerts)})</h2><ul>{lis}</ul></section>')
         if report.history:
             hrows = [[_e(h.get("run_id", "")), _e(h.get("candidate", "")), _e(h.get("result", "")),
                       _e(", ".join(f"{v} {k}" for k, v in h["counts"].items()) if isinstance(h.get("counts"), dict)
@@ -316,10 +335,18 @@ def render_run_report(run: RunOutcome, outcomes: list[CheckpointOutcome], findin
                       decisions: list[Decision], coverage: dict | None, health: dict | None,
                       manifest: dict | None, context: ReportContext, out_path: str | os.PathLike, *,
                       steps: list[StepOutcome] = (), objects_dir: str | os.PathLike | None = None,
-                      embed: bool = True) -> Path:
-    """Write the static run report to `out_path` and return the path (9.5)."""
+                      embed: bool = True, summary: dict | None = None, safety: SafetyRows | None = None) -> Path:
+    """Write the static run report to `out_path` and return the path (9.5); `summary` and `safety` as for
+    `model.build_report`."""
+    report = build_report(run, outcomes, findings, decisions, coverage, health, manifest, context, steps,
+                          summary=summary, safety=safety)
+    return write_run_report(report, out_path, objects_dir=objects_dir, embed=embed)
+
+
+def write_run_report(report: RunReport, out_path: str | os.PathLike, *,
+                     objects_dir: str | os.PathLike | None = None, embed: bool = True) -> Path:
+    """Write a built report's page to `out_path` (for `ReportInputs.build`) and return the path (9.5)."""
     out = Path(out_path)
-    report = build_report(run, outcomes, findings, decisions, coverage, health, manifest, context, steps)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(render_run_report_html(report, objects_dir=objects_dir, embed=embed, page_dir=out.parent),
                    encoding="utf-8")

@@ -24,8 +24,8 @@ import re
 
 from ..records import CheckpointOutcome, Decision, Finding, RunOutcome, StepOutcome
 from .inline import Code, Image, Line, Link, Text
-from .model import (FIELD_EVIDENCE, CommitStatus, Evidence, ReportContext, RunReport, build_report,
-                    commit_status, pending_status)
+from .model import (FIELD_EVIDENCE, G2_WITHHELD, CommitStatus, Evidence, ReportContext, RunReport, SafetyRows,
+                    build_report, commit_status, pending_status)
 
 __all__ = ["render_pr_comment", "render_report_markdown", "comment_marker", "commit_status",
            "pending_status", "CommitStatus", "ReportContext", "GITHUB_COMMENT_LIMIT", "md_text", "md_code"]
@@ -180,6 +180,12 @@ def _intended(r: RunReport, limit: int) -> list[str]:
     lines = ["", f"**Intended ({r.n_intended})**"]
     if r.manifest_line:
         lines.append(_md(r.manifest_line))
+    if r.manifest_lint_lead:                          # 4.3: the lint output of a manifest treated as missing
+        lines.append(_md(r.manifest_lint_lead))
+        lines += [f"- {_md(x)}" for x in r.manifest_lint]
+    for line in (r.manifest_template, r.empty_reason_line):
+        if line:
+            lines.append(_md(line))
     lines += _items(r.intended, limit)
     more = r.n_intended - limit
     if more > 0:
@@ -215,6 +221,9 @@ def _suppressed(r: RunReport, collapsed: bool) -> list[str]:
 
 def _coverage(r: RunReport) -> list[str]:
     not_run = [] if r.not_run_line is None else ["", _md(r.not_run_line)]   # checkpoints, under the 2.12 table
+    if r.g2_failures:                                 # 1.4 G2: a matrix whose cells do not sum is never published
+        return (["", "**Coverage**", md_text(G2_WITHHELD)] + [f"- {md_text(f)}" for f in r.g2_failures]
+                + not_run)
     if not r.coverage_rows:                           # the run stopped before scope: no table to show
         return ["", "**Coverage**", _md(r.scope_line)] + not_run
     lines = ["", "**Coverage**", "| Tier | Registered | In scope | Covered | Not compared | not_run |",
@@ -274,11 +283,15 @@ def render_report_markdown(report: RunReport, limit_chars: int = GITHUB_COMMENT_
 def render_pr_comment(run: RunOutcome, outcomes: list[CheckpointOutcome], findings: list[Finding],
                       decisions: list[Decision], coverage: dict | None, health: dict | None,
                       manifest: dict | None, context: ReportContext, *, steps: list[StepOutcome] = (),
-                      limit_chars: int = GITHUB_COMMENT_LIMIT) -> str:
+                      limit_chars: int = GITHUB_COMMENT_LIMIT, summary: dict | None = None,
+                      safety: SafetyRows | None = None) -> str:
     """The 9.2 PR comment for one run, marker first, edited in place by later runs (9.1).
 
     `manifest` is the loaded change manifest (4.3) as a plain dict, or None when no manifest
-    was loaded; `coverage` and `health` are the plain dicts described in `report.model`.
+    was loaded; `coverage`, `health`, `summary` (the run's summary_json) and `safety` (the
+    store rows of the Safety row) are described in `report.model`; `ReportInputs.from_store`
+    reads them all for a finished run.
     """
-    report = build_report(run, outcomes, findings, decisions, coverage, health, manifest, context, steps)
+    report = build_report(run, outcomes, findings, decisions, coverage, health, manifest, context, steps,
+                          summary=summary, safety=safety)
     return render_report_markdown(report, limit_chars)

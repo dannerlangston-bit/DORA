@@ -722,8 +722,8 @@ CREATE TABLE decisions (
   revoked_at TEXT, revoked_by TEXT, revoke_reason TEXT,
   source_finding_id INTEGER REFERENCES findings(finding_id),
   bbox_q4           TEXT,                   -- x,y,w,h of the largest component quantized to 4 px: the fallback key at or below noise spread (4.14)
-  role              TEXT CHECK (role IS NULL OR role IN ('system_owner','triage_rotation','flow_owner','pr_author',
-                                                         'jira_resolver')),   -- 9.12, L-DEC-01
+  role              TEXT CHECK (role IS NULL OR role IN ('triage_rotation','flow_owner','system_owner',
+                                                         'release_manager','pr_author','ticket_resolver')),   -- 4.14, 9.12, L-DEC-01
   reopen_count      INTEGER NOT NULL DEFAULT 0 CHECK (reopen_count >= 0),   -- fixed_in_build signatures that returned (4.14)
   CHECK ((action IN ('confirm_bug','fixed_in_build') AND verdict = 'confirmed_bug')
       OR (action IN ('mark_intended','approve_baseline') AND verdict = 'intended')

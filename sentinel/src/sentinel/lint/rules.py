@@ -430,6 +430,7 @@ PASCAL = re.compile(r"^[A-Z][A-Za-z0-9]*$")
 POP_ID = re.compile(r"^POP-[0-9]{2,}$")
 MUTANT_ID = re.compile(r"^M[0-9]{2,}$")
 ACCOUNT = re.compile(r"^D-[0-9A-Z]+$")
+INV_IDS = tuple(f"INV-{n:02d}" for n in range(1, 16))      # the invariants of 2.7 (L-SRF-11)
 FUTURE_MONTH = re.compile(r"^/(?P<root>[A-Z0-9]+?)(?P<month>[FGHJKMNQUVXZ])(?P<year>[0-9]{2})$")
 MONTH_CODES = "FGHJKMNQUVXZ"              # January to December (4.9 futures month code)
 VAULT_REF = re.compile(r"^vault://[^#]+#.+$")               # 4.1 secrets: vault://<path>#<field>
@@ -1334,6 +1335,9 @@ class _Linter:
                         self.add("L-SRF-11", f, f"parent chain of {sid} has a cycle at {cur}", "parent")
             for i, x in enumerate(map(_d, _l(s.get("invariant_exceptions")))):
                 exp, at = _ts(x.get("expires_at")), f"invariant_exceptions[{i}]"
+                if x.get("invariant_id") not in INV_IDS:
+                    self.add("L-SRF-11", f, f"invariant_id {x.get('invariant_id')!r} is not one of INV-01 to INV-15 (2.7)",
+                             f"{at}.invariant_id")
                 if not (x.get("owner") and x.get("reason")) or exp is None:
                     self.add("L-SRF-11", f, "an invariant exception carries owner, reason and a future expires_at", at)
                 elif exp <= self.now:
@@ -2146,14 +2150,33 @@ class _Linter:
 
     # -- 4.9 fixtures ----------------------------------------------------------------------------
 
+    def _paper_format(self) -> re.Pattern[str]:
+        """The paperMoney account id format L-FIX-01 checks: `^D-[0-9A-Z]+$`, or the format 6.13 item 5 branch B
+        recorded in phase0/branches.yaml (`branches.identity().paper`)."""
+        bdoc = self.r.one("branches")
+        if bdoc is None or not isinstance(bdoc.data, dict):
+            return ACCOUNT
+        from ..branches import BranchesError, parse as parse_branches
+        try:
+            return parse_branches(bdoc.data).identity().paper
+        except (BranchesError, ValueError, TypeError, re.error):
+            return ACCOUNT
+
+    def _item3_different(self) -> bool:
+        """6.13 item 3 read `different`: the build has no Order Confirmation setting, A3 is "absent"."""
+        bdoc = self.r.one("branches")
+        safety = _l(_d(bdoc.data).get("safety")) if bdoc is not None else []
+        return any(_d(x).get("item") == 3 and _d(x).get("result") == "different" for x in safety)
+
     def check_fixtures(self) -> None:
+        paper = self._paper_format()
         al = self.r.one("allowlist")
         rigs = {_d(x).get("rig"): [a for a in _l(_d(x).get("account_ids"))] for x in _l(_d(al.data).get("rigs") if al else [])}
         if al:
             for i, x in enumerate(map(_d, _l(_d(al.data).get("rigs")))):
                 for a in _l(x.get("account_ids")):
-                    if not (isinstance(a, str) and ACCOUNT.match(a)):
-                        self.add("L-FIX-01", al.rel, f"allowlist entry {a!r} is not an exact ^D-[0-9A-Z]+$ id (no patterns, globs or prefixes)", f"rigs[{i}].account_ids")
+                    if not (isinstance(a, str) and paper.match(a)):
+                        self.add("L-FIX-01", al.rel, f"allowlist entry {a!r} is not an exact {paper.pattern} id (no patterns, globs or prefixes)", f"rigs[{i}].account_ids")
         elif self.r.of("fixture"):
             self.add("L-FIX-01", "gateway/allowlist.yaml", "gateway/allowlist.yaml is missing")
         send_enabled = self.send_policy.get("enabled") is True
@@ -2164,8 +2187,8 @@ class _Linter:
             ids = {a.get("account_id") for a in accounts}
             for i, a in enumerate(accounts):
                 aid = a.get("account_id")
-                if not (isinstance(aid, str) and ACCOUNT.match(aid)):
-                    self.add("L-FIX-01", f, f"account_id {aid!r} does not match ^D-[0-9A-Z]+$", f"accounts[{i}].account_id")
+                if not (isinstance(aid, str) and paper.match(aid)):
+                    self.add("L-FIX-01", f, f"account_id {aid!r} does not match {paper.pattern}", f"accounts[{i}].account_id")
                 if aid not in rigs.get(fx.get("rig"), []):
                     self.add("L-FIX-01", f, f"account {aid} is not in gateway/allowlist.yaml for rig {fx.get('rig')}", f"accounts[{i}].account_id")
                 if send_enabled and "cash_floor" in a:
@@ -2189,7 +2212,8 @@ class _Linter:
                 self.add("L-FIX-05", f, f"settings_profile {fx.get('settings_profile')} is not an app_settings profile in profiles/", "settings_profile")
             else:
                 st = _d(sp.get("settings"))
-                pins = (("order_confirmation", st.get("order_confirmation") is True),
+                pins = (("order_confirmation", st.get("order_confirmation") is True
+                         or (st.get("order_confirmation") == "absent" and self._item3_different())),
                         ("shift_click_send", st.get("shift_click_send") in (False, "absent")),
                         ("active_trader_hotkeys", st.get("active_trader_hotkeys") is False),
                         ("order_hotkeys", st.get("order_hotkeys") == []))
@@ -2572,8 +2596,8 @@ class _Linter:
             v = self.branches.get(k)
             if k not in self.branches:
                 self.add("L-XREF-15", f, f"no branch for unknown {k}", k)
-            elif v not in ("A", "B"):
-                self.add("L-XREF-15", f, f"unknown {k} is unresolved ({v!r}); choose A or B", k, self._phase_sev(1))
+            elif v not in ("A", "B") and self.phase >= 1:     # Phase 0: only past its deadline (checks/branches.py)
+                self.add("L-XREF-15", f, f"unknown {k} is unresolved ({v!r}); choose A or B", k, "error")
         data = self.branches.get("data_fixture")
         for doc in self.r.of("fixture"):
             provider = _d(_d(_d(doc.data).get("data_mode")).get("frozen")).get("provider")

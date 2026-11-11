@@ -263,11 +263,14 @@ def test_tbd_glob_warns_in_phase0_and_errors_after(base):
         assert [v.severity for v in found] == [sev]
 
 
-def test_unresolved_branch_warns_in_phase0_and_errors_after(base):
-    for phase, sev in ((0, "warn"), (1, "error")):
+def test_unresolved_branch_warns_past_its_deadline_in_phase0_and_errors_after(base):
+    """The coordinator's decision (4.15 row with 11.8 and R23): in Phase 0 an undecided record warns only once its
+    deadline passed; from Phase 1 any undecided record is an error."""
+    for phase, deadline, sevs in ((0, "2026-12-01", []), (0, "2026-11-01", ["warn"]), (1, "2026-12-01", ["error"])):
         r = copy.deepcopy(base)
-        r.docs[BRANCHES].data["session_rule"] = {"branch": "undecided", "deadline": "2026-12-01"}   # 4.16 branch_choice
-        assert [v.severity for v in lint_repo(r, phase, TODAY).violations if v.rule == "L-XREF-15"] == [sev]
+        r.docs[BRANCHES].data["session_rule"] = {"branch": "undecided", "deadline": deadline}   # 4.16 branch_choice
+        found = [v.severity for v in lint_repo(r, phase, TODAY).violations if v.rule == "L-XREF-15"]
+        assert sorted(set(found)) == sevs, (phase, deadline, found)
 
 
 def test_golden_list_is_warn_until_phase2(base):

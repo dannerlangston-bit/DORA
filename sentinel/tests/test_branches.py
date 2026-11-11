@@ -46,7 +46,8 @@ def undecided(deadline: str | None = "2026-11-20") -> dict:
 def test_the_example_loads_with_its_recorded_branches():
     b = br.load(EXAMPLE / BRANCHES)
     assert {k: b.branch(k) for k in BRANCH_KEYS} == {k: "A" for k in BRANCH_KEYS}
-    assert b.run_health_lines(TODAY) == () and b.batch_api == "undecided" and b.model_id is None
+    assert b.run_health_lines(TODAY) == () and b.batch_api == "undecided"
+    assert b.model_id == "simulated-reviewer-offline"            # the demo's pinned model (w2 wiring)
     assert sorted(b.safety) == list(br.SAFETY_ITEMS) and all(not s.read for s in b.safety.values())
 
 
@@ -196,7 +197,7 @@ def test_dr07_gates_the_agent_rung_explorer_reviewer_and_batch_api():
     assert b.reviewer_enabled and not b.agent_rung_allowed and not b.explorer_allowed
     a = br.parse(data(reviewer={"model_id": "claude-x"}, batch_api="on")).models()
     assert a.reviewer_enabled and a.agent_rung_allowed and a.explorer_allowed and a.batch_api_enabled
-    unpinned = br.parse(data()).models()
+    unpinned = br.parse(data(reviewer={})).models()        # the example pins the demo model; unpin it
     assert not (unpinned.reviewer_enabled or unpinned.agent_rung_allowed or unpinned.batch_api_enabled)
 
 

@@ -123,6 +123,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+from types import SimpleNamespace
 import hashlib
 import itertools
 import json
@@ -152,6 +153,9 @@ from ..capture.capture import (ForeignWindowLog, TargetWindow, capture_meta, cho
 from ..capture.sweep import SizeLadder, compare_minimums, minimums_summary, size_step_event
 from ..orchestrator.version_read import DEFAULT_TITLE_REGEX
 from ..orchestrator import fixture_checks
+from .. import branches as branches_mod
+from ..effective import checker_config, effective_registry as config_registry, workspace_theme
+from ..orchestrator.popups import error_title_patterns
 from ..store.lifecycle import expire_due, expiring_within, export_decisions, first_seen, suspect_decisions, verify_fixes
 from ..store.mirror import apply_renames, load_config_mirror
 from ..store.store import Roster
@@ -443,6 +447,9 @@ class _Run:
         self.fp_base_id = self.fp_id
         self.cal_key: str | None = None                  # 4.12 calibration key of the run's fingerprint (7.13)
         self.fp_ids: dict[str, str] = {}                 # shard -> its candidate fingerprint_id (4.12)
+        self.effective = config_registry(cfg, now)        # the registry as it applies at run start (4.5, 4.7, 2.7)
+        self.checkers: dict[str, inv.CheckerConfig] = {}  # theme -> the Invariant Checker's run-wide settings
+        self.cp_rules: dict[str, inv.SurfaceRules] = {}
         self.epoch = epoch
         self.calibration: CalibrationFile | None = None
         self.rules: dict[str, inv.SurfaceRules] = {}
@@ -508,10 +515,24 @@ class _Run:
         return self.registries[cp.checkpoint_id]
 
     def surface_rules(self, cp: PlannedCheckpoint) -> inv.SurfaceRules:
-        key = f"{cp.surface_id}|{cp.data_mode}"
-        if key not in self.rules:
-            self.rules[key] = self.live_rules(cp.surface_id, cp.data_mode)
-        return self.rules[key]
+        """The checkpoint's invariant inputs from the effective registry (its overrides, the exceptions in force at
+        run start), with the A/A enablement of its surface and data mode applied (2.7)."""
+        if cp.checkpoint_id not in self.cp_rules:
+            rules = self.effective.surface_rules(cp)
+            calibrated = self.rules.get(f"{cp.surface_id}|{cp.data_mode}")
+            if calibrated is not None:                    # the surface's A/A enablement test (2.7)
+                rules = dataclasses.replace(rules, calibration_pending=calibrated.calibration_pending)
+            self.cp_rules[cp.checkpoint_id] = rules
+        return self.cp_rules[cp.checkpoint_id]
+
+    def checker(self, cp: PlannedCheckpoint) -> inv.CheckerConfig:
+        """The Invariant Checker's settings for the checkpoint's workspace theme (`effective.checker_config`: the
+        pinned palette, INV-15, and the popup catalog's error title patterns, INV-14)."""
+        theme = workspace_theme(self.cfg, cp.workspace_id)
+        if theme not in self.checkers:
+            cat = popup_catalog(self.cfg)
+            self.checkers[theme] = checker_config(self.cfg, theme, error_title_patterns(cat) if cat else ())
+        return self.checkers[theme]
 
     def live_rules(self, surface_id: str, data_mode: str) -> inv.SurfaceRules:
         """The surface's invariant inputs as they apply at run start: an invariant exception expired by then is
@@ -654,7 +675,7 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
         else:
             facts = Facts(base="absent", base_reason=absent_reason or ("new_surface" if new_surface
                                                                         else "base_not_settled"), **fkw)
-        comparison = inv.compare(None, cand.models, rules)
+        comparison = inv.compare(None, cand.models, rules, config=run.checker(cp))
     elif (red := run.redact(cp, base, cand, s_b.capture, s_c.capture)).terminal is not None:
         t = red.terminal                                # a redaction landmark on one side only: nothing is stored
         facts = Facts(landmark=Condition(t.reason, side=t.side, detail=t.detail), **fkw)
@@ -664,7 +685,7 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
                         system_masks=[park_rect(park)],
                         context=DiffContext(run.run_id, cp.checkpoint_id, cp.tier, synthetic=synthetic),
                         params=run.params)
-        comparison = inv.compare(base.models, cand.models, rules)
+        comparison = inv.compare(base.models, cand.models, rules, config=run.checker(cp))
         if res.terminal is not None:
             t = res.terminal
             if t.outcome == "landmark_missing":
@@ -684,7 +705,8 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
                 else:
                     again = recapture()
                     recaps = 1
-                    p = inv.confirm(comparison, inv.check_capture(again.models, rules, reference=base.models[0]))
+                    p = inv.confirm(comparison, inv.check_capture(again.models, rules, reference=base.models[0],
+                                                                  config=run.checker(cp)))
                 inv_ids = tuple(r.violation.invariant_id for r in (p.confirmed or p.unconfirmed))
                 inv_stab, inv_cause = p.stability, p.stability_cause
             if res.level == "above":
@@ -1374,6 +1396,28 @@ def _decision_rows(store: Store, verified: Any, at: str) -> list[list[str]]:
     return rows
 
 
+class _UnreviewedReviewer:
+    """The Reviewer while DR-07 is undecided or no model is pinned (11.8, 10.7): every call is unavailable, so the
+    items it would review take R from the failed verdict (3.11 row 23) and the report says unreviewed."""
+
+    model_id = "none"
+    prompt_hash = "none"
+
+    def review(self, request: Any) -> Any:
+        raise _Unreviewed()
+
+
+class _Unreviewed(ReviewerUnavailable):
+    """No Reviewer for the run (DR-07, 10.7): R is `unavailable` with cause `reviewer_disabled`."""
+
+    def __init__(self) -> None:
+        RuntimeError.__init__(self, "unavailable: reviewer_disabled")
+        self.verdict = SimpleNamespace(state="unavailable", cause="reviewer_disabled")
+
+    def review(self, threshold: float = 0.0) -> Review:
+        return Review("unavailable", cause="reviewer_disabled")
+
+
 def _branches_doc(cfg: SentinelConfig) -> dict:
     """The parsed `phase0/branches.yaml` (4.16), or nothing when the config has none (every branch undecided)."""
     path = cfg.root / "phase0" / "branches.yaml"
@@ -1482,6 +1526,7 @@ class _ShardWork:
         self.faults = faults_from(self.script.faults) if self.script.faults else None
         self.vault = SimVault(unreachable=self.script.vault_unreachable)   # 6.9: secrets leased at typing time
         self.sides: dict[str, str] = {}                      # the side the Executor ran for a step-decided outcome
+        self.agent_allowed = True                            # DR-07 branch A with a pinned model (5.5)
         self.foreign_log = ForeignWindowLog()                # 5.7: one alert per run per foreign image name
         self.ladders: dict[tuple[str, str, str], SizeLadder] = {}   # (surface, host, side) -> its 2.5.1 ladder
         self.health_rows: list[list[str]] = []               # run-health rows the wiring adds (report.model)
@@ -1676,7 +1721,7 @@ class _ShardWork:
         rig's ports and the locator ladder over the desk."""
         sc, rig = self.scenario, st.rig
         st.exec = ExecContext(sc.run_id, st.shard_id, st.clock, ledger=self.ledger, budgets=st.orch.budgets,
-                              side="candidate", agent_available=st.orch.model.agent_available,
+                              side="candidate", agent_available=st.orch.model.agent_available and self.agent_allowed,
                               dr07_branch_b=Branches.from_doc(self.branches_doc).computer_use == "B",
                               heartbeat=st.policy, life=st.life, audit=st.drainer, resolve_target=self.desk.target,
                               next_seq=lambda: next(st.seq))
@@ -2606,6 +2651,10 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
             oracle = FlowOracle.load(cfg, now)
         except OracleConfigError as exc:
             return _abort_config(store, scenario, cfg_root, [str(exc)], [], out, today, started)
+        try:                                             # 11.8: every Phase 0 branch, its default while undecided
+            phase0 = branches_mod.load(cfg.root / branches_mod.BRANCHES_PATH)
+        except branches_mod.BranchesError as exc:
+            return _abort_config(store, scenario, cfg_root, [str(exc)], ["L-XREF-15"], out, today, started)
         cand_doc = cfg.builds.get(scenario.candidate.build_id, {})
         pair = cand_doc.get("build_pair") or {}
         base_id = pair.get("base", scenario.base.build_id)
@@ -2665,6 +2714,9 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                             flow_docs=cfg.flow_docs, pad=(live.config if live else ReviewerConfig()).crop.pad_px)
         if reviewer is None and live is not None:          # 3.12: the real Reviewer; crops from the artifact store
             rev = ModelReviewer(live, items)
+        if not phase0.models().reviewer_enabled:          # DR-07 undecided or no pinned model: unreviewed (10.7)
+            rev = _UnreviewedReviewer()
+        work.agent_allowed = phase0.models().agent_rung_allowed
         if isinstance(rev, CollectingReviewer):
             rev.item_for = items
         # -- 5.2: every shard through the Orchestrator; 5.17 per checkpoint inside `running`
@@ -2765,6 +2817,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         minimums, _ = work.sweep_minimums()
         if minimums:                                    # 2.5.1: stored with the run, the report's minimum line
             summary["sweep_minimums"] = minimums
+        work.health_rows += [["Phase 0 branches", line] for line in phase0.run_health_lines(today)]
         stage1 = sorted({line for st, _ in work.reports for line in st.orch.stage1_steps})
         rows = list(work.health_rows) + churn_rows + ([["Fixture Stage 1", "; ".join(stage1)]] if stage1 else [])
         if rows:

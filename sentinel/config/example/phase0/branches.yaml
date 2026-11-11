@@ -13,7 +13,7 @@ aa_floor: {branch: A}         # DR-05 A/A floor near zero on frozen checkpoints
 session_rule: {branch: A}     # DR-06 a second login kicks the first; one session per login
 computer_use: {branch: A}     # DR-07 computer use allowed on the approved endpoint
 batch_api: undecided
-reviewer: {}                  # model_id once pinned (3.15)
+reviewer: {model_id: simulated-reviewer-offline}   # the pinned model (3.15); the demo's offline stand-in
 version_read: {}              # title_regex and about_regex once read (4.2, 7.3)
 safety:                       # the ten Phase 0 assumptions of 6.13, all still to be read
   - {item: 1, result: undecided}

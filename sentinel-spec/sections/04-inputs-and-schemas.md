@@ -1011,7 +1011,6 @@ fixture:
     nearest_monthly_expiration: date
     option_expirations: map[str, list[date]]?   # per option symbol
     data_delay: enum[delayed_20|realtime]
-    trading_24h_list_sha256: sha256?    # hash of the 24-hour trading list (7.4)
   churn_calendar: list[{date: date, event: enum[expiration|roll|holiday|earnings|ex_dividend|reseed_due], symbol_ref: ref:symbol.id?, action: enum[reapprove|skip_checkpoints|reseed|none]}]
 
 account:
@@ -1082,7 +1081,7 @@ churn_calendar:
   - {date: 2026-12-18, event: reseed_due, action: reseed}
 ```
 
-paperMoney data is delayed 20 minutes by default (verified), so `data_delay: delayed_20` is the normal state and `realtime` is set only after the platform team confirms it for the login; the badge is read at `fixture_verified` and a mismatch is `env_error (gate: fixture_verified, reason: delay_state)`. The `prices` list is recomputed by the fixture reset flow before each run so a far-from-market limit stays far from the market. The epoch is the fixture's contribution to the fingerprint (4.12 `data_epoch`): base and candidate must share `epoch_id`, else every checkpoint is `not_comparable (reason: fingerprint_mismatch)` with `data_epoch` in `detail` (3.2); base-capture reuse (11.2) is allowed only when fingerprint and `epoch_id` both match. The churn calendar is generated from the exchange-calendar library and the market-data API (7.9) and checked in; `reapprove` marks the day's frozen baselines for re-approval instead of scoring, `skip_checkpoints` makes the affected checkpoints `not_run (reason: scope)` with the event in `detail`, `reseed` is a calendar task for the login owner.
+paperMoney data is delayed 20 minutes by default (verified), so `data_delay: delayed_20` is the normal state and `realtime` is set only after the platform team confirms it for the login; the badge is read at `fixture_verified` and a mismatch is `env_error (gate: fixture_verified, reason: delay_state)`. The `prices` list is recomputed by the fixture reset flow before each run so a far-from-market limit stays far from the market. The epoch is the fixture's contribution to the fingerprint (4.12 `data_epoch`): base and candidate must share `epoch_id`, else every checkpoint is `not_comparable (reason: fingerprint_mismatch)` with `data_epoch` in `detail` (3.2). The hash of the 24-hour trading list is not an epoch field and not in `epoch_id`: it is read each run and recorded in the fingerprint's `record` block (4.12, 7.4), so a change of the list never makes a pair `not_comparable`. Base-capture reuse (11.2) is allowed only when the whole reuse key of 7.9 matches: `fingerprint_id`, `epoch_id`, the sha256 of the fixture file and the golden account's latest `seeded_at`. The churn calendar is generated from the exchange-calendar library and the market-data API (7.9) and checked in; `reapprove` marks the day's frozen baselines for re-approval instead of scoring, `skip_checkpoints` makes the affected checkpoints `not_run (reason: scope)` with the event in `detail`, `reseed` is a calendar task for the login owner.
 
 | Rule | Check | Severity |
 |---|---|---|
@@ -1097,19 +1096,41 @@ paperMoney data is delayed 20 minutes by default (verified), so `data_delay: del
 | L-FIX-09 | the `golden` account's positions cover the checked-in golden list of 7.6: an equity below 1 dollar, an equity above 1,000 dollars, a multi-leg option position, a LEAPS, one futures and one forex position | warn until Phase 2, then error |
 | L-FIX-10 | the `empty` account has no positions and `working_orders_expected: 0` | error |
 
-A working order found at run start that the fixture does not declare is `aborted_safety (reason: unexpected_working_order)`, the process tree is killed, and the on-call channel is paged with the Working Orders screenshot and the Copy All text. A position, cash or watchlist mismatch is `env_error (gate: fixture_verified, reason: fixture_drift)`: the fixture reset flow runs once (7.6 stage 2) and `verify_account_fixture` is re-run; on a second mismatch the drift stands, every checkpoint whose surface or step carries `account_state: true` is `env_error` with that reason, the rest of the run proceeds, the run ends `complete_with_env_errors`, and the channel gets the screenshots. There is no third attempt.
+A working order found at run start that the fixture does not declare is `aborted_safety (reason: unexpected_working_order)`, the process tree is killed, and the on-call channel is paged with the Working Orders screenshot and the Copy All text. Drift follows three rules (7.5, 7.6):
+
+- Position and cash drift is scoped to `account_state` checkpoints and found at gate `fixture_verified`. On the `empty` account the fixture reset flow runs once (7.6 stage 2) and `verify_account_fixture` is re-run; a second mismatch makes every checkpoint whose surface or step carries `account_state: true` `env_error (gate: fixture_verified, reason: fixture_drift)`. There is no third attempt.
+- The `golden` account is never reset: a position or cash mismatch there makes its `account_state` checkpoints `env_error (gate: fixture_verified, reason: fixture_drift)` at once and opens a re-seed task for the accounts owner.
+- Watchlist drift is whole-shard and found at gate `settings_attested`, after the one correction pass of 7.6 stage 1: every scoped checkpoint of the shard is `env_error (gate: settings_attested, reason: fixture_drift)`.
+
+In every case the rest of the run proceeds, the run ends `complete_with_env_errors`, and the channel gets the screenshots.
+
+`fixtures/margin_rules.yaml` holds the brackets of rule R02 (2.8.3). Until Phase 0 pins the paperMoney formula from twenty staged tickets, `pinned` is false and R02 checks sign and bracket only, labelled "bracket check" in the report:
+
+```yaml
+# schemas/margin-rules.schema.json  (fixtures/margin_rules.yaml)
+margin_rules_file:
+  schema_version: int = 1
+  pinned: bool = false                  # true once Phase 0 has read the formula per asset class
+  brackets: list[{asset: enum[equity|option|future|future_option|forex|index], account: enum[margin|ira], of: enum[notional|initial_margin], low: num, high: num}]   # the share of `of` the Buying Power Effect may take, low and high inclusive
+  initial_margin: map[str, num]?        # per futures root: the exchange initial margin per contract
+```
 
 ### 4.10 Popup catalog entry
 
 The popup catalog names everything the app throws on its own, with an action for each (policy in 7.8 Popup catalog policy and starter entries; the merged starter table with ids `POP-01` onward is 12.8). Before every step and every capture the Executor enumerates the top-level windows of the process tree by PID and matches each unexpected one against the catalog. An unmatched window while the current step's `order_stage` is set ends the run `aborted_safety (reason: unknown_dialog_in_order_stage)`, since an unknown dialog over a staged order may be a send path. Otherwise the flow is quarantined (`not_run (reason: quarantine)` from the next run until a human reviews the entry) and the window goes to the agent with a dismiss-only toolset, logged as an `unknown_popup` finding with a proposed catalog entry; with agent mode disabled the Executor sends WM_CLOSE, and a window that persists makes the step `failed` with the same finding. An Order Confirmation dialog is never in the catalog as something to dismiss; only a flow owns it.
 
 ```yaml
-# schemas/popup.schema.json  (popups/catalog.yaml is a list of these)
+# schemas/popup.schema.json  (popups/catalog.yaml)
+popup_catalog:
+  schema_version: int = 1
+  entries: list[popup]                  # a bare list without schema_version warns in Phase 0 and is an error from Phase 1
+
 popup:
-  popup_id: str                         # ^POP-[0-9]{2,}$, the id of the 12.8 table
+  popup_id: str                         # ^POP-[0-9]{2,}$: the starter ids of the 12.8 table, then further ids in sequence
   name: id                              # readable slug
   class: enum[dismissable|env|login|app_failure|safety|order_event]   # the policy class of 7.8
   title_regex: str
+  seed_titles: list[str]?               # real window titles the entry must match; L-POP-05 compares entries over them
   template: path?                       # small identifying crop; required when action = click
   window_class_hint: str?               # e.g. SunAwtDialog; confirmed in Phase 0
   action: enum[dismiss_key|click|wait|relogin|abort|ignore]
@@ -1121,6 +1142,8 @@ popup:
   expected_phases: list[enum[launch|login|workspace_load|running|teardown]]
   owner: str
   status: enum[verified|unverified|disabled]   # disabled entries are kept but never matched (Trade Flash until seen)
+  retired: bool = false                 # a starter row of 12.8 explicitly retired: kept, never matched; requires retired_reason (L-XREF-12)
+  retired_reason: str?
   first_seen_build: ref:build.build_id
   last_seen_build: ref:build.build_id?
   notes: str?
@@ -1128,7 +1151,7 @@ popup:
 
 What each action produces is fixed. `dismiss_key` and `click` dismiss, log a hit with a screenshot, count per run and per build, and the step continues; a per-build rise in hits is a `popup_rate_increase` finding in the Unexpected section. `wait` polls up to `wait_timeout_ms` for the window to leave, then falls through to `on_abort`. `relogin` runs the re-login flow of 7.7 with its own checkpoints and the paper-mode assertion. `abort` ends the flow: the step is `failed`, the checkpoint in progress takes `on_abort.outcome` (`env_error` with the gate and reason named, or `invariant_violation` with the invariant id), every later checkpoint of the flow is `not_run (reason: step_failed:<step>)`, teardown runs, and the sentinel closes the window with WM_CLOSE; `aborted_run` additionally ends the run with `run_outcome`. `ignore` is for windows that are part of the product state (a detached window the corpus declares) and must never be closed.
 
-Worked example (title regexes are drafts until Phase 0 reads the real windows):
+Worked example, four entries of the file's `entries` list (title regexes are drafts until Phase 0 reads the real windows):
 
 ```yaml
 - popup_id: POP-02
@@ -1183,34 +1206,38 @@ Worked example (title regexes are drafts until Phase 0 reads the real windows):
 
 | Rule | Check | Severity |
 |---|---|---|
-| L-POP-01 | `popup_id` matches `^POP-[0-9]{2,}$`, is unique and exists in the 12.8 table; `name` unique; `title_regex` compiles | error |
+| L-POP-01 | `popup_id` matches `^POP-[0-9]{2,}$` and is unique; ids beyond the 12.8 starter rows continue the sequence; `name` unique; `title_regex` compiles; `retired: true` requires `retired_reason`; the file is `{schema_version, entries}` (a bare list warns in Phase 0 and is an error from Phase 1) | error |
 | L-POP-02 | `dismiss_key.key` is not Enter, Space or Ctrl+Enter | error |
 | L-POP-03 | a `title_regex` that matches "Order Confirmation", "Confirm" or "Send" is `class: safety` with no input action and `on_abort: {outcome: aborted_run, run_outcome: aborted_safety, reason: kill_switch}` (POP-14 of 7.8: the kill switch fires after 30 s without an owning step); a `click` target whose OCR text is Accept, Agree, Confirm, Send or Yes is refused | error |
 | L-POP-04 | `class` present; `click` requires `template` and an existing `target`; `abort`, `relogin` and `wait` require `on_abort`; `app_failure` entries route to INV-14 through `on_abort`; `on_abort.reason` is in `taxonomy.yaml` for the named outcome; `invariant_id` exists in the 2.7 catalog | error |
-| L-POP-05 | two entries whose regexes both match the same seeded title list | warn |
+| L-POP-05 | two entries whose `title_regex` both match one title of either entry's `seed_titles` | warn |
 | L-POP-06 | `last_seen_build` more than three releases old | warn (flag for removal) |
 
 ### 4.11 Mutant catalog entry
 
-Mutants are the proof that the detector can see. One catalog, `canaries/mutants.yaml` in `sentinel-config`, holds every mutant: ids M01 to M33 as 12.5 lists them (12.5 is authoritative for the ids), seed 20260101, M25 the identical control. Image mutants are applied to the approved baseline of a checkpoint with that seed and injected as candidate images through the same `evaluate_checkpoint` entry point and harness commit as a real pair (5.15); behavioural mutants drive the real app through a `canary` flow. Every mutant outcome is flagged `synthetic: true`, never promotes a baseline, never creates a decision record and never counts in product metrics. The Canary Service records one of the `canary_states` per mutant per night, `detected` or `missed`; a `missed` on a `money_cell` mutant makes the night's state `detector_blind` and the missed mutant's record `harness_error (reason: detector_blind)`, a class below its rolling floor makes it `detector_degraded`, and no canary generated at all is `generation_failed` (10.3 Canary Service and the mutant catalog). The Nightly run's outcome stays `complete`; `detector_blind` or `generation_failed` sets `system_state.detector_state`, pages P1 and puts the banner on every report until the next green canary (1.4 G3). A nightly re-evaluation of one real merge-run pair through the canary entry point that does not reproduce its outcome is `harness_error (reason: canary_path_divergence)` (5.15).
+Mutants are the proof that the detector can see. One catalog, `canaries/mutants.yaml` in `sentinel-config`, holds every mutant: ids M01 to M33 exactly as 12.5 tables them (12.5 is authoritative for those rows), then further entries from M34 in sequence, seed 20260101, M25 the identical control. Image mutants are applied to the approved baseline of a checkpoint with that seed and injected as candidate images through the same `evaluate_checkpoint` entry point and harness commit as a real pair (5.15); behavioural mutants drive the real app through a `canary` flow. Every mutant outcome is flagged `synthetic: true`, never promotes a baseline, never creates a decision record and never counts in product metrics. The Canary Service records one of the `canary_states` per mutant per night, `detected` or `missed`; a `missed` on a `money_cell` mutant makes the night's state `detector_blind` and the missed mutant's record `harness_error (reason: detector_blind)`, a class below its rolling floor makes it `detector_degraded`, one mutant that cannot be generated is that mutant's row state only, and the night is `generation_failed` when a critical checkpoint has no generated mutant or the stage generated none (10.3 Canary Service and the mutant catalog). The Nightly run's outcome stays `complete`; `detector_blind` or `generation_failed` sets `system_state.detector_state`, pages P1 and puts the banner on every report until the next green canary (1.4 G3). A nightly re-evaluation of one real merge-run pair through the canary entry point that does not reproduce its outcome is `harness_error (reason: canary_path_divergence)` (5.15).
 
 ```yaml
-# schemas/mutant.schema.json  (canaries/mutants.yaml is a list of these)
+# schemas/mutant.schema.json  (canaries/mutants.yaml)
+mutant_catalog:
+  schema_version: int = 1
+  entries: list[mutant]                 # a bare list without schema_version warns in Phase 0 and is an error from Phase 1
+
 mutant:
-  mutant_id: str                        # ^M[0-9]{2,}$, the id of the 12.5 table
+  mutant_id: str                        # ^M[0-9]{2,}$: M01 to M33 as 12.5 tables them, then M34 onward in sequence
   name: id                              # readable slug
-  checkpoint_id: id
+  checkpoint_id: id | "*"               # "*" only for class aa_control: every bound checkpoint (M25)
   class: enum[erased_control|swapped_digit|swapped_label|color_swap|shifted_panel|clipped_label|overlapped_panels|missing_row|header_change|placeholder|font_height|scrollbar|redaction|sub_floor|global_shift|landmark_loss|study_removed|aa_control|wrong_quantity|blank_field|gateway|outside_parent|window_offscreen|misaligned_column|focus_order|error_dialog]   # the 26 snake_case class names of the 10.3 class table (F7); 12.5's Class column and 8.3 canary_results.defect_class carry the same names
   mode: enum[image|behavioral]
   money_cell: bool                      # money cell or Send control: 100 percent detection required (the money_cell column of 12.5); identity fields are proven by the redaction canary instead (6.10)
   generator: {op: enum[erase|translate|replace_glyph|channel_swap|crop_right|overlay|remove_row|type_value], params: map[str, any], seed: int = 20260101}
-  region_ref: ref:region.id
+  region_ref: ref:region.id?            # required unless checkpoint_id is "*"
   canary_flow: ref:flow.flow_id?        # behavioral only
-  expected: {outcomes: list[checkpoint outcome enum], min_confidence: num?, invariant_id: id?, assertion_id: id?}
+  expected: {outcomes: list[checkpoint outcome enum], min_confidence: num?, invariant_id: id?, assertion_id: id?, reason: str?, step_status: enum[passed|passed_after_retry|passed_via_agent_fallback|failed|blocked_by_gateway]?, redaction_hit: bool?}   # reason constrained by class (L-MUT-02); step_status for gateway mutants (M28); redaction_hit for redaction mutants (M19)
   owner: str
 ```
 
-Worked example (M02, M03 and M12 of 12.5; M02 and M03 bind to `s07` of the stock limit flow of 4.7, whose regions file uses the `rgn.confirm.*` ids of the 4.8 example, and M12, the acceptance mutant of 10.10, to the Flexible Grid cell sweep step as 10.3 and 10.10 bind it, which are authoritative for its entry):
+Worked example, three entries of the file's `entries` list (M02, M03 and M12 of 12.5; M02 and M03 bind to `s07` of the stock limit flow of 4.7, whose regions file uses the `rgn.confirm.*` ids of the 4.8 example, and M12, the acceptance mutant of 10.10, to the Flexible Grid cell sweep step as 10.3 and 10.10 bind it, which are authoritative for its entry):
 
 ```yaml
 - mutant_id: M02
@@ -1247,11 +1274,11 @@ Worked example (M02, M03 and M12 of 12.5; M02 and M03 bind to `s07` of the stock
 
 | Rule | Check | Severity |
 |---|---|---|
-| L-MUT-01 | `mutant_id` matches `^M[0-9]{2,}$`, is unique, and the catalog's id set is exactly M01 to M33 of 12.5; `seed` present; `region_ref` exists in the checkpoint's regions file | error |
-| L-MUT-02 | `money_cell = true` requires `expected.outcomes` within `{collateral, invariant_violation, assertion_failed, landmark_missing}` and, for `invariant_violation` or `assertion_failed`, at least one of `invariant_id` or `assertion_id`; the control classes `aa_control` (M25) and `sub_floor` (M20) are exempt and expect `identical` or `noise` by design; no other mutant expects `identical` or `noise`, and `needs_human` is expected only with reason `global_shift` (M21, M23) | error |
-| L-MUT-03 | every tier-1 checkpoint with an approved baseline has between 20 and 30 mutants; at least two are `behavioral` per money surface | warn until the first full catalog lands (Phase 1 week 5), then error |
-| L-MUT-04 | `behavioral` requires `canary_flow` of `class: canary`; `image` forbids it; a `canary_flow` never contains a `confirm-and-send` target | error |
-| L-MUT-05 | the six brief classes (erased button, shifted panel, swapped digit, red/green swap, clipped label, overlapping panels), written `erased_control`, `shifted_panel`, `swapped_digit`, `color_swap`, `clipped_label`, `overlapped_panels`, each appear at least once per tier-1 checkpoint; `color_swap` expects `invariant_violation` on INV-15 | error |
+| L-MUT-01 | `mutant_id` matches `^M[0-9]{2,}$` and is unique; the catalog contains M01 to M33, each equal to its 12.5 row (class, bound checkpoint, transformation, expected outcome, `money_cell`), and further ids run from M34 in sequence; `seed` present; `region_ref` exists in the checkpoint's regions file; `checkpoint_id: "*"` only for class `aa_control`, which may then omit `region_ref`; the file is `{schema_version, entries}` (a bare list warns in Phase 0 and is an error from Phase 1) | error |
+| L-MUT-02 | `money_cell = true` requires `expected.outcomes` within `{collateral, invariant_violation, assertion_failed, landmark_missing}` and, for `invariant_violation` or `assertion_failed`, at least one of `invariant_id` or `assertion_id`; the control classes `aa_control` (M25) and `sub_floor` (M20) are exempt and expect `identical` or `noise` by design, and class `gateway` (M28) is exempt and expects `step_status: blocked_by_gateway` with the later checkpoints `not_run`; no other mutant expects `identical` or `noise`, and `needs_human` is expected only with reason `global_shift` (M21, M23). `expected.reason`, when present, is a reason code of `taxonomy.yaml` for one of `expected.outcomes`, and the class fixes it: `global_shift` requires `global_shift`, `sub_floor` allows only `below_floor`, `gateway` requires `step_failed:<step>` with `not_run`; `step_status` is set only by class `gateway`, and `redaction_hit` only by class `redaction` (M19), which expects `redaction_hit: true` | error |
+| L-MUT-03 | every critical checkpoint (a checkpoint on a surface with `critical: true`, 4.5) has at least two `behavioral` entries bound to it, counting a behavioral entry whose `canary_flow` checkpoint is on the same surface | error |
+| L-MUT-04 | `behavioral` requires `canary_flow` of `class: canary`; `image` forbids it; a `canary_flow` may hold one `order_stage` step that clicks Confirm and Send, run under the order-stage gateway rules, with its Order Confirmation dialog closed by Delete through the dismiss allowlist, as attestation item A9 does (6.3); it never targets Send | error |
+| L-MUT-05 | `color_swap` expects `invariant_violation` on INV-15. Not lint: the six brief classes (erased button, shifted panel, swapped digit, red/green swap, clipped label, overlapping panels, written `erased_control`, `shifted_panel`, `swapped_digit`, `color_swap`, `clipped_label`, `overlapped_panels`) at least once per tier-1 checkpoint, and 20 to 30 mutants per tier-1 checkpoint with an approved baseline (10.3), are counted over the mutants generated at Nightly generation; a checkpoint short of either is a coverage-gap line in the morning report | error (the INV-15 expectation); the counts are a report line |
 | L-MUT-06 | `invariant_id` values exist in the 2.7 catalog (`INV-01` to `INV-15`) | error |
 
 ### 4.12 Environment fingerprint

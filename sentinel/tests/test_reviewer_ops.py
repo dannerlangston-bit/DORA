@@ -1,8 +1,9 @@
 """The real Reviewer adapter, part 4: the deprecation alarm input, the live entry point's network
-guard, and the SDK transport's mapping (3.15, 10.7). The SDK client here is a stand-in object; no
-request leaves the process."""
+guard, the SDK transport's mapping (3.15, 10.7), its pinned headers (3.12) and its egress gate (6.10). The SDK
+client here is a stand-in object or sends into an `httpx2.MockTransport`; no request leaves the process."""
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 from datetime import date
@@ -13,8 +14,10 @@ import httpx2
 import pytest
 from test_reviewer import MODEL, FakeTransport, answer, make_item, resp
 
+from sentinel.egress import EgressAllowlist, EgressGate
 from sentinel.reviewer import (AnthropicTransport, NetworkNotAllowed, TransportError, alarms_due, live, model_check,
                                parse_notices, review_live)
+from sentinel.reviewer.transport import UnsafeEnvironment
 
 NOTICES = {"schema_version": 1, "notices": [
     {"model_id": MODEL, "announced": "2027-01-01", "retires": "2027-03-15", "source": "vendor notice"},
@@ -156,3 +159,104 @@ def test_review_live_runs_the_synchronous_job_once_allowed(monkeypatch):
     verdicts = review_live([make_item()], allow_network=True, env={"ANTHROPIC_API_KEY": "sk-test"})
     assert seen["allow_network"] is True and len(fake.calls) == 1
     assert [v.state for v in verdicts.values()] == ["answered"]
+
+
+# -- pinned headers (3.12, 3.15) and the egress gate (6.10) -------------------------------------------------------
+
+KEY = {"ANTHROPIC_API_KEY": "sk-test"}
+MESSAGE = {"id": "msg_1", "type": "message", "role": "assistant", "model": MODEL,
+           "content": [{"type": "text", "text": "{}"}], "stop_reason": "end_turn", "stop_sequence": None,
+           "usage": {"input_tokens": 3, "output_tokens": 2}}
+PARAMS = {"model": MODEL, "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+ALLOW = EgressAllowlist.from_dict({"signed_by": "sec", "signed_at": "2026-11-01T00:00:00Z", "signature": "pgp:1",
+                                   "hosts": [{"host": "api.anthropic.com", "purposes": ["review", "model_check"]}]})
+
+
+class Sink:
+    def __init__(self):
+        self.rows, self.findings = [], []
+
+    def log_egress(self, row):
+        self.rows.append(row)
+        return len(self.rows)
+
+    def write_finding(self, finding, *, synthetic=False):
+        self.findings.append(finding)
+
+
+def mock(seen, status=200, body=None):
+    def handler(request):
+        seen.append(request)
+        return httpx2.Response(status, headers={"request-id": f"req_{len(seen)}"}, json=body or MESSAGE)
+    return httpx2.MockTransport(handler)
+
+
+@pytest.mark.parametrize("where", ["process", "mapping"])
+def test_custom_headers_in_the_environment_refuse_the_client(monkeypatch, caplog, where):
+    leak = "X-Leak: secret-value\nanthropic-beta: foo"
+    if where == "process":
+        monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", leak)
+    env = {**KEY, "ANTHROPIC_CUSTOM_HEADERS": leak} if where == "mapping" else KEY
+    with caplog.at_level(logging.ERROR, logger="sentinel.reviewer.transport"):
+        with pytest.raises(UnsafeEnvironment, match="ANTHROPIC_CUSTOM_HEADERS"):
+            AnthropicTransport.from_env(allow_network=True, env=env)
+    assert "ANTHROPIC_CUSTOM_HEADERS is set" in caplog.text and "secret-value" not in caplog.text
+    assert issubclass(UnsafeEnvironment, NetworkNotAllowed)
+
+
+def test_a_request_carries_only_the_sdk_headers(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    seen, sink = [], Sink()
+    t = AnthropicTransport.from_env(allow_network=True, env=KEY, gate=EgressGate(ALLOW, sink),
+                                    http_transport=mock(seen))
+    assert t._client._custom_headers == {}
+    t.create_message(PARAMS)
+    headers = {k.lower() for k in seen[0].headers}
+    assert "x-leak" not in headers and "anthropic-beta" not in headers
+
+
+def test_every_gated_request_writes_one_row_with_purpose_model_and_request_id():
+    seen, sink = [], Sink()
+    gate = EgressGate(ALLOW, sink, run_id="run-9", shard_id="run-9/1")
+    t = AnthropicTransport.from_env(allow_network=True, env=KEY, gate=gate, http_transport=mock(seen))
+    with gate.context(checkpoint_id="census/x.y/ws.z", artifact_sha256="c" * 64, redaction_version="redaction-1-a"):
+        r = t.create_message(PARAMS)
+    assert r.request_id == "req_1"
+    (row,) = sink.rows
+    assert (row.destination, row.purpose, row.status, row.response_status, row.request_id, row.model_id) == \
+        ("api.anthropic.com", "review", "sent", 200, "req_1", MODEL)
+    assert row.bytes == len(seen[0].content) and row.run_id == "run-9" and row.artifact_sha256 == "c" * 64
+    model = {"id": MODEL, "type": "model", "display_name": "m", "created_at": "2026-01-01T00:00:00Z"}
+    t2 = AnthropicTransport.from_env(allow_network=True, env=KEY, gate=gate, http_transport=mock(seen, body=model))
+    assert t2.retrieve_model(MODEL) is True
+    with gate.context(purpose="preflight"):                                # preflight N2's own purpose wins
+        with pytest.raises(TransportError, match="purpose preflight not allowlisted"):
+            t2.retrieve_model(MODEL)
+    assert [(x.purpose, x.status) for x in sink.rows] == [("review", "sent"), ("model_check", "sent"),
+                                                          ("preflight", "refused")]
+
+
+def test_a_host_off_the_allowlist_is_refused_before_connecting_and_not_retried():
+    seen, sink = [], Sink()
+    gate = EgressGate(ALLOW, sink, run_id="run-9")
+    t = AnthropicTransport.from_env(allow_network=True, env=KEY, base_url="https://collector.invalid", gate=gate,
+                                    http_transport=mock(seen))
+    with pytest.raises(TransportError) as e:
+        t.create_message(PARAMS)
+    assert (e.value.kind, e.value.transient) == ("client", False) and "egress refused" in str(e.value)
+    assert seen == [] and [(r.status, r.destination) for r in sink.rows] == [("refused", "collector.invalid")]
+    assert [(f.kind, f.severity) for f in sink.findings] == [("harness_error", "S3")]
+
+
+def test_each_attempt_without_a_response_is_a_failed_row(monkeypatch):
+    monkeypatch.setattr("anthropic._base_client.time.sleep", lambda s: None)
+    sink = Sink()
+
+    def down(request):
+        raise httpx2.ConnectError("reset", request=request)
+    t = AnthropicTransport.from_env(allow_network=True, env=KEY, gate=EgressGate(ALLOW, sink),
+                                    http_transport=httpx2.MockTransport(down))
+    with pytest.raises(TransportError) as e:
+        t.create_message(PARAMS)
+    assert e.value.kind == "connection"
+    assert [r.status for r in sink.rows] == ["failed"] * 3                  # the first try and the SDK's 2 retries

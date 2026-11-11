@@ -17,7 +17,6 @@
 - Teardown replays the mutation ledger; an item that cannot be deleted or read back blocks the Explorer
   login with `env_error (gate: teardown, reason: precondition:explorer_ledger_clean)` on the Explorer
   stage, the item in `detail`, P2 to the Explorer owner.
-
 - The versioned deny list is `policy/explorer_deny_list.yaml` (4.16, SD-30): `deny_list_problems` checks it
   against the registry (the L-XREF-13 checks, shared with the lint) and `deny_entries` / `load_deny_list`
   turn it into `DenyEntry` rows. `denied_action_plan` is the nightly denied-action test's list (6.8): one

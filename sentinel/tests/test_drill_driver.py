@@ -87,6 +87,14 @@ def test_a_hook_and_slow_half_that_let_enter_through_send_an_order_and_block_the
     assert "cancel_all" in rig.calls                     # item 5's recovery clicked Cancel All on the new row
 
 
+def test_a_broken_blocked_key_map_alone_is_item1_failed_without_an_order():
+    rig = ready(SimulatedRig())
+    rig.gw.blocked_vk = frozenset()                     # the raw Enter and Space now drop no_token, not blocked_key
+    r = drill(rig)
+    assert rig.sent_orders == 0 and r.failed == ("item1",) and r.result.run is None
+    assert r.result.checkpoint.reason == "drill_failed:item1" and r.result.has("quarantine_order_stage_flows")
+
+
 def test_cancel_all_not_located_fails_item5_and_quarantines_every_flow():
     rig = ready(SimulatedRig(SimScenario(cancel_all_located=False)))
     r = drill(rig)

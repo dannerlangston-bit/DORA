@@ -7,11 +7,11 @@ import sqlite3
 
 import pytest
 
-from sentinel.records import (CheckpointOutcome, Classification, Decision, DiffSummary, Finding, RunOutcome, Signature,
-                              StepOutcome)
+from sentinel.records import (ACTION_VERDICT, CheckpointOutcome, Classification, Decision, DiffSummary, Finding,
+                              RunOutcome, Signature, StepOutcome)
 from sentinel.store import RunPlan, ScopeEntry, ShardPlan, Store, StoreRefused
 from sentinel.store.artifacts import StoredArtifact
-from sentinel.store.store import PaperAssertionMissing, RecordIncomplete
+from sentinel.store.store import ActiveDecisionExists, PaperAssertionMissing, RecordIncomplete
 
 RUN = "run-01"
 WS = "ws.tier-a.active-trader"
@@ -221,3 +221,97 @@ def test_the_run_row_keeps_catalog_versions_and_the_data_window(tmp_path):
         row = s.conn.execute("SELECT catalog_versions_json, data_window_start, data_window_end FROM runs").fetchone()
         assert json.loads(row[0]) == {"popups": "v12", "mutants": "v7"}
         assert (row[1], row[2]) == ("2026-11-09T14:30:00+00:00", "2026-11-09T21:00:00+00:00")
+
+
+# -- decisions: the 4.14 record fields, L-DEC-03 and 9.7 two humans, one signature ---------------------------------
+
+PH = "0123456789abcdef"
+
+
+def finding(store, fid, run_id=RUN, cid=SWEEP):
+    store.write_finding(Finding(fid, run_id, "collateral", "ladder overlaps", run_id, checkpoint_id=cid, phash=PH,
+                                tier=2, category="collateral"))
+    return fid
+
+
+def decision(did, action="noise_signature", by="alice", phash=PH, category="collateral", region="rgn.ladder.bid-column",
+             **kw):
+    ticket = kw.pop("ticket", "TOS-1" if action in ("confirm_bug", "mark_intended", "fixed_in_build") else None)
+    return Decision(did, action, ACTION_VERDICT[action], Signature(SWEEP, region, phash, category), decided_by=by,
+                    ticket=ticket, reason="because", decided_at=kw.pop("decided_at", TS), **kw)
+
+
+def decide(store, did, action="noise_signature", *, run_id=RUN, call=None, **kw):
+    return store.record_decision(decision(did, action, **kw), run_id=run_id, **(call or {}))
+
+
+def test_record_fields_on_the_decision_are_stored_and_read_back(store):
+    finding(store, "F-1")
+    decide(store, "dec-000001", finding_ref="F-1")
+    got = decide(store, "dec-000002", by="bob", expires_at="2026-11-15T00:00:00+00:00", confirmed_by="carol",
+                 supersedes="dec-000001", finding_ref="F-1", role="triage_rotation", bbox_q4=(12, 388, 208, 20))
+    assert (got.expires_at, got.confirmed_by, got.supersedes, got.finding_ref, got.role, got.bbox_q4) == (
+        "2026-11-15T00:00:00+00:00", "carol", "dec-000001", "F-1", "triage_rotation", (12, 388, 208, 20))
+    assert store.get_decision("dec-000002") == got
+    with pytest.raises(StoreRefused, match="confirmed_by"):      # a keyword and the record disagree
+        decide(store, "dec-000003", region="rgn.other", confirmed_by="carol", call={"confirmed_by": "dave"})
+
+
+def test_a_waiver_with_its_expiry_on_the_record_is_accepted(store):
+    w = decide(store, "dec-000001", "mark_intended", category="invariant_violation",
+               expires_at="2026-11-19T15:00:00+00:00")
+    assert w.expires_at == "2026-11-19T15:00:00+00:00"
+    with pytest.raises(StoreRefused, match="L-DEC-07"):
+        decide(store, "dec-000002", "mark_intended", category="assertion_failed",
+               expires_at="2027-01-19T15:00:00+00:00")
+
+
+def test_a_second_plain_decision_on_the_signature_is_refused(store):
+    finding(store, "F-1")
+    first = decide(store, "dec-000001", finding_ref="F-1")
+    with pytest.raises(ActiveDecisionExists, match="dec-000001") as e:
+        decide(store, "dec-000002", "confirm_bug", by="bob", finding_ref="F-1")
+    assert [a.decision_id for a in e.value.active] == [first.decision_id]
+    assert store.get_decision("dec-000002") is None
+    second = decide(store, "dec-000002", "confirm_bug", by="bob", finding_ref="F-1", supersedes="dec-000001")
+    assert second.status == "active" and store.get_decision("dec-000001").status == "superseded"
+    assert store.get_finding("F-1").contested                    # 9.7: a supersession by another human
+
+
+def test_an_out_of_scope_intended_decision_does_not_block(store):
+    store.begin_run(plan(run_id="run-00"))
+    decide(store, "dec-000001", "mark_intended", run_id="run-00", ticket="TOS-9")
+    finding(store, "F-2")
+    with pytest.raises(ActiveDecisionExists):                    # the run's manifest carries the ticket: in scope
+        decide(store, "dec-000002", "confirm_bug", by="bob", finding_ref="F-2", call={"manifest_tickets": ["TOS-9"]})
+    assert decide(store, "dec-000002", "confirm_bug", by="bob", finding_ref="F-2").status == "active"
+
+
+def test_the_same_click_again_returns_the_same_decision(store):
+    finding(store, "F-1")
+    first = decide(store, "dec-000001", finding_ref="F-1")
+    again = decide(store, "dec-000005", finding_ref="F-1")
+    assert again.decision_id == first.decision_id
+    assert store.conn.execute("SELECT count(*) FROM decisions").fetchone()[0] == 1
+
+
+def test_a_frozen_signature_needs_the_system_owner(tmp_path):
+    with Store(tmp_path / "f.db", system_owners=["olga"]) as s:
+        s.begin_run(plan())
+        decide(s, "dec-000001", decided_at="2026-11-01T00:00:00+00:00")
+        decide(s, "dec-000002", by="bob", supersedes="dec-000001", decided_at="2026-11-05T00:00:00+00:00")
+        decide(s, "dec-000003", by="carl", supersedes="dec-000002", decided_at="2026-11-07T00:00:00+00:00")
+        with pytest.raises(StoreRefused, match="system owner"):
+            decide(s, "dec-000004", "confirm_bug", by="dana", supersedes="dec-000003")
+        assert decide(s, "dec-000004", "confirm_bug", by="olga", supersedes="dec-000003").decided_by == "olga"
+
+
+def test_fixed_in_build_is_not_a_contest(store):
+    finding(store, "F-1")
+    decide(store, "dec-000001", "confirm_bug", finding_ref="F-1")
+    for b, at in (("b1", "2026-11-01T00:00:00+00:00"), ("b2", "2026-11-05T00:00:00+00:00")):
+        store.register_build(b, channel="branch", source_commit=b, pipeline_artifact_url="u", installer_sha256=b,
+                             first_seen_at=at)
+    decide(store, "dec-000002", "fixed_in_build", by="bob", supersedes="dec-000001", finding_ref="F-1",
+           call={"fixed_in_build_id": "b2", "build_id": "b1"})
+    assert not store.get_finding("F-1").contested

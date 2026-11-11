@@ -56,11 +56,23 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
 - `reason_detail` holds the reason's parameter for a parametric reason and the record's `detail` otherwise; with
   both, `<param>\\n<detail>`. For invariant_violation without a detail it holds the fired invariant ids (8.3).
 - Decision ids are `dec-<zero-padded sequence>` (4.14) and map to the integer `decisions.decision_id`; finding ids
-  are the findings' `natural_key`. The stored `hamming_tolerance` is the effective one (4.14): the asked value,
-  clamped to 6 on a tier-1 checkpoint ("tier-1 checkpoint, so the override applies"; an unset
-  records.Decision.hamming_tolerance asks for the default 8) and to the region's calibrated tolerance at the run's
-  config commit.
-  noise_signature and request_mask get `expires_at` = decided_at + 30 days when none is given (8.3, 4.14).
+  are the findings' `natural_key`. The stored `hamming_tolerance` is the effective one (4.14): an unset
+  records.Decision.hamming_tolerance takes the tier's default (8, or 6 on tier 1: "tier-1 checkpoint, so the
+  override applies"), an explicit value above that default is refused (L-DEC-03: "at most 6 when the checkpoint's
+  tier is 1", write refused; never clamped), and the region's calibrated tolerance at the run's config commit
+  lowers it. noise_signature and request_mask get `expires_at` = decided_at + 30 days when none is given (8.3,
+  4.14).
+- A decision's `finding_ref`, `manifest_entry_ref` and `build_pair_id` are read back from its source finding and
+  its run's pair (8.3 has no decision columns for them); `bbox_q4` is stored as `x,y,w,h`.
+- 9.7 Two humans, one signature, and the 9.6 idempotency are the Reporter API's rules for a decision made on a
+  finding (4.14 makes `finding_ref` required; only store-level fixtures and imports write one without), so they
+  apply to a decision that names its finding: the same (finding, action, decided_by) on an active row returns that
+  row; a plain decision is refused with `ActiveDecisionExists` while an applicable (9.7 scope) active decision
+  matches the signature. approve_baseline and reject_baseline move a baselines row and are not signature
+  decisions. The frozen-signature rule (the next decision needs the system owner) applies to every signature
+  decision; the system owners are the store's configured `system_owners`. A supersession by another human marks the
+  findings of both rows contested; fixed_in_build superseding its confirm_bug is the 4.14 lifecycle, not a contest.
+  The triage-channel notice to the earlier decider is the Reporter's (an outbox job needs its payload stored).
 - Step outcomes become `step_events` rows with source orchestrator, action `step`, mode `agent` for an agent rung
   or fallback, and `finding:<ref>` in `reason`. The step's `gateway_event` (4.13) is stored as `gate_decision`,
   `gate_reason` and `gate_class` (the code itself, 5.4.4), and `gate_decision` none when the step has none;
@@ -680,9 +692,11 @@ WHERE d.checkpoint_id = :cp AND d.region_id = :region AND d.category = :cat
   AND d.revoked_at IS NULL AND (d.expires_at IS NULL OR d.expires_at > :now)
   AND (d.action IN ('confirm_bug','mark_intended','noise_signature','fixed_in_build')
        OR (d.action = 'request_mask' AND d.mask_ref IS NOT NULL))"""
-_LOOKUP_FROM = """SELECT d.*, r.pair_id AS run_pair_id, f.manifest_entry AS finding_manifest_entry,
-  hamming(d.phash, :phash) AS distance
-FROM decisions d LEFT JOIN runs r ON r.run_id = d.run_id LEFT JOIN findings f ON f.finding_id = d.source_finding_id"""
+_DECISION_FROM = """FROM decisions d LEFT JOIN runs r ON r.run_id = d.run_id
+  LEFT JOIN findings f ON f.finding_id = d.source_finding_id"""
+_DECISION_COLUMNS = """d.*, r.pair_id AS run_pair_id, f.manifest_entry AS finding_manifest_entry,
+  f.natural_key AS finding_natural_key"""
+_LOOKUP_FROM = f"SELECT {_DECISION_COLUMNS}, hamming(d.phash, :phash) AS distance\n{_DECISION_FROM}"
 LOOKUP_SQL = (_LOOKUP_FROM + _LOOKUP_WHERE + """
   AND hamming(d.phash, :phash) <= d.hamming_tolerance
 ORDER BY hamming(d.phash, :phash), d.decided_at DESC""")   # 8.3: no LIMIT, the verdict set is the answer (9.7)
@@ -694,18 +708,22 @@ WAIVER_CATEGORIES = ("invariant_violation", "assertion_failed")   # mark_intende
 # 1.10 precedence: the computed diff outcomes a noise or intended verdict may replace (S-06). Everything ranked
 # above them (env_error to needs_baseline) is not a diff the decision speaks for, and stays as computed.
 INHERITABLE_OUTCOMES = ("collateral", "needs_human")
+BASELINE_ACTIONS = ("approve_baseline", "reject_baseline")   # 9.8: act on baselines rows, not through the signature
 
 
 def _decision_from_row(r: sqlite3.Row) -> Decision:
-    keys = r.keys()
-    pair = r["run_pair_id"] if "run_pair_id" in keys else None
+    """A `decisions` row selected with `_DECISION_COLUMNS` as the 4.14 record: the build pair is the run's, the
+    finding ref and manifest entry are the source finding's (8.3 has no decision columns for them)."""
+    pair, box = r["run_pair_id"], r["bbox_q4"]
     return Decision(
         decision_id=decision_ref(r["decision_id"]), action=r["action"], verdict=r["verdict"],
         signature=Signature(r["checkpoint_id"], r["region_id"], bytes(r["phash"]).hex(), r["category"]),
         decided_by=r["decided_by"], hamming_tolerance=r["hamming_tolerance"], ticket=r["ticket_ref"],
         status=r["status"], source=r["source"], reason=r["reason"], decided_at=r["decided_at"],
         run_id=r["run_id"], build_pair_id=None if pair is None else str(pair),
-        manifest_entry_ref=r["finding_manifest_entry"] if "finding_manifest_entry" in keys else None,
+        manifest_entry_ref=r["finding_manifest_entry"], finding_ref=r["finding_natural_key"],
+        confirmed_by=r["confirmed_by"], expires_at=r["expires_at"], role=r["role"], reopen_count=r["reopen_count"],
+        bbox_q4=None if box is None else tuple(int(v) for v in box.split(",")),
         supersedes=decision_ref(r["supersedes_decision_id"]))
 
 
@@ -1842,19 +1860,41 @@ class Store:
         if fixed == base or fixed not in seen or base not in seen or seen[fixed] <= seen[base]:
             raise StoreRefused(f"fixed_in_build {fixed} is not a build newer than {base} (L-DEC-08)")
 
+    @staticmethod
+    def _same(name: str, call: Any, record: Any) -> Any:
+        """A 4.14 record field given both on the Decision and as a keyword: they must agree (one value wins)."""
+        if call is not None and record is not None and call != record:
+            raise StoreRefused(f"{name} {call!r} given to record_decision and {record!r} on the decision differ (4.14)")
+        return call if call is not None else record
+
     def record_decision(self, decision: Decision, *, run_id: str, finding_id: str | None = None,
                         build_id: str | None = None, expires_at: str | None = None,
                         confirmed_by: str | None = None, proposed_by: str | None = None,
                         fixed_in_build_id: str | None = None, baseline_id: int | None = None,
                         mask_ref: str | None = None, cluster_id: str | None = None,
-                        supersedes: str | None = None) -> Decision:
+                        supersedes: str | None = None, manifest_entries: Iterable[str] = (),
+                        manifest_tickets: Iterable[str] = ()) -> Decision:
         """Write a human decision (4.14, 8.3) and return it as stored (canonical id, effective tolerance, UTC).
 
-        The keyword fields are the 4.14 record fields records.Decision does not carry. With `finding_id` the
-        finding takes the decision and the triage state of the 4.14 table. With `supersedes` the old decision is
-        marked superseded in the same batch (8.3); a decision is never edited otherwise.
+        `finding_id`, `expires_at`, `confirmed_by` and `supersedes` default to the Decision's `finding_ref`,
+        `expires_at`, `confirmed_by` and `supersedes`; a keyword and a record field that disagree are refused. The
+        other keywords are 4.14 record fields records.Decision does not carry. With a finding the finding takes the
+        decision and the triage state of the 4.14 table. With `supersedes` the old decision is marked superseded in
+        the same batch (8.3); a decision is never edited otherwise.
+
+        Refused besides the 8.3 constraints: a service identity (L-DEC-01); an explicit `hamming_tolerance` above 6
+        on a tier-1 checkpoint (L-DEC-03); a waiver without an expiry at most 30 days out (L-DEC-07); the L-DEC-05
+        and L-DEC-08 cases; any decision on a frozen signature by a login not in `system_owners` (9.7); and, for a
+        decision made on a finding, a plain (not superseding) decision on a signature that already has an
+        applicable active decision (`ActiveDecisionExists`, 9.7; `manifest_entries` and `manifest_tickets` of the
+        run give the mark_intended scope). The same action on the same finding by the same person again returns the
+        decision already written (9.6 idempotent).
         """
         d = _revalidate(decision)
+        finding_id = self._same("finding_id", finding_id, d.finding_ref)
+        expires_at = self._same("expires_at", utc(expires_at), utc(d.expires_at))
+        confirmed_by = self._same("confirmed_by", confirmed_by, d.confirmed_by)
+        supersedes = self._same("supersedes", supersedes, d.supersedes)
         self._human(d.decided_by, "decided_by")
         self._human(confirmed_by, "confirmed_by")
         self._human(proposed_by, "proposed_by")
@@ -1866,8 +1906,11 @@ class Store:
         cp = self._one("SELECT tier FROM checkpoints WHERE checkpoint_id = ?", (d.signature.checkpoint_id,))
         if cp is None:
             raise StoreRefused(f"unknown checkpoint {d.signature.checkpoint_id}")
-        asked = DEFAULT_TOLERANCE if d.hamming_tolerance is None else d.hamming_tolerance
-        tolerance = min(asked, TIER1_TOLERANCE if cp["tier"] == 1 else DEFAULT_TOLERANCE)
+        default = TIER1_TOLERANCE if cp["tier"] == 1 else DEFAULT_TOLERANCE
+        if d.hamming_tolerance is not None and d.hamming_tolerance > default:
+            raise StoreRefused(f"hamming_tolerance {d.hamming_tolerance} is above {default}, the most a tier-"
+                               f"{cp['tier']} checkpoint allows (L-DEC-03)")
+        tolerance = default if d.hamming_tolerance is None else d.hamming_tolerance
         region = self._one("SELECT g.hamming_tolerance FROM regions g JOIN runs r ON r.config_commit = g.config_commit "
                            "WHERE r.run_id = ? AND g.checkpoint_id = ? AND g.region_id = ?",
                            (run_id, d.signature.checkpoint_id, d.signature.region_id))
@@ -1878,7 +1921,7 @@ class Store:
             expires_at = (datetime.fromisoformat(decided_at) + timedelta(days=EXPIRY_DAYS)).isoformat()
         if d.action == "mark_intended" and d.signature.category in WAIVER_CATEGORIES:
             # L-DEC-07, 9.7 waiver row: an expiry at most 30 days out, no silent renewal (S-03)
-            if expires_at is None or (datetime.fromisoformat(utc(expires_at))
+            if expires_at is None or (datetime.fromisoformat(expires_at)
                                       > datetime.fromisoformat(decided_at) + timedelta(days=EXPIRY_DAYS)):
                 raise StoreRefused("a waiver (mark_intended on an invariant or assertion) carries expires_at at most "
                                    "30 days after decided_at (L-DEC-07)")
@@ -1888,9 +1931,15 @@ class Store:
             if f is None:
                 raise StoreRefused(f"unknown finding {finding_id}")
             source_finding = f["finding_id"]
+            again = self._one("SELECT decision_id FROM decisions WHERE source_finding_id = ? AND action = ? AND "
+                              "decided_by = ? AND status IN ('active','reopened')",
+                              (source_finding, d.action, d.decided_by))
+            if again is not None:                                   # 9.6: idempotent per finding and action
+                return self._stored_decision(decision_ref(again[0]))
         old = None
         if supersedes is not None:
-            old = self._one("SELECT status, build_id FROM decisions WHERE decision_id = ?", (decision_int(supersedes),))
+            old = self._one("SELECT status, build_id, decided_by, source_finding_id FROM decisions "
+                            "WHERE decision_id = ?", (decision_int(supersedes),))
             if old is None or old["status"] not in ("active", "reopened"):
                 raise StoreRefused(f"{supersedes} is not an active decision to supersede (8.3)")
         if d.action == "approve_baseline":
@@ -1901,6 +1950,9 @@ class Store:
                   or ("confirmed_bug" if d.verdict == "confirmed_bug" else "open"))   # reject_baseline (4.14)
         self.taxonomy.check_member("triage_states", triage)
         with self._batch("decision") as rows:
+            if d.action not in BASELINE_ACTIONS:                    # inside the batch: writes serialize (9.7)
+                self._check_signature_free(d, run_id, decided_at, supersedes, source_finding, manifest_entries,
+                                           manifest_tickets)
             self._insert(rows, "decisions", {
                 "decision_id": did, "checkpoint_id": d.signature.checkpoint_id, "region_id": d.signature.region_id,
                 "phash": phash_bytes(d.signature.phash), "hamming_tolerance": tolerance,
@@ -1908,9 +1960,10 @@ class Store:
                 "decided_by": d.decided_by, "proposed_by": proposed_by, "confirmed_by": confirmed_by,
                 "decided_at": decided_at, "run_id": run_id, "build_id": build_id, "reason": d.reason,
                 "ticket_ref": d.ticket, "mask_ref": mask_ref, "baseline_id": baseline_id,
-                "fixed_in_build_id": fixed_in_build_id, "cluster_id": cluster_id, "expires_at": utc(expires_at),
+                "fixed_in_build_id": fixed_in_build_id, "cluster_id": cluster_id, "expires_at": expires_at,
                 "status": "active", "supersedes_decision_id": decision_int(supersedes),
-                "source_finding_id": source_finding})
+                "source_finding_id": source_finding, "role": d.role, "reopen_count": d.reopen_count,
+                "bbox_q4": None if d.bbox_q4 is None else ",".join(map(str, d.bbox_q4))})
             if supersedes is not None:
                 self._update(rows, "decisions", {"decision_id": decision_int(supersedes)}, {"status": "superseded"})
             if source_finding is not None:
@@ -1918,7 +1971,28 @@ class Store:
                 if d.ticket:
                     change["ticket_ref"] = d.ticket
                 self._update(rows, "findings", {"finding_id": source_finding}, change)
+            if old is not None and d.action != "fixed_in_build" and old["decided_by"] != d.decided_by:
+                # 9.7: a supersession by another human marks the finding contested (fixed_in_build is the 4.14
+                # lifecycle of a confirmed bug, not a contest)
+                for fid in {old["source_finding_id"], source_finding} - {None}:
+                    self._update(rows, "findings", {"finding_id": fid}, {"contested": 1})
         return self.get_decision(decision_ref(did))
+
+    def _check_signature_free(self, d: Decision, run_id: str, at: str, supersedes: str | None,
+                              source_finding: int | None, manifest_entries: Iterable[str],
+                              manifest_tickets: Iterable[str]) -> None:
+        """9.7 Two humans, one signature: on a frozen signature only a system owner decides; a plain decision made
+        on a finding is refused while an applicable active decision matches the signature."""
+        look = lookup_decisions(self._conn, d.signature, at=at, run_id=run_id, manifest_entries=manifest_entries,
+                                manifest_tickets=manifest_tickets)
+        if look.frozen and d.decided_by not in self.system_owners:
+            raise StoreRefused(f"the signature of {d.signature.checkpoint_id} / {d.signature.region_id} is frozen "
+                               "(two supersessions within 30 days): the next decision needs the system owner (9.7)")
+        active = [m.decision for m in look.applicable]
+        if supersedes is None and source_finding is not None and active:
+            ids = ", ".join(f"{a.decision_id} ({a.action} by {a.decided_by})" for a in active)
+            raise ActiveDecisionExists(f"the signature already has an active decision: {ids}; supersede or revoke "
+                                       "it (9.7)", active)
 
     def revoke_decision(self, decision_id: str, *, by: str, reason: str, at: str | None = None) -> Decision:
         """Revoke a decision: the three revoke fields together and status revoked (8.3, 4.14); the row stays."""
@@ -1938,7 +2012,10 @@ class Store:
         return self.get_decision(decision_id)
 
     def get_decision(self, decision_id: str) -> Decision | None:
-        r = self._one("SELECT * FROM decisions WHERE decision_id = ?", (decision_int(decision_id),))
+        """The decision as stored, with every 4.14 field the store keeps (expiry, confirmer, finding ref, role, the
+        build pair of its run)."""
+        r = self._one(f"SELECT {_DECISION_COLUMNS} {_DECISION_FROM} WHERE d.decision_id = ?",
+                      (decision_int(decision_id),))
         return None if r is None else _decision_from_row(r)
 
     def lookup_decisions(self, signature: Signature, *, at: str | None = None, rescued: bool = False,

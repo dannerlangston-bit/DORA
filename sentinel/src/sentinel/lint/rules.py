@@ -113,6 +113,18 @@ Choices where the spec is ambiguous (reported):
     repeat per dimension combination for tier-1 surfaces in tier A workspaces only, sweep ids exist on
     the flexgrid, detached and dialog hosts only, with `-asc` for Ladder F's ascending pass, and
     Ladder F's MAXW and MAXH are the work areas of configs/allowed.yaml.
+23. L-FPR-02 (`lint_fingerprint_rig_spec`) compares every value 7.1 and 7.12 pin: the display size and scale of
+    the workspace's configs/allowed.yaml entry with dpi = 96 x scale / 100, 32-bit, 60 Hz, one monitor and the
+    harness awareness PER_MONITOR_AWARE_V2; ClearType on (`smoothing: true`, type FE_FONTSMOOTHINGCLEARTYPE, i.e.
+    FontSmoothing 2 and FontSmoothingType 2); en-US layout 0x0409 alone, locale en-US and the R4 toggle keys; the
+    three America/New_York time zones; input desktop Default; transparency and animations off (7.12); the Java2D
+    pipeline of the rig kind (VM software, physical d3d) and a confirmation equal to it or `unknown`; the app
+    theme and font size of the allowed entry; the config commit's allowlist hash; and, given the snapshot
+    manifest (the fingerprint read at snapshot creation, 7.2), its Windows build and UBR, GPU, vmoptions and JRE
+    hashes and ClearType gamma, contrast and orientation (the golden image's defaults, R3). The OS light and dark
+    flags have no pin. Which outcome each value takes (the 12.7 item that reads it, else `rig_spec_mismatch`,
+    SD-71) is `sentinel.fingerprint.rig_spec_check`'s. `fingerprint_differences` is the one pair comparison of
+    L-FPR-03 and L-FPR-05; a null reaching it raises.
 
 Rules checked only in part from files (the rest needs live state, history or a store; reported):
 L-DEP-07 (the 90 days after the first Phase 1 scan), L-FLW-03 (that a removed id was renamed needs
@@ -125,7 +137,8 @@ sentinel.lint.checks.money_roles), L-MSK-01 (the decision record is in the Centr
 
 Public API beyond `lint`: `check_pair` (L-BLD-04 and L-BLD-05 at run creation, 4.2), `panel_share` and
 `money_cells_covered` (the mask budget of a regions file with an optional proposed mask, 4.8),
-`mask_budgets`, `ExpiredRecord`.
+`mask_budgets`, `ExpiredRecord`; the run-start fingerprint rules `lint_fingerprint` (L-FPR-00, L-FPR-01),
+`lint_fingerprint_rig_spec` (L-FPR-02), `lint_fingerprint_pair` (L-FPR-03, L-FPR-05) and `fingerprint_differences`.
 """
 from __future__ import annotations
 
@@ -2695,44 +2708,116 @@ def lint_fingerprint(fp: Any, file: str = "fingerprint") -> list[Violation]:
     return out
 
 
-def lint_fingerprint_rig_spec(fp: Any, allowlist_sha256: str | None = None, file: str = "fingerprint") -> list[Violation]:
-    """L-FPR-02 at run start: `match` equals the rig specification of 7.1 for the phase 1 config."""
+# 7.1 rig specification and 7.12 visual effects: the pinned values of L-FPR-02 that hold for every declared
+# display configuration and rig kind (the display size, scale and theme come from configs/allowed.yaml).
+RIG_SPEC_PINS: dict[str, Any] = {
+    "display.bits": 32, "display.frequency": 60, "display.monitors": 1, "display.awareness": "PER_MONITOR_AWARE_V2",
+    "cleartype.smoothing": True, "cleartype.type": "FE_FONTSMOOTHINGCLEARTYPE",
+    "keyboard.layout": "0x0409", "keyboard.layout_count": 1, "keyboard.locale": "en-US",
+    "keyboard.toggle_keys.caps": False, "keyboard.toggle_keys.num": True, "keyboard.toggle_keys.scroll": False,
+    "time_zone.os": "Eastern Standard Time", "time_zone.app_display": "America/New_York",
+    "time_zone.chart": "America/New_York", "input_desktop": "Default",
+    "os_theme.transparency": False, "os_theme.animations": False,
+}
+# 7.1: the phase 1 display configuration, the default when no configs/allowed.yaml entry is given
+PHASE1_DISPLAY: dict[str, Any] = {"width": 1920, "height": 1080, "scale_percent": 100}
+# 7.1 Java2D pipeline: d3d=false and noddraw=true on VM rigs (software), d3d=true on the physical rig
+RIG_KIND_PIPELINE: dict[str, str] = {"vm": "software", "physical": "d3d"}
+# 7.1, 7.2, 12.7 R1, R3, B3: the values pinned per snapshot generation, compared with the snapshot manifest (the
+# fingerprint read when the snapshot was created, 7.3 step 7): Windows build and UBR, the virtual adapter, the
+# vmoptions and JRE release hashes, and the golden image's ClearType tuning
+MANIFEST_PINS: tuple[str, ...] = (
+    "windows_build.current_build", "windows_build.ubr", "gpu.name", "gpu.driver_version", "vmoptions_hash",
+    "jre_release.sha256", "jre_release.java_version", "cleartype.gamma", "cleartype.contrast",
+    "cleartype.orientation",
+)
+
+
+def _at(tree: Any, path: str) -> Any:
+    """The value at dotted `path` in nested mappings, None when any step is missing."""
+    for part in path.split("."):
+        tree = tree.get(part) if isinstance(tree, Mapping) else None
+    return tree
+
+
+def lint_fingerprint_rig_spec(fp: Any, allowlist_sha256: str | None = None, file: str = "fingerprint", *,
+                              rig_kind: str = "vm", display_config: Mapping[str, Any] | None = None,
+                              manifest: Mapping[str, Any] | None = None) -> list[Violation]:
+    """L-FPR-02 at run start: `match` equals the rig specification of 7.1 (choice 23). `display_config` is the
+    workspace's configs/allowed.yaml entry (width, height, scale_percent, theme, font_size; default the phase 1
+    1920x1080 at 100 percent, theme and font size then unchecked); `rig_kind` (`vm` or `physical`) pins the Java2D
+    pipeline; `allowlist_sha256` is the config commit's `gateway/allowlist.yaml` hash; `manifest` is the snapshot
+    manifest's `match` block, whose MANIFEST_PINS values the live read must equal. One violation per differing
+    value, its path `match.<field>.<subfield>`."""
+    if rig_kind not in RIG_KIND_PIPELINE:
+        raise ValueError(f"rig kind {rig_kind!r} is not one of {sorted(RIG_KIND_PIPELINE)} (7.1)")
     m = _d(_d(fp).get("match"))
-    want = {
-        "display.width": 1920, "display.height": 1080, "display.scale_percent": 100, "display.dpi": 96,
-        "display.monitors": 1, "display.bits": 32, "display.frequency": 60,
-        "keyboard.layout": "0x0409", "keyboard.layout_count": 1,
-        "keyboard.toggle_keys.caps": False, "keyboard.toggle_keys.num": True, "keyboard.toggle_keys.scroll": False,
-        "time_zone.os": "Eastern Standard Time", "time_zone.app_display": "America/New_York",
-        "time_zone.chart": "America/New_York", "input_desktop": "Default",
-    }
+    cfg = dict(display_config) if display_config is not None else PHASE1_DISPLAY
+    scale = cfg.get("scale_percent")
+    want = dict(RIG_SPEC_PINS)
+    want.update({"display.width": cfg.get("width"), "display.height": cfg.get("height"),
+                 "display.scale_percent": scale,
+                 "display.dpi": round(96 * scale / 100) if isinstance(scale, int) else None,
+                 "java2d_pipeline.pinned": RIG_KIND_PIPELINE[rig_kind]})
+    if display_config is not None:
+        want.update({"app_theme.scheme": cfg.get("theme"), "app_theme.font_size": cfg.get("font_size")})
     if allowlist_sha256:
         want["harness.allowlist_sha256"] = allowlist_sha256
+    if manifest is not None:
+        missing = [p for p in MANIFEST_PINS if _at(manifest, p) is None]
+        if missing:
+            raise ValueError(f"the snapshot manifest lacks {missing} (7.2: it is the fingerprint read at creation)")
+        want.update({p: _at(manifest, p) for p in MANIFEST_PINS})
     out = []
     for path, value in want.items():
-        cur: Any = m
-        for part in path.split("."):
-            cur = _d(cur).get(part) if isinstance(cur, dict) else None
+        cur = _at(m, path)
         if cur != value:
             out.append(_fpr("L-FPR-02", file, f"{path} is {cur!r}; the rig specification says {value!r}", f"match.{path}"))
     j2d = _d(m.get("java2d_pipeline"))
     if j2d.get("confirmed") not in (j2d.get("pinned"), "unknown"):
-        out.append(_fpr("L-FPR-02", file, "java2d_pipeline.confirmed differs from the pinned pipeline", "match.java2d_pipeline"))
+        out.append(_fpr("L-FPR-02", file, f"java2d_pipeline.confirmed is {j2d.get('confirmed')!r}, not the pinned "
+                                          f"{j2d.get('pinned')!r}", "match.java2d_pipeline.confirmed"))
     return out
+
+
+def fingerprint_differences(base: Mapping[str, Any], candidate: Mapping[str, Any],
+                            fields: Iterable[str] | None = None) -> list[str]:
+    """3.3, 4.12 L-FPR-03 and L-FPR-05, the one comparison the lint, the Diff Engine and the Orchestrator share: the
+    sorted names of the `match` fields that differ between two match blocks, `build_id` (the variable under test)
+    left out and `render_probe_hash` compared as a 64-bit hash at Hamming distance 0 (hex case ignored). `fields`
+    limits the comparison (G5 compares the fields read so far); by default every field of either side. A null, or a
+    compared field one side lacks, raises ValueError: an unreadable field is `fingerprint_unreadable:<field>` at its
+    gate (7.4) and never reaches the pair check."""
+    names = (set(base) | set(candidate)) if fields is None else set(fields)
+    names.discard("build_id")
+    bad = sorted(k for k in names if base.get(k) is None or candidate.get(k) is None)
+    if bad:
+        raise ValueError(f"fingerprint fields {bad} are null or missing on one side; an unreadable field never "
+                         "reaches the pair check (7.4)")
+    differing = []
+    for k in sorted(names):
+        a, b = base[k], candidate[k]
+        if k == "render_probe_hash" and isinstance(a, str) and isinstance(b, str):
+            a, b = a.lower(), b.lower()
+        if a != b:
+            differing.append(k)
+    return differing
 
 
 def lint_fingerprint_pair(candidate: Any, base: Any, requested: dict[str, str] | None = None,
                           file: str = "fingerprint") -> list[Violation]:
     """L-FPR-03 and L-FPR-05 at run start: the two sides match apart from build_id, which must be
-    each side's requested build (`requested` maps `candidate`/`base` to build ids)."""
+    each side's requested build (`requested` maps `candidate`/`base` to build ids). A null match field
+    raises ValueError (`fingerprint_differences`)."""
     cm, bm = _d(_d(candidate).get("match")), _d(_d(base).get("match"))
     out = []
-    differing = sorted(k for k in set(cm) | set(bm) if k not in ("build_id", "render_probe_hash") and cm.get(k) != bm.get(k))
-    if differing:
-        out.append(_fpr("L-FPR-03", file, f"fingerprint_mismatch: {', '.join(differing)} differ between candidate and base", "match"))
+    differing = fingerprint_differences(bm, cm)
+    others = [k for k in differing if k != "render_probe_hash"]
+    if others:
+        out.append(_fpr("L-FPR-03", file, f"fingerprint_mismatch: {', '.join(others)} differ between candidate and base", "match"))
     for side, m in (("candidate", cm), ("base", bm)):
         if requested and side in requested and m.get("build_id") != requested[side]:
             out.append(_fpr("L-FPR-03", file, f"{side} build_id {m.get('build_id')} is not the requested {requested[side]} (version_mismatch)", "match.build_id"))
-    if cm.get("render_probe_hash") != bm.get("render_probe_hash"):
+    if "render_probe_hash" in differing:
         out.append(_fpr("L-FPR-05", file, "render_probe_hash differs between sides (Hamming 0 required)", "match.render_probe_hash"))
     return out

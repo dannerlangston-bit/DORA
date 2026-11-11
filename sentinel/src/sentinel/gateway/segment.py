@@ -88,7 +88,6 @@ OFF_LAST_PROBE, OFF_HOOK_ALIVE, OFF_RING_HEAD = 64, 72, 80
 OFF_REINSTALL_DONE, OFF_REINSTALL_OK, OFF_SEND_PASSED = 88, 92, 93
 HEADER_SIZE = 128
 _HEADER_SLOW = struct.Struct("<BBBBBxxxIIqI")          # @16: armed .. reinstall_request
-HEADER_SLOW_END = 64
 
 # -- token slots ----------------------------------------------------------------------------------------------
 OFF_TOKENS = HEADER_SIZE
@@ -134,7 +133,6 @@ BUTTONS = (None, "left", "right", "middle", "x1", "x2")
 BUTTON_CODE = {name: i for i, name in enumerate(BUTTONS) if name}
 MOD_BITS = {"shift": 1, "ctrl": 2, "alt": 4, "win": 8}
 RF_INJECTED, RF_SECRET = 16, 32
-FLAGS = ("clear", "set", "unknown")
 FLAG_CLEAR, FLAG_SET, FLAG_UNKNOWN = 0, 1, 2
 
 # The same tables as orchestrator.gateway (5.4.7), restated because this module imports the stdlib only;

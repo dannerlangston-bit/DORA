@@ -39,7 +39,6 @@ from ..orchestrator.watchdog import hook_host_died
 PROBE_INTERVAL_S = 5.0                 # 5.4.4: every 5 s while idle
 PROBE_WINDOW_S = 0.1                   # 5.4.4: a probe not seen within 100 ms means the hook was removed
 REINSTALL_ANSWER_S = 1.0               # choice 1
-PROBE_VERDICTS = ("seen", "pending", "missed")
 
 
 def judge_probe(sent_at: float, last_probe_ts: float, now: float) -> str:

@@ -10,6 +10,7 @@ import cv2
 import numpy as np
 import pytest
 
+from sentinel.canary import plant_identifier
 from sentinel.capture import (RedactionContext, RedactionError, RedactionList, Sweep, SyntheticOcr, h6_frame,
                               h6_self_test, redact_pair, redaction_version, sample_artifacts, verify)
 from sentinel.diff.engine import diff_pair
@@ -134,6 +135,19 @@ def test_a_candidate_only_hit_is_a_tier_one_suspected_leak_and_a_base_only_hit_i
     assert got == [("base", 2, None, "live_id"), ("candidate", 1, "candidate_only", "paper_id")]
     assert res.masked(pc[0][1]) and res.masked(pb[0][1])
     assert is_fill(res.base, pc[0][1]) and is_fill(res.candidate, pb[0][1])   # the union reaches both sides
+
+
+def test_the_m19_planted_identifier_is_masked_with_a_reader_per_side():
+    """12.5 M19: the canary plants 9 digits in the candidate; per-side readers allow captures of different sizes."""
+    base, _ = frame()
+    cand = np.pad(base, ((0, 0), (0, 20), (0, 0)), mode="edge")             # the candidate window is wider
+    box = (200, 150, 110, 20)
+    mutant = plant_identifier(cand, box, np.random.default_rng(20260101))
+    readers = {"base": SyntheticOcr([], (400, 240)),
+               "candidate": SyntheticOcr([("418026573", Rect(*box))], (420, 240))}
+    res = redact_pair(base, mutant, ANCHORS, readers, BG, context=CTX)
+    assert res.masked(Rect(*box)) and is_fill(res.candidate, Rect(*box))
+    assert [(f.side, f.tier, f.evidence["pattern"]) for f in res.findings] == [("candidate", 1, "live_id")]
 
 
 def test_a_redacted_frame_re_read_has_zero_hits():

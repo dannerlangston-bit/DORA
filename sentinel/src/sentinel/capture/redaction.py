@@ -376,17 +376,20 @@ def _finding(ctx: RedactionContext, side: str, hit: SweepHit, candidate_only: bo
         evidence={"crop": crop, "side": side, "pattern": hit.kind, "candidate_only": candidate_only})
 
 
-def redact_pair(base_img: np.ndarray, cand_img: np.ndarray, anchors: RedactionList, ocr: WordOcr,
-                theme: tuple[int, int, int] | Mapping[str, Any], *, sweep: Sweep | None = None,
-                context: RedactionContext | None = None, params: Mapping[str, Any] | None = None) -> RedactionResult:
+def redact_pair(base_img: np.ndarray, cand_img: np.ndarray, anchors: RedactionList,
+                ocr: WordOcr | Mapping[str, WordOcr], theme: tuple[int, int, int] | Mapping[str, Any], *,
+                sweep: Sweep | None = None, context: RedactionContext | None = None,
+                params: Mapping[str, Any] | None = None) -> RedactionResult:
     """Redact one base/candidate pair (module docstring). The inputs are not modified; the raw frames never leave
-    this call. `theme` is the background RGB or a theme mapping with `bg`; `params` the Diff Engine parameters
-    (landmark floors, 3.7)."""
+    this call. `ocr` is one reader for both captures or a reader per side (`{"base": ..., "candidate": ...}`);
+    `theme` is the background RGB or a theme mapping with `bg`; `params` the Diff Engine parameters (landmark
+    floors, 3.7)."""
     sw = sweep or Sweep()
     ctx = context or RedactionContext()
     version = redaction_version(anchors, sw)
     p = params or load_params()
     imgs = {"base": _rgb(base_img), "candidate": _rgb(cand_img)}
+    readers = {s: ocr[s] for s in SIDES} if isinstance(ocr, Mapping) else {s: ocr for s in SIDES}
 
     # stage 1: anchored boxes wherever the landmark is found; found on one side only refuses the checkpoint
     stage1: dict[str, list[RedactionBox]] = {s: [] for s in SIDES}
@@ -410,7 +413,7 @@ def redact_pair(base_img: np.ndarray, cand_img: np.ndarray, anchors: RedactionLi
     matchers = sw.matchers()
     hits: list[SweepHit] = []
     for s in SIDES:
-        for h in _sweep(imgs[s], ocr, matchers, s):
+        for h in _sweep(imgs[s], readers[s], matchers, s):
             inner = Rect(h.rect.x + 1, h.rect.y + 1, h.rect.w - 2, h.rect.h - 2) if min(h.rect.w, h.rect.h) > 2 \
                 else h.rect
             hits.append(SweepHit(s, h.kind, h.rect, _covered(inner, anchored)))

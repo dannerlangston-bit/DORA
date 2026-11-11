@@ -248,9 +248,9 @@ def render_run_report_html(report: RunReport, *, objects_dir: str | os.PathLike 
                            page_dir: Path | None = None) -> str:
     """The page as a string (see `render_run_report` to write it to disk)."""
     images = _Images(Path(objects_dir) if objects_dir else None, embed, page_dir)
-    run, ctx, st = report.run, report.context, report.status
+    run, st = report.run, report.status
     title = f"Sentinel {run.run_type} run {run.run_id}"
-    parts = [f"<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
+    parts = ["<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">",
              '<meta name="viewport" content="width=device-width, initial-scale=1">',
              f"<title>{_e(title)}</title><style>{_CSS}</style></head><body><main>"]
     if report.banner:

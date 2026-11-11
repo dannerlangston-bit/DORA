@@ -128,7 +128,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from ..canary import CanaryResult
-from ..orchestrator.killswitch import proof_line, send_lines
+from ..orchestrator.killswitch import CANCEL_ALL_CODES, CANCEL_ALL_TEXT, proof_line, send_lines
 from ..records import CheckpointOutcome, Decision, Finding, RunOutcome, StepOutcome
 from ..store import safety as store_safety
 from ..store.checks import matrix_failures
@@ -1534,7 +1534,8 @@ def health_rows(b: _Builder, items: list[Item], intended_clusters: list[Cluster]
     if "safety" in h:
         rows.append(("Safety", _safety_row(h["safety"], proof_detail_lines(b.safety.proofs))))
     s = b.safety
-    for kind, label in (("fire_drill", "Fire drill (last Nightly)"), ("safety_canary", "Safety canaries (last Nightly)")):
+    for kind, label in (("fire_drill", "Fire drill (last Nightly)"),
+                        ("safety_canary", "Safety canaries (last Nightly)")):
         rows_of = [r for r in s.canaries if r.kind == kind]
         if rows_of:
             rows.append((label, _canary_rows_line(rows_of, s.nightly_run_id)))
@@ -1706,6 +1707,10 @@ def _manifest_notes(b: _Builder) -> tuple[Line | None, list[Line], Line | None, 
 # Safety proof section and Alerts panel (6.5, 6.6, 6.12, 9.4 item 8, 9.5)
 # --------------------------------------------------------------------------------------------
 
+# the 8.3 `post_run_proofs.cancel_all` code as the 6.6 block says it (verified, failed, not needed)
+_CANCEL_ALL_SAID = {code: CANCEL_ALL_TEXT[k] for k, code in CANCEL_ALL_CODES.items()}
+
+
 def _count(x: Any) -> str:
     return "not read" if x is None else f"{float(x):g}"
 
@@ -1728,11 +1733,12 @@ def _proof_block(p: PostRunProof) -> tuple[str, list[Line]]:
         else:
             lines.append(f"{name}: start {_count(row.get('start'))}, end {_count(row.get('end'))}, new "
                          f"{row.get('new', 0)}, expected {row.get('expected', 0)}, {row.get('verdict', 'unknown')}")
-    lines.append(f"cancel all {p.cancel_all}")
+    lines.append(f"cancel all {_CANCEL_ALL_SAID[p.cancel_all]}")
     lines += send_lines(p.counts)
     if p.verified_by:
         lines.append(f"verified by hand by {p.verified_by} at {p.verified_at}")
-    return title, [(T(x),) for x in lines]
+    out: list[Line] = [(T(x),) for x in lines]
+    return title, out
 
 
 def _canary_block(title: str, rows: Sequence[CanaryResult]) -> tuple[str, list[Line]]:
@@ -1878,8 +1884,8 @@ class ReportInputs:
         ids = sorted({o.decision_ref for o in outcomes if o.decision_ref}
                      | {f.decision_ref for f in findings if f.decision_ref})
         decisions = [d for d in (store.get_decision(i) for i in ids) if d is not None]
-        safety = SafetyRows.from_store(store, run_id, nightly_run_id=(summary.get("safety") or {}).get("nightly_run_id"),
-                                       at=at)
+        nightly = (summary.get("safety") or {}).get("nightly_run_id")
+        safety = SafetyRows.from_store(store, run_id, nightly_run_id=nightly, at=at)
         return cls(run, outcomes, findings, decisions, store.step_outcomes(run_id), summary, safety)
 
     def build(self, manifest: dict | None, context: ReportContext) -> RunReport:

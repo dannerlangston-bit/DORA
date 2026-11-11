@@ -2444,21 +2444,22 @@ class Store:
         triage = (TRIAGE_FOR_ACTION.get(d.action)
                   or ("confirmed_bug" if d.verdict == "confirmed_bug" else "open"))   # reject_baseline (4.14)
         self.taxonomy.check_member("triage_states", triage)
+        values = {
+            "decision_id": did, "checkpoint_id": d.signature.checkpoint_id, "region_id": d.signature.region_id,
+            "phash": phash_bytes(d.signature.phash), "hamming_tolerance": tolerance,
+            "category": d.signature.category, "action": d.action, "verdict": d.verdict, "source": d.source,
+            "decided_by": d.decided_by, "proposed_by": proposed_by, "confirmed_by": confirmed_by,
+            "decided_at": decided_at, "run_id": run_id, "build_id": build_id, "reason": d.reason,
+            "ticket_ref": d.ticket, "mask_ref": mask_ref, "baseline_id": baseline_id,
+            "fixed_in_build_id": fixed_in_build_id, "cluster_id": cluster_id, "expires_at": expires_at,
+            "status": "active", "supersedes_decision_id": decision_int(supersedes),
+            "source_finding_id": source_finding, "role": d.role, "reopen_count": d.reopen_count,
+            "bbox_q4": None if d.bbox_q4 is None else ",".join(map(str, d.bbox_q4))}
         with self._batch("decision") as rows:
             if d.action not in BASELINE_ACTIONS:                    # inside the batch: writes serialize (9.7)
                 self._check_signature_free(d, run_id, decided_at, supersedes, source_finding, manifest_entries,
                                            manifest_tickets)
-            self._insert(rows, "decisions", {
-                "decision_id": did, "checkpoint_id": d.signature.checkpoint_id, "region_id": d.signature.region_id,
-                "phash": phash_bytes(d.signature.phash), "hamming_tolerance": tolerance,
-                "category": d.signature.category, "action": d.action, "verdict": d.verdict, "source": d.source,
-                "decided_by": d.decided_by, "proposed_by": proposed_by, "confirmed_by": confirmed_by,
-                "decided_at": decided_at, "run_id": run_id, "build_id": build_id, "reason": d.reason,
-                "ticket_ref": d.ticket, "mask_ref": mask_ref, "baseline_id": baseline_id,
-                "fixed_in_build_id": fixed_in_build_id, "cluster_id": cluster_id, "expires_at": expires_at,
-                "status": "active", "supersedes_decision_id": decision_int(supersedes),
-                "source_finding_id": source_finding, "role": d.role, "reopen_count": d.reopen_count,
-                "bbox_q4": None if d.bbox_q4 is None else ",".join(map(str, d.bbox_q4))})
+            self._insert(rows, "decisions", values)
             if supersedes is not None:
                 self._update(rows, "decisions", {"decision_id": decision_int(supersedes)}, {"status": "superseded"})
             if source_finding is not None:
@@ -2466,9 +2467,9 @@ class Store:
                 if d.ticket:
                     change["ticket_ref"] = d.ticket
                 self._update(rows, "findings", {"finding_id": source_finding}, change)
-            if old is not None and d.action != "fixed_in_build" and old["decided_by"] != d.decided_by:
-                # 9.7: a supersession by another human marks the finding contested (fixed_in_build is the 4.14
-                # lifecycle of a confirmed bug, not a contest)
+            if old is not None and not _lifecycle_supersession(values, old) and old["decided_by"] != d.decided_by:
+                # 9.7: a supersession by another human marks the finding contested (fixed_in_build, the 4.14
+                # lifecycle of a confirmed bug, and a re-confirmation are not contests)
                 for fid in {old["source_finding_id"], source_finding} - {None}:
                     self._update(rows, "findings", {"finding_id": fid}, {"contested": 1})
         return self.get_decision(decision_ref(did))

@@ -38,6 +38,8 @@ Choices (reported):
   A failed precondition marks every item missed with its reason, since none of them was proven.
 - A denied-action probe that the slow half refused because the ticket or dialog flag was up (`flag_abort`), or
   because the hook host was dead, did not test the deny list and counts as a miss.
+- A reader or checker that raises on a planted case is recorded for that case as `error: ...`, a miss: a blind
+  reader is never a pass and never stops the Nightly run.
 """
 from __future__ import annotations
 
@@ -53,7 +55,7 @@ from . import alerts
 from .alerts import AlertRoute
 from .attestation import SAFETY_ROWS, AttestationProfile, Floors, RowReads, attest
 from .drill import PRECONDITIONS, DrillResult, expected_records
-from .explorer import DenyEntry, denied_action_plan
+from .explorer import DenyEntry, DenyProbe, denied_action_plan
 from .gateway import Chord
 from .identity import OCR_FLOOR, Allowlist, judge_identity
 from .killswitch import ORDERS_SENT, ProofInputs, post_run_proof, proof_result
@@ -127,6 +129,16 @@ class SafetyCanaryResult:
     @property
     def missed(self) -> tuple[CanaryCase, ...]:
         return tuple(c for c in self.cases if not c.caught)
+
+
+def _case(case: str, expected: str, observe: Callable[[], str]) -> CanaryCase:
+    """One planted case. A reader or checker that raises on it reported nothing: the case is a miss with the error,
+    never a pass and never a crash of the Nightly run (6.5)."""
+    try:
+        observed = observe()
+    except Exception as e:      # noqa: BLE001 - a raising reader is a blind reader, recorded as such
+        observed = f"error: {type(e).__name__}: {e}"
+    return CanaryCase(case, expected, observed)
 
 
 def _alert(name: str) -> AlertRoute:
@@ -222,15 +234,16 @@ def attestation_canary(profile: AttestationProfile, *, read: Callable[[str, str]
     """The nightly attestation canary (6.3 Proof): flipped and unreadable crops of A3 to A8."""
     read = read or planted_setting(profile)
     evidence = {i: _sha(f"canary:evidence:{i}") for i in ("A1", "A2", *SAFETY_ROWS, "A9")}
-    cases = []
-    for item in SAFETY_ROWS:
-        for variant, expected in (("flipped", "mismatch"), ("unreadable", "unreadable")):
-            reads = {i: RowReads(SettingRead(i, expected_setting(i, profile), screenshot_sha256=_sha(f"canary:{i}")))
-                     for i in SAFETY_ROWS}
-            reads[item] = RowReads(read(item, variant), read(item, variant))     # the read and the read after reopening
-            res = attest(reads, profile, a9=ConfirmationCheck(True, 0, _sha("canary:a9")), evidence=evidence,
-                         floors=floors)
-            cases.append(CanaryCase(f"{item} {variant}", expected, "pass" if res.result.passed else res.rows[item]))
+
+    def observe(item: str, variant: str) -> str:
+        reads = {i: RowReads(SettingRead(i, expected_setting(i, profile), screenshot_sha256=_sha(f"canary:{i}")))
+                 for i in SAFETY_ROWS}
+        reads[item] = RowReads(read(item, variant), read(item, variant))         # the read and the read after reopening
+        res = attest(reads, profile, a9=ConfirmationCheck(True, 0, _sha("canary:a9")), evidence=evidence, floors=floors)
+        return "pass" if res.result.passed else res.rows[item]
+
+    cases = [_case(f"{item} {variant}", expected, lambda i=item, v=variant: observe(i, v))
+             for item in SAFETY_ROWS for variant, expected in (("flipped", "mismatch"), ("unreadable", "unreadable"))]
     return score_canary("attestation", cases, checkpoint_id=checkpoint_id)
 
 
@@ -263,16 +276,16 @@ def identity_canary(allowlist: Allowlist, *, read: Callable[[str], SelectorRead]
     """The nightly identity canary (6.4 Proof): the assertion in dry-run mode over three planted crops (two reads
     each, as the unreadable path takes them); nothing the judge asks for is done and no outcome is written."""
     read = read or planted_selector(allowlist)
-    cases = []
-    for variant, expected in IDENTITY_CASES:
+
+    def observe(variant: str) -> str:
         res = judge_identity([read(variant), read(variant)], allowlist, floor=floor)
         if res.passed:
-            observed = "allowlisted"
-        elif res.run_status == "aborted_safety":
-            observed = res.run_reason or ""
-        else:
-            observed = res.unreached.reason if res.unreached and res.unreached.reason else "no verdict"
-        cases.append(CanaryCase(variant, expected, observed))
+            return "allowlisted"
+        if res.run_status == "aborted_safety":
+            return res.run_reason or ""
+        return res.unreached.reason if res.unreached and res.unreached.reason else "no verdict"
+
+    cases = [_case(variant, expected, lambda v=variant: observe(v)) for variant, expected in IDENTITY_CASES]
     return score_canary("identity", cases, checkpoint_id=checkpoint_id)
 
 
@@ -288,17 +301,22 @@ def proof_canary(start: OrderBook | None = None, *, read: Callable[[str, OrderBo
                  checkpoint_id: str | None = None) -> SafetyCanaryResult:
     """The nightly proof canary (6.6): a planted extra Working row (ORDERS SENT, `aborted_safety`, the row named)
     and an unreadable Monitor crop (UNPROVEN `monitor_unreadable`) in the end snapshot of a dry run."""
-    start = start or OrderBook(position_rows=0, net_liq=25000.0)
+    begin = start or OrderBook(position_rows=0, net_liq=25000.0)
     read = read or planted_book
-    proof = post_run_proof(ProofInputs(start=start, end=read("extra_working_row", start)))
-    effect = proof_result(proof)
-    observed = proof.verdict_code
-    if proof.verdict == ORDERS_SENT and not (effect.run_status == "aborted_safety" and PLANTED_ROW.key in (effect.detail or "")):
-        observed += " without aborted_safety naming the row"
-    cases = [CanaryCase("extra_working_row", "orders_sent", observed)]
-    proof = post_run_proof(ProofInputs(start=start, end=read("unreadable", start)))
-    cases.append(CanaryCase("unreadable", "unproven:monitor_unreadable",
-                            f"{proof.verdict_code}:{proof.reason}" if proof.reason else proof.verdict_code))
+
+    def planted_row() -> str:
+        proof = post_run_proof(ProofInputs(start=begin, end=read("extra_working_row", begin)))
+        effect = proof_result(proof)
+        named = effect.run_status == "aborted_safety" and PLANTED_ROW.key in (effect.detail or "")
+        return proof.verdict_code + ("" if proof.verdict != ORDERS_SENT or named
+                                     else " without aborted_safety naming the row")
+
+    def unreadable() -> str:
+        proof = post_run_proof(ProofInputs(start=begin, end=read("unreadable", begin)))
+        return f"{proof.verdict_code}:{proof.reason}" if proof.reason else proof.verdict_code
+
+    cases = [_case("extra_working_row", "orders_sent", planted_row),
+             _case("unreadable", "unproven:monitor_unreadable", unreadable)]
     return score_canary("proof", cases, checkpoint_id=checkpoint_id)
 
 
@@ -333,11 +351,15 @@ def secret_scan_canary(scan: Callable[[Path, str], Iterable[str | Path]], workdi
     `workdir`, or absolute under it) of the artifacts where it found the marker; all three planted must be."""
     workdir = Path(workdir)
     planted = plant_secret_marker(workdir, marker)
-    hits = set()
-    for h in scan(workdir, marker):
-        p = Path(h)
-        hits.add((p.relative_to(workdir) if p.is_absolute() else p).as_posix())
-    cases = [CanaryCase(case, "flagged", "flagged" if rel in hits else "missed") for case, rel in planted.items()]
+    found: list[set[str]] = []
+
+    def flagged(rel: str) -> str:
+        if not found:                                    # one scan of the dry run, read by every case
+            found.append({(p.relative_to(workdir) if p.is_absolute() else p).as_posix()
+                          for p in map(Path, scan(workdir, marker))})
+        return "flagged" if rel in found[0] else "missed"
+
+    cases = [_case(case, "flagged", lambda r=rel: flagged(r)) for case, rel in planted.items()]
     return score_canary("secret_scan", cases, checkpoint_id=checkpoint_id)
 
 
@@ -348,16 +370,16 @@ def denied_action_test(rig: Rig, deny_list: Sequence[DenyEntry], *, deny_control
     `rig.send_input` under the Explorer profile must be refused by the gateway (`blocked_by_gateway`); an entry the
     plan cannot drive is a miss. Run it on the Explorer login with the ticket and dialog flag clear."""
     plan = denied_action_plan(deny_list, deny_controls)
-    cases = []
-    for probe in plan:
+
+    def observe(probe: DenyProbe) -> str:
         r = rig.send_input(probe.action)
         if r.refused is None:
-            observed = "allowed"
-        elif r.refused.flag_abort or r.refused.reason == "hook_host_dead":
-            observed = "not driven: " + ("flag up" if r.refused.flag_abort else "hook host dead")
-        else:
-            observed = "blocked_by_gateway"
-        cases.append(CanaryCase(f"{probe.entry} {probe.detection}", "blocked_by_gateway", observed))
+            return "allowed"
+        if r.refused.flag_abort or r.refused.reason == "hook_host_dead":
+            return "not driven: " + ("flag up" if r.refused.flag_abort else "hook host dead")
+        return "blocked_by_gateway"
+
+    cases = [_case(f"{p.entry} {p.detection}", "blocked_by_gateway", lambda p=p: observe(p)) for p in plan]
     driven = {p.entry for p in plan}
     cases += [CanaryCase(f"{e.name} (no probe)", "blocked_by_gateway", "not driven") for e in deny_list
               if e.name not in driven]

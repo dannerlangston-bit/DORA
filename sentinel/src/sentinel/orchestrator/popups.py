@@ -33,7 +33,8 @@ over those observations is here, and every decision is a `ControlResult` in the 
 
 `ControlResult.evidence` of every popup decision carries: `popup_id` (None for an unmatched window), `title`, `hwnd`,
 `popup_action` (the catalog action, or `unknown`), `input` (None, `{"kind": "key", "key": ...}` or `{"kind": "click",
-"target": ...}`) and `close` (None, `wm_close` or `agent_dismiss`, with `dismiss_labels` for the agent). Some carry
+"target": ...}`) and `close` (None, `wm_close` or `agent_dismiss`, with the agent's `dismiss_labels` and
+`refused_labels`, 7.8 policy 5). Some carry
 `wait_timeout_ms` (a `wait`, or the 30 s of an unowned Order Confirmation), `capture_first` (INV-14: capture the
 checkpoint with the dialog on screen before WM_CLOSE), `handoff: login_recovery` (POP-21 inside the LOGIN flow),
 `proactive_relaunch` (POP-11), `fixture_finding` (POP-07, POP-15), `ondemand_timeouts` (POP-12) or `proposed_entry`.
@@ -638,7 +639,7 @@ def unknown_window(window: Any, ctx: PopupContext, catalog: PopupCatalog, *,
     else:
         close = "agent_dismiss" if ctx.agent_enabled else "wm_close"
     if close == "agent_dismiss":
-        ev["dismiss_labels"] = list(AGENT_DISMISS_LABELS)
+        ev.update(dismiss_labels=list(AGENT_DISMISS_LABELS), refused_labels=list(AGENT_NEVER_LABELS))
     return ControlResult(CONTROL, False, ctx.gate, actions=("quarantine_flow",) if ctx.flow_id else (),
                          alert=alerts.flow_quarantined() if ctx.flow_id else None, findings=(finding,),
                          evidence={**ev, "close": close},

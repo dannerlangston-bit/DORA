@@ -348,6 +348,7 @@ def test_unknown_window_is_quarantined_and_dismissed_by_the_agent_or_wm_close():
     r = unknown_window(win("Rate this app"), PopupContext(flow_id="flow.x", build_id="main-2000.1.0-aaaaaaa"), CAT)
     assert r.has("quarantine_flow") and r.run is None and r.evidence["close"] == "agent_dismiss"
     assert r.evidence["dismiss_labels"] == list(AGENT_DISMISS_LABELS)
+    assert {"Accept", "Confirm", "Send", "Yes", "Save"} <= set(r.evidence["refused_labels"])
     draft = json.loads(r.findings[0].detail)
     assert draft["popup_id"] == "POP-23" and draft["class"] == "dismissable"
     assert draft["seed_titles"] == ["Rate this app"]
@@ -364,7 +365,7 @@ def test_unmatched_order_dialog_title_is_never_handed_to_the_agent_or_closed():
     cat = variant("POP-14", status="disabled")
     assert cat.match(win("Order Confirmation"), "running") is None
     r = unknown_window(win("Order Confirmation"), RUN, cat)
-    assert r.evidence["close"] is None and "dismiss_labels" not in r.evidence
+    assert r.evidence["close"] is None and "dismiss_labels" not in r.evidence and "refused_labels" not in r.evidence
     assert json.loads(r.findings[0].detail)["class"] == "safety"
 
 

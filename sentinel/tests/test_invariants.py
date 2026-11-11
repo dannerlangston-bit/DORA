@@ -159,7 +159,7 @@ def test_registry_control_ids_key_the_allowlist_and_allowed_scrollbars():
     grid = A(UIComponent("p", Rect(10, 10, 100, 100), "panel", parent="frame", control_id="positions-grid"),
              UIComponent("sb", Rect(100, 10, 10, 100), "scrollbar", parent="p"))
     assert ids(grid) == ["INV-06"]
-    assert ids(grid, replace(RULES, allowed_scrollbars={"positions-grid": (2000, 2000)})) == []   # none expected only from 2000x2000
+    assert ids(grid, replace(RULES, allowed_scrollbars={"positions-grid": (2000, 2000)})) == []   # from 2000x2000
 
 
 def test_inv01_branch_b_ignores_text_kinds():

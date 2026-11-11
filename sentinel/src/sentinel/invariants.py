@@ -417,7 +417,7 @@ class SurfaceRules:
     data_mode: str = "frozen"
     labels: tuple[RequiredLabel, ...] = ()
     controls: tuple[RequiredControl, ...] = ()
-    allowlist: tuple[tuple[str, str], ...] = ()                 # component name pairs; "*" is any
+    allowlist: tuple[tuple[str, str], ...] = ()                 # component name or control id pairs; "*" is any
     clipped_by_design: tuple[str | Rect, ...] = ()              # component names or regions (INV-02)
     allowed_scrollbars: Mapping[str, tuple[int, int]] = field(default_factory=dict)  # container -> (w, h) from which none is expected
     text_regions: tuple[TextRegion, ...] = ()

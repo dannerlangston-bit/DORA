@@ -157,7 +157,8 @@ class EffectiveRegistry:
         """The invariant inputs of the checkpoint (2.7 per-surface inputs, 5.9 inputs; choices 3 to 5)."""
         s = self._surface(checkpoint.surface_id)
         block = s.get("invariants") if isinstance(s.get("invariants"), dict) else {}
-        labels = dict.fromkeys([str(t) for t in s.get("labels") or ()] + list(self.overrides(checkpoint).required_labels))
+        surface_labels = [str(t) for t in s.get("labels") or ()]
+        labels = dict.fromkeys(surface_labels + list(self.overrides(checkpoint).required_labels))
         controls = []
         for c in s.get("controls") or ():
             if isinstance(c, dict) and c.get("required"):

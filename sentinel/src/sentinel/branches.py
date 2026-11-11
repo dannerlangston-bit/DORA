@@ -336,8 +336,7 @@ class Branches:
         for key in BRANCH_KEYS:
             c = self.choices[key]
             if c.undecided:
-                when = f"deadline {c.deadline.isoformat()} passed" if c.past_deadline(today) else \
-                    f"deadline {c.deadline.isoformat()}" if c.deadline else "no deadline"
+                when = f"deadline {c.deadline}" + (" passed" if c.past_deadline(today) else "")
                 out.append(f"phase 0 {c.record} {key} undecided: default branch {c.resolved} in force ({when})")
         return tuple(out)
 

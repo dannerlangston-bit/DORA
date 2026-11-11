@@ -171,7 +171,8 @@ def test_checker_config_reads_the_palette_and_the_error_titles():
     assert cfg.palette_tolerance == 50 and cfg.error_title_patterns == ERRORS
     untold = dict(PALETTE)
     del untold["tolerance"]
-    assert eff.checker_config(config(Doc("palettes/dark.yaml", "palette", untold)), "dark", ERRORS).palette_tolerance == 60
+    default = eff.checker_config(config(Doc("palettes/dark.yaml", "palette", untold)), "dark", ERRORS)
+    assert default.palette_tolerance == 60
     screen = Rect(0, 0, 1920, 1080)
     crash = model(windows=(Window("main", Rect(0, 0, 1920, 1040), "main"),
                            Window("dlg", Rect(800, 400, 300, 200), "owned", title="java.lang.NullPointerException",

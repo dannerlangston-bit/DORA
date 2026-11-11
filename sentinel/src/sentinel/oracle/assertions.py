@@ -161,6 +161,7 @@ class AssertionResult:
     reason: str | None = None                  # harness_error reason
     gate: str | None = None                    # env_error gate
     rule: RuleResult | None = None
+    region: str | None = None                  # the region the assertion is about (a rule region's id, 3.8)
 
     def __post_init__(self) -> None:
         if self.status not in STATUSES:
@@ -585,14 +586,16 @@ class _Evaluator:
                 if r.status == "unreadable":
                     self.readable()
                 return AssertionResult(a.id, a.kind, r.status, r.expected, r.extracted, r.detail, dict(self.operands),
-                                       rule=r)
+                                       rule=r, region=a.region)
             expected, extracted = getattr(self, a.kind)(a)
-            return AssertionResult(a.id, a.kind, "passed", expected, extracted, None, dict(self.operands))
+            return AssertionResult(a.id, a.kind, "passed", expected, extracted, None, dict(self.operands),
+                                   region=a.region)
         except _Fail as f:
-            return AssertionResult(a.id, a.kind, "failed", f.expected, f.extracted, f.detail, dict(self.operands))
+            return AssertionResult(a.id, a.kind, "failed", f.expected, f.extracted, f.detail, dict(self.operands),
+                                   region=a.region)
         except _Stop as s:
             return AssertionResult(a.id, a.kind, s.status, detail=s.detail, operands=dict(self.operands),
-                                   unreadable=s.unreadable, reason=s.reason, gate=s.gate)
+                                   unreadable=s.unreadable, reason=s.reason, gate=s.gate, region=a.region)
 
 
 def evaluate_assertions(flow_step: Mapping[str, Any], values_by_source: Mapping[str, ValueSource | ApiReader],

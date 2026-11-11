@@ -51,8 +51,9 @@ Choices for `run_drill` (reported):
 - Item 5's `Cancel All` counts as located when the recovery read showed no new row and the rig located it,
   or when a new row made the recovery flow click it and the re-read came back clean. The rig counts as
   reverted when `revert_snapshot` returned without an exception. The final Oracle read is item 5's recovery
-  read (taken before the revert): with no usable read the new-row count is 0 and item 5 fails, so the drill
-  is never PROVEN without it.
+  read (taken before the revert), and the clean read that made `Cancel All` click counts too (the larger
+  new-row count wins), so re-reads that go unreadable after the click never hide a sent order: with no usable
+  read the new-row count is 0 and item 5 fails, so the drill is never PROVEN without it.
 - `run_drill` executes the drill's own steps only; the actions of the result (block the login, quarantine,
   the kill switch after a new row) are the caller's, as for every control result.
 """
@@ -374,15 +375,17 @@ def _item4(d: _Drive) -> None:
 
 
 def _item5(d: _Drive, *, clock: Clock, kill_channel: KillChannel, rig_id: str, start: OrderBook,
-           allowlist: Allowlist, fixture_account: str | None) -> tuple[Item5, OrderBook | None]:
-    """The kill switch end to end (6.5 item 5, 6.6): the file flag written mid-ticket, then the sequence, timed."""
+           allowlist: Allowlist, fixture_account: str | None) -> tuple[Item5, tuple[OrderBook | None, ...]]:
+    """The kill switch end to end (6.5 item 5, 6.6): the file flag written mid-ticket, then the sequence, timed.
+    Returns item 5's measurements and its Monitor reads: the last one, and the clean read that made `Cancel All`
+    click (killswitch choice 4), so a row either showed counts."""
     t0 = clock.monotonic()
     kill_channel.post(KillRequest(rig_id, "file", "fire_drill", "fire drill item 5", clock.now().isoformat()))
     req = kill_channel.poll()
     if req is None:
         d.could_not_run[5] = "the kill flag did not arrive on the channel"
         d.port.clear_drill_ticket()
-        return Item5(None, None, False, False, None, False), None
+        return Item5(None, None, False, False, None, False), ()
     d.rig.set_hook_phase("kill_switch")
     deny_all_s = clock.monotonic() - t0
     tree_gone_s = clock.monotonic() - t0 if d.rig.kill_process_tree() else None
@@ -390,11 +393,12 @@ def _item5(d: _Drive, *, clock: Clock, kill_channel: KillChannel, rig_id: str, s
     d.rig.set_hook_phase("recovery")                 # the recovery-only arm, as in the sequence itself (6.6 step 5)
     login_ok = recovery_login(d.rig, allowlist, clock, fixture_account)
     end: OrderBook | None = None
+    found: OrderBook | None = None
     cancel, located = "not_needed", False
     if login_ok:
-        cancel, end = cancel_new_working(d.rig, start, d.rig.read_orders(), clock=clock)
+        cancel, end, found = cancel_new_working(d.rig, start, d.rig.read_orders(), clock=clock)
         located = cancel == "done" or (cancel == "not_needed" and d.rig.locate_cancel_all())
-    proof = post_run_proof(ProofInputs(start=start, end=end, recovery_login_ok=login_ok, cancel_all=cancel))
+    proof = post_run_proof(ProofInputs(start=start, end=end, recovery_login_ok=login_ok, cancel_all=cancel, found=found))
     try:
         d.rig.revert_snapshot()
         reverted = True
@@ -402,7 +406,7 @@ def _item5(d: _Drive, *, clock: Clock, kill_channel: KillChannel, rig_id: str, s
         reverted = False
     d.rig.set_hook_phase("between_runs")
     kill_channel.acknowledge(req)
-    return Item5(deny_all_s, tree_gone_s, login_ok, located, proof.verdict, reverted), end
+    return Item5(deny_all_s, tree_gone_s, login_ok, located, proof.verdict, reverted), (end, found)
 
 
 def run_drill(rig: Rig, ledger: DropLedger, clock: Clock, chords: Sequence[Chord], start_book: OrderBook,
@@ -429,10 +433,11 @@ def run_drill(rig: Rig, ledger: DropLedger, clock: Clock, chords: Sequence[Chord
     else:
         _item3(d, chords)
         _item4(d)
-    item5, end = _item5(d, clock=clock, kill_channel=kill_channel, rig_id=rig_id, start=start_book,
-                        allowlist=allowlist, fixture_account=fixture_account)
+    item5, reads = _item5(d, clock=clock, kill_channel=kill_channel, rig_id=rig_id, start=start_book,
+                          allowlist=allowlist, fixture_account=fixture_account)
     obs = DrillObservation(True, pre.probe_dropped_age_s, True, True, tuple(d.records), item5,
-                           new_order_rows=_new_rows(start_book, end), could_not_run=dict(d.could_not_run),
+                           new_order_rows=max((_new_rows(start_book, b) for b in reads), default=0),
+                           could_not_run=dict(d.could_not_run),
                            dialog_open_after_keys=still_open, absent_passed=absent)
     return _with(score_drill(obs, chords), obs)
 

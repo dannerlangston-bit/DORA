@@ -32,8 +32,11 @@ Choices (reported):
    no new order row to explain it means the Monitor reads do not agree: UNPROVEN `monitor_unreadable`.
 3. The no-session rule is applied literally: the login never authenticated and the gateway issued no
    token in the run. A login that typed credentials issued secret tokens, so it takes the normal path.
-4. `Cancel All` re-reads Working every 5 s until a readable read shows no new row of any kind, declared sends
-   included, or 60 s pass (6.6 step 5: "until Working shows no new rows").
+4. `Cancel All` re-reads Working every 5 s until a clean read (readable and agreeing with Copy All) shows no new row
+   of any kind, declared sends included, or 60 s pass (6.6 step 5: "until Working shows no new rows"). The clean read
+   that made it click is kept (`ProofInputs.found`): its undeclared rows are ORDERS SENT whatever the re-reads show,
+   so re-reads that stay unreadable give `ORDERS SENT: ...; Cancel All failed`, never UNPROVEN (6.6 "which UNPROVEN
+   would understate"); the proof then names that read as its end read (choice 8).
 5. Undeclared rows found by a clean read are ORDERS SENT whatever `Cancel All` did, so `Cancel All` failing
    on undeclared rows reads `ORDERS SENT: ...; Cancel All failed`; UNPROVEN `cancel_all_failed` is left for
    a Cancel All that failed with no undeclared row (declared sends of the gated branch left Working, or a
@@ -211,7 +214,8 @@ class ProofInputs:
     """What the proof reads (6.6). `session` is `established`, `never` (the login never authenticated), `kicked`
     (`session_kicked`, 7.7) or `blocked` (a login just blocked for `live_identity`: no recovery login, SD-64);
     `cancel_all` is `not_needed`, `done` or `failed` (not located, or rows left after 60 s); `declared_sends` are the
-    gated branch's sends as SendGate recorded them (6.7, choice 9)."""
+    gated branch's sends as SendGate recorded them (6.7, choice 9); `found` is the clean read that made `Cancel All`
+    click (choice 4), whose undeclared rows count whatever `end` shows."""
 
     start: OrderBook | None
     end: OrderBook | None
@@ -222,6 +226,7 @@ class ProofInputs:
     cancel_all: str = "not_needed"
     declared_sends: tuple[DeclaredSend, ...] = ()
     net_liq_tolerance: float = NET_LIQ_TOLERANCE
+    found: OrderBook | None = None
 
     def __post_init__(self):
         if self.session not in SESSIONS:
@@ -355,6 +360,17 @@ def _new_rows(start: OrderBook, end: OrderBook) -> dict[str, list[OrderRow]]:
     return out
 
 
+def clean(book: OrderBook | None) -> bool:
+    """A clean Monitor read (6.6): readable and agreeing with Copy All."""
+    return book is not None and book.readable and book.copy_all_agrees
+
+
+def _undeclared(start: OrderBook, end: OrderBook, keys: set[str]) -> tuple[OrderRow, ...]:
+    """The new rows of `end` no declared send explains: any Working or Canceled row not keyed to one, every fill."""
+    new = _new_rows(start, end)
+    return tuple(r for g in GRIDS for r in new[g] if r.key not in keys or g == "filled")
+
+
 def _buying_power(book: OrderBook) -> float | None:
     return book.buying_power if isinstance(book, MonitorBook) else None
 
@@ -363,8 +379,9 @@ def post_run_proof(p: ProofInputs) -> Proof:
     """The proof verdict from the inputs (6.6 Post-run proof, Runs without a usable session), with what
     Cancel All did and the run's declared sends recorded on it."""
     verdict, reason, undeclared, declared, rows = _verdict(p)
+    end = p.found if verdict == ORDERS_SENT and not clean(p.end) else p.end      # the read the rows came from (choice 4)
     return Proof(verdict, reason, undeclared, declared, rows, cancel_all=p.cancel_all, start_sha256=book_sha256(p.start),
-                 end_sha256=book_sha256(p.end), sends=p.declared_sends)
+                 end_sha256=book_sha256(end), sends=p.declared_sends)
 
 
 _Verdict = tuple[str, str | None, tuple[OrderRow, ...], tuple[OrderRow, ...], tuple[ProofRow, ...]]
@@ -379,31 +396,35 @@ def _verdict(p: ProofInputs) -> _Verdict:
         return UNPROVEN, "recovery_login_failed", (), (), ()
     if p.start is None:
         return UNPROVEN, "snapshot_missing", (), (), ()
-    if p.end is None or not (p.end.readable and p.end.copy_all_agrees and p.start.readable
-                             and p.start.copy_all_agrees):
-        return UNPROVEN, "monitor_unreadable", (), (), ()           # either Monitor read failed its cross-check (6.6)
-    new = _new_rows(p.start, p.end)
     keys = {d.row_key for d in p.declared_sends}
+    found_rows = _undeclared(p.start, p.found, keys) if clean(p.start) and p.found is not None and clean(p.found) else ()
+    end = p.end
+    if end is None or not (clean(end) and clean(p.start)):
+        if found_rows:                                   # the clean read that made Cancel All click (choice 4)
+            return _verdict(replace(p, end=p.found, found=None))
+        return UNPROVEN, "monitor_unreadable", (), (), ()           # either Monitor read failed its cross-check (6.6)
+    new = _new_rows(p.start, end)
     declared = tuple(r for g in ("working", "canceled") for r in new[g] if r.key in keys)
-    undeclared = tuple(r for g in GRIDS for r in new[g] if r.key not in keys or g == "filled")
+    undeclared = _undeclared(p.start, end, keys)
+    undeclared += tuple(r for r in found_rows if r.key not in {u.key for u in undeclared})
     work, fill, canc = new["working"], new["filled"], new["canceled"]
     left_working = [r for r in work if r.key in keys]
     canceled = {r.key for r in canc if r.key in keys}
     missing = [d for d in p.declared_sends if d.row_key not in canceled]
     rows = [
-        ProofRow("working orders", len(p.start.working), len(p.end.working), len(work), 0,
+        ProofRow("working orders", len(p.start.working), len(end.working), len(work), 0,
                  "UNDECLARED" if any(r.key not in keys for r in work) else "not canceled" if work else "ok"),
-        ProofRow("filled orders", len(p.start.filled), len(p.end.filled), len(fill), 0, "UNDECLARED" if fill else "ok"),
-        ProofRow("canceled orders", len(p.start.canceled), len(p.end.canceled), len(canc), len(p.declared_sends),
+        ProofRow("filled orders", len(p.start.filled), len(end.filled), len(fill), 0, "UNDECLARED" if fill else "ok"),
+        ProofRow("canceled orders", len(p.start.canceled), len(end.canceled), len(canc), len(p.declared_sends),
                  "UNDECLARED" if any(r.key not in keys for r in canc) else "missing" if missing else "ok"),
     ]
-    pos_change = p.end.position_rows - p.start.position_rows
-    rows.append(ProofRow("position statement rows", p.start.position_rows, p.end.position_rows, max(pos_change, 0), 0,
+    pos_change = end.position_rows - p.start.position_rows
+    rows.append(ProofRow("position statement rows", p.start.position_rows, end.position_rows, max(pos_change, 0), 0,
                          "ok" if pos_change == 0 else "changed"))
-    drift = None if p.start.net_liq is None or p.end.net_liq is None else abs(p.end.net_liq - p.start.net_liq)
-    rows.append(ProofRow("net liq", p.start.net_liq, p.end.net_liq, 0, 0,
+    drift = None if p.start.net_liq is None or end.net_liq is None else abs(end.net_liq - p.start.net_liq)
+    rows.append(ProofRow("net liq", p.start.net_liq, end.net_liq, 0, 0,
                          "ok" if drift is not None and drift <= p.net_liq_tolerance else "drift"))
-    bp0, bp1 = _buying_power(p.start), _buying_power(p.end)
+    bp0, bp1 = _buying_power(p.start), _buying_power(end)
     bp_drift = None if bp0 is None or bp1 is None else abs(bp1 - bp0)
     if bp_drift is not None:                             # both reads carry it (choice 10)
         rows.append(ProofRow("buying power", bp0, bp1, 0, 0, "ok" if bp_drift <= p.net_liq_tolerance else "drift"))
@@ -539,12 +560,14 @@ def recovery_login(rig: Rig, allowlist: Allowlist, clock: Clock, fixture_account
 
 
 def cancel_new_working(rig: Rig, start: OrderBook | None, end: OrderBook, *, clock: Clock,
-                       steps: list[tuple[str, float]] | None = None) -> tuple[str, OrderBook]:
+                       steps: list[tuple[str, float]] | None = None) -> tuple[str, OrderBook, OrderBook | None]:
     """6.6 step 5: when a fresh read of Working shows a row not in the start snapshot, click `Cancel All` and
-    re-read every 5 s until a readable read shows no new Working row of any kind (declared sends too) or 60 s pass
-    (choice 4). Returns what Cancel All did (`not_needed`, `done`, `failed`) and the last read."""
+    re-read every 5 s until a clean read shows no new Working row of any kind (declared sends too) or 60 s pass
+    (choice 4). Returns what Cancel All did (`not_needed`, `done`, `failed`), the last read, and the read that made it
+    click when that read was clean (`ProofInputs.found`), else None."""
     if start is None or not end.readable or not _new_rows(start, end)["working"]:
-        return "not_needed", end
+        return "not_needed", end, None
+    found = end if clean(end) else None
     res = rig.cancel_all()
     if steps is not None:
         steps.append(("cancel_all", clock.monotonic()))
@@ -552,13 +575,13 @@ def cancel_new_working(rig: Rig, start: OrderBook | None, end: OrderBook, *, clo
     cancel = "done" if res.located and res.clicked else "failed"
     while cancel == "done":
         end = rig.read_orders()
-        if end.readable and not _new_rows(start, end)["working"]:
+        if clean(end) and not _new_rows(start, end)["working"]:
             break
         if clock.monotonic() >= deadline:
             cancel = "failed"
             break
         clock.sleep(CANCEL_POLL_S)
-    return cancel, end
+    return cancel, end, found
 
 
 def execute_kill_switch(rig: Rig, decision: ControlResult, *, clock: Clock, allowlist: Allowlist,
@@ -584,9 +607,11 @@ def execute_kill_switch(rig: Rig, decision: ControlResult, *, clock: Clock, allo
         rig.set_hook_phase("recovery")
         login_ok = recovery_login(rig, allowlist, clock, fixture_account)
         steps.append(("recovery_login", clock.monotonic()))
+        found = None
         if login_ok:
-            cancel, end = cancel_new_working(rig, start, rig.read_orders(), clock=clock, steps=steps)
-        inputs = ProofInputs(start=start, end=end, recovery_login_ok=login_ok, cancel_all=cancel, declared_sends=sends)
+            cancel, end, found = cancel_new_working(rig, start, rig.read_orders(), clock=clock, steps=steps)
+        inputs = ProofInputs(start=start, end=end, recovery_login_ok=login_ok, cancel_all=cancel, declared_sends=sends,
+                             found=found)
     proof = post_run_proof(inputs)
     steps.append(("proof", clock.monotonic()))
     rig.revert_snapshot()

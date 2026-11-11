@@ -19,7 +19,8 @@ from sentinel.orchestrator.identity import (Allowlist, assertion_due, classify, 
                                             judge_identity, load_allowlist, send_frame_fresh)
 from sentinel.orchestrator.killswitch import (CANCEL_BY_HAND, ORDERS_SENT, PROVEN_DECLARED, PROVEN_NO_SESSION,
                                               PROVEN_NONE, UNPROVEN, UNPROVEN_BLOCK, Proof, ProofInputs, TripWires,
-                                              account_ref, cancel_new_working, check_tripwires, config_invalid_proof,
+                                              account_ref, book_sha256, cancel_new_working, check_tripwires,
+                                              config_invalid_proof,
                                               execute_kill_switch, kill_switch, masked_account, post_run_proof,
                                               proof_result, send_lines)
 from sentinel.orchestrator.orderbook import MonitorBook
@@ -527,9 +528,82 @@ def test_cancel_all_rereads_until_no_new_row_of_any_kind_remains():
     rig = SlowRig(clock=clock)
     start = OrderBook(net_liq=2500.0)
     _with_send(rig)
-    cancel, end = cancel_new_working(rig, start, rig.book, clock=clock)
+    cancel, end, found = cancel_new_working(rig, start, rig.book, clock=clock)
     assert cancel == "done" and rig.reads == 3 and not end.working and end.readable     # an unreadable read is no "clear"
+    assert found is not None and [r.key for r in found.working] == ["s1"]               # the read that found the row
     assert cancel_new_working(rig, start, OrderBook(net_liq=2500.0), clock=clock)[0] == "not_needed"
+
+
+class BlurAfterCancel(SimulatedRig):
+    """A rig whose Monitor reads go bad once Cancel All is clicked (a confirmation popup over the grid): unreadable,
+    or with `disagree` readable with no Working row but disagreeing with Copy All."""
+
+    def __init__(self, *a, disagree: bool = False, **kw):
+        super().__init__(*a, **kw)
+        self.disagree, self.blurred = disagree, False
+
+    def cancel_all(self) -> CancelAllResult:
+        self.blurred = True
+        return super().cancel_all() if not self.disagree else CancelAllResult(True, True)
+
+    def read_orders(self) -> MonitorBook:
+        book = super().read_orders()
+        if not self.blurred:
+            return book
+        return replace(book, working=(), copy_all_agrees=False) if self.disagree else replace(book, readable=False)
+
+
+@pytest.mark.parametrize("disagree", [False, True])
+def test_a_clean_read_that_found_an_undeclared_row_is_orders_sent_though_every_reread_after_cancel_all_is_bad(
+        disagree):
+    """killswitch:0: the clean read that triggered Cancel All is kept (`ProofInputs.found`), so re-reads that are
+    unreadable, or readable but disagree with Copy All, for 60 s give ORDERS SENT with Cancel All failed and the
+    login-owner hand-over, not UNPROVEN monitor_unreadable."""
+    clock = ManualClock()
+    rig = BlurAfterCancel(clock=clock, disagree=disagree)
+    start = rig.read_orders()
+    rig._send()
+    rep = _ks(rig, clock, start)
+    assert rig.calls.count("cancel_all") <= 1 and rep.proof.cancel_all == "failed"
+    assert rep.proof.line == "ORDERS SENT: undeclared rows (sim-order-1); Cancel All failed"
+    e = rep.proof_effect
+    assert e.incident == "S1" and e.run_reason == "undeclared_order_row" and "login_owner" in e.alert.paged
+    assert e.evidence["blocked_reason"] == "incident" and e.evidence["instruction"] == CANCEL_BY_HAND
+
+
+def test_the_recovery_proof_after_a_killed_tree_keeps_the_clean_read_that_found_the_row():
+    """killswitch:0 on machine._recovery_proof: a result that killed the tree (a deferred assertion past five minutes)
+    with an order out; every re-read after Cancel All is unreadable, so the run is ORDERS SENT, not UNPROVEN."""
+    from sentinel.orchestrator.identity import deferral_unreadable
+    from sentinel.orchestrator.machine import Orchestrator
+    from sentinel.orchestrator.simrig import MemorySink, default_context
+
+    clock = ManualClock()
+    rig = BlurAfterCancel(clock=clock)
+
+    def work(o):
+        rig._send()
+        o.apply(deferral_unreadable(deferred_s=400.0))
+
+    rep = Orchestrator(rig, default_context(), MemorySink(["c1"]), clock=clock).run(work)
+    assert rep.proof.line == "ORDERS SENT: undeclared rows (sim-order-1); Cancel All failed"
+    assert (rep.verdict.status, rep.verdict.reason) == ("aborted_safety", "undeclared_order_row")
+
+
+def test_the_proof_takes_orders_sent_from_a_clean_found_read_and_names_that_read():
+    """killswitch:0: `found` only ever adds undeclared rows, and only from a clean read; its sha is the end read the
+    proof compared when the last read was not clean."""
+    row = OrderRow("x1", "working", "WORKING")
+    found = OrderBook(working=(row,), net_liq=2500.0)
+    p = post_run_proof(ProofInputs(START, replace(found, readable=False), cancel_all="failed", found=found))
+    assert p.line == "ORDERS SENT: undeclared rows (x1); Cancel All failed" and p.end_sha256 == book_sha256(found)
+    dirty = post_run_proof(ProofInputs(START, None, cancel_all="failed", found=replace(found, copy_all_agrees=False)))
+    assert (dirty.verdict, dirty.reason) == (UNPROVEN, "monitor_unreadable")
+    canceled = OrderBook(canceled=(replace(row, grid="canceled", status="CANCELED"),), net_liq=2500.0)
+    both = post_run_proof(ProofInputs(START, canceled, cancel_all="done", found=found))
+    assert both.line == "ORDERS SENT: undeclared rows (x1); Cancel All verified"     # one row, by its key
+    vanished = post_run_proof(ProofInputs(START, START, cancel_all="done", found=found))
+    assert vanished.verdict == ORDERS_SENT and [r.key for r in vanished.undeclared] == ["x1"]
 
 
 def test_a_failed_recovery_login_pages_the_login_owner_and_blocks_with_its_reason():

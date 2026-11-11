@@ -707,14 +707,14 @@ class Orchestrator:
             if ok:
                 break
         end = rig.read_orders() if ok else None
-        cancel = "not_needed"
+        cancel, found = "not_needed", None
         if end is not None:
-            cancel, end = cancel_new_working(rig, self.start_book, end, clock=self.clock)    # 6.6 step 5
+            cancel, end, found = cancel_new_working(rig, self.start_book, end, clock=self.clock)    # 6.6 step 5
         if kicked:
             return post_run_proof(ProofInputs(start=self.start_book, end=end, session="kicked", kicked_login_ok=ok,
-                                              cancel_all=cancel, declared_sends=sends)), end
+                                              cancel_all=cancel, declared_sends=sends, found=found)), end
         return post_run_proof(ProofInputs(start=self.start_book, end=end, recovery_login_ok=ok, cancel_all=cancel,
-                                          declared_sends=sends)), end
+                                          declared_sends=sends, found=found)), end
 
 
 def _screenshot(book: OrderBook | None) -> str | None:

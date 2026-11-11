@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 
 import pytest
 
@@ -211,6 +212,29 @@ def test_a_recovery_login_that_fails_fails_item5_with_no_read():
     r = drill(rig)
     assert r.failed == ("item5",) and not r.observation.item5.recovery_login_ok
     assert r.observation.new_order_rows == 0 and "recovery login failed" in r.result.checkpoint.detail
+
+
+def test_an_order_found_by_item5s_clean_read_is_the_s1_case_though_the_rereads_go_unreadable():
+    """killswitch:0: item 5's recovery read finds a stray order and clicks Cancel All; every re-read after the click is
+    unreadable. The clean read that found it still counts, so the drill is the S1 drill_order_placed case."""
+    class BlurAfterCancel(SimulatedRig):
+        blurred = False
+
+        def cancel_all(self):
+            self.blurred = True
+            return super().cancel_all()
+
+        def read_orders(self):
+            book = super().read_orders()
+            return book if not self.blurred else replace(book, readable=False)
+
+    rig = ready(BlurAfterCancel())
+    start = rig.read_orders()
+    rig._send()                                          # a stray order before item 5
+    r = run_drill(rig, DropLedger(), rig.clock, CHORDS, start, MemoryChannel(), port=SimDrillPort(rig),
+                  preconditions=OK, allowlist=CTX.allowlist, rig_id="rig-01", fixture_account=CTX.fixture_account)
+    assert r.observation.new_order_rows == 1 and r.result.incident == "S1"
+    assert (r.result.run_status, r.result.run_reason) == ("aborted_safety", "drill_order_placed")
 
 
 def test_sim_drill_port_names_only_the_drill_targets():

@@ -78,6 +78,14 @@ Choices (reported):
     shard and no login, `PROVEN: no session established` read from the gateway log (`config_invalid_proof`).
 15. A human request (`ports.KillRequest`, killflag.py) is named in the decision's detail and evidence (6.6 step 2: the
     run is marked with its trigger).
+16. Incident severity (6.12): a kill switch is S1 for a new order row or a Live identity, else S2 ("kill switch tripped
+    with a clean proof"); the proof raises it to S1 when it finds an undeclared row (`proof_result`).
+17. The hook per phase of the sequence (gateway.HOOK_STATES, 6.6 steps 1 and 5): deny-all before the tree is killed; the
+    recovery-only arm for the recovery login and Cancel All, so the slow half tokens nothing but the scripted login and
+    the recovery teardown actions; `between_runs` once the proof is produced and the snapshot reverted. After
+    `live_identity` the recovery arm is never entered, since no recovery login is made (SD-64). `reset_input_state`
+    runs right after the kill, as before every relaunch (7.7, 10.2 step 4), so no token of the dead tree's input is
+    pending when the recovery login types.
 """
 from __future__ import annotations
 
@@ -192,7 +200,7 @@ def kill_switch(trigger: str, *, gate: str, running_flow: str | None = None,
         ev["request"] = asdict(request)
         asked = f" (requested by {request.requested_by} via {request.channel}: {request.reason})"
     return ControlResult("kill_switch", False, gate, run=run, unreached=un, alert=alerts.safety_abort(),
-                         actions=tuple(acts), incident="S1" if trigger in ("new_order_row", "live_identity") else None,
+                         actions=tuple(acts), incident="S1" if trigger in ("new_order_row", "live_identity") else "S2",
                          detail=f"kill switch: {trigger}{asked}" + (f"; flow {running_flow} quarantined" if running_flow
                                                                      else ""), evidence=ev)
 
@@ -499,9 +507,16 @@ def account_ref(allowlist: Allowlist, account_id: str | None) -> str:
     return f"account {masked_account(account_id)} (allowlist entry {allowlist.index(account_id)}) on rig {allowlist.rig}"
 
 
+def live_identity_blocked(decision: ControlResult, run_so_far: RunVerdict | None = None) -> bool:
+    """True when the login was just blocked for `live_identity`, by the decision or the run so far: no recovery
+    login may be made on it (6.4, 6.6 step 5, SD-64)."""
+    return "live_identity" in (decision.run_reason, run_so_far.reason if run_so_far is not None else None)
+
+
 def recovery_login(rig: Rig, allowlist: Allowlist, clock: Clock, fixture_account: str | None) -> bool:
     """A fresh scripted login with A1 and A2 (6.6 step 5): relaunch, LOGIN, an allowlisted selector, the fixture
-    account selected. True when the session is usable for the proof."""
+    account selected. True when the session is usable for the proof. The caller puts the hook in the recovery-only arm
+    first (choice 17): the login's typing goes through the gateway like any other input."""
     rig.launch()
     o = rig.login()
     if o.auth_error or o.challenge or o.session_kicked or o.live_selected or not o.vault_lease \
@@ -551,19 +566,22 @@ def execute_kill_switch(rig: Rig, decision: ControlResult, *, clock: Clock, allo
                         declared_sends: Sequence[DeclaredSend] = (), run_so_far: RunVerdict | None = None,
                         unproven_streak: int = 0) -> KillSwitchReport:
     """Drive steps 1, 3, 5 and 6 of the 6.6 sequence on `rig` after `kill_switch` decided (steps 2 and 4 are
-    the decision's unreached outcome and alert, written by the caller). After `live_identity` no recovery login is
-    made and the proof is UNPROVEN `session_unavailable` (SD-64)."""
+    the decision's unreached outcome and alert, written by the caller), with the hook in the phase each step needs
+    (choice 17). After `live_identity` (the decision's or the run's so far) no recovery login is made and the proof
+    is UNPROVEN `session_unavailable` (SD-64)."""
     steps: list[tuple[str, float]] = []
-    rig.set_hook_state(armed=False, deny_all=True)
+    rig.set_hook_phase("kill_switch")
     steps.append(("deny_all", clock.monotonic()))
     rig.kill_process_tree()
+    rig.reset_input_state()                     # a fresh gateway instance before the relaunch (7.7, 10.2 step 4)
     steps.append(("kill_tree", clock.monotonic()))
     sends = tuple(declared_sends)
     end: OrderBook | None = None
-    if decision.run_reason == "live_identity":
+    if live_identity_blocked(decision, run_so_far):
         inputs = ProofInputs(start=start, end=None, session="blocked", declared_sends=sends)
     else:
         cancel = "not_needed"
+        rig.set_hook_phase("recovery")
         login_ok = recovery_login(rig, allowlist, clock, fixture_account)
         steps.append(("recovery_login", clock.monotonic()))
         if login_ok:
@@ -573,6 +591,7 @@ def execute_kill_switch(rig: Rig, decision: ControlResult, *, clock: Clock, allo
     steps.append(("proof", clock.monotonic()))
     rig.revert_snapshot()
     steps.append(("revert_snapshot", clock.monotonic()))
+    rig.set_hook_phase("between_runs")
     shot = end.screenshot_sha256 if isinstance(end, MonitorBook) else None
     return KillSwitchReport(decision, proof, proof_result(proof, run_so_far=run_so_far or decision.run,
                                                           unproven_streak=unproven_streak,

@@ -12,7 +12,7 @@ from sentinel.orchestrator.killflag import (FLAG_PATH, PIPE_NAME, PROBE_REASON, 
 from sentinel.orchestrator.killswitch import PROVEN_NONE, TripWires
 from sentinel.orchestrator.machine import Orchestrator
 from sentinel.orchestrator.ports import KillChannel, KillRequest
-from sentinel.orchestrator.simrig import MemorySink, SimulatedRig, default_context
+from sentinel.orchestrator.simrig import MemorySink, SimScenario, SimulatedRig, default_context
 
 FLOW = "flow.trade.order-ticket.stock.limit"
 REQ = KillRequest("rig-01", "cli", "asmith", "wrong build on the rig", "2026-11-10T14:00:00+00:00")
@@ -108,16 +108,16 @@ def test_sentinel_stop_writes_the_flag_and_reports_usage_and_transport_errors(tm
 def test_sentinel_stop_mid_run_aborts_kill_switch_runs_the_sequence_and_proves_no_orders_sent(tmp_path):
     """The gap's end-to-end case: `sentinel stop rig-01` against a simulated rig mid-run."""
     clock = ManualClock()
-    rig = SimulatedRig(clock=clock)
+    rig = SimulatedRig(SimScenario(kill_root=tmp_path), clock=clock)       # the rig's flag is <root>/rig-01/run
     sink = MemorySink(["c1", "c2", "c3"])
-    ch, pipe = flag(tmp_path), MemoryKillChannel()
+    ch, pipe = rig.kill_channels()
+    assert isinstance(ch, FileFlagChannel) and ch.path == rig_flag_path(tmp_path, "rig-01")
 
     def work(o: Orchestrator) -> None:
         o.sink.record("c1", "identical")
-        assert check(ch, pipe, gate="running", running_flow=FLOW) is None
+        assert o.flow_boundary(flow_id=FLOW) is None
         assert main(["rig-01", "--root", str(tmp_path), "--by", "asmith"], clock=clock) == 0
-        r = check(ch, pipe, gate="running", running_flow=FLOW)            # the next step boundary
-        o.apply(r)
+        assert o.step_boundary() is o.stop is not None                     # the next step boundary polls the flag
 
     report = Orchestrator(rig, default_context(), sink, clock=clock).run(work)
     assert (report.verdict.status, report.verdict.reason) == ("aborted_safety", "kill_switch")
@@ -126,9 +126,32 @@ def test_sentinel_stop_mid_run_aborts_kill_switch_runs_the_sequence_and_proves_n
     ks = report.kill_switch
     assert ks is not None and [s for s, _ in ks.steps] == ["deny_all", "kill_tree", "recovery_login", "proof",
                                                            "revert_snapshot"]
-    assert report.proof.verdict == PROVEN_NONE and report.proof.line == "PROVEN: no orders sent" and rig.gw.deny_all
+    assert report.proof.verdict == PROVEN_NONE and report.proof.line == "PROVEN: no orders sent"
+    assert ks.result.evidence["trigger"] == "file_flag" and ks.result.incident == "S2"
     asked = KillRequest(**ks.result.evidence["request"])
-    assert asked.requested_by == "asmith" and acknowledge(ch, pipe) == [asked] and ch.poll() is None
+    assert asked.requested_by == "asmith" and ks.result.has("quarantine_flow")
+    assert ch.poll() is None and acknowledge(ch, pipe) == []               # handled once the sequence ran
+    assert not rig.gw.deny_all and not rig.gw.armed                          # between runs
+
+
+def test_a_named_pipe_request_and_a_pending_flag_at_preflight(tmp_path):
+    """The pipe trips the switch at a flow boundary too; a request left pending fails the next run's H5 (12.7)."""
+    clock = ManualClock()
+    rig = SimulatedRig(clock=clock)
+    _, pipe = rig.kill_channels()
+
+    def work(o: Orchestrator) -> None:
+        pipe.post(KillRequest("rig-01", "watchdog", "watchdog", "hang", clock.now().isoformat()))
+        assert o.flow_boundary(flow_id=FLOW) is o.stop
+
+    report = Orchestrator(rig, default_context(), MemorySink(["c1"]), clock=clock).run(work)
+    assert report.kill_switch.result.evidence["trigger"] == "named_pipe" and pipe.poll() is None
+    stuck = SimulatedRig(SimScenario(kill_root=tmp_path), clock=clock)
+    main(["rig-01", "--root", str(tmp_path)], clock=clock)
+    report = Orchestrator(stuck, default_context(), MemorySink(["c1"]), clock=clock).run()
+    assert (report.verdict.status, report.verdict.reason) == ("aborted_harness", "preflight.H5")
+    assert "a stop request is pending" in report.gate("provisioned").evidence["detail"]["H5"]
+    assert stuck.kill_channels()[0].poll() is not None                      # never overwritten by the probe
 
 
 def test_h5_round_trips_both_channels_and_leaves_nothing_behind(tmp_path):

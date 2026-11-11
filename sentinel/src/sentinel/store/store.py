@@ -1090,7 +1090,9 @@ class Store:
     # -- identity: logins, rigs, builds, checkpoints -------------------------------------------------------
     def register_rig(self, rig_id: str, *, login_alias: str, owner: str, snapshot_id: str, allowlist_entry: int,
                      tier: str = "A", role: str = "pool", login_kind: str = "scripted") -> None:
-        """Add or refresh a rig and its login (8.3 `rigs`, `logins`); the vault alias only, never a credential."""
+        """Add or refresh a rig and its login (8.3 `rigs`, `logins`); the vault alias only, never a credential. A
+        refresh never puts back in service a rig a safety action took out (`disabled_at` set and no human re-enable
+        since): only `safety.enable_rig` does that (6.6 step 6, 6.12)."""
         with self._batch("rig") as rows:
             if self._one("SELECT 1 FROM logins WHERE login_alias = ?", (login_alias,)) is None:
                 self._insert(rows, "logins", {"login_alias": login_alias, "kind": login_kind,
@@ -1098,7 +1100,9 @@ class Store:
             self._insert(rows, "rigs", {"rig_id": rig_id, "tier": tier, "role": role, "login_alias": login_alias,
                                         "snapshot_id": snapshot_id, "active": 1},
                          upsert="(rig_id) DO UPDATE SET tier = excluded.tier, role = excluded.role, "
-                                "login_alias = excluded.login_alias, snapshot_id = excluded.snapshot_id, active = 1")
+                                "login_alias = excluded.login_alias, snapshot_id = excluded.snapshot_id, "
+                                "active = CASE WHEN rigs.disabled_at IS NOT NULL AND rigs.enabled_at IS NULL "
+                                "THEN rigs.active ELSE 1 END")
 
     def register_build(self, build_id: str, *, channel: str, source_commit: str, pipeline_artifact_url: str,
                        installer_sha256: str, branch: str | None = None, first_seen_at: str | None = None,

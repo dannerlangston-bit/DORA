@@ -27,9 +27,19 @@ LOGIN flow, a relaunch login, a recovery login), every A9 drill ticket and every
 lets run count themselves; the caller adds symbol changes (`counters.symbol_change`) and seeds earlier runs'
 events from the store.
 
-The session's safety state is a `ports.SessionSafety` (`safety`, pushed to `safety_listener` on every change): the
-attestation stage `a3_a8` before the A9 click and `a3_a9` once the gate passed (SD-57), and the last passing
-assertion; it is cleared whenever the session ends (the tree killed, a relaunch, a kicked session, the run's end).
+The session's safety state is a `ports.SessionSafety` (`safety`, pushed to `safety_listener` on every change; the
+caller passes `rig.set_session_safety` there so the slow half reads it): the attestation stage `a3_a8` before the A9
+click and `a3_a9` once the gate passed (SD-57), and the last passing assertion; it is cleared whenever the session
+ends (the tree killed, a relaunch, a kicked session, the run's end).
+
+What the Orchestrator reads from the rig besides the gates (rig.py): the kill switch's human channels
+(`kill_channels`), polled first at every step and flow boundary (`killflag.check`, 6.6) and acknowledged once the
+sequence ran; the Watchdog's reverse heartbeat and free space (`watchdog_status`, `free_bytes`; a caller's
+`watchdog_status` or a boundary's observations take precedence); the Window Watcher's `order_event` window and dialog
+age (`window_tripwires`); and the gated branch's declared sends (`declared_sends`), which every proof lists and the
+new-row trip-wire does not count. The hook follows `gateway.HOOK_STATES`: `running` once the main frame is up, the
+recovery-only arm for every recovery login and its Cancel All (the kill switch sequence, the recovery proof after a
+killed tree, the kicked session's proof login), `between_runs` at the end of every run.
 
 How a run ends, by the result that stopped it:
 
@@ -71,8 +81,11 @@ Relaunch choices (reported): a relaunch never replaces the run-start snapshot, s
 whole run; its fresh Monitor read is checked against the snapshot instead, and a new Working or Filled row is the
 kill switch (6.6 Triggers) at the gate in force. The hook is put in deny-all before the tree is killed and stays
 there until the relaunch's `launched` gate arms it for the LOGIN flow. `session_release_wait` is waited before the
-relaunch, which precedes its login (7.7 "before any relaunch login"). The default wall budget starts when the
-Orchestrator is built; a Calibration run must be given its `WallBudget` (its window end is a calendar time).
+relaunch, which precedes its login (7.7 "before any relaunch login"); `reset_input_state` runs right after the kill
+(7.7). The default wall budget starts when the Orchestrator is built; a Calibration run must be given its
+`WallBudget` (its window end is a calendar time). The chords loaded at `settings_attested` are the A6 bindings and the
+pinned defaults (`gateway_config.order_hotkey_list`, from `RunContext.order_hotkeys` or the chords given alone); more
+than sixteen fail the run closed there (`aborted_harness (reason: config_invalid)`, 5.4.7).
 """
 from __future__ import annotations
 
@@ -80,7 +93,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 
-from ..records import RunOutcome
+from ..records import DeclaredSend, RunOutcome
+from . import killflag
 from .attestation import SAFETY_ROWS, AttestationProfile, RowReads, a9_passed, attest, matches, readable
 from .boundary import (BoundaryObservations, DialogTimer, FlowTimer, flow_budget_cut, flow_budget_s, new_order_rows,
                        tripwire_result)
@@ -88,13 +102,16 @@ from .budgets import SESSION_RELEASE_WAIT_S, RateCounters, ReloginBudget, ShardB
 from .clock import Clock, SystemClock
 from .degraded import ModelAvailability, SpendTracker
 from .gateway import Chord, DropLedger
+from .gateway_config import DefaultOrderHotkeys, GatewayConfigError, order_hotkey_list
 from .gates import (AccountExpectation, WorkspaceExpectation, check_authenticated, check_canary_flow, check_fixture,
                     check_launched, check_provisioned, check_teardown, check_workspace, decide_run_outcome)
 from .identity import (READ_GAP_S, TIMER_S, Allowlist, assertion_due, deferral_unreadable, judge_fixture_account,
                        judge_identity, paper_stamp, readable as selector_readable, stamp_current)
-from .killswitch import (ORDERS_SENT, KillSwitchReport, Proof, ProofInputs, cancel_new_working, execute_kill_switch,
-                         kill_switch, post_run_proof, proof_result, recovery_login, teardown_incident)
+from .killswitch import (ORDERS_SENT, KillSwitchReport, Proof, ProofInputs, account_ref, cancel_new_working,
+                         execute_kill_switch, kill_switch, post_run_proof, proof_result, recovery_login,
+                         teardown_incident)
 from .alerts import AlertRoute
+from .orderbook import MonitorBook
 from .ports import SessionSafety
 from .results import ControlResult, OutcomeSink, RunVerdict, write_unreached
 from .rig import ConfirmationCheck, OrderBook, Rig, SelectorRead
@@ -130,11 +147,20 @@ class RunContext:
     profile: AttestationProfile
     fixture: dict[str, AccountExpectation]
     workspace: WorkspaceExpectation
-    default_order_chords: tuple[Chord, ...] = ()
+    default_order_chords: tuple[Chord, ...] = ()            # the default order chords alone, without their file
     reseed_due_passed: bool = False
     history: LoginHistory = LoginHistory()
     shard: int = 1
     attempt: int = 1
+    order_hotkeys: DefaultOrderHotkeys | None = None         # the loaded gateway/default_order_hotkeys.yaml (5.4.7)
+
+    def default_hotkeys(self) -> DefaultOrderHotkeys:
+        """The pinned build's default order chords loaded at `settings_attested` (5.4.7): the loaded file, or the
+        chords given alone."""
+        if self.order_hotkeys is not None:
+            return self.order_hotkeys
+        return DefaultOrderHotkeys(build=self.expected_build, verified=False, chords=tuple(self.default_order_chords),
+                                   actions=("",) * len(self.default_order_chords))
 
 
 @dataclass
@@ -183,7 +209,8 @@ class Orchestrator:
         self.relogin = relogin or ReloginBudget()
         self.ledger = ledger or DropLedger()
         self.heartbeat = heartbeat
-        self.watchdog_status = watchdog_status
+        self.watchdog_status = watchdog_status or rig.watchdog_status
+        self.kill_flag, self.kill_pipe = rig.kill_channels()
         self.wall = wall if wall is not None else WallBudget.for_run(ctx.run_type, self.clock.monotonic())
         self.spend = spend or SpendTracker()
         self.model = model or ModelAvailability()
@@ -237,11 +264,9 @@ class Orchestrator:
             except HeartbeatUnwritable as e:
                 self.apply(heartbeat_failed(e))
                 return self.stop is None
-        if self.watchdog_status is not None:
-            age, alive = self.watchdog_status()
-            r = watchdog_check(age, alive)
-            if r is not None:
-                self.apply(r)
+        r = watchdog_check(*self.watchdog_status())
+        if r is not None:
+            self.apply(r)
         return self.stop is None
 
     # -- the session's safety state (6.3, 6.4, SD-57) ---------------------------------------------------
@@ -315,7 +340,7 @@ class Orchestrator:
             break
         self.launched_mono = self.clock.monotonic()
         self.flows_since_launch = 0
-        rig.set_hook_state(armed=True, deny_all=False)
+        rig.set_hook_phase("running")
         if not self._gate("authenticated"):
             return False
         self.counters.login(self.clock.now())
@@ -394,6 +419,7 @@ class Orchestrator:
         if self.start_book is None:
             self.start_book = book
             return True
+        self.declared_sends |= {d.row_key for d in self.rig.declared_sends()}
         rows = new_order_rows(self.start_book, book, frozenset(self.declared_sends))
         if not rows:
             return True
@@ -429,10 +455,16 @@ class Orchestrator:
         res = attest(reads, ctx.profile, a9=a9, a9_second=a9b, a10=a10, rc_run=rc, evidence=evidence,
                      previous_unreadable=ctx.history.attestation_unreadable_last_run)
         self.apply(res.result)
-        if res.result.passed:
-            rig.load_order_chords(list(res.chords) + list(ctx.default_order_chords))
-            self._set_safety(replace(self.safety, attestation_stage="a3_a9"))    # SD-57: a later send may run
-        return res.result.passed
+        if not res.result.passed:
+            return False
+        try:                                    # the A6 bindings and the pinned defaults, at most sixteen (5.4.7)
+            chords = order_hotkey_list(res.chords, ctx.default_hotkeys())
+        except GatewayConfigError as err:
+            self.apply(err.result)
+            return False
+        rig.load_order_chords(chords)
+        self._set_safety(replace(self.safety, attestation_stage="a3_a9"))    # SD-57: a later send may run
+        return True
 
     # -- boundaries inside `running` (boundary.py) -----------------------------------------------------
     def flow_boundary(self, obs: BoundaryObservations | None = None, *, now: float | None = None,
@@ -515,29 +547,33 @@ class Orchestrator:
         return r
 
     def _tripwires(self, now: float, obs: BoundaryObservations, *, read_book: bool) -> ControlResult | None:
-        """The 6.6 trip-wires at a boundary: the caller's wires, plus a new Working or Filled row against the
-        run-start snapshot, the dialog timer and the run's gateway drops."""
-        self.declared_sends |= obs.declared_sends
+        """The 6.6 trip-wires at a boundary: first the human channels, the rig's file flag and named pipe
+        (`killflag.check`, the request named on the decision); then the caller's wires, plus a new Working or Filled
+        row against the run-start snapshot (the rig's declared sends excluded), the Window Watcher's `order_event`
+        window and dialog age, the dialog timer and the run's gateway drops."""
+        running = self.flow.flow_id if self.flow is not None else self._last_flow
+        human = killflag.check(self.kill_flag, self.kill_pipe, gate=self.state, running_flow=running)
+        if human is not None:
+            return human
+        self.declared_sends |= obs.declared_sends | {d.row_key for d in self.rig.declared_sends()}
         orders = obs.orders if obs.orders is not None else (self.rig.read_orders() if read_book else None)
         rows = new_order_rows(self.start_book, orders, frozenset(self.declared_sends))
         open_s = self._dialog.observe(obs.order_dialog_visible, now) if obs.order_dialog_visible is not None else 0.0
+        seen = self.rig.window_tripwires()
         w = obs.tripwires
         wires = replace(w, new_working_or_filled=w.new_working_or_filled or bool(rows),
-                        dialog_open_s=max(w.dialog_open_s, open_s),
+                        order_event_window=w.order_event_window or seen.order_event_window,
+                        dialog_open_s=max(w.dialog_open_s, open_s, seen.dialog_open_s),
                         gateway_drops=max(w.gateway_drops, self.ledger.run_count))
-        running = self.flow.flow_id if self.flow is not None else self._last_flow
         return tripwire_result(wires, gate=self.state, running_flow=running, drop_limit=self.ledger.per_run,
                                new_rows=rows)
 
     def _watchdog(self, obs: BoundaryObservations) -> ControlResult | None:
-        status = obs.watchdog if obs.watchdog is not None else (
-            self.watchdog_status() if self.watchdog_status is not None else None)
-        return watchdog_check(*status) if status is not None else None
+        return watchdog_check(*(obs.watchdog if obs.watchdog is not None else self.watchdog_status()))
 
     def _disk(self, obs: BoundaryObservations) -> ControlResult | None:
-        if obs.free_bytes is None:
-            return None
-        r = disk_check(obs.free_bytes, obs.disk_floor_bytes)
+        free = obs.free_bytes if obs.free_bytes is not None else self.rig.free_bytes()
+        r = disk_check(free, obs.disk_floor_bytes)
         if r is not None and r.run is None:                 # the run-health warning, once per shard
             if self._disk_warned:
                 return None
@@ -578,6 +614,7 @@ class Orchestrator:
                                            "flows_since_launch": self.flows_since_launch}))
         self.rig.set_hook_state(armed=True, deny_all=True)
         self.rig.kill_process_tree()
+        self.rig.reset_input_state()                       # 7.7: after the kill, before the relaunch
         self._clear_safety()
         self.flow = None
         self.clock.sleep(SESSION_RELEASE_WAIT_S)
@@ -593,12 +630,13 @@ class Orchestrator:
         streak = ctx.history.unproven_streak
         so_far = stop.run if stop else None
         kill_switch_path = stop is not None and (stop.run_status == "aborted_safety" or stop.has("kill_switch"))
+        sends = rig.declared_sends()                        # the gated branch's declared sends, for every proof (6.7)
+        account = account_ref(ctx.allowlist, ctx.fixture_account)
         if not kill_switch_path and ((stop is not None and stop.has("kill_tree")) or self.session == "kicked"):
             rig.kill_process_tree()          # a kicked session's tree goes too: the proof's login starts afresh
+            rig.reset_input_state()          # as before every relaunch (7.7)
         if kill_switch_path:
-            ks = execute_kill_switch(rig, stop, clock=self.clock, allowlist=ctx.allowlist, start=self.start_book,
-                                     fixture_account=ctx.fixture_account, run_so_far=so_far, unproven_streak=streak)
-            self._count_recovery_login(ks)
+            ks = self._kill_switch_sequence(stop, so_far, sends)
             proof = ks.proof
             self.apply(ks.proof_effect)
         elif self.session == "never" or (self.session == "established" and self.start_book is None
@@ -607,26 +645,26 @@ class Orchestrator:
             proof = post_run_proof(ProofInputs(start=None, end=None, session="never", tokens_issued=tokens))
             self.apply(proof_result(proof, run_so_far=so_far, unproven_streak=streak))
         elif self.session == "kicked" or (stop is not None and stop.has("kill_tree")):
-            proof = self._recovery_proof(kicked=self.session == "kicked")
-            self.apply(proof_result(proof, run_so_far=so_far, unproven_streak=streak))
+            proof, end = self._recovery_proof(kicked=self.session == "kicked", sends=sends)
+            self.apply(proof_result(proof, run_so_far=so_far, unproven_streak=streak, account=account,
+                                    screenshot_sha256=_screenshot(end)))
         else:
             self.state = last_gate = "teardown"
             obs = rig.teardown()
             self.apply(check_teardown(obs))
             end = rig.read_orders()
-            proof = post_run_proof(ProofInputs(start=self.start_book, end=end,
+            proof = post_run_proof(ProofInputs(start=self.start_book, end=end, declared_sends=sends,
                                                cancel_all="not_needed" if obs.cancel_all_verified else "failed"))
-            effect = proof_result(proof, run_so_far=so_far, unproven_streak=streak)
+            effect = proof_result(proof, run_so_far=so_far, unproven_streak=streak, account=account,
+                                  screenshot_sha256=_screenshot(end))
             if proof.verdict == ORDERS_SENT:
                 # 1.10, 6.6: an undeclared row at teardown is an aborted_safety; the kill switch sequence cancels it,
                 # and the incident pages once, after the sequence, with what Cancel All finally did (9.10)
-                ks = execute_kill_switch(rig, effect, clock=self.clock, allowlist=ctx.allowlist, start=self.start_book,
-                                         fixture_account=ctx.fixture_account, run_so_far=effect.run,
-                                         unproven_streak=streak)
-                self._count_recovery_login(ks)
+                ks = self._kill_switch_sequence(effect, effect.run, sends)
                 effect = teardown_incident(proof, effect, ks)
                 proof = ks.proof
             self.apply(effect)
+        rig.set_hook_phase("between_runs")                  # every run ends with the hook disarmed (6.6, 6.2)
         report = RunReport(ctx.run_id, ctx.run_type, RunVerdict("complete"), last_gate, proof, kill_switch=ks)
         any_env = any(o is not None and o.outcome == "env_error"
                       for r in self.results for o in (r.unreached, r.checkpoint, *[s.outcome for s in r.outcomes]))
@@ -641,14 +679,24 @@ class Orchestrator:
         report.last_gate = stop.gate if stop is not None and stop.gate else last_gate
         return report
 
-    def _count_recovery_login(self, ks: KillSwitchReport) -> None:
-        """The kill switch's recovery login is a login on the login id (6.4 rate caps)."""
+    def _kill_switch_sequence(self, decision: ControlResult, so_far: RunVerdict | None,
+                              sends: tuple[DeclaredSend, ...]) -> KillSwitchReport:
+        """The 6.6 sequence on the rig with the run's declared sends; its recovery login counts toward the 6.4 rate
+        caps, and the human requests pending on the kill channels are handled once it has run (killflag.py)."""
+        ctx = self.ctx
+        ks = execute_kill_switch(self.rig, decision, clock=self.clock, allowlist=ctx.allowlist, start=self.start_book,
+                                 fixture_account=ctx.fixture_account, declared_sends=sends, run_so_far=so_far,
+                                 unproven_streak=ctx.history.unproven_streak)
         if any(name == "recovery_login" for name, _ in ks.steps):
             self.counters.login(self.clock.now())
+        killflag.acknowledge(self.kill_flag, self.kill_pipe)
+        return ks
 
-    def _recovery_proof(self, *, kicked: bool) -> Proof:
-        """6.6 step 5 (and the kicked-session rule): a fresh scripted login with A1 and A2, then the proof."""
+    def _recovery_proof(self, *, kicked: bool, sends: tuple[DeclaredSend, ...]) -> tuple[Proof, OrderBook | None]:
+        """6.6 step 5 (and the kicked-session rule): in the hook's recovery-only arm, a fresh scripted login with A1
+        and A2, then the proof; returns it with the last Monitor read."""
         rig, ctx = self.rig, self.ctx
+        rig.set_hook_phase("recovery")
         attempts = 2 if kicked else 1
         ok = False
         for _ in range(attempts):
@@ -664,5 +712,11 @@ class Orchestrator:
             cancel, end = cancel_new_working(rig, self.start_book, end, clock=self.clock)    # 6.6 step 5
         if kicked:
             return post_run_proof(ProofInputs(start=self.start_book, end=end, session="kicked", kicked_login_ok=ok,
-                                              cancel_all=cancel))
-        return post_run_proof(ProofInputs(start=self.start_book, end=end, recovery_login_ok=ok, cancel_all=cancel))
+                                              cancel_all=cancel, declared_sends=sends)), end
+        return post_run_proof(ProofInputs(start=self.start_book, end=end, recovery_login_ok=ok, cancel_all=cancel,
+                                          declared_sends=sends)), end
+
+
+def _screenshot(book: OrderBook | None) -> str | None:
+    """The Working Orders screenshot of a Monitor read, for the 6.6 Cancel All failure page."""
+    return book.screenshot_sha256 if isinstance(book, MonitorBook) else None

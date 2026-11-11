@@ -18,6 +18,14 @@ from sentinel.orchestrator.watchdog import HeartbeatWriter, app_failure, hook_ho
 SCOPE = ["census/trade.order-entry.stock/ws.tier-a.active-trader",
          "flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07",
          "sweep/charts.flexible-grid.active-trader-cell/flexgrid/480x360"]
+# the simulated rig's log of each gateway.HOOK_STATES phase
+DENY_ALL, RECOVERY, BETWEEN_RUNS = "set_hook_state:False:True", "set_hook_state:True:False:recovery_only", \
+    "set_hook_state:False:False"
+
+
+def disarmed(rig: SimulatedRig) -> bool:
+    """The hook ends the run between runs: not armed, no deny-all, no recovery arm (gateway.py choice 12)."""
+    return not rig.gw.armed and not rig.gw.deny_all and not rig.recovery_only and rig.calls[-1] == BETWEEN_RUNS
 
 
 def run(scenario: SimScenario | None = None, work=None, **kw):
@@ -106,7 +114,8 @@ def test_a_session_kicked_mid_run_waits_logs_in_once_more_and_proves_normally():
     assert report.verdict.status == "complete_with_env_errors" and report.proof.verdict == PROVEN_NONE
     assert {sink.outcomes[c][:3] for c in SCOPE[1:]} == {("env_error", "session_kicked", "authenticated")}
     after = rig.calls[seen["calls"]:]
-    assert after[:3] == ["kill_process_tree", "launch", "login"] and "teardown" not in after
+    assert after[:5] == ["kill_process_tree", "reset_input_state", RECOVERY, "launch", "login"]
+    assert "teardown" not in after and disarmed(rig)
     assert orch.clock.monotonic() - seen["t0"] >= SESSION_RELEASE_WAIT_S
     report, rig, _, _ = run(SimScenario(recovery_login_fails=2), work=work)
     assert (report.proof.verdict, report.proof.reason) == (UNPROVEN, "session_unavailable")
@@ -127,9 +136,9 @@ def test_live_identity_runs_the_kill_switch_and_stays_aborted_safety():
     report, rig, sink, _ = run(SimScenario(selector_reads=[SelectorRead("12345678SCHW")]))
     assert (report.verdict.status, report.verdict.reason) == ("aborted_safety", "live_identity")
     assert filled(sink) == {("env_error", "live_identity", "paper_mode_asserted")}
-    assert report.kill_switch is not None and rig.gw.deny_all and "kill_process_tree" in rig.calls
+    assert report.kill_switch is not None and rig.calls.index(DENY_ALL) < rig.calls.index("kill_process_tree")
     assert report.proof.verdict == UNPROVEN and report.proof.reason == "session_unavailable"   # SD-64: no recovery login
-    assert rig.calls.count("login") == 1
+    assert rig.calls.count("login") == 1 and RECOVERY not in rig.calls and disarmed(rig)
 
 
 def test_paper_mode_mismatch_and_unreadable_identity():
@@ -200,7 +209,9 @@ def test_attempted_send_in_running_aborts_through_the_kill_switch():
     assert (report.verdict.status, report.verdict.reason) == ("aborted_safety", "attempted_send")
     assert sink.outcomes[SCOPE[0]][0] == "identical"
     assert {sink.outcomes[c][:3] for c in SCOPE[1:]} == {("env_error", "attempted_send", "running")}
-    assert report.proof.verdict == PROVEN_NONE and rig.sent_orders == 0 and rig.gw.deny_all
+    assert report.proof.verdict == PROVEN_NONE and rig.sent_orders == 0
+    assert rig.calls.index(DENY_ALL) < rig.calls.index("kill_process_tree") < rig.calls.index(RECOVERY) \
+        < rig.calls.index("revert_snapshot") and disarmed(rig)
 
 
 def test_an_order_that_got_out_is_found_by_the_proof():

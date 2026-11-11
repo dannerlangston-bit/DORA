@@ -78,8 +78,9 @@ Choices where the spec is ambiguous (reported):
 10. Dismiss allowlist (6.2, 6.13 item 10, SD-65). The pinned set comes from `gateway/dismiss_allowlist.yaml`
    through `gateway_config.load_dismiss_allowlist`, which is empty until Phase 0 records its read. An empty
    allowlist refuses `Confirm and Send` (`deny_profile`), so no dialog is opened that no click could dismiss
-   and ticket flows stop before the dialog. `SafetyContext`'s default stays `{"Delete"}` (the label 6.2
-   expects; `Edit` only when Phase 0 observes it) for callers that do not load the file yet (SimulatedRig).
+   and ticket flows stop before the dialog. `SafetyContext`'s default is the empty set: a caller that does not
+   pass the loaded file gets no dialog click. `DISMISS_ALLOWLIST` is the label 6.2 expects the dialog to show
+   (`Delete`; `Edit` only when Phase 0 observes it), which a pinned file lists; it is never a default.
 11. The gated send (6.7). A click whose two labels are exactly `Send` consults `SafetyContext.send_gate` (a
    `SendClearance`, implemented by `sendgate.SendGate`) before the never-tokenize check: when every gate of
    6.7 holds, the click skips the never-tokenize list and the dialog allowlist, the flag re-check ignores
@@ -102,6 +103,12 @@ Choices where the spec is ambiguous (reported):
    6.2, 10.2): deny-all, kill the tree, restart the hook host once per shard and relaunch, or the second time
    `aborted_harness (reason: hook_lost)`. The closed action list of results.py has no `hook_host_died`
    action, so `DropLedger.record` returns the Watchdog's own result and refuses to run without the budgets.
+15. Rule 3 by mode (5.4.8, 5.4.3 stage 4, 5.5): one non-send refusal leaves a scripted step `blocked_by_gateway`
+   and ends the flow; in an agent rescue it ends the rescue and the step is `failed`; in an Explorer session the
+   tool call is `blocked_by_gateway` and the session goes on until the third.
+16. Incident severities (6.12): the per-flow threshold's quarantine is S3 ("drop or refusal count above the per-flow
+   threshold"); every result that runs the kill switch is S2 at least ("kill switch tripped with a clean proof"),
+   which the proof raises to S1 when it finds an undeclared row (6.6).
 """
 from __future__ import annotations
 
@@ -162,7 +169,7 @@ NEVER_TOKENIZE_RE = re.compile(r"^(send|auto send|flatten|blast all|replace|subm
 SEND_LIKE_RE = re.compile(r"send|submit|replace|flatten|blast|auto", re.I)
 CONFIRM_AND_SEND = "confirm and send"
 SEND_LABEL = "Send"                                   # the only label the gated send token may click (6.7)
-# choice 10: the default for callers that do not load gateway/dismiss_allowlist.yaml yet; Edit only when observed
+# choice 10: the label 6.2 expects on the Order Confirmation dialog (Edit only when Phase 0 observes it); never a default
 DISMISS_ALLOWLIST = frozenset({"Delete"})
 A9_STAGE, CONFIRM_STAGE = "a3_a8", "a3_a9"           # SD-57: the A9 click itself, every later Confirm and Send
 PAPER_ASSERTION_CURRENT_S = 120.0                     # choice 9: the 6.4 two-minute timer (identity.TIMER_S)
@@ -618,7 +625,7 @@ class SafetyContext:
     order_dialog_present: bool = False
     deny_rects: tuple[DenyRect, ...] = ()
     chords: tuple[Chord, ...] = ()
-    dismiss_allowlist: frozenset[str] = DISMISS_ALLOWLIST
+    dismiss_allowlist: frozenset[str] = frozenset()   # the loaded gateway/dismiss_allowlist.yaml (choice 10)
     attestation_passed: bool = False            # read only without `session` (choice 9)
     paper_assertion_current: bool = False       # read only without `session` (choice 9)
     deny_list_hit: str | None = None            # the Explorer deny list entry the target matches (explorer.py)
@@ -923,7 +930,7 @@ class DropLedger:
                 run, un = safety_abort_outcome("running", "unknown_dialog_in_order_stage")
                 return ControlResult("gateway", False, "running", run=run, unreached=un, alert=alerts.safety_abort(),
                                      actions=("end_flow", "kill_switch"), step="blocked_by_gateway",
-                                     step_reason=drop.reason, evidence=ev)
+                                     step_reason=drop.reason, incident="S2", evidence=ev)
             return ControlResult("gateway", False, "running", step="blocked_by_gateway", step_reason=drop.reason,
                                  actions=("end_flow", "quarantine_flow"), alert=alerts.flow_quarantined(),
                                  findings=(FindingSpec("unknown_popup", "click requested on an unknown label in an "
@@ -947,7 +954,7 @@ class DropLedger:
             run, un = safety_abort_outcome("running", "kill_switch")
             return ControlResult("gateway", False, "running", run=run, unreached=un, alert=alerts.safety_abort(),
                                  actions=("end_flow", "quarantine_flow", "kill_switch"), step="blocked_by_gateway",
-                                 step_reason=drop.reason, findings=findings,
+                                 step_reason=drop.reason, findings=findings, incident="S2",
                                  detail=f"{self.run_count} gateway drops or refusals in the run", evidence=ev)
         if drop.attempted_send:
             # an Explorer attempted send: the session ends at once, S3 ticket, counted toward the ten
@@ -961,7 +968,7 @@ class DropLedger:
                                  checkpoint=Outcome("harness_error", "hook_lost"),
                                  actions=("end_flow", "kill_tree", "restart_hook_host")
                                  + (("quarantine_flow",) if quarantine else ()),
-                                 alert=alerts.harness_error(),
+                                 alert=alerts.harness_error(), incident="S3" if quarantine else None,
                                  findings=(FindingSpec("gateway_integrity", f"own token dropped {drop.reason} after "
                                                        "the retry or with the hook silent"),), evidence=ev)
         if quarantine:
@@ -972,8 +979,8 @@ class DropLedger:
             end = "end_session" if drop.mode == "agent" else "end_flow"
             return ControlResult("gateway", False, "running", step="failed", step_reason=drop.reason,
                                  actions=(end, "quarantine_flow"), alert=alert or alerts.flow_quarantined(),
-                                 findings=findings, detail=f"{self.unit_counts[unit]} drops or refusals in {unit}",
-                                 evidence=ev)
+                                 findings=findings, incident="S3",
+                                 detail=f"{self.unit_counts[unit]} drops or refusals in {unit}", evidence=ev)
         if drop.reason in INTEGRITY_FINDING:
             return ControlResult("gateway", True, "running", alert=alert, findings=findings, evidence=ev,
                                  detail="nothing reached the app; the run continues")
@@ -983,9 +990,11 @@ class DropLedger:
         if drop.mode == "explorer":
             return ControlResult("gateway", False, "running", step="blocked_by_gateway", step_reason=drop.reason,
                                  evidence=ev, detail=f"denied attempt {self.unit_counts[unit]} of {self.per_flow}")
-        end = "end_session" if drop.mode == "agent" else "end_flow"
+        if drop.mode == "agent":                    # rule 3: an agent rescue ends at once, its step failed (choice 15)
+            return ControlResult("gateway", False, "running", step="failed", step_reason=drop.reason,
+                                 actions=("end_session",), evidence=ev)
         return ControlResult("gateway", False, "running", step="blocked_by_gateway", step_reason=drop.reason,
-                             actions=(end,), evidence=ev)
+                             actions=("end_flow",), evidence=ev)
 
 
 def agent_flag_abort(mode: str) -> ControlResult:

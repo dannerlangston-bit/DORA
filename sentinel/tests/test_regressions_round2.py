@@ -23,8 +23,8 @@ from sentinel.oracle.values import digit_count, format_error, parse
 from sentinel.orchestrator.attestation import AttestationProfile, RowReads, attest
 from sentinel.orchestrator.clock import ManualClock
 from sentinel.orchestrator.drill import DrillObservation, DrillRecord, Item5, expected_records, score_drill
-from sentinel.orchestrator.gateway import (VK_F1, VK_RETURN, VK_TAB, Action, Flag, SafetyContext, refusal,
-                                           slow_half)
+from sentinel.orchestrator.gateway import (DISMISS_ALLOWLIST, VK_F1, VK_RETURN, VK_TAB, Action, Flag, SafetyContext,
+                                           refusal, slow_half)
 from sentinel.orchestrator.explorer import match_deny
 from sentinel.orchestrator.killswitch import PROVEN_NO_SESSION, PROVEN_NONE, ProofInputs, post_run_proof, recovery_login
 from sentinel.report.model import ORDERS_SENT_PROOF, PROOF_FORMS, proof_severity
@@ -83,7 +83,8 @@ def test_r2_01_confirm_and_send_plus_declared_enter_in_one_action_never_reaches_
 
 def test_r2_01_a_guarded_key_in_an_order_stage_is_refused_as_an_attempted_send():
     s = slow_half(_confirm_and_send(keys=(VK_RETURN,), declared_guarded=True),
-                  SafetyContext(attestation_passed=True, paper_assertion_current=True))
+                  SafetyContext(attestation_passed=True, paper_assertion_current=True,
+                                dismiss_allowlist=DISMISS_ALLOWLIST))
     assert (s.reason, s.attempted_send) == ("guarded_key_refused", True)
     assert refusal(s).attempted_send
     later = Action("press", keys=(VK_RETURN,), declared_guarded=True)          # a later step, sticky flag held

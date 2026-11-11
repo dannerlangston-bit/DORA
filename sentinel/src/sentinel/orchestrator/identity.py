@@ -14,7 +14,8 @@ fingerprint's `harness` field (7.4).
   every scoped checkpoint, run `complete_with_env_errors`, P2 to the on-call channel and the login owner
   (P1 on repeat); the second consecutive unreadable result on one login blocks it and opens a
   maintenance task for the LOGIN flow. A timer read deferred past five minutes takes the same path
-  (`deferral_unreadable`, 6.4 Schedule).
+  (`deferral_unreadable`, 6.4 Schedule). An unreadable identity is an S3 incident (6.12: "attestation or identity
+  unreadable").
 - The paper-asserted stamp (6.4 Schedule, 4.13 `paper_assertion`): `{account_id_sha256, mode, asserted_at}` of
   the latest passing assertion; a capture is released only under a stamp from the current session
   (`stamp_current`).
@@ -130,7 +131,7 @@ def _unreadable(detail: str, crops: list[str | None], unreadable_streak: int) ->
     return ControlResult(
         "paper_mode", False, GATE, run=RunVerdict("complete_with_env_errors"),
         unreached=Outcome("env_error", "identity_unreadable", GATE),
-        alert=alerts.env_error(repeat=unreadable_streak >= 1, notified=("login_owner",)), actions=acts,
+        alert=alerts.env_error(repeat=unreadable_streak >= 1, notified=("login_owner",)), actions=acts, incident="S3",
         detail=detail + ("; login blocked" if blocked else ""), evidence={"crops": crops})
 
 

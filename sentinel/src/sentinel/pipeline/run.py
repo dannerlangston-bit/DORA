@@ -146,6 +146,11 @@ from ..diff.engine import (DiffContext, DiffResult, compare_fingerprints, diff_p
                            global_shift_prepass)
 from ..capture import (RedactionContext, RedactionList, RedactionResult, Sweep, SyntheticOcr, redact_pair,
                        redaction_version)
+from ..capture.capture import (ForeignWindowLog, TargetWindow, capture_meta, choose_target, foreign_window_event,
+                               masked_live_median, masked_live_offsets, modal_blocking, occluded, occlusion,
+                               occlusion_grid, pid_tree, put_capture, select_windows)
+from ..capture.sweep import SizeLadder, compare_minimums, minimums_summary, size_step_event
+from ..orchestrator.version_read import DEFAULT_TITLE_REGEX
 from ..diff.phash import phash
 from ..egress import EgressAllowlist, EgressGate, reconcile
 from ..synth import THEME
@@ -204,8 +209,9 @@ from .orchestration import (RigScript, ShardSink, alert_entry, login_alias, logi
                             persisted_actions, shard_setup)
 from .reviewer import ReviewerAdapter, ReviewRequest, SimulatedReviewer, change_types, to_review, validate
 from .sim import Capture, SimApp, SimBuild, observe
-from .simports import (APPLIED, SimDesk, SimLadder, SimUnitPorts, SimVault, applied as _applied, fixture_values,
-                       step_action)
+from .simports import (APP_PID, APPLIED, FOREIGN_IMAGE, LAUNCHER_PID, VIRTUAL_SCREEN, SimDesk, SimLadder,
+                       SimUnitPorts, SimVault, applied as _applied, fixture_values, sim_point_owners, sim_processes,
+                       sim_windows, step_action)
 from ..executor.emitter import ExecContext
 from ..executor.failures import FailureLedger, faults_from
 from ..executor.flow import Captured, Unit, UnitHooks, UnitResult, WorkspaceStreak, census_unit, run_unit
@@ -280,6 +286,7 @@ class Evaluated:
     redaction: RedactionResult | None = None       # the redaction stage's result (3.6); None: not redacted
     app_uptime_s: int | None = None                # 10.2: the app's age when the checkpoint was captured
     app_restart_count: int | None = None
+    window: Any = None                             # the target window Capture chose (3.4 rule 3), for CaptureMeta
 
     @property
     def storable(self) -> bool:
@@ -442,14 +449,14 @@ class _Run:
 
     # -- the redaction stage of Capture (3.6, 5.7, 6.10) ----------------------------------------------
     def redact(self, cp: PlannedCheckpoint, base: Capture | None, cand: Capture, base_img: np.ndarray | None,
-               cand_img: np.ndarray) -> RedactionResult:
+               cand_img: np.ndarray, *, count: bool = True) -> RedactionResult:
         """Redact one checkpoint's pair in memory before anything is diffed or stored (`capture.redact_pair`): the
         simulated OCR reads what synth drew on each side; a capture without a base is redacted against itself."""
         b_cap, b_img = (base, base_img) if base is not None and base_img is not None else (cand, cand_img)
         ocr = {"base": SyntheticOcr.from_screen(b_cap.screen), "candidate": SyntheticOcr.from_screen(cand.screen)}
         res = redact_pair(b_img, cand_img, self.anchors, ocr, THEME["bg"], sweep=self.sweep,
                           context=RedactionContext(self.run_id, cp.checkpoint_id, cp.tier), params=self.params)
-        if res.terminal is None:
+        if res.terminal is None and count:
             for side in ("base", "candidate") if base is not None else ("candidate",):
                 self.redaction_counts[side] += int(res.counts.get(side, 0))
         return res
@@ -976,10 +983,69 @@ class _Writer:
             out["heatmap"] = hmap.sha256
         return out, stored
 
+    def captures(self, ev: Evaluated) -> list[StoredArtifact]:
+        """Each side's redacted capture with its `CaptureMeta` (3.3, 5.7, 8.4; `capture.put_capture`): the target
+        window's class, redacted title and bounds, the fingerprint, the app's age, the settle time and the redaction
+        applied; a masked_live checkpoint also stores the later frames of its median (7.9: the frames at
+        `masked_live_offsets` after the settle frame, each redacted, whose per-pixel median is the stored capture)."""
+        if not ev.storable or ev.window is None:
+            return []
+        cp, run = ev.cp, self.run
+        out: list[StoredArtifact] = []
+        boxes = ev.redaction.boxes if ev.redaction is not None else ()
+        for side, img in zip(("base", "candidate"), ev.images()):
+            if img is None:
+                continue
+            png = _png(img)
+            meta = capture_meta(sha256=hashlib.sha256(png).hexdigest(), run_id=run.run_id,
+                                checkpoint_id=cp.checkpoint_id, side=side, window=ev.window,
+                                captured_at=_ts(self.today, self.clock, 600), sweep=run.sweep, dpi=96, scale_percent=100,
+                                dpi_awareness="PER_MONITOR_AWARE_V2", fingerprint_id=run.fp_id,
+                                app_uptime_s=ev.app_uptime_s, app_restart_count=ev.app_restart_count, mode="scripted",
+                                action_path=f"{cp.flow_id}/{cp.step_id}" if cp.flow_id else cp.checkpoint_id,
+                                settle_ms=ev.settle_ms, redaction_version=run.red_header.version,
+                                redaction_boxes=len(boxes))
+            out += put_capture(self.arts, png, run.red_header,
+                               name=f"{run.run_id}/{cp.checkpoint_id}/capture-{side}.png", meta=meta)
+        if cp.data_mode == "masked_live":
+            out += self._masked_live(ev)
+        return out
+
+    def _masked_live(self, ev: Evaluated) -> list[StoredArtifact]:
+        """The masked_live frames of the candidate (7.9): the settled triple and the later frames of the live
+        values, redacted; their median equals the settled frame outside masks, redactions and the parking point,
+        which `masked_live_median` checks; the later frames are stored next to the capture."""
+        cp, run = ev.cp, self.run
+        offsets = masked_live_offsets(run.params)
+        _, settled = ev.images()
+        h, w = settled.shape[:2]
+        ignore = np.zeros((h, w), dtype=bool)
+        placed = locate(ev.registry, {lm.id: lm.expected for lm in ev.registry.landmarks if lm.expected is not None})
+        rects = [placed[r.id] for r in ev.registry.regions if r.type == "mask" and r.id in placed]
+        rects += [b.rect for b in (ev.redaction.boxes if ev.redaction is not None else ())]
+        px, py = _park(ev.cand)
+        rects.append(RedactRect(px - 8, py - 8, 16, 16))
+        for r in rects:
+            ignore[max(0, r.y):max(0, r.y + r.h), max(0, r.x):max(0, r.x + r.w)] = True
+        triple = sum(1 for o in offsets if o < 3 * 250)
+        later = []
+        for k in range(len(offsets) - triple):
+            cap = run.capture(cp, "candidate", tick=20 + k)
+            red = run.redact(cp, None, cap, None, cap.screen.image, count=False)
+            later.append(red.candidate if red.terminal is None and red.candidate is not None else settled)
+        frames = [settled] * triple + [f if f.shape == settled.shape else settled for f in later]
+        ml = masked_live_median(frames, offsets, ignore=ignore)
+        return [self.arts.put(_png(f), name=f"{run.run_id}/{cp.checkpoint_id}/masked-live-{t}ms.png", kind="capture",
+                              media_type="image/png", redaction=run.red_header, checkpoint_id=cp.checkpoint_id,
+                              side="candidate", captured_at=_ts(self.today, self.clock, 600))
+                for t, f in zip(ml.times_ms[triple:], ml.frames[triple:])]
+
     def records(self, ev: Evaluated, *, synthetic: bool = False, data_mode: str | None = None, tag: str = ""
                 ) -> tuple[CheckpointOutcome, list[Finding], list[StoredArtifact]]:
         cp, c = ev.cp, ev.classified
         arts, stored = self.artifacts(ev, tag)
+        if not synthetic:
+            stored += self.captures(ev)
         diff = None
         if ev.diff is not None and ev.diff.terminal is None:
             diff = ev.diff.summary
@@ -1263,6 +1329,7 @@ class _Shard:
     emitting: bool = False                                 # the emitter is sending: the rig's observer holds off
     interrupt: ControlResult | None = None                 # an app failure seen inside a step (`_after_step`)
     unit: Any = None                                       # the unit in progress
+    host: tuple[str, str | None] | None = None             # the sweep host the shard ran last (2.5.1)
     rest: list[PlannedCheckpoint] = field(default_factory=list)   # the unit's later checkpoints outside it
 
     def assertion(self, stamp: dict[str, str] | None) -> None:
@@ -1308,6 +1375,8 @@ class _ShardWork:
         self.faults = faults_from(self.script.faults) if self.script.faults else None
         self.vault = SimVault(unreachable=self.script.vault_unreachable)   # 6.9: secrets leased at typing time
         self.sides: dict[str, str] = {}                      # the side the Executor ran for a step-decided outcome
+        self.foreign_log = ForeignWindowLog()                # 5.7: one alert per run per foreign image name
+        self.ladders: dict[tuple[str, str, str], SizeLadder] = {}   # (surface, host, side) -> its 2.5.1 ladder
 
     # -- the shards -------------------------------------------------------------------------------------
     def run_shards(self, specs: Sequence[tuple[str, int, str, list[PlannedCheckpoint]]]) -> None:
@@ -1562,6 +1631,14 @@ class _ShardWork:
             self._execute(st, Unit("flow", first.flow_id or "", doc, tuple(cp.checkpoint_id for cp in todo),
                                    first.workspace_id), todo, ())
             return
+        if first.test_kind in ("sweep", "split"):
+            host = (first.surface_id, _host(first))
+            if st.host is not None and st.host != host:     # 2.5.1: the next host starts from a clean slate
+                ok = st.ports.reset_input_state() and st.ports.reload_workspace()
+                st.events.append(st.exec.event("reset_input_state", None, reason="next sweep host: reset_input_state "
+                                               "and the tier C workspace reload (2.5.1)"
+                                               + ("" if ok else "; the reset or the reload failed")))
+            st.host = host
         for i, cp in enumerate(unit):
             if st.orch.stop is not None:
                 return
@@ -1739,9 +1816,14 @@ class _ShardWork:
                                                      running_flow=cp.flow_id)), checkpoint=cp, flow_id=cp.flow_id)
             st.seen = len(st.orch.results)
             return None
+        window = self._window(st, cp, rest)
+        if window is None:
+            return None
         live = cp.data_mode == "masked_live"
         base_cap = self.run.capture(cp, "base", tick=1 if live else 0)
         cand_cap = self.run.capture(cp, "candidate", tick=2 if live else 0)
+        if cp.test_kind == "sweep" and self._size_step(st, cp, base_cap, cand_cap, rest):
+            return None
         att = self.plan.attribution.get(cp.surface_id)
         ticks = iter(range(3, 9))
         ev = evaluate(self.run, cp, base_cap, cand_cap, x=self.plan.x_input(cp.surface_id),
@@ -1751,9 +1833,108 @@ class _ShardWork:
         ev.paper, ev.released = stamp, st.orch.may_release(stamp)
         ev.shard_id, ev.session, ev.rig_id = st.shard_id, len(st.sessions) - 1, st.rig_id
         ev.app_uptime_s, ev.app_restart_count = st.life.tags(st.clock.monotonic())     # 10.2
+        ev.window = window
         self.evals.append(ev)
         st.sink.done.add(cid)
         return ev
+
+    def _decide(self, st: _Shard, cp: PlannedCheckpoint, o: Outcome, side: str | None = None) -> None:
+        """A checkpoint outcome Capture decided before any evaluation (3.4, 2.5.1)."""
+        self.bare[cp.checkpoint_id] = (cp, o)
+        if side is not None:
+            self.sides[cp.checkpoint_id] = side
+        st.sink.done.add(cp.checkpoint_id)
+
+    def _target_window(self, cp: PlannedCheckpoint) -> TargetWindow:
+        """The checkpoint's `target_window` (4.7): the flow step's, else the surface's, else the main window."""
+        tw = (self.cfg.flow_step(cp.flow_id, cp.step_id or "").get("target_window") if cp.flow_id else None) or \
+            (self.cfg.surfaces.get(cp.surface_id) or {}).get("target_window") or {"kind": "main"}
+        return TargetWindow.from_dict(tw)
+
+    def _window(self, st: _Shard, cp: PlannedCheckpoint, rest: Sequence[PlannedCheckpoint]):
+        """Capture's window rules before the settle loop (3.4 rules 1, 3 and 4; 5.7), on the rig's windows: the PID
+        tree's `SunAwt*` windows, the checkpoint's target window (`not_comparable (window_mismatch)` when it is not
+        on screen), the 8 x 8 occlusion grid over it (`env_error (reason: occluded)` with a `foreign_window` event,
+        one alert and one `hardening` finding per foreign image name) and a modal over a main-window target
+        (`not_settled (reason: unexpected_window:<title>)`). The target window, or None when one decided."""
+        cid, sc = cp.checkpoint_id, self.scenario
+        tw = self._target_window(cp)
+        hide = (tw.title_regex if tw.kind != "main" else DEFAULT_TITLE_REGEX) if cid in self.script.window_missing \
+            else None
+        foreign = cid in self.script.occluded
+        pids = pid_tree([LAUNCHER_PID, APP_PID], sim_processes())
+        sel = select_windows(sim_windows(st.rig, foreign=foreign, hide=hide), pids, VIRTUAL_SCREEN)
+        choice = choose_target(sel.kept, tw, virtual_screen=VIRTUAL_SCREEN, main_title_regex=DEFAULT_TITLE_REGEX,
+                               side="candidate")
+        if choice.terminal is not None:
+            t = choice.terminal
+            self._decide(st, cp, Outcome(t.outcome, t.reason, None, t.detail), t.side)
+            return None
+        occ = occlusion(sim_point_owners(occlusion_grid(choice.window.rect), foreign=foreign), pids)
+        if occ is not None:
+            r = st.orch.apply(occluded(occ, image_name=FOREIGN_IMAGE, log=self.foreign_log, gate="running"))
+            up, restarts = st.life.tags(st.clock.monotonic())
+            st.events.append(foreign_window_event(
+                occ, run_id=sc.run_id, shard_id=st.shard_id, side="candidate", seq=next(st.seq),
+                wall_at=st.clock.now().isoformat(), mono_ms=int(st.clock.monotonic() * 1000), checkpoint_id=cid,
+                flow_id=cp.flow_id, step_id=cp.step_id, app_uptime_s=up, app_restart_count=restarts))
+            self._note(st, r, checkpoint=cp, flow_id=cp.flow_id)
+            self._subsets(st, r, cp, rest)
+            st.seen = len(st.orch.results)
+            return None
+        main = next((w for w in sel.kept if w.cls == "SunAwtFrame"), None)
+        modal = modal_blocking(sel.kept, main_hwnd=main.hwnd, target_hwnd=choice.window.hwnd) \
+            if main is not None and tw.kind == "main" else None
+        if modal is not None:
+            self._decide(st, cp, Outcome("not_settled", f"unexpected_window:{modal}", None,
+                                         f"modal {modal!r} over the main window at max wait"), "candidate")
+            return None
+        return choice.window
+
+    def _size_step(self, st: _Shard, cp: PlannedCheckpoint, base: Capture, cand: Capture,
+                   rest: Sequence[PlannedCheckpoint]) -> bool:
+        """2.5.1 for one sweep step on both builds (`capture.sweep.SizeLadder` per surface, host and side): the size
+        each build's gadget took (a gadget's minimum clamps it, `size_clamped`), one retry when it was not reached,
+        a `size_step` event per side; a step not reached after its retry is `assertion_failed (assertion:
+        size_reached)` with the rest of its ladder `not_run (reason: step_failed:<step>)`. True when it decided."""
+        cid, host, sc = cp.checkpoint_id, _host(cp) or "", self.scenario
+        failed = None
+        for side, cap in (("base", base), ("candidate", cand)):
+            lad = self.ladders.setdefault((cp.surface_id, host, side), SizeLadder(cp.surface_id, host, side))
+            if lad.blocked() is not None:
+                continue
+            h, w = cap.screen.image.shape[:2]
+            first = (int(w), int(h))
+            r = lad.measure(cid, first, first if lad.needs_retry(cid, first) else None)   # the sim's re-set is exact
+            up, restarts = st.life.tags(st.clock.monotonic())
+            st.events.append(size_step_event(r, checkpoint_id=cid, run_id=sc.run_id, shard_id=st.shard_id, side=side,
+                                             seq=next(st.seq), wall_at=st.clock.now().isoformat(),
+                                             mono_ms=int(st.clock.monotonic() * 1000), app_uptime_s=up,
+                                             app_restart_count=restarts))
+            failed = failed or (r if r.checkpoint is not None else None)
+        if failed is None:
+            return False
+        self._decide(st, cp, dataclasses.replace(failed.checkpoint), failed.side)
+        for later in rest:
+            if later.test_kind == "sweep" and later.surface_id == cp.surface_id and _host(later) == host \
+                    and later in self._todo(st):
+                self._decide(st, later, failed.rest_of_ladder)
+        return True
+
+    def sweep_minimums(self) -> tuple[list[dict], list[Finding]]:
+        """2.5.1: the run's achieved minimum per gadget and host on the candidate (stored with the run), and a
+        `window_geometry_changed` finding where a build moved it by more than 4 px."""
+        cand = [lad for (s, h, side), lad in sorted(self.ladders.items()) if side == "candidate"]
+        findings = []
+        for lad in cand:
+            base = self.ladders.get((lad.surface_id, lad.host, "base"))
+            bm, cm = (base.minimum() if base else None), lad.minimum()
+            spec = compare_minimums(bm, cm) if bm is not None and cm is not None else None
+            if spec is not None:
+                n = len(findings) + 1
+                findings.append(spec.to_finding(f"fnd-{self.scenario.run_id}-min-{n:03d}", self.scenario.run_id,
+                                                created_at=_ts(self.today, self.scenario.clock, 900)))
+        return minimums_summary(cand), findings
 
     def _freeze(self, st: _Shard, cp: PlannedCheckpoint, rest: Sequence[PlannedCheckpoint]) -> None:
         """The app's EDT freezes while `cp` is captured: the Watchdog's screenshot-staleness detector, read over the
@@ -2172,8 +2353,8 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
             if gf is not None:
                 store.write_finding(dataclasses.replace(gf, created_at=started))
         calls = _review_pass(run, evals, rev, scenario.reviewer_cap, gate)
-        for f in plan.findings:
-            store.write_finding(dataclasses.replace(f, created_at=started))
+        for f in list(plan.findings) + work.sweep_minimums()[1]:
+            store.write_finding(dataclasses.replace(f, created_at=f.created_at or started))
         for f in _expired_findings(scenario.run_id, start.expired, run.expiry_notices, run.expired_exceptions,
                                    started):
             store.write_finding(f)
@@ -2242,6 +2423,9 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                      "a human scans the run and rotates the credential (6.9)"}
         summary = _summary(store, cfg, plan, run, scenario, wall, len(work.reports), safety=work.safety(), abort=abort,
                            start=start, alerts=work.alerts)
+        minimums, _ = work.sweep_minimums()
+        if minimums:                                    # 2.5.1: stored with the run, the report's minimum line
+            summary["sweep_minimums"] = minimums
         if secret is not None:
             summary["secret_scan"] = {"result": secret.run_reason, "detail": secret.detail, "report_withheld": True}
         dims = summary["coverage"]["matrix"]          # 1.4 G2 and L-OUT-07 on the stored rows, before anything reports

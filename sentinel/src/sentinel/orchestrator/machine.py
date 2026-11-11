@@ -93,6 +93,13 @@ PIDs and the fields step heartbeats carry, and a write that fails twice is the p
 with `life` (an `executor.heartbeat.AppLife`) every pass of the `launched` gate is recorded, the first as the launch and
 every later one (a relaunch of any cause, a launch retry) as a relaunch, so captures and step rows carry the uptime
 and the restart count. Both are duck-typed here: the executor imports this package's modules.
+
+The bounds source (5.9, 7.5; `bounds.BoundsState` for DR-01 `RunContext.bounds_branch`): under Branch A the
+`launched` gate applies `bounds.jab_enablement` to the launch's two probe reads (`LaunchObservation.
+jab_properties_present`, `jab_query_answers`; unread means not checked), a relaunch's `launched` gate
+`bounds.after_relaunch`; the Executor reports a bridge lost mid-run through `bounds_lost(checkpoint_id)` and reads
+`bounds_outcome()` before a checkpoint; the next `flow_boundary` relaunches with cause `bounds_source`, which spends
+no budget (`RELAUNCH_BUDGETS`). Branch B has no bridge: nothing here applies.
 """
 from __future__ import annotations
 
@@ -103,6 +110,8 @@ from typing import Any
 
 from ..records import DeclaredSend, RunOutcome
 from . import killflag
+from .bounds import (BoundsState, after_relaunch, bridge_lost, checkpoint_outcome, jab_enablement,
+                     relaunch_due)
 from .attestation import SAFETY_ROWS, AttestationProfile, RowReads, a9_passed, attest, matches, readable
 from .boundary import (BoundaryObservations, DialogTimer, FlowTimer, flow_budget_cut, flow_budget_s, new_order_rows,
                        tripwire_result)
@@ -121,15 +130,15 @@ from .killswitch import (ORDERS_SENT, KillSwitchReport, Proof, ProofInputs, acco
 from .alerts import AlertRoute
 from .orderbook import MonitorBook
 from .ports import SessionSafety
-from .results import ControlResult, OutcomeSink, RunVerdict, write_unreached
-from .rig import ConfirmationCheck, OrderBook, Rig, SelectorRead
+from .results import ControlResult, Outcome, OutcomeSink, RunVerdict, write_unreached
+from .rig import ConfirmationCheck, LaunchObservation, OrderBook, Rig, SelectorRead
 from .watchdog import (Heartbeat, HeartbeatUnwritable, HeartbeatWriter, disk_check, heartbeat_failed,
                        proactive_relaunch_due, watchdog_check)
 
 # what each relaunch cause spends (7.7, 10.2, SD-66): K for an environment re-login; an app relaunch or the hook host
 # restart, already charged by the control that asked for the relaunch; nothing for the proactive relaunch
 RELAUNCH_BUDGETS = {"environment_relogin": "relogin_k", "app_failure": "app_relaunch", "hook_host": "hook_host",
-                    "proactive": None}
+                    "proactive": None, "bounds_source": None}     # a lost bridge's relaunch spends nothing (5.9)
 
 
 @dataclass(frozen=True)
@@ -161,6 +170,7 @@ class RunContext:
     shard: int = 1
     attempt: int = 1
     order_hotkeys: DefaultOrderHotkeys | None = None         # the loaded gateway/default_order_hotkeys.yaml (5.4.7)
+    bounds_branch: str = "B"                                  # DR-01: A reads bounds from the JAB tree (5.9, 7.5)
 
     def default_hotkeys(self) -> DefaultOrderHotkeys:
         """The pinned build's default order chords loaded at `settings_attested` (5.4.7): the loaded file, or the
@@ -244,6 +254,7 @@ class Orchestrator:
         self._session_started_at: datetime | None = None
         self._a1: str | None = None
         self._a2: str | None = None
+        self.bounds = BoundsState(ctx.bounds_branch)       # the session's bounds source (5.9, 7.5)
 
     # -- recording --------------------------------------------------------------------------------------
     def apply(self, r: ControlResult) -> ControlResult:
@@ -345,7 +356,8 @@ class Orchestrator:
         while True:
             if not self._gate("launched"):
                 return False
-            r = self.apply(check_launched(rig.launch(), expected_build=ctx.expected_build, first_launch=first,
+            obs = rig.launch()
+            r = self.apply(check_launched(obs, expected_build=ctx.expected_build, first_launch=first,
                                           budgets=self.budgets))
             if r.has("relaunch") and self.stop is None:
                 rig.kill_process_tree()
@@ -355,6 +367,8 @@ class Orchestrator:
                 return False
             break
         self.launched_mono = self.clock.monotonic()
+        if not self._bounds_at_launch(obs, relaunch=start == "launched"):
+            return False
         if self.life is not None:                          # 10.2: every capture carries the app's age
             if self.life.launched_mono is None:
                 self.life.launched(self.launched_mono)
@@ -394,6 +408,28 @@ class Orchestrator:
             return False
         self.apply(check_canary_flow(rig.run_canary_flow()))
         return self.stop is None
+
+    def _bounds_at_launch(self, obs: LaunchObservation, *, relaunch: bool) -> bool:
+        """The 7.5 Java Access Bridge row at `launched` (`bounds.jab_enablement`; after a relaunch
+        `bounds.after_relaunch`, which ends the run when a bridge lost mid-run is still down, 5.9). A launch that did
+        not read the bridge (Branch B, or no probe) checks nothing. False when the run stopped."""
+        if self.bounds.branch == "B" or obs.jab_properties_present is None or obs.jab_query_answers is None:
+            return True
+        check = after_relaunch if relaunch else jab_enablement
+        r = check(self.bounds, properties_present=obs.jab_properties_present, query_answers=obs.jab_query_answers)
+        if r is not None:
+            self.apply(r)
+        return self.stop is None
+
+    def bounds_lost(self, checkpoint_id: str | None = None) -> ControlResult:
+        """The bridge stopped answering mid-run before `checkpoint_id` (5.9, Branch A): the checkpoint in progress and
+        the rest of the flow are `harness_error (reason: bounds_source_unavailable)`, and the next flow boundary
+        relaunches (`relaunch("bounds_source")`)."""
+        return self.apply(bridge_lost(self.bounds, checkpoint_id=checkpoint_id))
+
+    def bounds_outcome(self, *, needs_bounds: bool = True) -> Outcome | None:
+        """The outcome a checkpoint takes from the bounds source now (`bounds.checkpoint_outcome`), or None."""
+        return checkpoint_outcome(self.bounds, needs_bounds=needs_bounds)
 
     def _read_identity(self) -> tuple[ControlResult, SelectorRead]:
         """One paper-mode assertion (6.4): a selector read, and under deny-all a second one 1 s later when the first
@@ -516,7 +552,11 @@ class Orchestrator:
         if self.stop is not None:
             return self.stop
         uptime = now - self.launched_mono if self.launched_mono is not None else 0.0
-        if proactive_relaunch_due(self.flows_since_launch, uptime, inside_flow=False):
+        if relaunch_due(self.bounds):                      # 5.9: a lost bridge relaunches at the next boundary
+            if not self.relaunch("bounds_source"):
+                return self.stop
+            now = self.clock.monotonic()
+        elif proactive_relaunch_due(self.flows_since_launch, uptime, inside_flow=False):
             if not self.relaunch("proactive"):
                 return self.stop
             now = self.clock.monotonic()
@@ -628,7 +668,7 @@ class Orchestrator:
         spent = {"environment_relogin": f"re-login {self.relogin.used} of {self.relogin.k}",
                  "app_failure": f"app relaunch {self.budgets.used_app} of {self.budgets.app_relaunches}",
                  "hook_host": f"hook host restart {self.budgets.used_hook_host} of {self.budgets.hook_host_restarts}",
-                 "proactive": "none"}[cause]
+                 "proactive": "none", "bounds_source": "none"}[cause]
         self.apply(ControlResult("relaunch", True, "running",
                                  detail=f"relaunch ({cause}), budget: {spent}; every gate passes again",
                                  evidence={"cause": cause, "budget": RELAUNCH_BUDGETS[cause],

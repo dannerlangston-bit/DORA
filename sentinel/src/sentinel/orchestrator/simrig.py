@@ -442,7 +442,7 @@ class SimulatedRig(Rig):
         if self.app_running:
             wins += [ScreenWindow(2000 + i, 4100, "SunAwtDialog", t) for i, t in enumerate(self.extra_windows)]
             wins.append(ScreenWindow(1, 4100, "SunAwtFrame", f"Main@thinkorswim [build {self.title_build_id}]",
-                                     rect=MAIN_RECT, z_order=1))
+                                     rect=MAIN_RECT, z_order=1, enabled=not self.dialog_open))   # a modal disables it
         return tuple(wins)
 
     def window_tripwires(self) -> TripWires:

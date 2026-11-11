@@ -101,6 +101,8 @@ class RigScript:
     postcondition_fail: tuple[str, ...] = ()
     faults: tuple[tuple[str, str | None, str], ...] = ()
     vault_unreachable: bool = False                  # every vault lease of the LOGIN secret step fails (6.9, 7.7)
+    occluded: tuple[str, ...] = ()                   # checkpoint ids: a foreign window covers the target (3.4)
+    window_missing: tuple[str, ...] = ()             # checkpoint ids: the target window is not on screen (3.4 rule 3)
 
 
 class ShardSink:

@@ -61,7 +61,7 @@ from ..executor.flow import AssertVerdict, Captured, CheckRead, WaitPoll
 from ..executor.locator import Ladder, LadderContext, WindowCapture, target_from_control
 from ..oracle.tables import OracleConfigError, resolve_ref
 from ..orchestrator.gateway import Action, Flag
-from ..orchestrator.ports import Frame, LocateResult, VaultLease, WindowInfo
+from ..orchestrator.ports import Frame, LocateResult, PointOwner, ProcessInfo, VaultLease, WindowInfo
 from ..orchestrator.results import ControlResult
 from ..orchestrator.rig import EmitResult
 from ..orchestrator.simrig import (CONFIRM_RECT, DELETE_POINT, DIALOG_RECT, FRAME_ORIGIN, FRAME_SIZE, SEND_RECT,
@@ -254,6 +254,34 @@ def step_action(step: Mapping[str, Any], status: str, gateway_event: Mapping[str
     if kind == "teardown":
         return "click" if step.get("target") else None
     return STEP_ACTIONS.get(kind)
+
+
+LAUNCHER_PID, APP_PID, FOREIGN_PID = 4000, 4100, 5100       # the launcher, the app (the rig's windows) and a stranger
+FOREIGN_IMAGE = "notepad.exe"
+VIRTUAL_SCREEN = (0, 0, 1920, 1080)
+
+
+def sim_processes() -> tuple[ProcessInfo, ...]:
+    """The launched process tree of the simulated rig and one foreign process (5.7 PID filter)."""
+    return (ProcessInfo(LAUNCHER_PID, None, "thinkorswim-launcher.exe"),
+            ProcessInfo(APP_PID, LAUNCHER_PID, "thinkorswim.exe"), ProcessInfo(FOREIGN_PID, None, FOREIGN_IMAGE))
+
+
+def sim_windows(rig: SimulatedRig, *, foreign: bool = False, hide: str | None = None) -> tuple[WindowInfo, ...]:
+    """The rig's windows as Capture enumerates them (3.4 rule 1): the main frame and the open dialog, a foreign
+    window over the screen's centre with `foreign`, and without the window whose title matches `hide`."""
+    out = [w for w in rig.enumerate_windows() if hide is None or not re.search(hide, w.title or "")]
+    if foreign:
+        out.append(WindowInfo(9100, FOREIGN_PID, "Notepad", "Untitled - Notepad", rect=(0, 0, 1920, 1080), z_order=0,
+                              process_name=FOREIGN_IMAGE))
+    return tuple(out)
+
+
+def sim_point_owners(points: Sequence[tuple[int, int]], *, foreign: bool = False) -> tuple[PointOwner, ...]:
+    """`WindowFromPoint` at each sample (3.4): the app, or the foreign window over every point with `foreign`."""
+    if foreign:
+        return tuple(PointOwner(x, y, 9100, FOREIGN_PID, "Untitled - Notepad") for x, y in points)
+    return tuple(PointOwner(x, y, 1, APP_PID, "Main@thinkorswim") for x, y in points)
 
 
 class SimUnitPorts:

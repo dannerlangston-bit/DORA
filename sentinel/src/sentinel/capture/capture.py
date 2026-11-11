@@ -213,9 +213,10 @@ def choose_target(windows: Sequence[WindowInfo], target: TargetWindow, *, virtua
     main = target.kind == "main"
     rx = re.compile((main_title_regex if main else target.title_regex) or "")
     found = [w for w in windows if (not main or w.cls == MAIN_CLASS) and rx.search(w.title)]
+    what = f"{target.kind} window titled /{rx.pattern}/"
     if template is not None and frame is not None:
         found = [w for w in found if _template_in(frame, _rect(w), template, floor)]
-    what = f"{target.kind} window titled /{rx.pattern}/" + (" with its template" if template is not None else "")
+        what += " with its template"
     if not found:
         return TargetChoice(None, Terminal("not_comparable", "window_mismatch", side, f"no {what}"), tuple(windows))
     win = min(found, key=_z)

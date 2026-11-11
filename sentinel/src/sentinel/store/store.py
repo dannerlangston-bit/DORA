@@ -2218,9 +2218,12 @@ class Store:
 
     # -- retention (8.6) -------------------------------------------------------------------------------------
     def deletable(self, sha256: str) -> bool:
-        """8.6: never a pinned object, one a baseline row names, or one a finding not closed references."""
+        """8.6: never a pinned object, a quarantined one (8.4), one a baseline row names, or one a finding not closed
+        references."""
         art = self._one("SELECT pinned, deleted_at FROM artifacts WHERE sha256 = ?", (sha256,))
         if art is None or art["pinned"] or art["deleted_at"] is not None:
+            return False
+        if self._one("SELECT 1 FROM artifact_sets WHERE sha256 = ? AND quarantined_at IS NOT NULL", (sha256,)):
             return False
         if self._one("SELECT 1 FROM baselines WHERE image_sha256 = ?1 OR sidecar_sha256 = ?1", (sha256,)):
             return False

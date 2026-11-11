@@ -122,6 +122,24 @@ def test_store_indexes_artifacts_and_sweeps_safely(tmp_path):
         assert ledger[-1] == "retention"
 
 
+
+def test_sweep_never_deletes_a_quarantined_object(tmp_path):
+    """8.4 / 8.6: an object whose set was quarantined after a secret leak is evidence; the sweep skips it."""
+    arts = ArtifactStore(tmp_path / "objects-set", "runs/run-01")
+    with Store(tmp_path / "db" / "run.db") as s:
+        s.begin_run(RunPlan("run-01", "merge", "c0ffee", "a" * 64, "b" * 64, "d00d", "auth/v1.md", 2700,
+                            scope=(ScopeEntry(CID, "ws.tier-a.active-trader", "active_trader", 1, "frozen"),)))
+        cap = put_capture(arts)
+        o = CheckpointOutcome(run_id="run-01", checkpoint_id=CID, outcome="identical", workspace_id="ws.tier-a."
+                              "active-trader", persona="active_trader", data_mode="frozen",
+                              artifacts={"candidate": cap.sha256})
+        s.write_checkpoint(o, artifacts=[cap])
+        assert s.deletable(cap.sha256)
+        s.write_artifact_set(cap.sha256, "runs/run-01")
+        s.conn.execute("UPDATE artifact_sets SET quarantined_at = '2026-11-10T15:00:00Z' WHERE sha256 = ?", (cap.sha256,))
+        assert not s.deletable(cap.sha256)
+        assert s.sweep(arts, [cap.sha256], backup_ok=True).deleted == ()
+
 # -- the plaintext put hook (6.9) and quarantine (8.4, 8.9) ---------------------------------------------------------
 
 SECRET = "hunter2-Qx9!"

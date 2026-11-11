@@ -66,7 +66,8 @@ def test_the_canary_marker_in_a_row_a_log_line_and_a_transcript_is_found_three_t
     assert places[1] == f"file:{arts.path_of(log)}" and places[2] == f"file:{transcripts / 'agent-1.jsonl'}"
     assert [(f.kind, f.severity) for f in res.findings] == [("secret_leaked", "S1")]
     assert "3 place(s)" in res.findings[0].description
-    assert MARKER not in json.dumps([res.evidence, res.detail, [f.description + (f.detail or "") for f in res.findings]])
+    told = [res.evidence, res.detail, [f.description + (f.detail or "") for f in res.findings]]
+    assert MARKER not in json.dumps(told)
     assert secret == bytearray(len(MARKER))                               # the buffer is zeroed when the scan ends
 
 

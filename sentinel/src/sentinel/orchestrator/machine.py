@@ -6,6 +6,26 @@ hands `running` to the caller's `work` function (the Executor's flows; it report
 `apply`), then runs teardown and the post-run proof, decides the run outcome and writes every silent
 scoped checkpoint through the `OutcomeSink` (1.10, L-OUT-07).
 
+Inside `running` the Executor calls, in this order (boundary.py has the check sequences):
+
+- `flow_boundary(now, obs, flow_id=..., p50_s=...)` before every flow, census visit or sweep ladder: the trip-wires,
+  the Watchdog's reverse heartbeat, free space, the run budgets, the spend ceiling, the model re-check, the
+  paper-mode assertion and the proactive relaunch; it returns the result that stopped the run, or None;
+- `step_boundary(now, obs, order_stage_step=..., session_dialog=...)` before every step of a flow: the trip-wires,
+  the flow's own budget (a returned result with `end_flow` ends the flow, the run continues) and the paper-mode
+  assertion when due;
+- `relaunch(cause)` after a POP-05 dialog (`environment_relogin`, budget K), an app failure (`app_failure`, the
+  relaunch `watchdog.app_failure` already charged) or a hook host restart (`hook_host`); the proactive relaunch is
+  `flow_boundary`'s own. It kills the tree, waits `session_release_wait` and re-enters at `launched`, passing every
+  gate again (LOGIN, paper-mode assertion with A2, attestation with A9 and the chord reload, workspace, fixture,
+  canary flow), then `running` (7.7 Re-login flow, 10.2, SD-66);
+- `paper_stamp()` for every capture and outcome record, and `may_release(stamp)` before a frame goes to the
+  Reviewer, the agent or a report (6.4 Schedule); `counters` takes the staged orders and symbol changes (6.4).
+
+The session's safety state is a `ports.SessionSafety` (`safety`, pushed to `safety_listener` on every change): the
+attestation stage `a3_a8` before the A9 click and `a3_a9` once the gate passed (SD-57), and the last passing
+assertion; it is cleared whenever the session ends (the tree killed, a relaunch, a kicked session, the run's end).
+
 How a run ends, by the result that stopped it:
 
 - an `aborted_safety` (or any result asking for the kill switch): the 6.6 sequence on the rig, its
@@ -13,8 +33,9 @@ How a run ends, by the result that stopped it:
 - a result that killed the tree with a session established (identity unreadable, app or hook budget
   spent): the recovery login and proof of 6.6 step 5;
 - the login never authenticated: `PROVEN: no session established` when the gateway issued no session
-  token, else the recovery path; a kicked session waits `session_release_wait` and logs in once more
-  for the proof, UNPROVEN `session_unavailable` when that fails twice;
+  token, else the recovery path; a kicked session (at the `authenticated` gate or mid-run, `session_kicked`)
+  has its tree killed, waits `session_release_wait` and logs in once more for the proof, UNPROVEN
+  `session_unavailable` when that fails twice;
 - otherwise: teardown (`check_teardown`) and the proof from the session's own Monitor read; when that
   proof finds an undeclared row, the 6.6 sequence runs as for any `aborted_safety` (deny-all, the tree
   killed, a fresh scripted login, verified Cancel All, re-read, the proof, the revert; 1.10), and the
@@ -29,7 +50,8 @@ abort's gate and reason (1.10).
 Choices (reported): the run-start order snapshot is read as soon as A1 passes (the selector text is an
 allowlist entry), the first moment identity is known, before A2 selects an account and before A9 touches a
 ticket, so a later gate failure, an A2 failure included, still has a snapshot to prove against; the
-account A2 selects is judged against the allowlist like A1 (6.4); the hook is armed once the main frame is up, so the LOGIN flow's input goes
+account A2 selects is asserted like A1, with the two-read unreadable path (6.3 A2 "On unreadable: as A1", 6.4);
+the hook is armed once the main frame is up, so the LOGIN flow's input goes
 through it; the no-session rule counts the tokens issued outside `class: login` flows
 (`GatewayLog.tokens_issued`), since before authentication there is no session in which anything could
 be pressed (F43 names an authentication failure as a no-session case although its credentials were typed). A session
@@ -39,26 +61,45 @@ whose identity was never asserted (the paper-mode gate stopped the run before an
 usable session (6.6 "Runs without a usable session"): with no session token issued its proof is `PROVEN: no
 session established`, so an unreadable selector stays the P2, non-incident outcome 6.4 describes; an
 `aborted_safety` at that gate still runs the full kill switch sequence.
+
+Relaunch choices (reported): a relaunch never replaces the run-start snapshot, since the proof must cover the
+whole run; its fresh Monitor read is checked against the snapshot instead, and a new Working or Filled row is the
+kill switch (6.6 Triggers) at the gate in force. The hook is put in deny-all before the tree is killed and stays
+there until the relaunch's `launched` gate arms it for the LOGIN flow. `session_release_wait` is waited before the
+relaunch, which precedes its login (7.7 "before any relaunch login"). The default wall budget starts when the
+Orchestrator is built; a Calibration run must be given its `WallBudget` (its window end is a calendar time).
 """
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 
 from ..records import RunOutcome
-from .attestation import SAFETY_ROWS, AttestationProfile, RowReads, attest, matches, readable
-from .budgets import SESSION_RELEASE_WAIT_S, ReloginBudget, ShardBudgets
+from .attestation import SAFETY_ROWS, AttestationProfile, RowReads, a9_passed, attest, matches, readable
+from .boundary import (BoundaryObservations, DialogTimer, FlowTimer, flow_budget_cut, flow_budget_s, new_order_rows,
+                       tripwire_result)
+from .budgets import SESSION_RELEASE_WAIT_S, RateCounters, ReloginBudget, ShardBudgets, WallBudget, run_budget
 from .clock import Clock, SystemClock
+from .degraded import ModelAvailability, SpendTracker
 from .gateway import Chord, DropLedger
 from .gates import (AccountExpectation, WorkspaceExpectation, check_authenticated, check_canary_flow, check_fixture,
                     check_launched, check_provisioned, check_teardown, check_workspace, decide_run_outcome)
-from .identity import READ_GAP_S, Allowlist, judge_fixture_account, judge_identity, readable as selector_readable
+from .identity import (READ_GAP_S, TIMER_S, Allowlist, assertion_due, deferral_unreadable, judge_fixture_account,
+                       judge_identity, paper_stamp, readable as selector_readable, stamp_current)
 from .killswitch import (ORDERS_SENT, KillSwitchReport, Proof, ProofInputs, cancel_new_working, execute_kill_switch,
-                         post_run_proof, proof_result, recovery_login, teardown_incident)
+                         kill_switch, post_run_proof, proof_result, recovery_login, teardown_incident)
 from .alerts import AlertRoute
+from .ports import SessionSafety
 from .results import ControlResult, OutcomeSink, RunVerdict, write_unreached
-from .rig import OrderBook, Rig
-from .watchdog import Heartbeat, HeartbeatUnwritable, HeartbeatWriter, heartbeat_failed, watchdog_check
+from .rig import OrderBook, Rig, SelectorRead
+from .watchdog import (Heartbeat, HeartbeatUnwritable, HeartbeatWriter, disk_check, heartbeat_failed,
+                       proactive_relaunch_due, watchdog_check)
+
+# what each relaunch cause spends (7.7, 10.2, SD-66): K for an environment re-login; an app relaunch or the hook host
+# restart, already charged by the control that asked for the relaunch; nothing for the proactive relaunch
+RELAUNCH_BUDGETS = {"environment_relogin": "relogin_k", "app_failure": "app_relaunch", "hook_host": "hook_host",
+                    "proactive": None}
 
 
 @dataclass(frozen=True)
@@ -125,7 +166,10 @@ class Orchestrator:
     def __init__(self, rig: Rig, ctx: RunContext, sink: OutcomeSink, *, clock: Clock | None = None,
                  budgets: ShardBudgets | None = None, relogin: ReloginBudget | None = None,
                  ledger: DropLedger | None = None, heartbeat: HeartbeatWriter | None = None,
-                 watchdog_status: Callable[[], tuple[float, bool]] | None = None):
+                 watchdog_status: Callable[[], tuple[float, bool]] | None = None, wall: WallBudget | None = None,
+                 spend: SpendTracker | None = None, model: ModelAvailability | None = None,
+                 counters: RateCounters | None = None,
+                 safety_listener: Callable[[SessionSafety], None] | None = None):
         self.rig = rig
         self.ctx = ctx
         self.sink = sink
@@ -135,21 +179,48 @@ class Orchestrator:
         self.ledger = ledger or DropLedger()
         self.heartbeat = heartbeat
         self.watchdog_status = watchdog_status
+        self.wall = wall if wall is not None else WallBudget.for_run(ctx.run_type, self.clock.monotonic())
+        self.spend = spend or SpendTracker()
+        self.model = model or ModelAvailability()
+        self.counters = counters if counters is not None else RateCounters()
+        self.safety = SessionSafety()
+        self.safety_listener = safety_listener
         self.state = "provisioned"
         self.results: list[ControlResult] = []
         self.stop: ControlResult | None = None
         self.session = "never"
         self.start_book: OrderBook | None = None
+        self.declared_sends: set[str] = set()
+        self.flow: FlowTimer | None = None
+        self.flows_since_launch = 0
+        self.launched_mono: float | None = None
+        self._last_flow: str | None = None
+        self._dialog = DialogTimer()
+        self._disk_warned = False
+        self._stamp: dict[str, str] | None = None
+        self._session_started_at: datetime | None = None
         self._a1: str | None = None
         self._a2: str | None = None
 
     # -- recording --------------------------------------------------------------------------------------
     def apply(self, r: ControlResult) -> ControlResult:
-        """Record a control result; the first one that sets a run outcome stops the shard."""
+        """Record a control result; the first one that sets a run outcome stops the shard. A `session_kicked`
+        result marks the session kicked (its proof takes the kicked path of 6.6), and a result that kills the tree
+        or runs the kill switch ends the session's safety state."""
         self.results.append(r)
+        if r.unreached is not None and r.unreached.reason == "session_kicked":
+            self.session = "kicked"
+            self._clear_safety()
+        elif r.has("kill_tree") or r.has("kill_switch"):
+            self._clear_safety()
         if r.run is not None and self.stop is None:
             self.stop = r
         return r
+
+    def _contain(self, r: ControlResult) -> None:
+        """A stopping result that asks for deny-all or the kill switch puts the hook in deny-all at once (6.6 step 1)."""
+        if r.run is not None and (r.has("deny_all") or r.has("kill_switch")):
+            self.rig.set_hook_state(armed=True, deny_all=True)
 
     def _gate(self, state: str) -> bool:
         """Enter a gate: heartbeat and the Watchdog's reverse heartbeat (5.2, 10.2). False when either stops the run."""
@@ -168,6 +239,41 @@ class Orchestrator:
                 self.apply(r)
         return self.stop is None
 
+    # -- the session's safety state (6.3, 6.4, SD-57) ---------------------------------------------------
+    def _set_safety(self, s: SessionSafety) -> None:
+        if s != self.safety:
+            self.safety = s
+            if self.safety_listener is not None:
+                self.safety_listener(s)
+
+    def _clear_safety(self) -> None:
+        """The session ended (or has not been asserted yet): nothing attested, no assertion, no stamp."""
+        self._stamp = None
+        self._set_safety(SessionSafety(session_kicked=self.session == "kicked"))
+
+    def _new_session(self) -> None:
+        """The `authenticated` gate passed: a new session, with nothing asserted in it yet."""
+        self.session = "established"
+        self._session_started_at = self.clock.now()
+        self._clear_safety()
+
+    def _asserted(self, read: SelectorRead) -> None:
+        """A passing paper-mode assertion of `read`: the session's stamp and its last assertion time (6.4)."""
+        self._stamp = paper_stamp(read.text or "", self.clock.now())
+        self._set_safety(replace(self.safety, last_assertion_mono=self.clock.monotonic(),
+                                 account_id_sha256=self._stamp["account_id_sha256"]))
+
+    def paper_stamp(self) -> dict[str, str] | None:
+        """The paper-asserted stamp `{account_id_sha256, mode, asserted_at}` of the current session's latest passing
+        assertion, for every checkpoint and outcome record (6.4; 8.3 `paper_asserted_at`); None when no assertion
+        has passed in the current session. Take it at capture time: it is cleared when the session ends."""
+        return dict(self._stamp) if self._stamp is not None else None
+
+    def may_release(self, stamp: dict[str, str] | None) -> bool:
+        """Capture releases no frame to the Reviewer, the agent or a report without a paper-asserted stamp from the
+        current session (6.4 Schedule)."""
+        return self._stamp is not None and stamp_current(stamp, self._session_started_at)
+
     # -- the gate sequence --------------------------------------------------------------------------------
     def run(self, work: Callable[["Orchestrator"], None] | None = None) -> RunReport:
         """Run the shard. `work` runs the shard's work items while the state is `running`, reports every control
@@ -177,15 +283,19 @@ class Orchestrator:
                 work(self)
         return self._finish()
 
-    def _gates(self) -> bool:
+    def _gates(self, start: str = "provisioned") -> bool:
+        """The gates from `start` (`provisioned` for the shard, `launched` for a relaunch) to `canary_flow_passed`."""
+        if start not in ("provisioned", "launched"):
+            raise ValueError(f"the gate sequence starts at provisioned or launched, not {start!r}")
         ctx, rig = self.ctx, self.rig
-        if not self._gate("provisioned"):
-            return False
-        r = self.apply(check_provisioned(rig.preflight(), repeat_gates=frozenset(
-            g for g in ctx.history.failed_gates_last_run if g.startswith("preflight."))))
-        if not r.passed:
-            return False
-        first = True
+        if start == "provisioned":
+            if not self._gate("provisioned"):
+                return False
+            r = self.apply(check_provisioned(rig.preflight(), repeat_gates=frozenset(
+                g for g in ctx.history.failed_gates_last_run if g.startswith("preflight."))))
+            if not r.passed:
+                return False
+        first = start == "provisioned"
         while True:
             if not self._gate("launched"):
                 return False
@@ -198,15 +308,16 @@ class Orchestrator:
             if not r.passed:
                 return False
             break
+        self.launched_mono = self.clock.monotonic()
+        self.flows_since_launch = 0
         rig.set_hook_state(armed=True, deny_all=False)
         if not self._gate("authenticated"):
             return False
+        self.counters.login(self.clock.now())
         r = self.apply(check_authenticated(rig.login()))
         if not r.passed:
-            if r.unreached is not None and r.unreached.reason == "session_kicked":
-                self.session = "kicked"
             return False
-        self.session = "established"
+        self._new_session()
         if not self._gate("paper_mode_asserted") or not self._paper_mode():
             return False
         if not self._gate("settings_attested") or not self._attest():
@@ -233,7 +344,9 @@ class Orchestrator:
         self.apply(check_canary_flow(rig.run_canary_flow()))
         return self.stop is None
 
-    def _paper_mode(self) -> bool:
+    def _read_identity(self) -> tuple[ControlResult, SelectorRead]:
+        """One paper-mode assertion (6.4): a selector read, and under deny-all a second one 1 s later when the first
+        is unreadable; a pass lifts the deny-all and stamps the session."""
         rig, ctx = self.rig, self.ctx
         reads = [rig.read_account_selector()]
         if not selector_readable(reads[0]):
@@ -242,27 +355,47 @@ class Orchestrator:
             reads.append(rig.read_account_selector())
         r = self.apply(judge_identity(reads, ctx.allowlist,
                                       unreadable_streak=ctx.history.identity_unreadable_streak))
+        if r.passed:
+            if r.has("rearm"):
+                rig.set_hook_state(armed=True, deny_all=False)
+            self._asserted(reads[-1])
+        return r, reads[-1]
+
+    def _paper_mode(self) -> bool:
+        rig, ctx = self.rig, self.ctx
+        r, read = self._read_identity()
         if not r.passed:
             return False
-        if r.has("rearm"):
-            rig.set_hook_state(armed=True, deny_all=False)
-        self._a1 = reads[-1].crop_sha256
-        self.start_book = rig.read_orders()                  # identity known: the run-start snapshot (choice)
-        selected = reads[-1].text or ""
+        self._a1 = read.crop_sha256
+        if not self._snapshot():
+            return False
+        selected = read.text or ""
         if selected != ctx.fixture_account:
             rig.select_account(ctx.fixture_account)
-            after = rig.read_account_selector()
+            # 6.4: the selector text must equal an allowlist entry before every flow, the selected one too
+            r, after = self._read_identity()
             self._a2 = after.crop_sha256
-            if selector_readable(after):
-                # 6.4: the selector text must equal an allowlist entry before every flow, the selected one too
-                r = self.apply(judge_identity([after], ctx.allowlist,
-                                              unreadable_streak=ctx.history.identity_unreadable_streak))
-                if not r.passed:
-                    return False
+            if not r.passed:
+                return False
             r = self.apply(judge_fixture_account(selected, ctx.fixture_account, after_select=after.text))
             return r.passed
-        self._a2 = reads[-1].crop_sha256
+        self._a2 = read.crop_sha256
         return True
+
+    def _snapshot(self) -> bool:
+        """The run-start order snapshot, once identity is known; after a relaunch the snapshot is kept and the fresh
+        read is checked against it instead (module docstring). False when a new row trips the kill switch."""
+        book = self.rig.read_orders()
+        if self.start_book is None:
+            self.start_book = book
+            return True
+        rows = new_order_rows(self.start_book, book, frozenset(self.declared_sends))
+        if not rows:
+            return True
+        r = self.apply(replace(kill_switch("new_order_row", gate=self.state, running_flow=self._last_flow),
+                               evidence={"new_rows": [x.key for x in rows]}))
+        self._contain(r)
+        return False
 
     def _attest(self) -> bool:
         rig, ctx = self.rig, self.ctx
@@ -274,31 +407,191 @@ class Orchestrator:
             seconds = {i: rig.read_setting(i) for i in bad}
         reads = {i: RowReads(firsts[i], seconds.get(i)) for i in SAFETY_ROWS}
         all_match = all(readable(r.last, ctx.profile) and matches(r.last, ctx.profile) for r in reads.values())
-        a9 = rig.confirmation_check() if all_match else None
+        checks = []
+        if all_match:
+            self._set_safety(replace(self.safety, attestation_stage="a3_a8"))    # SD-57: the A9 click may run
+            checks.append(rig.confirmation_check())
+            if ctx.profile.a9_runs == 2 and a9_passed(checks[0]):
+                checks.append(rig.confirmation_check())                         # 6.13 item 3: A9 runs twice
+        a9 = checks[0] if checks else None
+        a9b = checks[1] if len(checks) > 1 else None
         rc = ctx.run_type == "rc"
         a10 = rig.read_notifications() if rc and all_match else None
         evidence = {"A1": self._a1, "A2": self._a2, **{i: reads[i].last.screenshot_sha256 for i in SAFETY_ROWS},
                     "A9": a9.screenshot_sha256 if a9 else None, "A10": a10.screenshot_sha256 if a10 else None}
-        res = attest(reads, ctx.profile, a9=a9, a10=a10, rc_run=rc, evidence=evidence,
+        if ctx.profile.a9_runs == 2:
+            evidence["A9_second"] = a9b.screenshot_sha256 if a9b else None
+        res = attest(reads, ctx.profile, a9=a9, a9_second=a9b, a10=a10, rc_run=rc, evidence=evidence,
                      previous_unreadable=ctx.history.attestation_unreadable_last_run)
         self.apply(res.result)
         if res.result.passed:
             rig.load_order_chords(list(res.chords) + list(ctx.default_order_chords))
+            self._set_safety(replace(self.safety, attestation_stage="a3_a9"))    # SD-57: a later send may run
         return res.result.passed
+
+    # -- boundaries inside `running` (boundary.py) -----------------------------------------------------
+    def flow_boundary(self, now: float | None = None, obs: BoundaryObservations | None = None, *,
+                      flow_id: str | None = None, p50_s: float | None = None) -> ControlResult | None:
+        """The checks before every flow, census visit or sweep ladder, in boundary.py's order; returns the result
+        that stopped the run (already applied), or None, in which case the unit may start. `now` is the
+        Orchestrator clock's monotonic reading (the default); `flow_id` names a flow, whose budget `p50_s` sets
+        (3 x p50, 5 minutes until measured) and which counts toward the proactive relaunch."""
+        if self.stop is not None:
+            return self.stop
+        now = self.clock.monotonic() if now is None else now
+        obs = obs or BoundaryObservations()
+        self.flow = None                                   # the unit before this boundary has ended
+        checks: tuple[Callable[[], ControlResult | None], ...] = (
+            lambda: self._tripwires(now, obs, read_book=True),
+            lambda: self._watchdog(obs),
+            lambda: self._disk(obs),
+            lambda: self._run_budget(now, obs),
+            self.spend.at_flow_boundary,
+            lambda: self._model(obs))
+        for check in checks:
+            r = check()
+            if r is not None:
+                self._contain(self.apply(r))
+                if self.stop is not None:
+                    return self.stop
+        self.assert_paper_mode()                           # before every flow (6.4 Schedule)
+        if self.stop is not None:
+            return self.stop
+        uptime = now - self.launched_mono if self.launched_mono is not None else 0.0
+        if proactive_relaunch_due(self.flows_since_launch, uptime, inside_flow=False):
+            if not self.relaunch("proactive"):
+                return self.stop
+            now = self.clock.monotonic()
+        if flow_id is not None:
+            self.flows_since_launch += 1
+            self._last_flow = flow_id
+            self.flow = FlowTimer(flow_id, now, flow_budget_s(p50_s))
+        return None
+
+    def step_boundary(self, now: float | None = None, obs: BoundaryObservations | None = None, *,
+                      order_stage_step: bool = False, session_dialog: bool = False) -> ControlResult | None:
+        """The checks before every step of a flow: the trip-wires, the flow's own budget and the paper-mode assertion
+        when 6.4 makes it due (`order_stage_step`: the next step is an order-stage step; `session_dialog`: a re-login
+        or session dialog was just handled). Returns the result that stopped the run, or the flow-budget result
+        (`end_flow`: the flow ends, its remaining checkpoints `not_run (reason: budget)`), else None."""
+        if self.stop is not None:
+            return self.stop
+        now = self.clock.monotonic() if now is None else now
+        obs = obs or BoundaryObservations()
+        r = self._tripwires(now, obs, read_book=False)
+        if r is not None:
+            self._contain(self.apply(r))
+            return self.stop
+        if self.flow is not None and self.flow.over(now):
+            cut = self.apply(flow_budget_cut(self.flow, now))
+            self.flow = None
+            return cut
+        last = self.safety.last_assertion_mono
+        due = "now" if last is None else assertion_due(now, last, boundary=order_stage_step or session_dialog,
+                                                         main_foreground=obs.main_foreground, modal_up=obs.modal_up)
+        if due == "now":
+            self.assert_paper_mode()
+        elif due == "unreadable":
+            self.rig.set_hook_state(armed=True, deny_all=True)
+            self.apply(deferral_unreadable(deferred_s=now - (last or now) - TIMER_S,
+                                           unreadable_streak=self.ctx.history.identity_unreadable_streak))
+        return self.stop
+
+    def assert_paper_mode(self) -> ControlResult:
+        """The paper-mode assertion outside the gate (6.4 Schedule): before every flow, after a re-login or session
+        dialog, on the two-minute timer, before every order-stage step. A mismatch is `aborted_safety` with the
+        kill switch; two unreadable reads 1 s apart are the identity-unreadable path."""
+        if self.stop is not None:
+            return self.stop
+        r, _ = self._read_identity()
+        self._contain(r)
+        return r
+
+    def _tripwires(self, now: float, obs: BoundaryObservations, *, read_book: bool) -> ControlResult | None:
+        """The 6.6 trip-wires at a boundary: the caller's wires, plus a new Working or Filled row against the
+        run-start snapshot, the dialog timer and the run's gateway drops."""
+        self.declared_sends |= obs.declared_sends
+        orders = obs.orders if obs.orders is not None else (self.rig.read_orders() if read_book else None)
+        rows = new_order_rows(self.start_book, orders, frozenset(self.declared_sends))
+        open_s = self._dialog.observe(obs.order_dialog_visible, now) if obs.order_dialog_visible is not None else 0.0
+        w = obs.tripwires
+        wires = replace(w, new_working_or_filled=w.new_working_or_filled or bool(rows),
+                        dialog_open_s=max(w.dialog_open_s, open_s),
+                        gateway_drops=max(w.gateway_drops, self.ledger.run_count))
+        running = self.flow.flow_id if self.flow is not None else self._last_flow
+        return tripwire_result(wires, gate=self.state, running_flow=running, drop_limit=self.ledger.per_run,
+                               new_rows=rows)
+
+    def _watchdog(self, obs: BoundaryObservations) -> ControlResult | None:
+        status = obs.watchdog if obs.watchdog is not None else (
+            self.watchdog_status() if self.watchdog_status is not None else None)
+        return watchdog_check(*status) if status is not None else None
+
+    def _disk(self, obs: BoundaryObservations) -> ControlResult | None:
+        if obs.free_bytes is None:
+            return None
+        r = disk_check(obs.free_bytes, obs.disk_floor_bytes)
+        if r is not None and r.run is None:                 # the run-health warning, once per shard
+            if self._disk_warned:
+                return None
+            self._disk_warned = True
+        return r
+
+    def _run_budget(self, now: float, obs: BoundaryObservations) -> ControlResult | None:
+        return run_budget(now_s=self.wall.elapsed(now), wall_budget_s=self.wall.budget_s,
+                          report_margin_s=self.wall.margin_s, counters=self.counters.counts(self.clock.now()),
+                          superseded=obs.superseded, caps=self.counters.caps)
+
+    def _model(self, obs: BoundaryObservations) -> ControlResult | None:
+        if obs.model_endpoint_ok is None or not self.model.recheck(obs.model_endpoint_ok):
+            return None
+        return ControlResult("model_recheck", True, "running",
+                             detail="model endpoint back: review live, agent fallback and the Explorer enabled (10.7)")
+
+    # -- relaunch (7.7, 10.2) ---------------------------------------------------------------------------
+    def relaunch(self, cause: str) -> bool:
+        """The re-login flow of 7.7 for `cause` (RELAUNCH_BUDGETS): an environment re-login spends one of K, and past
+        K ends the run `complete_with_env_errors (reason: relogin_budget)`; the other causes spend nothing here. The
+        tree is killed, `session_release_wait` waited, and the state machine re-enters at `launched` and passes every
+        gate again, then `running`; the caller resumes at the next flow boundary. True when the shard is `running`
+        again, False when the budget or a gate stopped the run."""
+        if cause not in RELAUNCH_BUDGETS:
+            raise ValueError(f"relaunch cause {cause!r}; one of {sorted(RELAUNCH_BUDGETS)}")
+        if self.stop is not None:
+            return False
+        if cause == "environment_relogin" and not self.apply(self.relogin.environment_relogin()).passed:
+            return False
+        spent = {"environment_relogin": f"re-login {self.relogin.used} of {self.relogin.k}",
+                 "app_failure": f"app relaunch {self.budgets.used_app} of {self.budgets.app_relaunches}",
+                 "hook_host": f"hook host restart {self.budgets.used_hook_host} of {self.budgets.hook_host_restarts}",
+                 "proactive": "none"}[cause]
+        self.apply(ControlResult("relaunch", True, "running",
+                                 detail=f"relaunch ({cause}), budget: {spent}; every gate passes again",
+                                 evidence={"cause": cause, "budget": RELAUNCH_BUDGETS[cause],
+                                           "flows_since_launch": self.flows_since_launch}))
+        self.rig.set_hook_state(armed=True, deny_all=True)
+        self.rig.kill_process_tree()
+        self._clear_safety()
+        self.flow = None
+        self.clock.sleep(SESSION_RELEASE_WAIT_S)
+        return self._gates(start="launched") and self._gate("running")
 
     # -- ending ----------------------------------------------------------------------------------------
     def _finish(self) -> RunReport:
         stop, rig, ctx = self.stop, self.rig, self.ctx
         last_gate = self.state
+        self.flow = None
+        self._clear_safety()
         ks: KillSwitchReport | None = None
         streak = ctx.history.unproven_streak
         so_far = stop.run if stop else None
         kill_switch_path = stop is not None and (stop.run_status == "aborted_safety" or stop.has("kill_switch"))
-        if stop is not None and stop.has("kill_tree") and not kill_switch_path:
-            rig.kill_process_tree()
+        if not kill_switch_path and ((stop is not None and stop.has("kill_tree")) or self.session == "kicked"):
+            rig.kill_process_tree()          # a kicked session's tree goes too: the proof's login starts afresh
         if kill_switch_path:
             ks = execute_kill_switch(rig, stop, clock=self.clock, allowlist=ctx.allowlist, start=self.start_book,
                                      fixture_account=ctx.fixture_account, run_so_far=so_far, unproven_streak=streak)
+            self._count_recovery_login(ks)
             proof = ks.proof
             self.apply(ks.proof_effect)
         elif self.session == "never" or (self.session == "established" and self.start_book is None
@@ -323,6 +616,7 @@ class Orchestrator:
                 ks = execute_kill_switch(rig, effect, clock=self.clock, allowlist=ctx.allowlist, start=self.start_book,
                                          fixture_account=ctx.fixture_account, run_so_far=effect.run,
                                          unproven_streak=streak)
+                self._count_recovery_login(ks)
                 effect = teardown_incident(proof, effect, ks)
                 proof = ks.proof
             self.apply(effect)
@@ -340,6 +634,11 @@ class Orchestrator:
         report.last_gate = stop.gate if stop is not None and stop.gate else last_gate
         return report
 
+    def _count_recovery_login(self, ks: KillSwitchReport) -> None:
+        """The kill switch's recovery login is a login on the login id (6.4 rate caps)."""
+        if any(name == "recovery_login" for name, _ in ks.steps):
+            self.counters.login(self.clock.now())
+
     def _recovery_proof(self, *, kicked: bool) -> Proof:
         """6.6 step 5 (and the kicked-session rule): a fresh scripted login with A1 and A2, then the proof."""
         rig, ctx = self.rig, self.ctx
@@ -348,6 +647,7 @@ class Orchestrator:
         for _ in range(attempts):
             if kicked:
                 self.clock.sleep(SESSION_RELEASE_WAIT_S)
+            self.counters.login(self.clock.now())
             ok = recovery_login(rig, ctx.allowlist, self.clock, ctx.fixture_account)
             if ok:
                 break

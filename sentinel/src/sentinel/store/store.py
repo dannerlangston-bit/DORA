@@ -126,6 +126,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 from .. import required_fields
+from ..classify import DecisionMatch
 from ..canonical import canonical_json
 from ..records import (ACTION_VERDICT, DATA_MODES, PERSONAS, RUN_TYPES, CheckpointOutcome, Classification, Component,
                        Decision, DiffSummary, EgressRow, Escape, ExplorerFinding, Extraction, Finding, Fingerprint,
@@ -174,6 +175,7 @@ SYSTEM_STATE_KEYS = frozenset({
     "last_artifact_audit_at", "kill_switch_state", "detector_state", "canaries_pending", "nightly_skipped_for",
     "reviewer_disabled", "harness_freeze", "free_bytes_at_last_preflight"})
 OUTBOX_OPEN = ("queued", "failed")             # 9.1: states a job is retried from
+PAIR_KINDS = ("pr", "merge", "rc", "aa")       # 8.3 build_pairs.pair_kind
 RUN_REFS = ("report_sha256", "comment_sha256", "coverage_matrix_ref", "egress_log_ref", "post_run_proof_ref")   # 4.13
 
 
@@ -362,12 +364,6 @@ class Review:
     votes_json: str | None = None
     task: str | None = None                # manifest_match | describe_collateral | manifest_visibility
     intent: str | None = None
-
-
-@dataclass(frozen=True)
-class DecisionMatch:
-    decision: Decision
-    distance: int
 
 
 @dataclass(frozen=True)
@@ -727,6 +723,12 @@ def _decision_from_row(r: sqlite3.Row) -> Decision:
         supersedes=decision_ref(r["supersedes_decision_id"]))
 
 
+def _match(r: sqlite3.Row) -> DecisionMatch:
+    """A lookup row as the one match type (classify.DecisionMatch), with the build pair of the decision's run."""
+    d = _decision_from_row(r)
+    return DecisionMatch(d, r["distance"], build_pair_id=d.build_pair_id)
+
+
 def _frozen(conn: sqlite3.Connection, rows: Iterable[sqlite3.Row]) -> bool:
     """9.7: two supersessions within 30 days on one signature freeze it (S-05). Walks each row's chain."""
     for row in rows:
@@ -777,9 +779,9 @@ def lookup_decisions(conn: sqlite3.Connection, signature: Signature, *, at: str 
         r = conn.execute("SELECT pair_id FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         pair = None if r is None or r["pair_id"] is None else str(r["pair_id"])
     entries, tickets = frozenset(manifest_entries), frozenset(manifest_tickets)
-    found = [DecisionMatch(_decision_from_row(r), r["distance"]) for r in rows]
+    found = [_match(r) for r in rows]
     outside = [m for m in found if not _in_ticket_scope(m.decision, run_id, pair, entries, tickets)]
-    related = [DecisionMatch(_decision_from_row(r), r["distance"]) for r in conn.execute(RELATED_SQL, args)]
+    related = [_match(r) for r in conn.execute(RELATED_SQL, args)]
     return DecisionLookup(tuple(found), tuple(related), frozen=_frozen(conn, rows), out_of_scope=tuple(outside))
 
 
@@ -1081,6 +1083,27 @@ class Store:
             return
         with self._batch("build") as rows:
             self._insert(rows, "builds", row)
+
+    def register_pair(self, candidate_build_id: str, base_build_id: str, pair_kind: str, *,
+                      merge_base_commit: str | None = None, created_at: str | None = None) -> int:
+        """The 8.3 `build_pairs` row of a run's two builds (3.1), registered before `begin_run` so the run plan can
+        carry its `pair_id`; returns the pair id. The same builds, kind and merge base again return the same pair,
+        so every run on the pair shares it (the 9.7 mark_intended scope). Both builds must be registered; candidate
+        and base differ except for an `aa` pair (8.3 CHECK)."""
+        if pair_kind not in PAIR_KINDS:
+            raise StoreRefused(f"pair_kind {pair_kind!r}; one of {PAIR_KINDS} (8.3)")
+        for b in (candidate_build_id, base_build_id):
+            if self._one("SELECT 1 FROM builds WHERE build_id = ?", (b,)) is None:
+                raise StoreRefused(f"build {b} is not registered (register_build first, 8.3)")
+        old = self._one("SELECT pair_id FROM build_pairs WHERE candidate_build_id = ? AND base_build_id = ? AND "
+                        "pair_kind = ? AND merge_base_commit IS ?",
+                        (candidate_build_id, base_build_id, pair_kind, merge_base_commit))
+        if old is not None:
+            return old[0]
+        with self._batch("build_pair") as rows:
+            return self._insert(rows, "build_pairs", {
+                "candidate_build_id": candidate_build_id, "base_build_id": base_build_id, "pair_kind": pair_kind,
+                "merge_base_commit": merge_base_commit, "created_at": utc(created_at) or now()})
 
     def _checkpoint_row(self, e: ScopeEntry, config_commit: str) -> dict:
         parts = checkpoint_parts(e.checkpoint_id)

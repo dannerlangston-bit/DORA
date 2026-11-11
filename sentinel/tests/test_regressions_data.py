@@ -214,6 +214,38 @@ def test_mark_intended_scope_by_manifest_entry_and_build_pair(tmp_path):
         assert s.lookup_decisions(sig, run_id="run-03", manifest_entries=["tos-48120-1"]).inherited is not None
 
 
+def test_registered_build_pairs_scope_mark_intended(tmp_path):
+    # 08-build-pairs, 8.3 build_pairs and runs.pair_id, 9.7: two PR runs on the same registered pair, no manifest
+    # tickets: the second inherits the first's mark_intended, through the store and through classify (input M with
+    # Facts.build_pair_id); a run on another pair does not. The lookup returns classify's one DecisionMatch type.
+    from sentinel.classify import DecisionMatch, Facts, classify
+    facts = dict(channel="branch", pipeline_artifact_url="u")
+    with Store(tmp_path / "run.db") as s:
+        for b in ("cand", "base", "other"):
+            s.register_build(b, source_commit=b, installer_sha256=b * 4, **facts)
+        pair = s.register_pair("cand", "base", "pr", merge_base_commit="4f1c9a2")
+        assert s.register_pair("cand", "base", "pr", merge_base_commit="4f1c9a2") == pair       # one pair, reused
+        other = s.register_pair("other", "base", "pr")
+        assert s.register_pair("base", "base", "aa") not in (pair, other)                     # aa: equal builds
+        with pytest.raises(REFUSED):
+            s.register_pair("base", "base", "pr")
+        with pytest.raises(REFUSED):
+            s.register_pair("cand", "nope", "pr")
+        s.begin_run(plan(pair_id=pair))
+        record(s, "dec-000001", "mark_intended", "intended", ticket="TOS-48120")
+        s.begin_run(plan(run_id="run-02", pair_id=pair))
+        s.begin_run(plan(run_id="run-03", pair_id=other))
+        sig = Signature(SWEEP, REGION, ph(), "collateral")
+        same = s.lookup_decisions(sig, run_id="run-02")
+        assert same.inherited.decision_id == "dec-000001" and same.inherited.build_pair_id == str(pair)
+        m = same.matches[0]
+        assert isinstance(m, DecisionMatch) and m.build_pair_id == str(pair) and m.distance == m.hamming == 0
+        assert s.lookup_decisions(sig, run_id="run-03").inherited is None
+        above = dict(diff="above", stability="stable", manifest="undeclared")
+        assert classify(Facts(**above, decisions=same.matches, build_pair_id=str(pair))).outcome == "intended"
+        assert classify(Facts(**above, decisions=same.matches, build_pair_id=str(other))).outcome == "collateral"
+
+
 def test_waiver_is_not_ticket_scoped(store):
     # 9.7 table: a waiver (mark_intended on an invariant or assertion) applies to every run while active.
     record(store, "dec-000001", "mark_intended", "intended", category="invariant_violation",

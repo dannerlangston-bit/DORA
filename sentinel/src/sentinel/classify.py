@@ -237,11 +237,18 @@ class Condition:
 
 @dataclass(frozen=True)
 class DecisionMatch:
-    """A persisted human decision whose signature matches this checkpoint (9.7)."""
+    """A persisted human decision whose signature matches this checkpoint (9.7): the one match type of the store's
+    lookup (`store.lookup_decisions`) and of input M. `hamming` is the pHash distance (`distance` reads the same);
+    `build_pair_id` is the build pair the decision was made on (the store fills it from the decision's run)."""
 
     decision: Decision
     hamming: int
-    build_pair_id: str | None = None    # the build pair the decision was made on
+    build_pair_id: str | None = None
+
+    @property
+    def distance(self) -> int:
+        """The pHash distance under the store's name for it (8.3 lookup `distance`)."""
+        return self.hamming
 
 
 @dataclass(frozen=True)

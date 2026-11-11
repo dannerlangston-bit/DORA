@@ -11,7 +11,8 @@ the post-run proof follow. The shard's checkpoints are the Executor's work in `r
 - `RigScript`: what a scenario makes the rig do (a live-format account id in the selector, a scripted
   Enter on the open Order Confirmation dialog, an EDT freeze during a checkpoint);
 - `shard_setup`: the `RunContext` of one shard and the `SimScenario` its rig observes, from the config
-  (the rig launches the build under test, so the Executor's build re-read before each flow sees it); the default
+  (the rig launches the build under test, so the Executor's build re-read before each flow sees it; with
+  `kill_root` its file flag is `<kill_root>/<rig>/run/kill.flag`, so `sentinel stop --root` reaches it); the default
   order chords come from `gateway/default_order_hotkeys.yaml` (`gateway_config.load_default_order_hotkeys`, 5.4.7):
   a file that is missing or breaks L-XREF-17 is returned as the `GatewayConfigError` whose result fails the shard
   closed at `settings_attested`;
@@ -86,6 +87,7 @@ class RigScript:
     selector_text: str | None = None                 # each shard's first account selector read (6.4)
     enter_after: tuple[str, str] | None = None       # (flow id, step id): a scripted Enter on the open dialog after it
     freeze_at: str | None = None                     # checkpoint id: the app's EDT freezes while it is captured
+    stop_at: str | None = None                       # checkpoint id: an operator runs `sentinel stop` on its rig then
 
 
 class ShardSink:
@@ -131,7 +133,8 @@ def order_hotkeys(cfg: SentinelConfig) -> tuple[DefaultOrderHotkeys | None, Gate
 
 
 def shard_setup(cfg: SentinelConfig, *, run_id: str, run_type: str, shard_id: str, shard_no: int, build_id: str,
-                workspace_id: str, script: RigScript) -> tuple[RunContext, SimScenario]:
+                workspace_id: str, script: RigScript, rig_id: str | None = None,
+                kill_root: Path | None = None) -> tuple[RunContext, SimScenario]:
     """The `RunContext` of one shard and the `SimScenario` its simulated rig observes (module docstring). The
     context carries the default order chords file when it loads (`order_hotkeys`); the caller applies the load
     error's result otherwise."""
@@ -159,7 +162,8 @@ def shard_setup(cfg: SentinelConfig, *, run_id: str, run_type: str, shard_id: st
              ] if script.selector_text else []
     scenario = SimScenario(launches=[LaunchObservation(True, build_id, waited_s=40.0)] * LAUNCHES,
                            selector_reads=reads, selected=empty, settings=settings,
-                           workspace=WorkspaceObservation(ws_sha, True, TABS, 1), accounts=states)
+                           workspace=WorkspaceObservation(ws_sha, True, TABS, 1), accounts=states,
+                           rig_id=rig_id or rig, kill_root=kill_root)
     return ctx, scenario
 
 

@@ -51,7 +51,11 @@ checkpoint sequence of 5.17 with the rig replaced by `sim`:
 captures of the base build, every mutant goes through the same `evaluate` path as a PR checkpoint
 with `synthetic: true`, behavioral canaries run their canary flow on the simulated app, and
 `canary.score` gives the result rows, the detector state, the synthetic `harness_error` rows and
-the morning banner.
+the morning banner. Its safety pass (`safety_pass`, 6.5, 6.8, 10.3) then runs the attestation, identity, proof and
+secret-scan canaries, the denied-action test and the fire drill (`orchestrator.drill.run_drill` with `SimDrillPort`)
+on the shard's rig; their `canary_results` rows are written, a blind one's result is persisted
+(`apply_safety_actions`), its banner and detector state join the run's (summary `safety`, which later PR runs in the
+store read), and the day's egress rows are reconciled against the allowlist (`egress.reconcile`).
 
 The Orchestrator (5.2): every shard goes through `orchestrator.Orchestrator` on a simulated rig
 (`pipeline.orchestration`): provisioned, launched, authenticated, the paper-mode assertion against
@@ -163,7 +167,11 @@ from ..orchestrator.degraded import ModelAvailability, SpendTracker
 from ..orchestrator.gates import check_build_unchanged
 from ..orchestrator.gateway import VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB, Action, DropLedger, drain, refusal
 from ..orchestrator.identity import account_id_sha256
+from ..orchestrator.killflag import main as stop_main
 from ..orchestrator.killswitch import TripWires, config_invalid_proof, kill_switch, proof_line
+from ..orchestrator import safety_canaries as sc_mod
+from ..orchestrator.drill import DrillPreconditions, DrillResult, SimDrillPort, run_drill
+from ..orchestrator.explorer import load_deny_list
 from ..orchestrator.ports import SessionSafety
 from ..orchestrator.machine import Orchestrator, RunContext, RunReport
 from ..orchestrator.results import ControlResult, Outcome, RunVerdict, worse
@@ -1244,7 +1252,8 @@ class _ShardWork:
         sc = self.scenario
         clock = ManualClock(start=self.run.now.astimezone(timezone.utc), mono=1000.0 + 10_000 * shard_no)
         ctx, sim = shard_setup(self.cfg, run_id=sc.run_id, run_type="pr", shard_id=shard_id, shard_no=shard_no,
-                               build_id=sc.candidate.build_id, workspace_id=cps[0].workspace_id, script=self.script)
+                               build_id=sc.candidate.build_id, workspace_id=cps[0].workspace_id, script=self.script,
+                               rig_id=rig_id, kill_root=self.out / "rigs")
         rig = SimulatedRig(sim, clock=clock)
         sink = ShardSink([cp.checkpoint_id for cp in cps])
         hb = HeartbeatWriter(self.out / "heartbeat" / f"shard-{shard_no}.json", clock)
@@ -1594,6 +1603,10 @@ class _ShardWork:
         cid = cp.checkpoint_id
         if self.script.freeze_at == cid and cid not in self.frozen:
             return self._freeze(st, cp, rest)
+        if self.script.stop_at == cid and cid not in self.frozen:      # an operator stops the rig (6.6)
+            self.frozen.add(cid)
+            stop_main([st.rig_id, "--root", str(self.out / "rigs"), "--by", "asmith",
+                       "--reason", "an unexpected dialog on the rig's console"], clock=st.clock)
         stamp = st.orch.paper_stamp()                    # 6.4: taken at capture time, for every record
         if stamp is None:                                # L-OUT-06: no assertion in this session; nothing captured
             self._note(st, st.orch.apply(kill_switch("paper_mode_mismatch", gate="running",
@@ -2251,6 +2264,9 @@ def _summary(store: Store, cfg: SentinelConfig, plan: ScopePlan, run: _Run, scen
                            "alerts": list(alerts)}
     if abort:
         out["abort"] = abort
+    nightly = last_nightly_safety(store)            # 10.3: the last Nightly's safety banner and canary rows
+    if nightly:
+        out["safety"] = nightly
     if start.manifest_lint:
         out["manifest_lint"] = list(start.manifest_lint)
     if start.expiring:
@@ -2278,6 +2294,57 @@ def nightly_reconcile(store: Store, cfg_root: Path, now: datetime) -> ControlRes
     return reconcile(rows, EgressAllowlist.load(path), ()).control()
 
 
+@dataclass(frozen=True)
+class SafetyPass:
+    """What the Nightly's safety pass did (6.5, 6.8, 10.3): each safety canary and the denied-action test, the fire
+    drill, their `canary_results` rows, the results to persist, and the banner and detector state they give."""
+
+    canaries: tuple[sc_mod.SafetyCanaryResult, ...]
+    drill: DrillResult
+    rows: tuple[Any, ...]
+
+    @property
+    def results(self) -> tuple[ControlResult, ...]:
+        return tuple(c.result for c in self.canaries) + (self.drill.result,)
+
+    @property
+    def state(self) -> str:
+        return sc_mod.detector_state(self.canaries)
+
+    @property
+    def banner(self) -> str | None:
+        return sc_mod.banner(self.canaries)
+
+
+def _scan_dir(workdir: Path, marker: str) -> list[Path]:
+    """The secret-scan canary's adapter: the files under `workdir` where the 6.9 plaintext scanner finds `marker`."""
+    scanner = SecretScanner({"canary.marker": marker})
+    try:
+        return sorted(p for p in workdir.rglob("*") if p.is_file() and scanner.scan_file(p, str(p)))
+    finally:
+        scanner.zero()
+
+
+def safety_pass(cfg: SentinelConfig, orch: Orchestrator, rig: SimulatedRig, ctx: RunContext, ledger: DropLedger,
+                workdir: Path) -> SafetyPass:
+    """The Nightly's safety pass inside `running` (10.3, 6.5, 6.8): the attestation, identity, proof and secret-scan
+    canaries (each planted input through the real checker), the denied-action test over the config's Explorer deny
+    list (every probe through the gateway), then the fire drill (`run_drill` with `SimDrillPort` on the shard's rig and
+    its kill channel), last because its item 5 runs the kill switch sequence. The drill's preconditions come from the
+    session: A1 to A9 passed (`a3_a9`), a liveness probe the hook dropped a second ago (the simulated hook answers
+    every probe), the signed injector (the simulation has no binary to check)."""
+    entries, registry = load_deny_list(cfg.root)
+    canaries = (sc_mod.attestation_canary(ctx.profile), sc_mod.identity_canary(ctx.allowlist),
+                sc_mod.proof_canary(orch.start_book), sc_mod.secret_scan_canary(_scan_dir, workdir),
+                sc_mod.denied_action_test(rig, entries, deny_controls=registry.deny_controls))
+    chords = ctx.default_hotkeys().chords
+    drill = run_drill(rig, ledger, orch.clock, chords, orch.start_book or rig.read_orders(), rig.flag_channel,
+                      port=SimDrillPort(rig), preconditions=DrillPreconditions(
+                          orch.safety.attestation_stage == "a3_a9", 1.0, True),
+                      allowlist=ctx.allowlist, rig_id=rig.s.rig_id, fixture_account=ctx.fixture_account)
+    return SafetyPass(canaries, drill, tuple(c.row for c in canaries) + tuple(sc_mod.drill_rows(drill, chords)))
+
+
 SIM_SECRET = "sim-paper-login-secret-4b7e19"     # the stand-in plaintext of every simulated login's password (6.9)
 
 
@@ -2299,6 +2366,17 @@ def _withheld(store: Store, plan: ScopePlan, scenario: Scenario, runrec: RunOutc
     return RunResult(scenario.run_id, "pr", runrec.status, runrec.reason, out, store.outcomes(scenario.run_id),
                      store.findings(scenario.run_id), [], "", status, plan, None,
                      notes=[f"report withheld: {why}"])
+
+
+def last_nightly_safety(store: Store) -> dict | None:
+    """The `safety` block of the last finished Nightly run in the store (10.3): its safety canary banner and its run
+    id, whose `canary_results` rows the PR report's Safety section prints; None before any Nightly."""
+    rows = store.query("SELECT summary_json FROM runs WHERE run_type = 'nightly' AND lifecycle = 'finished' "
+                       "ORDER BY finished_at DESC, run_id DESC LIMIT 1")
+    if not rows:
+        return None
+    s = json.loads(rows[0]["summary_json"] or "{}").get("safety")
+    return {"banner": s.get("banner"), "nightly_run_id": s.get("nightly_run_id")} if isinstance(s, dict) else None
 
 
 def _report(store: Store, plan: ScopePlan, scenario: Scenario, runrec: RunOutcome, mdoc: dict | None,
@@ -2544,6 +2622,7 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
             report = cn.score(results, history=history or {}, since=f"{today.isoformat()} {scenario.clock[:5]} ET",
                               context=cn.RowContext(scenario.run_id, "ws.tier-a.swing-trader", "swing_trader", "frozen"))
             done.update(report=report, rows_meta=rows_meta, produced=produced, writer=writer, arts_by_sha=arts_by_sha)
+            done["safety"] = safety_pass(cfg, orch, nrig, ctx, work.ledger, out / "safety-canaries" / scenario.run_id)
 
         shard = orch.run(canary_pass)
         st = _Shard(ctx.shard_id, cfg.fixture.get("rig", "rig-01"), [], orch, orch.rig, orch.sink, clock, ctx)
@@ -2578,6 +2657,11 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                                              started)
         for f in expired_findings:
             store.write_finding(f)
+        work.apply_pending()                          # the gate results noted before the run row existed
+        safety = done["safety"]                      # 6.5, 6.8, 10.3: the drill and the safety canaries' rows
+        store.write_canary_results(scenario.run_id, safety.rows, created_at=_ts(today, scenario.clock, 1800))
+        for res in safety.results:
+            work._note(st, res)
         written: set[str] = set()
         for row in report.outcome_rows:
             if row.checkpoint_id in written:
@@ -2615,8 +2699,13 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                                           reason=shard.verdict.reason, started_at=started,
                                           ended_at=_ts(today, scenario.clock, 2 * 3600)),
                                summary={"coverage": {}, "health": health, "alerts": work.alerts,
-                                        "detector_state": report.state})
+                                        "detector_state": "detector_blind" if "detector_blind" in
+                                        (report.state, safety.state) else report.state,
+                                        "safety": {"banner": safety.banner, "nightly_run_id": scenario.run_id,
+                                                   "detector_state": safety.state}})
         body = {"run_id": scenario.run_id, "detector_state": report.state, "banner": report.banner,
+                "safety": {"detector_state": safety.state, "banner": safety.banner,
+                           "rows": [r.mutant_id for r in safety.rows], "drill": safety.drill.result.detail},
                 "catalog_version": cfg.catalog.version, "simulated": sorted(wanted),
                 "not_simulated": {k: v for k, v in NOT_SIMULATED.items() if k not in wanted},
                 "results": [r.to_dict() for r in report.results],

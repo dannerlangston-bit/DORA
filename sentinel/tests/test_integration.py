@@ -370,6 +370,34 @@ def test_expired_mask_runs_the_day_after_the_first_mask_expiry_and_completes(run
     assert "mask expired: msk.ps.last-update-01" in (out / "summary.txt").read_text()
 
 
+def test_operator_stop_trips_the_kill_switch_through_the_file_flag(runs):
+    """6.6 human channels: `sentinel stop` writes the rig's file flag; the next boundary's `killflag.check` trips the
+    kill switch (`aborted_safety (kill_switch)`, S2), the sequence runs and proves no order was sent, the request is
+    acknowledged, and store.safety holds the incident."""
+    out, (r,) = runs("operator-stop")
+    outs, _, _, _ = stored(out, r.run_id)
+    legal(outs)
+    assert (r.status, r.reason) == ("aborted_safety", "kill_switch") and r.proof == "PROVEN: no orders sent"
+    shard = next(s for s in orchestrator(out)[0]["shards"] if s["verdict"] == "aborted_safety")
+    ks = next(g for g in shard["gates"] if g["control"] == "kill_switch")
+    assert "file_flag" in ks["detail"] and "requested by asmith via cli" in ks["detail"]
+    assert {(o.outcome, o.reason) for o in outs if o.outcome == "env_error"} == {("env_error", "kill_switch")}
+    assert not list((out / "rigs").rglob("kill.flag"))                       # acknowledged: the flag is gone
+    with Store(out / "sentinel.db") as store:
+        assert {i.severity for i in S.incidents(store, run_id=r.run_id)} == {"S2"}
+
+
+def test_redaction_miss_masks_a_stray_account_id_and_reports_it_tier_1(runs):
+    """3.6, 6.10: an account id outside the anchors on the candidate only is masked by the redaction stage, stored as
+    a tier-1 `redaction_miss` finding (never the id itself), counted in run health, and the check still passes."""
+    out, (r,) = runs("redaction-miss")
+    (miss,) = [f for f in r.findings if f.kind == "redaction_miss"]
+    assert (miss.tier, miss.side, miss.evidence["candidate_only"]) == (1, "candidate", True)
+    text = (out / "pr-comment.md").read_text()
+    assert "redaction_miss" in text and "1 candidate only, tier 1" in text and "D-20481134" not in text
+    assert r.status == "complete" and r.commit_status["state"] == "success"
+
+
 # -- sentinel demo all: one line per scenario and out/index.html ---------------------------------------------
 
 def test_the_index_links_every_scenario_output_and_says_what_to_check(runs):

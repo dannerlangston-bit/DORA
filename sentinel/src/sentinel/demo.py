@@ -26,6 +26,10 @@ and its calibration):
   run-start lint) fails and the run is `aborted_harness (reason: config_invalid)`.
 - `expired-mask`: the run date is past the first mask's expiry; the mask stops applying at run start, run health
   lists it, a `mask_expired` finding is stored and the run completes (4.1, 4.8).
+- `operator-stop`: `sentinel stop` writes a rig's file flag mid-run; the next boundary trips the kill switch, the
+  run is `aborted_safety (reason: kill_switch)` and the proof reads PROVEN: no orders sent (6.6).
+- `redaction-miss`: the candidate echoes an account id outside the redaction anchors; the redaction stage masks it
+  and stores a tier-1 `redaction_miss` finding; the check still passes (3.6, 6.10).
 
 `sentinel demo all` runs every scenario, prints one line each and writes `DIR/index.html`, a page that
 links each scenario's report, PR comment, summary and alerts with what to check.
@@ -61,7 +65,8 @@ from .store import Store
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "example"
 SCENARIOS = ("flexgrid-ladder", "clean-pr", "backend-only", "ui-no-manifest", "nightly-canary", "decision-inheritance",
-             "wrong-number", "paper-mode-mismatch", "attempted-send", "app-crash", "config-invalid", "expired-mask")
+             "wrong-number", "paper-mode-mismatch", "attempted-send", "app-crash", "config-invalid", "expired-mask",
+             "operator-stop", "redaction-miss")
 AT = "charts.flexible-grid.active-trader-cell"
 LADDER = "trade.active-trader.ladder"
 STOCK_FLOW = "flow.trade.order-ticket.stock.limit"
@@ -339,8 +344,31 @@ PR_SCENARIOS: dict[str, Callable[[date], Scenario]] = {
     "flexgrid-ladder": lambda d: flexgrid_scenario(d), "clean-pr": lambda d: clean_scenario(d),
     "backend-only": backend_scenario, "ui-no-manifest": ui_no_manifest_scenario, "wrong-number": wrong_number_scenario,
     "paper-mode-mismatch": paper_mode_scenario, "attempted-send": attempted_send_scenario,
-    "app-crash": app_crash_scenario,
+    "app-crash": app_crash_scenario, "operator-stop": lambda d: operator_stop_scenario(d),
+    "redaction-miss": lambda d: redaction_miss_scenario(d),
 }
+
+S03_CHECKPOINT = f"flow/trade.order-entry.stock/{STOCK_FLOW}/s03"
+
+
+def operator_stop_scenario(today: date) -> Scenario:
+    """PR 4856: a backend change with no visible effect; while the stock ticket flow's s03 is captured, an operator
+    runs `sentinel stop` on that shard's rig."""
+    cand, overlay, paths = _backend_pr("d4c8b21", 4856, "chore/TOS-48356-quote-cache",
+                                       "desktop/trade/quotes/src/main/resources/quotes/cache.properties")
+    return Scenario("operator-stop", f"run-{today.isoformat()}-pr-4856-01", SimBuild(cand), SimBuild(BASE_ID),
+                    pr=4856, author="okafor", overlay=overlay, changed_paths=paths, depends_on={},
+                    rig=RigScript(stop_at=S03_CHECKPOINT))
+
+
+def redaction_miss_scenario(today: date) -> Scenario:
+    """PR 4857: a logging change echoes the selected account id on the Order Confirmation, outside the redaction
+    anchors, on the candidate only."""
+    cand, overlay, paths = _backend_pr("e7f3a90", 4857, "chore/TOS-48357-confirm-logging",
+                                       "desktop/trade/orders/src/main/resources/orders/confirm-logging.properties")
+    return Scenario("redaction-miss", f"run-{today.isoformat()}-pr-4857-01",
+                    SimBuild(cand, frozenset({"confirm-account-echo"})), SimBuild(BASE_ID), pr=4857, author="pchen",
+                    overlay=overlay, changed_paths=paths, depends_on={})
 
 S07 = "regions/flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07.yaml"
 S07_MASK = "masks/flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07/msk.confirm.clock-01.yaml"
@@ -828,12 +856,55 @@ def demo_expired_mask(out: Path, today: date = DEFAULT_TODAY, config: Path = EXA
     return [r]
 
 
+def demo_operator_stop(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                       ) -> list[RunResult]:
+    r = run_pipeline(config, operator_stop_scenario(today), out, today, **_rev(reviewer))
+    story = [
+        "PR 4856 changes a backend cache setting (no visible effect, no manifest), so the smoke flows run. While the",
+        "stock ticket flow's s03 is captured, an operator who sees an unexpected dialog on the rig's console runs",
+        f"`sentinel stop <rig> --root {out / 'rigs'}`: the command writes the rig's file flag (6.6).",
+        "",
+        "- The Orchestrator polls the kill channels first at every step and flow boundary (killflag.check): at the next",
+        "  step the flag trips the kill switch, aborted_safety (reason: kill_switch), with the request (who, why, the",
+        "  cli channel) on the result. The checkpoints not yet reached are env_error (gate running, reason kill_switch).",
+        "- The 6.6 sequence runs: deny-all, the tree killed, a recovery login, Cancel All, the proof, the revert; the",
+        "  request is acknowledged (the flag removed). The proof reads PROVEN: no orders sent.",
+        "- store.safety persists what the kill switch decided: an S2 incident, the flow quarantined and the rig",
+        "  disabled until a person re-enables it (`sentinel reenable`). The other shards finish normally.",
+    ]
+    _write_summary(out, "Scenario operator-stop: `sentinel stop` trips the kill switch mid-run", story, [r],
+                   _safety_lines(r))
+    return [r]
+
+
+def demo_redaction_miss(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                        ) -> list[RunResult]:
+    r = run_pipeline(config, redaction_miss_scenario(today), out, today, **_rev(reviewer))
+    misses = [f for f in r.findings if f.kind == "redaction_miss"]
+    story = [
+        "PR 4857 changes an order logging setting. The candidate build echoes the selected account id in the Order",
+        "Confirmation's top row, right of the account fields the redaction anchors cover (redaction/anchors.yaml).",
+        "",
+        "- Capture's redaction stage (3.6, 6.10) runs before anything is diffed or stored: the anchored boxes, then an",
+        "  OCR sweep for the fixture's account ids and the id patterns. The sweep finds the echoed id outside every",
+        "  anchor and fills it on both captures in the theme's background, so nothing unredacted is stored or sent.",
+        f"- The miss is recorded: {len(misses)} redaction_miss finding(s), on the candidate only, so ranked tier 1 as a",
+        "  suspected identifier leak; the finding names the place and the pattern, never the id itself.",
+        "- A redaction miss never fails the check by itself (3.6): the anchor list needs the new field. Run health's",
+        "  Redaction row counts the boxes per side and the misses.",
+    ]
+    _write_summary(out, "Scenario redaction-miss: an account id outside the anchors is masked and reported", story,
+                   [r], _safety_lines(r))
+    return [r]
+
+
 DEMOS: dict[str, Callable[..., list[RunResult]]] = {
     "flexgrid-ladder": demo_flexgrid_ladder, "clean-pr": demo_clean_pr, "backend-only": demo_backend_only,
     "ui-no-manifest": demo_ui_no_manifest, "nightly-canary": demo_nightly_canary,
     "decision-inheritance": demo_decision_inheritance, "wrong-number": demo_wrong_number,
     "paper-mode-mismatch": demo_paper_mode_mismatch, "attempted-send": demo_attempted_send,
     "app-crash": demo_app_crash, "config-invalid": demo_config_invalid, "expired-mask": demo_expired_mask,
+    "operator-stop": demo_operator_stop, "redaction-miss": demo_redaction_miss,
 }
 
 # One sentence per scenario for out/index.html: what it demonstrates, and what a tester should check.
@@ -874,6 +945,13 @@ INDEX = {
                        "lint at preflight G1 and the run ends before any product action.",
                        "the run is aborted_harness (config_invalid), the comment's abort block names L-RGN-03 and "
                        "alerts.json has the P1 aborted_harness page."),
+    "operator-stop": ("An operator runs `sentinel stop` on a rig mid-run; the kill switch runs and proves no order "
+                      "was sent (6.6).",
+                      "the run is aborted_safety (kill_switch), the request (who, why, channel cli) is on the kill "
+                      "switch result in orchestrator.json, and the proof reads PROVEN: no orders sent."),
+    "redaction-miss": ("An account id appears outside the redaction anchors on the candidate only (3.6, 6.10).",
+                       "the redaction stage masks it and stores a tier-1 redaction_miss finding (candidate only), the "
+                       "Run health row counts the boxes, and the check still passes."),
     "expired-mask": ("An expired mask stops applying at run start and the run goes on (4.1, 4.8).",
                      "the run is complete, Run health lists \"mask expired: msk.ps.last-update-01\" and the store "
                      "holds a mask_expired finding."),

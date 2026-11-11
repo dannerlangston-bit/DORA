@@ -102,6 +102,10 @@ VISUAL_CHANGES: dict[str, VisualChange] = {c.change_id: c for c in (
                  "A pricing refactor transposes two digits of the Order Confirmation cost (15,205.00 for "
                  "100 x 150.25); every other pixel of the dialog is the base's",
                  frozenset({"dialog.order-confirmation"})),
+    VisualChange("confirm-account-echo", None,
+                 "A logging change echoes the selected account id in the Order Confirmation's top row, right of "
+                 "the account fields the redaction anchors cover (a suspected identifier leak, 3.6)",
+                 frozenset({"dialog.order-confirmation"})),
 )}
 
 
@@ -346,6 +350,9 @@ def _order_confirmation(build: SimBuild, clock: str) -> tuple[dict, ScreenInfo]:
                      "rect": _at(lm, o, 24, dy, 200, 20)})
         kids.append({"type": "text", "name": f"confirm.{name}", "text": value, "align": "right", "rect": _at(lm, o, 24, dy, 200, 20)})
     kids.append({"type": "text", "name": "confirm.clock", "text": clock, "color": "dim", "rect": _at(lm, o, 260, 200, 110, 16)})
+    if build.has("confirm-account-echo"):
+        kids.append({"type": "text", "name": "confirm.echo", "text": EMPTY_ACCOUNT, "color": "dim",
+                     "rect": _at(lm, o, 400, 24, 120, 18)})
     for name, dx, label, style in (("send", 380, "Send", "primary"), ("cancel", 480, "Cancel", "default"),
                                    ("delete", 580, "Delete", "default")):
         kids.append({"type": "button", "name": f"confirm.{name}", "label": label, "style": style,
@@ -353,6 +360,7 @@ def _order_confirmation(build: SimBuild, clock: str) -> tuple[dict, ScreenInfo]:
     return dialog, ScreenInfo("dialog.title.label", target_window="dialog")
 
 
+EMPTY_ACCOUNT = "D-20481134"              # the fixture's empty account (4.9), the one a PR shard selects
 POSITIONS = (("AAPL", 100, 180.25, 1, 181.40), ("/MESZ26", 1, 6210.50, 5, 6195.25), ("CEI", 1000, 0.62, 1, 0.58),
              ("BKNG", 1, 4100.00, 1, 4122.80), (".AAPL261218C200", 1, 12.40, 100, 11.95),
              (".AAPL261218C210", -1, 8.10, 100, 7.60), ("EUR/USD", 10000, 1.0825, 1, 1.0871))

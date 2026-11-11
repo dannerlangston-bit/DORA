@@ -398,3 +398,49 @@ def test_a_quarantined_flow_is_cut_from_the_next_runs_scope(tmp_path):
     b = run_pipeline(EXAMPLE, backend_scenario(TODAY), tmp_path, today=TODAY)
     stock = [o for o in b.outcomes if o.flow_id == STOCK_FLOW]
     assert stock and {(o.outcome, o.reason) for o in stock} == {("not_run", "quarantine")}
+
+
+def _nightly(tmp_path, run_id: str = "run-2026-11-10-nightly-01"):
+    from sentinel.demo import BASE_ID, _main_build
+    from sentinel.pipeline.run import NightlyScenario, run_nightly
+    from sentinel.pipeline.sim import SimBuild
+    return run_nightly(EXAMPLE, NightlyScenario("nightly", run_id, SimBuild(BASE_ID), overlay=dict([_main_build()]),
+                                                mutants=("M01",)), tmp_path)
+
+
+def test_the_nightly_runs_the_safety_canaries_the_denied_action_test_and_the_fire_drill(tmp_path):
+    """10.3, 6.5, 6.8: the Nightly runs the attestation, identity, proof and secret-scan canaries, the denied-action
+    test and the fire drill; their `canary_results` rows (kinds `safety_canary` and `fire_drill`) are written, and the
+    next PR run's summary names that Nightly for its Safety section."""
+    n = _nightly(tmp_path)
+    with Store(tmp_path / "sentinel.db") as store:
+        rows = store.canary_results(n.run_id)
+        safety = store.run_summary(n.run_id)["safety"]
+    kinds = {r.kind for r in rows}
+    assert {"safety_canary", "fire_drill"} <= kinds
+    assert all(r.state == "detected" for r in rows if r.kind in ("safety_canary", "fire_drill"))
+    assert len([r for r in rows if r.kind == "fire_drill"]) == 5 and safety["banner"] is None
+    pr = run_pipeline(EXAMPLE, clean_scenario(TODAY), tmp_path, today=TODAY)
+    with Store(tmp_path / "sentinel.db") as store:
+        assert store.run_summary(pr.run_id)["safety"] == {"banner": None, "nightly_run_id": n.run_id}
+    assert "Fire drill (last Nightly)" in pr.comment and "Safety canaries (last Nightly)" in pr.comment
+
+
+def test_a_blind_safety_canary_raises_the_banner_and_quarantines_the_rigs_flows(tmp_path, monkeypatch):
+    """10.3, 6.4 Proof: an identity canary that misses a planted crop makes the Nightly detector_blind with the
+    safety banner, and its result persists a quarantine of every flow on the rig (`apply_safety_actions`)."""
+    import sentinel.pipeline.run as pr
+    from sentinel.orchestrator.rig import SelectorRead
+    from sentinel.store import safety as S
+    real = pr.sc_mod.identity_canary
+
+    def blind(allowlist, **kw):
+        return real(allowlist, read=lambda variant: SelectorRead(allowlist.entries[0], crop_sha256="0" * 64))
+
+    monkeypatch.setattr(pr.sc_mod, "identity_canary", blind)
+    n = _nightly(tmp_path)
+    with Store(tmp_path / "sentinel.db") as store:
+        summary = store.run_summary(n.run_id)
+        quarantines = S.open_quarantines(store)
+    assert summary["detector_state"] == "detector_blind" and summary["safety"]["banner"].startswith("DETECTOR BLIND")
+    assert any(q.target_kind == "rig" and q.reason == "safety_canary" for q in quarantines)

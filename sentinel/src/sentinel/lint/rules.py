@@ -668,6 +668,27 @@ def _is_cancel(control: dict) -> bool:
     return not _is_cancel_all(control) and ("cancel" in _s(control.get("id")) or any("cancel" in t for t in _labels(control)))
 
 
+_CLICKS = ("click_named", "rclick", "dblclick")
+# order fields of a paper_send_ok ticket by the control or region id that carries them (6.7, choice 17)
+_ORDER_FIELDS = (("qty", ("qty", "quantity")), ("price", ("price",)), ("tif", ("tif", "time-in-force")),
+                 ("type", ("order-type",)), ("symbol", ("symbol",)))
+
+
+def _order_field(name: str) -> str | None:
+    n = name.casefold()
+    return next((fld for fld, keys in _ORDER_FIELDS if any(k in n for k in keys)), None)
+
+
+def _dec(v: Any) -> float | None:
+    """A typed or asserted number: an int or float, or a string that reads as one."""
+    if isinstance(v, str):
+        try:
+            return float(v.strip())
+        except ValueError:
+            return None
+    return _num(v)
+
+
 def _channel(build_id: str) -> str:
     return build_id.split("-", 1)[0] if isinstance(build_id, str) else ""
 
@@ -1375,6 +1396,21 @@ class _Linter:
             self._flow_assertions(fl, f)
             self._flow_safety(fl, f)
             self._flow_budget(fl, f, fid)
+        self._send_caps()
+
+    def _send_caps(self) -> None:
+        """L-FLW-08, 6.7: every paper_send_ok flow sends one order, so the library never holds more of them than the
+        per-run send cap (default 5), which a run scoping all of them would breach (the gateway refuses the send past
+        the cap: an attempted send, aborted_safety); the per-run cap is at most the per-day cap (default 20)."""
+        sends = [doc.rel for doc in self.r.of("flow") if _d(doc.data).get("class") == "paper_send_ok"]
+        caps = _d(self.send_policy.get("caps"))
+        per_run = caps.get("per_run", SEND_CAPS_6_7["per_run"])
+        per_day = caps.get("per_day", SEND_CAPS_6_7["per_day"])
+        f = sp.rel if (sp := self.r.one("send_policy")) else "policy/send_policy.yaml"
+        if isinstance(per_run, int) and len(sends) > per_run:
+            self.add("L-FLW-08", f, f"{len(sends)} paper_send_ok flows send {len(sends)} orders; the per-run send cap is {per_run}")
+        if isinstance(per_run, int) and isinstance(per_day, int) and per_run > per_day:
+            self.add("L-FLW-08", f, f"per-run send cap {per_run} is above the per-day cap {per_day}", "caps")
 
     def _flow_structure(self, fl: dict, f: str) -> None:
         ids = [st.get("id") for _sec, st in self._all_steps(fl)]
@@ -1397,6 +1433,10 @@ class _Linter:
         if fl.get("fixture") not in self.fixtures:
             self.add("L-FLW-00", f, f"fixture {fl.get('fixture')} is not in fixtures/", "fixture")
         pre = [_d(x) for x in _l(fl.get("preconditions"))]
+        for p in pre:
+            if p.get("type") != "precondition":
+                self.add("L-FLW-00", f, f"preconditions hold only type precondition steps, not {p.get('type')}",
+                         f"preconditions[{p.get('id')}]")
         checks = {p.get("check") for p in pre}
         for need in ("paper_mode", "no_modal"):
             if need not in checks:
@@ -1418,12 +1458,42 @@ class _Linter:
         if is_quarantine and fl.get("class") != "explorer_candidate":
             self.add("L-FLW-14", f, "flows under flows/quarantine/ are class explorer_candidate", "class")
 
+    def _flow_landmarks(self, fl: dict) -> set[str]:
+        """Landmark ids a flow's wait_for may name: the landmarks of its surfaces and of its checkpoints' regions files."""
+        out = {_d(x).get("id") for s in {*_l(fl.get("surfaces")), fl.get("surface")} if isinstance(s, str)
+               for x in _l(_d(self.surfaces.get(s)).get("landmarks"))}
+        for st in self._seq(fl):
+            reg = st.get("regions")
+            doc = self.r.docs.get(reg) if isinstance(reg, str) else None
+            out |= {_d(x).get("id") for x in _l(_d(doc.data if doc else None).get("landmarks"))}
+        return {x for x in out if isinstance(x, str)}
+
+    def _regex(self, f: str, at: str, value: Any) -> None:
+        """A regex field of a flow (title_regex, window_title_regex) compiles (L-FLW-00)."""
+        if isinstance(value, str):
+            try:
+                re.compile(value)
+            except re.error as exc:
+                self.add("L-FLW-00", f, f"regex {value!r} does not compile: {exc}", at)
+
     def _flow_targets(self, fl: dict, f: str) -> None:
         cls = fl.get("class")
+        landmarks = self._flow_landmarks(fl)
+        exempt = self._send_steps(fl) if cls == "paper_send_ok" and self._send_policy_on() else set()
         for sec, st in self._all_steps(fl):
             at = f"{sec}[{st.get('id')}]"
             if st.get("type") == "secret" and cls != "login":
                 self.add("L-FLW-06", f, "secret steps are allowed only in class login flows", at)
+            if st.get("type") == "secret" and not VAULT_REF.match(_s(st.get("vault_ref"))):
+                self.add("L-FLW-06", f, f"vault_ref {st.get('vault_ref')!r} is not vault://<path>#<field>", f"{at}.vault_ref")
+            if st.get("type") == "checkpoint":
+                self._regex(f, f"{at}.target_window.title_regex", _d(st.get("target_window")).get("title_regex"))
+            if st.get("type") == "wait_for":
+                anchor = _d(st.get("anchor"))
+                self._regex(f, f"{at}.anchor.window_title_regex", anchor.get("window_title_regex"))
+                if "landmark" in anchor and anchor.get("landmark") not in landmarks:
+                    self.add("L-FLW-00", f, f"wait_for landmark {anchor.get('landmark')} is a landmark of none of the "
+                                            "flow's surfaces and regions files", f"{at}.anchor.landmark")
             if st.get("type") == "type_fixture" and isinstance(st.get("value"), str):
                 if credential_hits(f"value: {st['value']}"):
                     self.add("L-FLW-06", f, "a value literal matches a credential pattern", f"{at}.value")
@@ -1443,7 +1513,7 @@ class _Linter:
                     self.add("L-FLW-02", f, f"target {t} is not a <surface>.<control> of the registry", f"{at}.{k}")
                     continue
                 c = ctl[1]
-                if c.get("deny") is True or c.get("id") == "auto-send-checkbox":
+                if c.get("id") == "auto-send-checkbox" or (c.get("deny") is True and st.get("id") not in exempt):
                     self.add("L-FLW-13", f, f"step targets {t}, a denied control", f"{at}.{k}")
                 if self.rungs(t) < 2:
                     self.add("L-FLW-17", f, f"target {t} resolves on fewer than two rungs (template plus jab or ocr_text)", f"{at}.{k}")
@@ -1452,9 +1522,152 @@ class _Linter:
         if cls == "login" and fl.get("agent_fallback") != "disabled":
             self.add("L-FLW-06", f, "login flows have agent_fallback: disabled", "agent_fallback")
         if cls == "paper_send_ok":
-            sp = self.send_policy
-            if not (sp.get("enabled") is True and sp.get("risk_owner") and sp.get("signature")):
+            if not self._send_policy_on():
                 self.add("L-FLW-08", f, "class paper_send_ok needs policy/send_policy.yaml enabled: true with a risk-owner signature", "class")
+            self._paper_send_ok(fl, f)
+
+    # -- 6.7 gated branch: the paper_send_ok order (L-FLW-08) ----------------------------------------
+
+    def _send_policy_on(self) -> bool:
+        sp = self.send_policy
+        return bool(sp.get("enabled") is True and sp.get("risk_owner") and sp.get("signature"))
+
+    def _ctl(self, st: dict) -> dict:
+        return _d(self.controls.get(_s(st.get("target")), (None, {}))[1])
+
+    def _send_steps(self, fl: dict) -> set[Any]:
+        """The steps the gated branch lets touch a denied control (6.7, 5.4): the one Send click after the
+        order-stage step, which the single-use send token lifts, and the row's cancel action after it, allowed only
+        in class paper_send_ok (choice 17)."""
+        seq = self._seq(fl)
+        stage = next((k for k, st in enumerate(seq) if st.get("order_stage") is True), None)
+        if stage is None:
+            return set()
+        clicks = [(k, st) for k, st in enumerate(seq) if k > stage and st.get("type") in _CLICKS]
+        send = next((k for k, st in clicks if _is_send(self._ctl(st))), None)
+        if send is None:
+            return set()
+        return {seq[send].get("id")} | {st.get("id") for k, st in clicks if k > send and _is_cancel(self._ctl(st))}
+
+    def _order_values(self, seq: list[dict], fx: dict) -> dict[str, list[tuple[Any, str | None]]]:
+        """The order a paper_send_ok flow builds, as (value, value_ref) per field (qty, price, type, tif, symbol): what
+        it types into the ticket (`type_fixture`, by the control id) and what it asserts with `equals` on the ticket
+        and the dialog (by the region id), before the Send click (choice 17)."""
+        from ..oracle.tables import resolve_ref     # lazy: sentinel.oracle imports this module
+
+        out: dict[str, list[tuple[Any, str | None]]] = {}
+
+        def put(name: str, value: Any, ref: Any) -> None:
+            fld = _order_field(name)
+            if fld is None:
+                return
+            if isinstance(ref, str):
+                try:
+                    value = resolve_ref(fx, ref)
+                except ValueError:
+                    value = None
+            out.setdefault(fld, []).append((value, ref if isinstance(ref, str) else None))
+
+        for st in seq:
+            if st.get("type") == "type_fixture":
+                put(_s(self._ctl(st).get("id")), st.get("value"), st.get("value_ref"))
+            items = _l(st.get("expect")) + _l(st.get("assertions")) + ([st["verify"]] if isinstance(st.get("verify"), dict) else [])
+            for a in map(_d, items):
+                if a.get("kind") == "equals" and isinstance(a.get("region"), str):
+                    put(a["region"].rsplit(".", 1)[-1], a.get("expected"), a.get("value_ref"))
+        return out
+
+    def _paper_send_ok(self, fl: dict, f: str) -> None:
+        """L-FLW-08 for class paper_send_ok (6.7 gated branch): one Send click after the order-stage step; quantity 1;
+        a limit order; DAY; a limit price from the fixture's `prices`, whose rule puts it at least the declared
+        distance from the last price (20 percent for equities by default, the policy's tick_distance_futures for
+        futures); a symbol of the fixture; the expected Working row text asserted after the send; a cancel step after
+        it; and a working_orders_check teardown with expect: 0."""
+        seq = self._seq(fl)
+        fdoc = self.fixtures.get(fl.get("fixture"))
+        fx = _d(fdoc.data if fdoc else None)
+
+        def bad(message: str, path: str = "class") -> None:
+            self.add("L-FLW-08", f, f"paper_send_ok: {message}", path)
+
+        stage = next((k for k, st in enumerate(seq) if st.get("order_stage") is True), None)
+        sends = [k for k, st in enumerate(seq) if st.get("type") in _CLICKS and _is_send(self._ctl(st))]
+        if stage is None or len(sends) != 1 or sends[0] < stage:
+            bad("exactly one Send click, after the order-stage step; the send token lifts the dialog allowlist for one "
+                "click and a second is an attempted send (6.7)", "steps")
+        end = sends[0] if sends else len(seq)
+        vals = self._order_values(seq[:end], fx)
+        for fld, ok, want in (("qty", lambda v: _dec(v) == 1, "1 share or 1 contract"),
+                              ("type", lambda v: _s(v).strip().casefold() in ("lmt", "limit"), "a limit order"),
+                              ("tif", lambda v: _s(v).strip().casefold() == "day", "DAY time in force")):
+            got = [v for v, _ref in vals.get(fld, [])]
+            if not got:
+                bad(f"declares no order {fld}; type it or assert it with equals before the send ({want})", "steps")
+            for v in got:
+                if not ok(v):
+                    bad(f"order {fld} {v!r}; the order is {want}", "steps")
+        known = {_d(s).get("symbol") for s in _l(fx.get("symbols"))}
+        syms = [v for v, _ref in vals.get("symbol", [])]
+        if not syms:
+            bad("declares no symbol; type a symbol of the fixture's list into the ticket", "steps")
+        for v in syms:
+            if v not in known:
+                bad(f"symbol {v!r} is not in fixture {fl.get('fixture')}'s symbol list", "steps")
+        typed = [ref for _v, ref in vals.get("price", [])]
+        if not typed:
+            bad("declares no limit price; type one from the fixture's prices (fixture.prices.<id>.value)", "steps")
+        for ref in typed:
+            problem = self._price_distance(ref, fx)
+            if problem:
+                bad(problem, "steps")
+        after = seq[end + 1:]
+        texts = [_s(a.get("expected")) + " " + _s(a.get("pattern")) for st in after
+                 for a in map(_d, _l(st.get("expect")) + _l(st.get("assertions")))
+                 if a.get("kind") in ("equals", "matches", "present")]
+        if not any(re.search(r"(?i)working", t) for t in texts):
+            bad("declares no expected Working row text: an equals, matches or present assertion after the send whose "
+                "text names the Working row", "steps")
+        if not any(st.get("type") in _CLICKS and _is_cancel(self._ctl(st)) for st in after):
+            bad("has no cancel step after the send (the Working row's cancel action)", "steps")
+        if not any(t.get("type") == "teardown" and t.get("action") == "working_orders_check" and t.get("expect") == 0
+                   for t in map(_d, _l(fl.get("teardown")))):
+            bad("ends without a working_orders_check teardown with expect: 0 (L-FLW-12)", "teardown")
+
+    def _price_distance(self, ref: str | None, fx: dict) -> str | None:
+        """The limit price is a fixture price whose rule puts it far enough from the last price (6.7, 4.9 prices)."""
+        from ..oracle.tables import RuleConfig, tick_size     # lazy: sentinel.oracle imports this module
+
+        m = re.match(r"^fixture\.prices\.([^.]+)\.value$", ref or "")
+        if not m:
+            return f"limit price {ref or 'literal'} is not a fixture.prices.<id>.value, which the fixture reset flow recomputes"
+        price = next((p for p in map(_d, _l(fx.get("prices"))) if p.get("id") == m.group(1)), {})
+        sym = next((s for s in map(_d, _l(fx.get("symbols"))) if s.get("id") == price.get("symbol_ref")), {})
+        rule, value = _PRICE_RULE.match(_s(price.get("rule"))), _num(price.get("value"))
+        if not price or not rule or not value:
+            return f"fixture price {m.group(1)} has no rule of the form 'last_delayed x <factor>' or 'last_delayed - <points>'"
+        n = float(rule.group("n"))
+        last = value / n if rule.group("op") in "x*×" else value + n if rule.group("op") == "-" else value - n
+        if last <= 0:
+            return f"fixture price {m.group(1)} gives no positive last price"
+        distance, sp = abs(last - value), self.send_policy
+        if sym.get("asset") == "equity":
+            pct = _num(sp.get("distance_pct_equity"))
+            need = DISTANCE_PCT_EQUITY_6_7 if pct is None else pct
+            if distance / last * 100 < need:
+                return f"limit price {m.group(1)} is {distance / last:.0%} from the last price; at least {need:g} percent"
+            return None
+        if sym.get("asset") == "future":
+            need = _num(sp.get("tick_distance_futures"))
+            if need is None:
+                return "policy/send_policy.yaml declares no tick_distance_futures for a futures send (6.7)"
+            try:
+                ticks = distance / float(tick_size(_s(sym.get("symbol")), RuleConfig(), fx))
+            except ValueError:
+                return f"no tick size for {sym.get('symbol')}"
+            if ticks < need:
+                return f"limit price {m.group(1)} is {ticks:g} ticks from the last price; at least {need:g}"
+            return None
+        return f"symbol {sym.get('symbol')} is {sym.get('asset')}; paper_send_ok sends 1 share or 1 futures contract"
 
     def _flow_checkpoints(self, fl: dict, f: str, fid: str, seen_cp: dict[str, str]) -> None:
         surfaces = _l(fl.get("surfaces"))

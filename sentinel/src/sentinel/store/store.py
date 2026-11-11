@@ -78,8 +78,9 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   its run's pair (8.3 has no decision columns for them); `bbox_q4` is stored as `x,y,w,h`.
 - 9.7 Two humans, one signature, and the 9.6 idempotency are the Reporter API's rules for a decision made on a
   finding (4.14 makes `finding_ref` required; only store-level fixtures and imports write one without), so they
-  apply to a decision that names its finding: the same (finding, action, decided_by) on an active row returns that
-  row; a plain decision is refused with `ActiveDecisionExists` while an applicable (9.7 scope) active decision
+  apply to a decision that names its finding: the same (finding, action, decided_by) on an active row with the same
+  verdict, ticket and signature returns that row when the request supersedes nothing (the same click again; a
+  supersession or a changed field is a new request); a plain decision is refused with `ActiveDecisionExists` while an applicable (9.7 scope) active decision
   matches the signature. approve_baseline and reject_baseline move a baselines row and are not signature
   decisions. The frozen-signature rule (the next decision needs the system owner) applies to every signature
   decision; the system owners are the store's configured `system_owners`. A supersession by another human marks the
@@ -2100,8 +2101,9 @@ class Store:
         and L-DEC-08 cases; any decision on a frozen signature by a login not in `system_owners` (9.7); and, for a
         decision made on a finding, a plain (not superseding) decision on a signature that already has an
         applicable active decision (`ActiveDecisionExists`, 9.7; `manifest_entries` and `manifest_tickets` of the
-        run give the mark_intended scope). The same action on the same finding by the same person again returns the
-        decision already written (9.6 idempotent).
+        run give the mark_intended scope). The same action on the same finding by the same person again, with the
+        same verdict, ticket and signature and superseding nothing, returns the decision already written (9.6
+        idempotent); with `supersedes` it always takes the supersede path.
         """
         d = _revalidate(decision)
         finding_id = self._same("finding_id", finding_id, d.finding_ref)
@@ -2144,10 +2146,13 @@ class Store:
             if f is None:
                 raise StoreRefused(f"unknown finding {finding_id}")
             source_finding = f["finding_id"]
-            again = self._one("SELECT decision_id FROM decisions WHERE source_finding_id = ? AND action = ? AND "
-                              "decided_by = ? AND status IN ('active','reopened')",
-                              (source_finding, d.action, d.decided_by))
-            if again is not None:                                   # 9.6: idempotent per finding and action
+            again = None if supersedes is not None else self._one(
+                "SELECT decision_id FROM decisions WHERE source_finding_id = ? AND action = ? AND decided_by = ? "
+                "AND status IN ('active','reopened') AND verdict IS ? AND ticket_ref IS ? AND checkpoint_id = ? "
+                "AND region_id = ? AND category = ? AND phash = ?",
+                (source_finding, d.action, d.decided_by, d.verdict, d.ticket, d.signature.checkpoint_id,
+                 d.signature.region_id, d.signature.category, phash_bytes(d.signature.phash)))
+            if again is not None:      # 9.6: the same click again (a supersession or a changed field is no repeat)
                 return self._stored_decision(decision_ref(again[0]))
         old = None
         if supersedes is not None:

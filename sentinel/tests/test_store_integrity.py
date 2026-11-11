@@ -327,6 +327,18 @@ def test_the_same_click_again_returns_the_same_decision(store):
     assert store.conn.execute("SELECT count(*) FROM decisions").fetchone()[0] == 1
 
 
+def test_superseding_your_own_decision_writes_a_new_row(store):
+    # store:3, 9.6 Supersede decision, 9.7: the idempotent return is for the same click again, never a supersession
+    finding(store, "F-1")
+    decide(store, "dec-000001", "confirm_bug", finding_ref="F-1", ticket="TOS-1")
+    with pytest.raises(ActiveDecisionExists, match="dec-000001"):          # a plain change is no repeat: refused
+        decide(store, "dec-000002", "confirm_bug", finding_ref="F-1", ticket="TOS-2")
+    new = decide(store, "dec-000002", "confirm_bug", finding_ref="F-1", ticket="TOS-2", supersedes="dec-000001")
+    assert (new.decision_id, new.ticket, new.supersedes) == ("dec-000002", "TOS-2", "dec-000001")
+    assert store.get_decision("dec-000001").status == "superseded"
+    assert store.get_finding("F-1").ticket == "TOS-2" and not store.get_finding("F-1").contested
+
+
 def test_a_frozen_signature_needs_the_system_owner(tmp_path):
     with Store(tmp_path / "f.db", system_owners=["olga"]) as s:
         s.begin_run(plan())

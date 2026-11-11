@@ -1,64 +1,78 @@
 ## 4. Inputs and schemas
 
-Everything Sentinel reads or writes is one of fifteen record types. Twelve are files in the `sentinel-config` git repository and are validated by `sentinel lint` in CI on every pull request and again by the Orchestrator at run start. Three, the outcome record, the finding record and the decision record, are rows in the SQLite store (see 8.3 Schema) with a JSON export form; they are validated on write. This section gives each record's schema, one worked example, its validation rules and the lint rules that enforce them. Component behaviour that consumes these records lives in sections 2 (What is tested and how), 3 (Comparison, classification and the reviewer) and 5 (Architecture and components); this section only states what a valid input is and what happens when one is invalid.
+Everything Sentinel reads or writes is one of the record types this section defines. The input records of 4.2 to 4.12 and the safety and operations files of 4.16 are files in the `sentinel-config` git repository and are validated by `sentinel lint` in CI on every pull request and again by the Orchestrator at run start. The outcome record, the finding record and the decision record (4.13, 4.14) are rows in the SQLite store (see 8.3 Schema) with a JSON export form; they are validated on write. This section gives each record's schema, one worked example, its validation rules and the lint rules that enforce them. Component behaviour that consumes these records lives in sections 2 (What is tested and how), 3 (Comparison, classification and the reviewer) and 5 (Architecture and components); this section only states what a valid input is and what happens when one is invalid.
 
 ### 4.1 Conventions, repository layout and the lint
 
-**Repository layout.** Two repositories. `sentinel-config` holds everything below: what a run is asked to do. `sentinel` holds the harness code, the lint binary and the generated JSON Schema files, and is pinned separately as the run's harness commit (8.5 What lives in git and how a run pins it). Every run records both commits in its environment fingerprint (4.12). The change manifest for a PR run is the one exception to this layout: it is authored in the product repository, at `.sentinel/manifest.yaml` on the branch, and copied into the run as described in 4.3.
+**Repository layout.** Two repositories. `sentinel-config` holds everything below: what a run is asked to do. `sentinel` holds the harness code, the lint binary and the generated JSON Schema files (`schemas/*.schema.json`, draft 2020-12, one per record type, generated from the notation below), and is pinned separately as the run's harness commit (8.5 What lives in git and how a run pins it). Every run records both commits in its environment fingerprint (4.12). The change manifest for a PR run is the one exception to this layout: it is authored in the product repository, at `.sentinel/manifest.yaml` on the branch, and copied into the run as described in 4.3.
 
 | Path | Record type | Consumed by |
 |---|---|---|
-| `schemas/*.schema.json` | JSON Schema (draft 2020-12), one per record type, generated from the notation below | `sentinel lint`, Orchestrator |
-| `taxonomy.yaml` | every closed vocabulary: the outcome enums of brief 1.5 verbatim plus reasons, gates, finding kinds, triage states, decision actions and verdicts, canary states and reviewer verdicts (table below) | every schema that carries one of them, Reporter |
+| `taxonomy.yaml` | every closed vocabulary: the outcome enums of brief 1.5 verbatim plus reasons, gates, finding kinds, triage states, decision actions and verdicts, canary states and kinds, reviewer verdicts, quarantine reasons, money roles and popup actions (table below) | every schema that carries one of them, Reporter |
 | `builds/*.yaml` | build identity and build pair | Orchestrator, Rig Manager |
 | `manifests/<build_id>.yaml`, `manifests/mocks/` | change manifest | scope computation, Reviewer, Reporter |
 | `registry/dependency-map.yaml` | dependency map | scope computation, Reporter |
 | `registry/surfaces/<area>/*.yaml` | surface registry entries | census, Executor, registry validation |
 | `registry/ladders.yaml` | size-sweep ladders F and S and the splitter sets (semantics in 2.5.2 The ladders) | size sweeps |
 | `corpus/workspaces/<id>/` | workspace corpus entry plus the workspace file | Rig Manager, census, size sweeps |
+| `corpus/measured_sizes.yaml` | each gadget's size in every tier A and B workspace hosting it, measured by probe P8 on the first validated run and written by the Reporter's registry pull request; the corpus sizes of Ladder F (2.5.2). Owner: the registry owner. Until a surface has sizes here, its Ladder F corpus steps are `not_run (reason: scope)` with a run-health line (4.16) | scope computation, size sweeps |
 | `corpus/odd-inputs.yaml` | the versioned odd-input corpus (symbol box, order fields, Analyze inputs, study parameters) with its sampling seed; `type_fixture` steps reference entries by id | Executor, Explorer |
-| `configs/allowed.yaml` | the display configurations a workspace may declare (phase 1: 1920x1080 at 100 percent only) | lint |
+| `configs/allowed.yaml` | the display configurations a workspace may declare, each with its work area, which gives MAXW and MAXH of Ladder F (2.5.2); phase 1: 1920x1080 at 100 percent only (schema in 4.6) | lint, size sweeps |
+| `palettes/<theme>.yaml` | the pinned INV-15 palette for one theme, selected by the workspace's `display_config.theme` (2.7). Owner: the registry owner (4.16) | Invariant Checker |
 | `flows/<tier>/*.yaml`, `flows/RENAMES.yaml` | flow files, checkpoint rename map | Executor, Oracle |
 | `flows/quarantine/<finding-id>.yaml` | Explorer candidate flows (`class: explorer_candidate`, 2.9) until a human promotes them | Executor (replay), lint |
 | `regions/<checkpoint_id>.yaml` | region registry; the checkpoint id is a directory path because it contains slashes (4.7) | Diff Engine, Oracle, Capture |
 | `masks/<checkpoint_id>/*.yaml` | mask records | Diff Engine |
 | `fixtures/*.yaml`, `profiles/*.yaml` | account and data fixture, pinned settings profiles | fixture reset flow, attestation |
-| `fixtures/margin_rules.yaml` | the per-asset-class buying power brackets of rule R02 (2.8.3), pinned in Phase 0 | Oracle |
+| `fixtures/margin_rules.yaml` | the per-asset-class buying power brackets of rule R02 (2.8.3), pinned in Phase 0 (schema in 4.9) | Oracle |
 | `gateway/allowlist.yaml` | the exact-match paperMoney account allowlist per rig, compiled into the gateway hook host (4.9) | lint, Input Gateway, paper-mode assertion |
-| `gateway/default_order_hotkeys.yaml` | the pinned build's default order-action chords, read once in Phase 0; the blocked chord set and fire drill item 3 use it (5.4.7, 6.5) | Input Gateway, fire drill |
-| `redaction/anchors.yaml` | the redaction list of 6.10 Redaction pipeline and egress log, owned by the security contact; same record shape as a regions file with every region `type: mask` | Capture |
-| `popups/catalog.yaml` | popup catalog | Executor sentinel, Watchdog |
-| `canaries/mutants.yaml` | the one mutant catalog: ids M01 to M33 of 12.5, classes of 4.11, seed 20260101, M25 the identical control | Canary Service |
-| `soak.yaml` | soak resource budgets per metric, calibrated from the lineage soak curve (10.11) | Watchdog, Reporter |
-| `calibration/<fingerprint_id>.yaml` | per-region A/A floors (written by the Calibration Service, read-only for humans) | Diff Engine |
+| `gateway/default_order_hotkeys.yaml` | the pinned build's default order-action chords, read once in Phase 0; the blocked chord set and fire drill item 3 use it (5.4.7, 6.5). Owner: the system owner (4.16) | Input Gateway, fire drill |
+| `gateway/dismiss_allowlist.yaml` | the pinned dismiss allowlist of 6.2: the only labels clickable while an order dialog is in front (`Delete`, plus `Edit` only when Phase 0 observes it, 6.13 item 10). Owner: the system owner (4.16) | Input Gateway |
+| `redaction/anchors.yaml` | the one global redaction list of 6.10 Redaction pipeline and egress log, owned by the security contact: the regions-file shape of 4.8 with landmarks and regions of `type: redaction`, each with `identity_field`, applied wherever its landmark is found | Capture |
+| `popups/catalog.yaml` | popup catalog: `schema_version` and `entries` (4.10) | Executor sentinel, Watchdog |
+| `canaries/mutants.yaml` | the one mutant catalog, `schema_version` and `entries`: ids M01 to M33 exactly as 12.5 tables them, then M34 onward in sequence, classes of 4.11, seed 20260101, M25 the identical control | Canary Service |
+| `soak.yaml` | soak resource budgets per metric, calibrated from the lineage soak curve (10.11; schema in 4.16) | Watchdog, Reporter |
+| `calibration/<hex>.yaml` | per-region A/A floors and thresholds for one calibration key, `<hex>` being the key without its `sha256:` prefix (4.12 Calibration key); exported by the Calibration Service from `calibration_floors` (8.3), read-only for humans (4.16) | Diff Engine |
 | `diff_engine.yaml` | the Diff Engine parameters of 3.7 Three-granularity diff; any change re-runs the canary catalog before the next product run | Diff Engine, Canary Service |
-| `quarantine.yaml` | quarantine records (checkpoint, owner, ticket, entered, reason), opened by the Orchestrator as a pull request and merged by the system owner (10.5 Flake tracking, targeted re-runs and quarantine) | scope computation, Reporter |
+| `quarantine.yaml` | quarantine records, each naming exactly one checkpoint or one flow, with owner, ticket, entered date and reason (10.5 Flake tracking, targeted re-runs and quarantine), opened by the Orchestrator as a pull request and merged by the system owner (4.16) | scope computation, Reporter |
 | `policy/send_policy.yaml` | the OPEN `paper_send_ok` switch, signed by the risk owner | lint, Input Gateway |
 | `policy/explorer_budget.yaml` | Explorer session budgets: `max_actions: 400`, `max_minutes: 90`, `max_no_change_actions: 20`, `max_usd_per_session: 25`, `max_usd_per_week` (6.8 Explorer boundary and deny list); a change needs the Explorer owner's approval in the PR | Orchestrator |
-| `policy/release_gate.yaml` | N business days before GA per release train, default 3 (11.2, 10.9) | Reporter, release gate |
-| `ops/rotation.yaml` | the on-call and triage rotation calendar (7.7, 11.6) | Reporter, alerting |
-| `phase0/branches.yaml` | the chosen branch for each of the seven unknowns of brief 1.11 (for example `jab: A`) | lint, Executor |
+| `policy/explorer_deny_list.yaml` | the Explorer deny list of 6.8: window titles, labels and landmark-anchored controls. Owner: the system owner; a change needs the Explorer owner's approval (6.8, 4.16) | Input Gateway, nightly denied-action test, lint |
+| `policy/egress_allowlist.yaml` | the signed egress allowlist of 6.10: the only hosts the harness HTTP client may reach. Owner: the system owner; signed by the security contact (4.16) | harness HTTP client, Nightly egress reconciliation |
+| `policy/computer_use_ruling.yaml` | the current computer-use ruling of 6.11 (endpoint, retention terms, approved model tiers, whether computer use is covered), read and validated at preflight G1. Owner: the system owner; signed by the security contact (4.16) | preflight, Orchestrator |
+| `policy/budgets.yaml` | the hard caps of 11.4: reviewer items per run type, agent rescue limits and the three dollar caps (4.16) | Orchestrator, Reviewer, Reporter |
+| `policy/release_gate.yaml` | N business days before GA per release train, default 3, with GA and RC cut dates per train (11.2, 10.9; 4.16) | Reporter, release gate |
+| `policy/reporting.yaml` | the Reporter's settings: commit status mode history, Jira project keys, Slack channels, paging and email targets, auto-filing switches per tier (9.9; 4.16) | Reporter |
+| `authorization/<version>.md`, `authorization/<version>.yaml` | the signed authorization of 6.12 as a document and as its machine-readable record, signed by the platform owner, the security contact and the compliance contact; every run manifest carries the reference and sha256 of the version in force (L-XREF-16, 4.16) | preflight, lint |
+| `schedule/windows.yaml` | the operating day, the named quiet windows and the maintenance windows of 7.10 (4.16) | Orchestrator scheduler, preflight |
+| `ops/oncall.yaml` | the role holders and deputies, the triage roster and the triage and harness on-call rotations (6.12, 9.12, 11.6); L-MSK-01, L-DEC-01 and L-DEC-06 read the roster (4.16) | Reporter, alerting, lint |
+| `ops/credential_rotation.yaml` | the credential rotation calendar of 7.7: login owners and, per rotation, the window, the owner and the validating run id (4.16) | Orchestrator (run hold), Reporter |
+| `rig/process_allowlist.yaml` | the running-process allowlist of 7.1: the harness processes, the elevated helper service, the thinkorswim tree and the golden image's Windows baseline (4.16) | Rig Manager |
+| `rig/thinkorswim.vmoptions.template` | the checked-in vmoptions template of 7.3 step 4 (pipeline flags, heap, crash flags); the Rig Manager writes `thinkorswim.vmoptions` from it and B3 and H10 compare the hash (L-XREF-28) | Rig Manager, preflight |
+| `phase0/branches.yaml` | the chosen branch for each of the seven unknowns of brief 1.11 (for example `jab: A`), plus the Phase 0 reads other files depend on (4.16) | lint, Executor |
+| `eval/<eval_set_version>/labels.jsonl`, `eval/reports/<hex>.yaml` | reviewer eval labels (10.4), and one eval report per reviewer version tuple of 3.15, `<hex>` being the tuple hash without its prefix (4.16) | Reviewer change control, lint |
 | `model_deprecations.yaml` | vendor deprecation notices for the pinned model ids (10.7 Degraded modes) | deprecation alarm |
+| `CODEOWNERS` | routes `flows/` and `registry/` to the tier's flow owner and each file of 4.16 to the owner its row names (11.5, L-XREF-26) | the `sentinel-config` pull request check |
 
 **Common conventions.**
 
-- Identifiers are dotted, hyphenated slugs: `^[a-z0-9]+(?:[.-][a-z0-9]+)*$` (hyphens inside a segment, dots between segments, never underscores), unique within their record type across the whole repository. Surface ids follow `<area>.<surface>[.<variant>]`. Two exceptions: primitive ids use the PascalCase class name (`FlexibleGrid`); popup and mutant catalog entries use the appendix ids `POP-nn` and `Mnn` (4.10, 4.11).
+- Identifiers. Top-level record ids (surface, workspace, fixture, flow, manifest, manifest entry, mask, and the `name` slugs of popup and mutant entries) are unique across the whole repository and match `^[a-z0-9][a-z0-9.-]*$` (lower case, digits, dots and hyphens, never underscores). Ids local to a flow (step ids and assertion ids) are unique within their flow and may contain underscores; a checkpoint step's id is also the last segment of its checkpoint id, so it follows the grammar below. Region ids are unique within their regions file, so two regions files may reuse one id (the `rgn.confirm.*` ids of 4.8 serve the stock and futures flows of 4.7). Ids local to one other file (fixture symbol and price ids, control and landmark ids within a surface) are unique within that file and may contain underscores. Surface ids follow `<area>.<surface>[.<variant>]`. Two exceptions: primitive ids use the PascalCase class name (`FlexibleGrid`); popup and mutant catalog entries are keyed by the appendix ids `POP-nn` and `Mnn` (4.10, 4.11).
 - Checkpoint ids are the one identifier that contains slashes. The grammar is `<kind>/<surface-id>/<qualifier>` with kind one of `census`, `sweep`, `split`, `flow`:
 
   | kind | qualifier | regex | example |
   |---|---|---|---|
   | `census` | `<workspace-id>` followed by an optional `/<dim>=<value>[,<dim>=<value>]` segment for surfaces the census repeats per declared dimension (2.4) | `^census/<slug>/<slug>(?:/[a-z]+=[A-Za-z0-9.-]+(?:,[a-z]+=[A-Za-z0-9.-]+)*)?$` | `census/trade.all-products.option-chain/ws.tier-a.options-trader/layout=delta,strikes=16` |
-  | `sweep` | `<host>/<w>x<h>` with host from `tab`, `sidebar`, `flexgrid`, `detached`, `dialog` | `^sweep/<slug>/(tab\|sidebar\|flexgrid\|detached\|dialog)/[0-9]+x[0-9]+$` | `sweep/charts.flexible-grid.active-trader-cell/flexgrid/480x360` |
+  | `sweep` | `<host>/<w>x<h>`, or `<host>/<w>x<h>-asc` for a step of Ladder F's ascending pass (2.5.2), with host from `flexgrid`, `detached`, `dialog` | `^sweep/<slug>/(flexgrid\|detached\|dialog)/[0-9]+x[0-9]+(-asc)?$` | `sweep/charts.flexible-grid.active-trader-cell/flexgrid/480x360`, `sweep/trade.active-trader.ladder/flexgrid/640x480-asc` |
   | `split` | `<splitter>/<fraction>` with the fraction as two decimals | `^split/<slug>/<slug>/(0\|1)\.[0-9]{2}$` | `split/trade.active-trader.ladder/side-panel/0.15` |
   | `flow` | `<flow-id>/<step-id>` where the flow id is the file's full `flow_id` including its `flow.` prefix and the step id is the checkpoint step's own `id` | `^flow/<slug>/<slug>/[a-z][a-z0-9-]*$` | `flow/dialog.order-confirmation/flow.trade.order-ticket.futures.single-leg/cp2` |
 
-  `<slug>` stands for the identifier regex above. The id is a stable name for a screen and a state; the step id inside a `flow` checkpoint id is part of the name, so renaming that step is a checkpoint rename and needs a `flows/RENAMES.yaml` entry (L-FLW-03), which is how baselines survive flow edits. Where a checkpoint id is used as a file path, each slash is a directory.
+  `<slug>` stands for the top-level identifier regex above. Tab and sidebar hosts have no `sweep` ids: they are swept through their splitters only, as `split` checkpoints (2.5.1). The id is a stable name for a screen and a state; the step id inside a `flow` checkpoint id is part of the name, so renaming that step is a checkpoint rename and needs a `flows/RENAMES.yaml` entry (L-FLW-03), which is how baselines survive flow edits. Where a checkpoint id is used as a file path, each slash is a directory.
 - Timestamps are RFC 3339 with an explicit offset. Dates are `YYYY-MM-DD`. Hashes carry an algorithm prefix (`sha256:`).
-- Every file carries `schema_version: int`. A schema change that is not backward compatible bumps the version and ships a migration under `schemas/migrations/`; lint refuses a file whose version the current harness does not know.
+- Every file carries `schema_version: int`. A schema change that is not backward compatible bumps the version and ships a migration under `schemas/migrations/` in the `sentinel` repository; lint refuses a file whose version the current harness does not know.
 - Paths are repository relative and must resolve. Images are PNG. Templates (landmarks, controls, popups) are between 16x16 and 400x400 pixels; mocks are at most 1920x1080 and 5 MB.
 - No secret value appears in any file. Secrets are vault references of the form `vault://<path>#<field>`; lint rejects any string that matches a credential pattern (see L-XREF-07).
 
-**Schema notation.** Each schema below is a YAML block in which a key maps to a type expression: `str`, `int`, `num`, `bool`, `ts`, `date`, `sha256`, `path`, `id`, `enum[a|b]`, `list[T]`, `map[K,V]`, `ref:<record>.<field>` for a cross-file reference, a trailing `?` for optional, `= x` for a default. Nested objects are indented. The normative artifacts are the generated JSON Schema files; the notation is the readable form and the two are kept in sync by a CI job (`sentinel schemas --check`).
+**Schema notation.** Each schema below is a YAML block in which a key maps to a type expression: `str`, `int`, `num`, `bool`, `ts`, `date`, `sha256`, `path`, `id`, `enum[a|b]`, `list[T]`, `map[K,V]`, `ref:<record>.<field>` for a cross-file reference, a trailing `?` for optional, `= x` for a default. Nested objects are indented. The normative artifacts are the generated JSON Schema files in the `sentinel` repository; the notation is the readable form and the two are kept in sync by a CI job (`sentinel schemas --check`).
 
 **The lint.** `sentinel lint` validates every file against its schema, then runs the cross-file rules of 4.15. Rule ids are `L-<FILE>-<nn>` with severity `error` (blocks the PR) or `warn` (review comment). A rule marked `error (run start)` is checked only against live state at run start. At run start the Orchestrator runs the whole lint before the `provisioned` gate; any `error` ends the run as `aborted_harness (reason: config_invalid)`, with the rule ids and file paths posted to the on-call channel and the run row written so the dead-man timer is satisfied. A lint failure never reaches the Diff Engine. Rules whose failure must not stop a run (an expired mask, a stale price) say so in their row and name the outcome they produce instead.
 
@@ -67,13 +81,17 @@ Everything Sentinel reads or writes is one of fifteen record types. Twelve are f
 | Key | Contents | Source of truth |
 |---|---|---|
 | `checkpoint_outcomes`, `step_outcomes`, `run_outcomes` | the 15, 5 and 5 names of brief 1.5 | 1.10 Outcome taxonomy; 12.2 is the verbatim copy |
-| `reasons.<outcome>` | the reason codes allowed with each outcome, as listed in 4.13 | this section |
+| `reasons.<outcome>` | the reason codes allowed with each outcome, as listed in 4.13, each with its owning section and what `detail` holds for it | this section; the owning section and `detail` meaning come from the `outcome_reasons` seed of 8.3, which 12.2 copies |
 | `gates` | the Orchestrator states `provisioned`, `launched`, `authenticated`, `paper_mode_asserted`, `settings_attested`, `workspace_loaded`, `fixture_verified`, `canary_flow_passed`, `running`, `teardown`, `reported`; the preflight gates `preflight.<item id>` for every item of 12.7 Preflight checklist; the mid-run gates `connectivity`, `rig_lost` (there is no `soak` gate: a freeze or crash during soak is the app failure trio of 4.7, 10.11) | 5.2 Orchestrator, 10.7 Degraded modes |
 | `finding_kinds` | the finding vocabulary of 4.13 | this section; 8.3 `findings.kind` is generated from it |
 | `triage_states` | `open`, `confirmed_bug`, `intended`, `noise`, `agent_mistake`, `expected_behavior`, `fixed_pending_verify`, `closed` | 8.3 Schema |
 | `decision_actions`, `decision_verdicts` | the UI actions and the stored verdicts of 4.14 | this section; 9.6 shows the same mapping |
 | `canary_states` | `detected`, `missed`, `detector_blind`, `detector_degraded`, `generation_failed`; result states, never run outcomes (the Nightly run stays `complete`) | 10.3 Canary Service and the mutant catalog |
+| `canary_kinds` | `mutant`, `safety_canary`, `fire_drill`, `path_equivalence`: the kinds of a `canary_results` row; for `mutant` the defect class is one of the 26 classes of 4.11, for the others it equals the kind | 8.3 `canary_results`, 10.3 |
 | `reviewer_verdicts` | `matches_manifest`, `partially_matches_manifest`, `does_not_match_manifest`, `no_visible_difference`, `cannot_judge`, `not_applicable`; not outcomes | 3.13 Structured output schema |
+| `quarantine_reasons` | the reasons a `quarantine.yaml` record may carry | 10.5 Flake tracking, targeted re-runs and quarantine |
+| `money_roles` | `qty`, `price`, `bp_effect`, `max_loss`, `send`, `cancel`, `delete`: the closed money-cell list | 4.8 `money_role` |
+| `popup_actions` | `dismiss_key`, `click`, `wait`, `relogin`, `abort`, `ignore` | 4.10 `action` |
 
 A CI test compares the three outcome lists with the taxonomy table in 1.10 and the appendix copy, and every other list with the table that owns it; a difference fails CI (L-XREF-08). The SQLite `CHECK` constraints of 8.3 are generated from this file (L-OUT-01). Nobody adds an outcome, a reason or a finding kind by editing a schema or a DDL file.
 

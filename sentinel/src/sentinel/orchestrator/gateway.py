@@ -72,8 +72,8 @@ Choices where the spec is ambiguous (reported):
    `a3_a8` for the A9 click itself (`Action.a9_check`) and `a3_a9` for every later click, a session that was
    not kicked, and a paper-mode assertion no older than the two-minute timer of 6.4 (`PAPER_ASSERTION_CURRENT_S`,
    equal to `identity.TIMER_S`): an older one means a scheduled read was missed or deferred, so it is not
-   current. A caller that does not pass `session` (SimulatedRig until the integrator wires
-   `set_session_safety`) is judged on the two booleans `attestation_passed` (stage `a3_a9`) and
+   current. A caller that does not pass `session` (a rig the Orchestrator's `safety_listener` does not feed
+   through `Rig.set_session_safety`) is judged on the two booleans `attestation_passed` (stage `a3_a9`) and
    `paper_assertion_current`; with `session` set the booleans are not read.
 10. Dismiss allowlist (6.2, 6.13 item 10, SD-65). The pinned set comes from `gateway/dismiss_allowlist.yaml`
    through `gateway_config.load_dismiss_allowlist`, which is empty until Phase 0 records its read. An empty

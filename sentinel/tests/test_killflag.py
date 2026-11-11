@@ -6,9 +6,9 @@ from pathlib import Path, PureWindowsPath
 import pytest
 
 from sentinel.orchestrator.clock import ManualClock
-from sentinel.orchestrator.killflag import (FLAG_PATH, PIPE_NAME, PROBE_REASON, FileFlagChannel, MemoryKillChannel,
-                                            acknowledge, check, h5_passed, h5_round_trip, main, pending, poll,
-                                            rig_flag_path, tripwires)
+from sentinel.orchestrator.killflag import (DRILL_BY, DRILL_REASON, FLAG_PATH, PIPE_NAME, PROBE_REASON, FileFlagChannel,
+                                            MemoryKillChannel, acknowledge, check, drill_request, h5_passed,
+                                            h5_round_trip, is_drill, main, pending, poll, rig_flag_path, tripwires)
 from sentinel.orchestrator.killswitch import PROVEN_NONE, TripWires
 from sentinel.orchestrator.machine import Orchestrator
 from sentinel.orchestrator.ports import KillChannel, KillRequest
@@ -210,6 +210,41 @@ def test_a_flag_that_is_not_utf8_is_an_unreadable_stop_and_acknowledge_removes_i
     assert own is not None and own.channel == "unreadable" and "not a request" in own.reason
     assert poll(ch) == own
     assert acknowledge(ch) == [own] and not ch.path.exists()
+
+
+def test_the_harness_never_overwrites_a_human_request_and_a_human_request_replaces_the_harness(tmp_path):
+    """killswitch:2, killflag choice 5: the drill's and H5's writes are exclusive (a stale probe gives way), a human
+    request replaces whatever is there, and `sentinel stop` refuses the drill's own name and reason."""
+    ch = flag(tmp_path)
+    drill = drill_request("rig-01", "t1")
+    probe = KillRequest("rig-01", "preflight", "sentinel", PROBE_REASON, "earlier")
+    ch.post(REQ)
+    for mine in (drill, probe):
+        with pytest.raises(FileExistsError):
+            ch.post(mine)
+        assert ch.poll() == REQ
+    ch.acknowledge(REQ)
+    ch.post(probe)
+    ch.post(drill)                                         # a stale probe gives way to the drill
+    assert ch.poll() == drill and is_drill(drill) and not is_drill(REQ)
+    ch.post(REQ)                                           # a human stop replaces the drill's request
+    assert ch.poll() == REQ and not list(ch.path.parent.glob("*.tmp"))
+    assert main(["rig-01", "--root", str(tmp_path), "--by", DRILL_BY, "--reason", DRILL_REASON]) == 2
+
+
+def test_a_stop_written_after_the_last_boundary_still_ends_the_run_aborted_safety(tmp_path):
+    """killswitch:2: the Orchestrator polls the human channels once more when the work returns."""
+    clock = ManualClock()
+    rig = SimulatedRig(SimScenario(kill_root=tmp_path), clock=clock)
+
+    def work(o: Orchestrator) -> None:
+        o.sink.record("c1", "identical")
+        main(["rig-01", "--root", str(tmp_path), "--by", "oncall"], clock=clock)
+
+    report = Orchestrator(rig, default_context(), MemorySink(["c1", "c2"]), clock=clock).run(work)
+    assert (report.verdict.status, report.verdict.reason) == ("aborted_safety", "kill_switch")
+    assert report.kill_switch.result.evidence["request"]["requested_by"] == "oncall"
+    assert rig.kill_channels()[0].poll() is None
 
 
 def test_a_non_utf8_flag_written_mid_run_ends_the_run_aborted_safety_with_a_proof(tmp_path):

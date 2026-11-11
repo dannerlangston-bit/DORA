@@ -311,7 +311,19 @@ class Orchestrator:
         if self._gates() and self._gate("running"):
             if work is not None:
                 work(self)
+            self._end_of_work()
         return self._finish()
+
+    def _end_of_work(self) -> None:
+        """The last check of `running`, once the work returned (6.6 Triggers, killflag choice 5): a human stop request
+        still pending on the kill channels (written after the last boundary, or left in place by fire drill item 5)
+        ends the run `aborted_safety (reason: kill_switch)` like one seen at a boundary."""
+        if self.stop is not None:
+            return
+        running = self.flow.flow_id if self.flow is not None else self._last_flow
+        human = killflag.check(self.kill_flag, self.kill_pipe, gate=self.state, running_flow=running)
+        if human is not None:
+            self._contain(self.apply(human))
 
     def _gates(self, start: str = "provisioned") -> bool:
         """The gates from `start` (`provisioned` for the shard, `launched` for a relaunch) to `canary_flow_passed`."""

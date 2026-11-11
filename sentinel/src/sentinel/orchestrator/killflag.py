@@ -37,6 +37,13 @@ Choices where the spec is silent (reported):
    overwritten: the run does not start while a stop is pending.
 4. `acknowledge` runs after the sequence's revert (6.6 step 6), which clears the flag on a real rig anyway, and
    removes only a request it read: one written in between stays pending.
+5. The harness's own writes never overwrite a human request: fire drill item 5 (`drill_request`) and the H5 probe
+   are posted to the file flag with an exclusive create, which a stale probe gives way to and any other request
+   refuses (FileExistsError), while a human request (`sentinel stop`) replaces whatever is there; `sentinel stop`
+   refuses the drill's own name and reason as it refuses the probe's, so a human request is never taken for either.
+   Item 5 also polls first and leaves a pending request in place (drill.py), and the Orchestrator polls the human
+   channels once more when the work returns, so a stop written during the drill ends the run `aborted_safety
+   (reason: kill_switch)` (6.6 Triggers).
 """
 from __future__ import annotations
 
@@ -59,6 +66,8 @@ RIG_ROOT = PureWindowsPath("C:/sentinel")
 PIPE_NAME = r"\\.\pipe\sentinel-kill"
 PROBE_CHANNEL = "preflight"
 PROBE_REASON = "preflight.H5"
+DRILL_BY = "fire_drill"                          # fire drill item 5's own request (choice 5)
+DRILL_REASON = "fire drill item 5"
 TRIGGERS = ("file_flag", "named_pipe")            # killswitch.check_tripwires names of the two human channels
 
 
@@ -80,6 +89,16 @@ def is_probe(request: KillRequest) -> bool:
     return request.channel == PROBE_CHANNEL and request.reason == PROBE_REASON
 
 
+def drill_request(rig_id: str, at: str) -> KillRequest:
+    """The request fire drill item 5 writes (6.5): a stop request, but the harness's own (choice 5)."""
+    return KillRequest(rig_id, "file", DRILL_BY, DRILL_REASON, at)
+
+
+def is_drill(request: KillRequest) -> bool:
+    """True for fire drill item 5's own request (choice 5)."""
+    return request.requested_by == DRILL_BY and request.reason == DRILL_REASON
+
+
 class FileFlagChannel:
     """The file flag as a `ports.KillChannel` (choice 2): `post` writes the request atomically, `poll` reads it,
     `acknowledge` removes it if it still holds that request."""
@@ -88,10 +107,24 @@ class FileFlagChannel:
         self.path = Path(path)
 
     def post(self, request: KillRequest) -> None:
+        """Write `request` atomically. A human request replaces whatever is there; the harness's own (the H5 probe,
+        drill item 5's) is written only where nothing but a stale probe is, and raises FileExistsError over any other
+        request, so it never overwrites a human stop (choice 5)."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
         tmp.write_text(json.dumps(asdict(request), sort_keys=True), encoding="utf-8")
-        os.replace(tmp, self.path)
+        try:
+            if is_probe(request) or is_drill(request):
+                try:
+                    os.link(tmp, self.path)              # an exclusive create: refused when a flag exists
+                    return
+                except FileExistsError:
+                    held = self.poll()
+                    if held is not None and not is_probe(held):
+                        raise FileExistsError(f"a stop request is pending in {self.path}") from None
+            os.replace(tmp, self.path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def poll(self) -> KillRequest | None:
         try:
@@ -238,6 +271,9 @@ def main(argv: Sequence[str] | None = None, *, transport: Callable[[str], KillCh
         return 2
     if args.reason == PROBE_REASON:
         print(f"sentinel stop: {PROBE_REASON!r} is reserved for the preflight probe", file=sys.stderr)
+        return 2
+    if args.by == DRILL_BY and args.reason == DRILL_REASON:
+        print(f"sentinel stop: {DRILL_REASON!r} by {DRILL_BY!r} is reserved for the fire drill", file=sys.stderr)
         return 2
     request = KillRequest(args.rig, "cli", args.by or _user(), args.reason,
                           (clock or SystemClock()).now().isoformat())

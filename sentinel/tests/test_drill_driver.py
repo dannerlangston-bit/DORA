@@ -278,6 +278,78 @@ def test_a_live_account_at_item5s_recovery_login_is_live_identity_s1_and_blocks_
     assert rows[4].produced_reason == "drill_failed:item5" and rows[0].state == "detected"
 
 
+class StopBetweenItems(SimDrillPort):
+    """A `SimDrillPort` that runs `stop()` when the ticket is rebuilt for items 3 and 4 (between items 2 and 3)."""
+
+    def __init__(self, rig: SimulatedRig, stop):
+        super().__init__(rig)
+        self.stop, self.builds = stop, 0
+
+    def build_drill_ticket(self):
+        self.builds += 1
+        if self.builds == 2:
+            self.stop()
+        return super().build_drill_ticket()
+
+
+HUMAN = KillRequest("rig-01", "cli", "oncall", "stop now", "2026-11-10T14:00:00+00:00")
+
+
+def test_a_stop_written_during_the_drill_is_left_pending_and_item5_does_not_run(tmp_path):
+    """killswitch:2, file flag: `sentinel stop` between items 2 and 3; item 5 neither overwrites, consumes nor
+    acknowledges it, so the request is still pending after the drill."""
+    from sentinel.orchestrator import killflag
+    rig = ready(SimulatedRig(SimScenario(kill_root=tmp_path)))
+    ch, _ = rig.kill_channels()
+    port = StopBetweenItems(rig, lambda: killflag.main(["rig-01", "--root", str(tmp_path), "--by", "oncall"],
+                                                       clock=rig.clock))
+    r = drill(rig, port=port, channel=ch)
+    assert r.failed == ("item5",) and "a stop request is pending (oncall via cli" in r.observation.could_not_run[5]
+    assert ch.poll().requested_by == "oncall" and "kill_process_tree" not in rig.calls
+
+
+def test_item5_never_consumes_a_human_request_on_a_fifo_channel():
+    """killswitch:2, FIFO channel: a request pending before item 5, or one that lands just before item 5's own, stays;
+    item 5's own request never stays behind."""
+    from sentinel.orchestrator.killflag import MemoryKillChannel
+    rig = ready(SimulatedRig())
+    ch = MemoryKillChannel()
+    r = drill(rig, port=StopBetweenItems(rig, lambda: ch.post(HUMAN)), channel=ch)
+    assert ch.requests == [HUMAN] and r.failed == ("item5",)
+
+    class Racy(MemoryKillChannel):
+        def post(self, request):
+            if request.requested_by == "fire_drill":
+                super().post(HUMAN)                        # a stop lands just before item 5's own request
+            super().post(request)
+
+    racy = Racy()
+    r = drill(ready(SimulatedRig()), channel=racy)
+    assert racy.requests == [HUMAN] and "a stop request is pending" in r.observation.could_not_run[5]
+
+
+def test_a_stop_during_the_drill_in_a_running_shard_ends_the_run_aborted_safety_kill_switch(tmp_path):
+    """killswitch:2 end to end: the drill as the shard's last work; the stop it left pending trips the kill switch
+    when the work returns."""
+    from sentinel.orchestrator import killflag
+    from sentinel.orchestrator.machine import Orchestrator
+    from sentinel.orchestrator.simrig import MemorySink
+    rig = SimulatedRig(SimScenario(kill_root=tmp_path))
+    ch, _ = rig.kill_channels()
+    seen = {}
+
+    def work(o: Orchestrator) -> None:
+        port = StopBetweenItems(rig, lambda: killflag.main(["rig-01", "--root", str(tmp_path), "--by", "oncall"],
+                                                           clock=rig.clock))
+        seen["drill"] = run_drill(rig, o.ledger, rig.clock, CHORDS, o.start_book, ch, port=port, preconditions=OK,
+                                  allowlist=CTX.allowlist, rig_id="rig-01", fixture_account=CTX.fixture_account)
+
+    rep = Orchestrator(rig, CTX, MemorySink(["c1"]), clock=rig.clock).run(work)
+    assert seen["drill"].failed == ("item5",)
+    assert (rep.verdict.status, rep.verdict.reason) == ("aborted_safety", "kill_switch")
+    assert rep.kill_switch.result.evidence["request"]["requested_by"] == "oncall" and ch.poll() is None
+
+
 def test_sim_drill_port_names_only_the_drill_targets():
     with pytest.raises(ValueError):
         SimDrillPort(SimulatedRig()).locate("send_button")

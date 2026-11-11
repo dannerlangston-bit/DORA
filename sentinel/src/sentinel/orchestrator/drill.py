@@ -72,12 +72,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
 
-from . import alerts
+from . import alerts, killflag
 from .clock import Clock
 from .gateway import VK_ESCAPE, VK_F24, VK_RETURN, VK_SPACE, Action, Chord, DropLedger, InputEvent, drain, refusal
 from .identity import Allowlist
 from .killswitch import GRIDS, PROVEN_NONE, ProofInputs, cancel_new_working, post_run_proof, recovery_login
-from .ports import KillChannel, KillRequest
+from .ports import KillChannel
 from .results import ControlResult, Outcome, safety_abort_outcome
 from .rig import EmitResult, OrderBook, Rig
 from .simrig import CONFIRM_POINT, DELETE_POINT, SimulatedRig
@@ -407,12 +407,25 @@ def _item5(d: _Drive, *, clock: Clock, kill_channel: KillChannel, rig_id: str, s
            allowlist: Allowlist, fixture_account: str | None) -> tuple[Item5, tuple[OrderBook | None, ...]]:
     """The kill switch end to end (6.5 item 5, 6.6): the file flag written mid-ticket, then the sequence, timed.
     Returns item 5's measurements and its Monitor reads: the last one, and the clean read that made `Cancel All`
-    click (killswitch choice 4), so a row either showed counts."""
+    click (killswitch choice 4), so a row either showed counts. A human stop request pending on the channel is never
+    overwritten, consumed or acknowledged: item 5 does not run and the request stays for the Orchestrator (killflag
+    choice 5)."""
     t0 = clock.monotonic()
-    kill_channel.post(KillRequest(rig_id, "file", "fire_drill", "fire drill item 5", clock.now().isoformat()))
-    req = kill_channel.poll()
-    if req is None:
-        d.could_not_run[5] = "the kill flag did not arrive on the channel"
+    human = killflag.poll(kill_channel)
+    mine = killflag.drill_request(rig_id, clock.now().isoformat())
+    if human is None:
+        try:
+            kill_channel.post(mine)
+        except FileExistsError:                      # the flag holds a request that is not ours (killflag choice 5)
+            human = killflag.poll(kill_channel)
+    req = kill_channel.poll() if human is None else None
+    if req is not None and req != mine and not killflag.is_probe(req):     # a human request came first: leave it
+        human = req
+        kill_channel.acknowledge(mine)
+    if human is not None or req is None:
+        d.could_not_run[5] = ("the kill flag did not arrive on the channel" if human is None else
+                              f"a stop request is pending ({human.requested_by} via {human.channel}: {human.reason}); "
+                              "it is left for the kill switch")
         d.port.clear_drill_ticket()
         return Item5(None, None, False, False, None, False), ()
     d.rig.set_hook_phase("kill_switch")
@@ -436,7 +449,7 @@ def _item5(d: _Drive, *, clock: Clock, kill_channel: KillChannel, rig_id: str, s
     except Exception:            # noqa: BLE001 - any revert failure is "rig not reverted" (6.5 item 5), never a crash
         reverted = False
     d.rig.set_hook_phase("between_runs")
-    kill_channel.acknowledge(req)
+    kill_channel.acknowledge(mine)                   # only our own request (killflag choice 4)
     return Item5(deny_all_s, tree_gone_s, login_ok, located, proof.verdict, reverted), (end, found)
 
 

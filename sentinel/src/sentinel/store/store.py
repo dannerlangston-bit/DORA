@@ -56,8 +56,9 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   both, `<param>\\n<detail>`. For invariant_violation without a detail it holds the fired invariant ids (8.3).
 - Decision ids are `dec-<zero-padded sequence>` (4.14) and map to the integer `decisions.decision_id`; finding ids
   are the findings' `natural_key`. The stored `hamming_tolerance` is the effective one (4.14): the asked value,
-  clamped to 6 on a tier-1 checkpoint ("tier-1 checkpoint, so the override applies"; records.Decision defaults to
-  8 and cannot say whether 8 was asked for) and to the region's calibrated tolerance at the run's config commit.
+  clamped to 6 on a tier-1 checkpoint ("tier-1 checkpoint, so the override applies"; an unset
+  records.Decision.hamming_tolerance asks for the default 8) and to the region's calibrated tolerance at the run's
+  config commit.
   noise_signature and request_mask get `expires_at` = decided_at + 30 days when none is given (8.3, 4.14).
 - Step outcomes become `step_events` rows with source orchestrator, action `step`, mode `agent` for an agent rung
   or fallback, and `finding:<ref>` in `reason`. The step's `gateway_event` (4.13) is stored as `gate_decision`,
@@ -1607,7 +1608,8 @@ class Store:
         cp = self._one("SELECT tier FROM checkpoints WHERE checkpoint_id = ?", (d.signature.checkpoint_id,))
         if cp is None:
             raise StoreRefused(f"unknown checkpoint {d.signature.checkpoint_id}")
-        tolerance = min(d.hamming_tolerance, TIER1_TOLERANCE if cp["tier"] == 1 else DEFAULT_TOLERANCE)
+        asked = DEFAULT_TOLERANCE if d.hamming_tolerance is None else d.hamming_tolerance
+        tolerance = min(asked, TIER1_TOLERANCE if cp["tier"] == 1 else DEFAULT_TOLERANCE)
         region = self._one("SELECT g.hamming_tolerance FROM regions g JOIN runs r ON r.config_commit = g.config_commit "
                            "WHERE r.run_id = ? AND g.checkpoint_id = ? AND g.region_id = ?",
                            (run_id, d.signature.checkpoint_id, d.signature.region_id))

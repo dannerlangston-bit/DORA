@@ -30,6 +30,9 @@ Choices where the spec is ambiguous (reported):
 5. A config without `policy/egress_allowlist.yaml` (which L-XREF-19 accepts) has the empty allowlist
    (`EgressAllowlist.empty`): the harness HTTP client refuses every host, as the lint's choice 1 assumes, and the
    Nightly reconciliation compares the day's rows with it, so any `sent` row is to a host outside the allowlist.
+6. A live client built without a run's gate (`reviewer.AnthropicTransport.from_env` with no `gate`) is not left
+   ungated: it gets `refuse_all()`, a gate over the empty allowlist whose rows and findings go to the log
+   (`LogSink`), since there is no run or store to write them to. Every request is refused before connecting.
 """
 from __future__ import annotations
 
@@ -37,6 +40,7 @@ import contextlib
 import contextvars
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -55,6 +59,7 @@ MODEL_PURPOSES = frozenset({"review", "batch_review", "agent_step", "explorer_st
 TEXT_ONLY_PURPOSES = frozenset({"pr_comment", "slack"})          # 6.10, 8.7: images never go to the PR host or Slack
 ROW_FIELDS = ("purpose", "checkpoint_id", "artifact_sha256", "redaction_version", "model_id", "image")
 _CONTEXT: contextvars.ContextVar[Mapping[str, Any]] = contextvars.ContextVar("sentinel_egress_context", default={})
+log = logging.getLogger(__name__)
 
 
 class AllowlistError(ValueError):
@@ -180,6 +185,23 @@ class EgressSink(Protocol):
     def write_finding(self, finding: Finding, *, synthetic: bool = False) -> None: ...
 
 
+class LogSink:
+    """An `EgressSink` with no store, for a gate that belongs to no run (choice 6): each row and finding is logged
+    (ERROR for a refusal, INFO otherwise) and nothing is written."""
+
+    def __init__(self) -> None:
+        self.rows: list[EgressRow] = []
+
+    def log_egress(self, row: EgressRow) -> int:
+        self.rows.append(row)
+        log.log(logging.ERROR if row.status == "refused" else logging.INFO, "egress %s to %s for %s%s", row.status,
+                row.destination, row.purpose, f": {row.refusal_reason}" if row.refusal_reason else "")
+        return len(self.rows)
+
+    def write_finding(self, finding: Finding, *, synthetic: bool = False) -> None:
+        log.error("egress finding %s: %s", finding.kind, finding.description)
+
+
 class EgressGate:
     """The harness HTTP client's policy point (module docstring). `run_id` and `shard_id` go on every row; a
     refusal's `harness_error` finding is written to the store when the gate has a run, and kept in `findings`."""
@@ -261,6 +283,11 @@ class EgressGate:
         self._row(host, p, "sent", nbytes, ctx, response_status=status_of(response),
                   request_id=request_id_of(response))
         return response
+
+
+def refuse_all() -> EgressGate:
+    """A gate over the empty allowlist with a `LogSink`: every request is refused before connecting (choice 6)."""
+    return EgressGate(EgressAllowlist.empty(), LogSink())
 
 
 # -- Nightly reconciliation (6.10) --------------------------------------------------------------------------------
@@ -346,4 +373,5 @@ def reconcile(rows: Sequence[EgressRow], allowlist: EgressAllowlist, firewall_lo
 
 
 __all__ = ["AllowedHost", "AllowlistError", "EgressAllowlist", "EgressGate", "EgressRefused", "EgressSink",
-           "FirewallEntry", "MODEL_PURPOSES", "Reconciliation", "allowlist_problems", "normalize_host", "reconcile"]
+           "FirewallEntry", "LogSink", "MODEL_PURPOSES", "Reconciliation", "allowlist_problems", "normalize_host",
+           "reconcile", "refuse_all"]

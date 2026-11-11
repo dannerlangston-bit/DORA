@@ -75,3 +75,58 @@ def test_secrets_0_the_nightly_reconciliation_without_an_allowlist_flags_any_sen
                                    sent_at="2026-11-10T08:00:00+00:00"))
         result = nightly_reconcile(store, cfg, now)
     assert result is not None and not result.passed and result.incident == "S1"
+
+
+# == secrets:1: `sentinel review --live` goes through the run's egress gate ======================================
+
+def _no_network(monkeypatch) -> list:
+    """Record every request the SDK's network transport would send, and answer none of them."""
+    seen: list = []
+
+    def handle(self, request):
+        seen.append(request.url.host)
+        raise httpx2.ConnectError("no network in tests", request=request)
+    monkeypatch.setattr(httpx2.HTTPTransport, "handle_request", handle)
+    monkeypatch.setattr("anthropic._base_client.time.sleep", lambda s: None)
+    return seen
+
+
+def test_secrets_1_review_live_sends_through_the_runs_gate_and_logs_each_request(tmp_path, monkeypatch):
+    """6.10: `sentinel review --live` reviews the items inside the run, through the run's gate: an endpoint off the
+    allowlist is refused before connecting, each refusal is an `egress_log` row naming the run and checkpoint, and
+    the refusal's `harness_error` finding lands on the run."""
+    from sentinel.cli import main as cli
+    seen = _no_network(monkeypatch)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    rc = tmp_path / "rc.yaml"
+    rc.write_text("reviewer:\n  endpoint_base_url: https://exfil.attacker.example\n  sync_concurrency: 1\n")
+    assert cli(["review", "--live", "clean-pr", "--out", str(tmp_path), "--reviewer-config", str(rc)]) == 0
+    assert seen == []
+    out = tmp_path / "review-clean-pr"
+    run_id = clean_scenario(TODAY).run_id
+    db = sqlite3.connect(out / "sentinel.db")
+    rows = db.execute("SELECT run_id, checkpoint_id, destination, status, redaction_version FROM egress_log").fetchall()
+    assert rows and {(r[0], r[2], r[3]) for r in rows} == {(run_id, "exfil.attacker.example", "refused")}
+    assert all(r[1] and r[4] for r in rows)                    # the item's checkpoint and redaction version
+    with Store(out / "sentinel.db") as store:
+        assert [f.kind for f in store.findings(run_id) if f.detail == "egress_refused"] == ["harness_error"]
+    assert (out / "review-live.json").exists()
+
+
+def test_secrets_1_a_live_transport_without_a_gate_refuses_every_request(monkeypatch, caplog):
+    """6.10, egress choice 6: a client built without the run's gate is never ungated; it refuses every request before
+    connecting, and the refusal is logged."""
+    import logging
+
+    from sentinel.reviewer import TransportError
+    seen = _no_network(monkeypatch)
+    t = AnthropicTransport.from_env(allow_network=True, env=KEY)
+    params = {"model": "claude-opus-5-5", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+    with caplog.at_level(logging.ERROR, logger="sentinel.egress"):
+        try:
+            t.create_message(params)
+        except TransportError as e:
+            assert e.kind == "client" and "egress refused" in str(e)
+        else:
+            raise AssertionError("an ungated request was not refused")
+    assert seen == [] and "refused to api.anthropic.com" in caplog.text

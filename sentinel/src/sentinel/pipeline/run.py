@@ -2008,8 +2008,8 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                             flow_docs=cfg.flow_docs, pad=(live.config if live else ReviewerConfig()).crop.pad_px)
         if reviewer is None and live is not None:          # 3.12: the real Reviewer; crops from the artifact store
             rev = ModelReviewer(live, items)
-        if isinstance(rev, CollectingReviewer):
-            rev.item_for = items
+        if isinstance(rev, CollectingReviewer):            # `sentinel review`: its live items go through `gate`
+            rev.item_for, rev.live = items, live
         # -- 5.2: every shard through the Orchestrator; 5.17 per checkpoint inside `running`
         work.run_shards([(shard_of[r], i, r, [cp for cp in planned if rig_of[cp.checkpoint_id] == r])
                          for i, r in enumerate(used, 1)])

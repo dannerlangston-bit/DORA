@@ -18,8 +18,11 @@ so `ItemBuilder` turns each request into the full 3.12 `ReviewItem`:
   untrusted screen text, the manifest entry (task A) or dependency edge (task B), and the version fields
   of the verdict cache (base and candidate crop hashes, mask, redaction and registry versions).
 
-`CollectingReviewer` answers a run offline and keeps every request's `ReviewItem`; `sentinel review --live`
-hands them to `reviewer.review_live` (network only with `allow_network=True` and a key).
+`CollectingReviewer` answers a run offline and keeps every request's `ReviewItem`. `sentinel review --live` gives
+the run a `live_factory` too: the run binds the gated job it builds (`CollectingReviewer.live`), and each item is
+also sent to the real Reviewer from inside the run, under the run's egress gate and its per-item context
+(checkpoint id, redaction version), so every request is allowlisted and logged to `egress_log` (6.10) and a
+refusal's `harness_error` finding lands on the open run; its verdicts are kept in `verdicts`.
 """
 from __future__ import annotations
 
@@ -32,7 +35,7 @@ import numpy as np
 import yaml
 
 from ..egress import EgressGate
-from ..reviewer import ConfigError, ReviewerConfig, ReviewerJob
+from ..reviewer import ConfigError, ReviewerConfig, ReviewerJob, Verdict
 from ..reviewer.images import crop_box
 from ..reviewer.prompt import DependencyEdge, DiffMetrics, FlowContext, ManifestEntryRef, ReviewItem, StepCrops
 from ..reviewer.transport import AnthropicTransport
@@ -58,7 +61,8 @@ def live_job(env: Mapping[str, str] | None = None, config: ReviewerConfig | None
              gate: EgressGate | None = None) -> ReviewerJob:
     """A PR-run `ReviewerJob` over the real API; raises `NetworkNotAllowed` unless `ANTHROPIC_API_KEY` is set. With
     `gate` (the run's `egress.EgressGate`, built by `run.run_pipeline`) every request is checked against the signed
-    allowlist and logged to `egress_log` (6.10)."""
+    allowlist and logged to `egress_log` (6.10); without one every request is refused (`egress.refuse_all`), so a job
+    built only to check the key sends nothing."""
     cfg = config or ReviewerConfig()
     transport = AnthropicTransport.from_env(allow_network=True, env=env, base_url=cfg.endpoint_base_url, gate=gate)
     return ReviewerJob(cfg, transport, "pr")
@@ -173,16 +177,23 @@ class ItemBuilder:
 
 class CollectingReviewer:
     """The offline `SimulatedReviewer` answering a run, keeping the `ReviewItem` of every request it got, for
-    `sentinel review --live` to hand to `reviewer.review_live`. The run sets `item_for` (an `ItemBuilder`)."""
+    `sentinel review`. The run sets `item_for` (an `ItemBuilder`) and `live`, the gated job of its `live_factory`
+    (None without one): with it each item is also reviewed live inside the run (module docstring), its verdict
+    kept in `verdicts` by queue key; the run's own classification still comes from the offline answer."""
 
     def __init__(self) -> None:
         self.sim = SimulatedReviewer()
         self.model_id, self.prompt_hash = self.sim.model_id, self.sim.prompt_hash
         self.item_for: Callable[[ReviewRequest], ReviewItem] | None = None
+        self.live: ReviewerJob | None = None
         self.items: list[ReviewItem] = []
+        self.verdicts: dict[str, Verdict] = {}
 
     def review(self, request: ReviewRequest) -> dict:
         if self.item_for is None:
             raise RuntimeError("the run has not bound an ItemBuilder to this reviewer")
-        self.items.append(self.item_for(request))
+        item = self.item_for(request)
+        self.items.append(item)
+        if self.live is not None:                  # inside the run's gate.context for this item (6.10)
+            self.verdicts[item.queue_key] = self.live.review_now(item)
         return self.sim.review(request)

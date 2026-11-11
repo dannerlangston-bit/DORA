@@ -753,3 +753,34 @@ def test_a_new_send_ok_token_reopens_the_send_rect_once_and_the_writer_never_set
     finally:
         seg.close()
         seg.unlink()
+
+
+def test_a_secret_keys_up_is_flagged_secret_whatever_happened_to_its_down():
+    """6.9, choice 7: the up of a secret key whose down passed before the kill switch, was dropped under deny-all or
+    came after its token expired matches no half consumed token, yet its record carries the secret flag, so the
+    drainer never writes its vk; a key event the hook has no consistent picture for is flagged too."""
+    g = armed()
+    for vk in (0x50, 0x57):
+        g.issue_key(vk, T, secret=True)
+    g.issue_key(0x41, T)                                                           # not secret: stays in clear
+    buf, w = published(g)
+    assert decide_from_segment(buf, ev("key_down", vk=0x50), to_ns(T)).allowed       # P passes, then the trip
+    g.deny_all = True
+    w.publish(g)
+    for e in (ev("key_up", vk=0x50), ev("key_down", vk=0x57), ev("key_up", vk=0x57), ev("key_down", vk=0x41),
+              ev("key_up", vk=0x41)):
+        assert decide_from_segment(buf, e, to_ns(T)).reason == "deny_all"
+    assert [(r.event_type, r.vk, r.secret) for r in RingReader().read(buf)] == [
+        ("key_down", 0x50, True), ("key_up", 0x50, True), ("key_down", 0x57, True), ("key_up", 0x57, True),
+        ("key_down", 0x41, False), ("key_up", 0x41, False)]
+    g = armed()
+    g.issue_key(0x39, T, secret=True)
+    buf, _ = published(g)
+    assert decide_from_segment(buf, ev("key_down", vk=0x39), to_ns(T + 0.6)).reason == "token_expired"
+    assert decide_from_segment(buf, ev("key_up", vk=0x39), to_ns(T + 0.6)).reason == "no_token"
+    assert [r.secret for r in RingReader().read(buf)] == [True, True]
+    torn = fresh()
+    struct.pack_into("<Q", torn, sg.OFF_SEQ, 1)                                    # a writer died mid-write
+    for e in (ev("key_up", vk=0x52), ev("button_up", 1, 1)):
+        assert decide_from_segment(torn, e, to_ns(T)).reason == "deny_all"
+    assert [(r.event_type, r.secret) for r in RingReader().read(torn)] == [("key_up", True), ("button_up", False)]

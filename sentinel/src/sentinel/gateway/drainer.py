@@ -31,8 +31,10 @@ Choices where the spec is silent or ambiguous (reported):
    `liveness_probe`.
 3. `keys` is `<event type>[:<detail>]`: `move`, `button_down:shift+left`, `wheel:-120`, `key_down:ctrl+0x42`.
    A key event of a secret token, or any key event while `ctx.secret_step` is set, shows `<redacted>` for the vk
-   (6.9: a secret never becomes a record). The screen point is set for pointer events only (the low-level
-   keyboard hook has none).
+   (6.9: a secret never becomes a record). The hook flags the up of a secret key whatever happened to its down
+   (segment.py choice 7); as a backstop for an up it could not flag (the token's slot freed between the down and
+   the up), the first key up after a secret key down of the same vk is redacted too. The screen point is set for
+   pointer events only (the low-level keyboard hook has none).
 4. The delay of a `late_up` (5.4.5 "the step event carries the delay") goes in `duration_ms`; a refusal's
    detail goes in `reason`.
 5. A row a token explains takes the token's mode, flow, step, attempt, target, rect and click crop from its
@@ -118,6 +120,7 @@ class Drainer:
         self.crop_at = crop_at
         self.reader = RingReader()
         self.notes: dict[int, TokenNote] = {}
+        self._secret_down: set[int] = set()   # vks of secret key downs whose up is not drained yet (choice 3)
 
     @property
     def lost(self) -> int:
@@ -185,6 +188,11 @@ class Drainer:
             d = classify_drop(HookDecision(False, r.reason, r.token_id), e, mode=mode, drill_phase=c.drill_phase)
             reason, cls, drill = d.reason, d.gate_class, d.tag == "drill"
         secret = r.secret or (c.secret_step and r.event_type in KEY_EVENTS)
+        if r.event_type == "key_down" and secret:
+            self._secret_down.add(r.vk_or_button)
+        elif r.event_type == "key_up" and r.vk_or_button in self._secret_down:
+            self._secret_down.discard(r.vk_or_button)
+            secret = True
         pointer = r.event_type in POINTER_EVENTS
         crop = note.click_crop_sha256 if note else None
         if crop is None and self.crop_at is not None and r.event_type == "button_down":

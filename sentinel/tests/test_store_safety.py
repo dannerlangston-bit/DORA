@@ -303,7 +303,8 @@ def test_override_check_is_the_system_owners_only_and_set_once(st):
 def test_quarantine_rows_validate_dedupe_and_filter_flows(st):
     rig_q = S.write_safety_quarantine(st, "rig", "rig-01", "safety_canary", cause="safety_canary_blind:identity",
                                       detail="identity check blind")
-    assert S.write_safety_quarantine(st, "rig", "rig-01", "safety_canary", cause="safety_canary_blind:identity") == rig_q
+    again = S.write_safety_quarantine(st, "rig", "rig-01", "safety_canary", cause="safety_canary_blind:identity")
+    assert again == rig_q
     stage = S.write_safety_quarantine(st, "activity", "order_stage_flows", "fire_drill", cause="drill_failed:item1")
     flow = S.write_safety_quarantine(st, "flow", "flow.trade.x", "kill_switch", cause="attempted_send")
     for bad in (dict(target_kind="window", target="x", reason="kill_switch", cause="c"),
@@ -331,8 +332,8 @@ def test_quarantine_rows_validate_dedupe_and_filter_flows(st):
 
 
 def test_a_quarantine_is_reenabled_with_the_canary_that_opened_it(st):
-    qid = S.write_safety_quarantine(st, "activity", "explorer_stage", "safety_canary", cause="safety_canary_blind:deny_list",
-                                    at=T1)
+    qid = S.write_safety_quarantine(st, "activity", "explorer_stage", "safety_canary",
+                                    cause="safety_canary_blind:deny_list", at=T1)
     drill = S.write_safety_quarantine(st, "activity", "order_stage_flows", "fire_drill", cause="drill_failed:item2",
                                       at=T1)
     evidence(st, "nightly-2", [canary_row("identity")])

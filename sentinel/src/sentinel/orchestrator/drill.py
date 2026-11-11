@@ -355,8 +355,9 @@ def _item2(d: _Drive) -> None:
     """The Auto Send ladder click: a ladder Buy cell on the fixture Active Trader panel."""
     p = d.located(2, "ladder_buy_cell", "the Active Trader panel or a ladder cell")
     if p is not None:
-        d.attempt(2, Action("click", point=p, resolved_name="Buy", under_point_text="Buy", target_kind="ladder_order_cell",
-                            flow_class="canary"), InputEvent("button_down", *p, button="left", origin="drill"))
+        d.attempt(2, Action("click", point=p, resolved_name="Buy", under_point_text="Buy",
+                            target_kind="ladder_order_cell", flow_class="canary"),
+                  InputEvent("button_down", *p, button="left", origin="drill"))
 
 
 def _item3(d: _Drive, chords: Sequence[Chord]) -> None:

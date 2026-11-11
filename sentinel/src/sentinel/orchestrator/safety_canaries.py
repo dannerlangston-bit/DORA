@@ -46,7 +46,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -156,10 +156,10 @@ def score_canary(name: str, cases: Sequence[CanaryCase], *, checkpoint_id: str |
     why = "; ".join(f"{c.case}: expected {c.expected}, the reader reported {c.observed}" for c in missed) \
         or "no planted case ran"
     reason = f"safety_canary_blind:{name}"
+    stage = (SubsetOutcome("explorer_stage", Outcome("not_run", "quarantine")),) if name == "deny_list" else ()
     if blind:
         result = ControlResult(
-            "safety_canary", False, "running", checkpoint=Outcome("harness_error", reason, detail=why),
-            outcomes=(SubsetOutcome("explorer_stage", Outcome("not_run", "quarantine")),) if name == "deny_list" else (),
+            "safety_canary", False, "running", checkpoint=Outcome("harness_error", reason, detail=why), outcomes=stage,
             alert=_alert(name), actions=_ACTIONS[name], incident="S2",
             detail=f"{BLIND_TEXT[name]}: {why}; {PROTECTED_TEXT[name]}",
             evidence={"canary": name, "missed": [c.case for c in missed]})
@@ -328,20 +328,22 @@ def plant_secret_marker(workdir: Path, marker: str) -> dict[str, str]:
     paths = dict(SECRET_ARTIFACTS)
     log = workdir / paths["log_line"]
     log.parent.mkdir(parents=True, exist_ok=True)
-    log.write_text(f"2026-11-11T03:00:00Z orchestrator step s01 started\n2026-11-11T03:00:01Z step s02 typed {marker}\n",
-                   encoding="utf-8")
+    log.write_text("2026-11-11T03:00:00Z orchestrator step s01 started\n"
+                   f"2026-11-11T03:00:01Z step s02 typed {marker}\n", encoding="utf-8")
     db = workdir / paths["sqlite_row"]
     db.unlink(missing_ok=True)
     conn = sqlite3.connect(db)
     try:
         conn.execute("CREATE TABLE step_events (seq INTEGER PRIMARY KEY, target_text TEXT)")
-        conn.executemany("INSERT INTO step_events (target_text) VALUES (?)", [("<redacted:login.password>",), (marker,)])
+        conn.executemany("INSERT INTO step_events (target_text) VALUES (?)",
+                         [("<redacted:login.password>",), (marker,)])
         conn.commit()
     finally:
         conn.close()
     tx = workdir / paths["transcript"]
     tx.parent.mkdir(parents=True, exist_ok=True)
-    tx.write_text(json.dumps({"role": "assistant", "content": f"typed {marker} into the field"}) + "\n", encoding="utf-8")
+    tx.write_text(json.dumps({"role": "assistant", "content": f"typed {marker} into the field"}) + "\n",
+                  encoding="utf-8")
     return paths
 
 
@@ -364,7 +366,8 @@ def secret_scan_canary(scan: Callable[[Path, str], Iterable[str | Path]], workdi
 
 
 # -- the denied-action test (6.8) ----------------------------------------------------------------------------
-def denied_action_test(rig: Rig, deny_list: Sequence[DenyEntry], *, deny_controls: dict[str, tuple[str, ...]] | None = None,
+def denied_action_test(rig: Rig, deny_list: Sequence[DenyEntry], *,
+                       deny_controls: Mapping[str, Sequence[str]] | None = None,
                        checkpoint_id: str | None = None) -> SafetyCanaryResult:
     """The nightly (and build-intake) denied-action test (6.8 Proof): every probe of `denied_action_plan` through
     `rig.send_input` under the Explorer profile must be refused by the gateway (`blocked_by_gateway`); an entry the

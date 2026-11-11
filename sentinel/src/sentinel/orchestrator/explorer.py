@@ -297,6 +297,12 @@ def _click(**kw: Any) -> Action:
     return Action("click", profile="explorer", **kw)
 
 
+def _named(names: Sequence[str]) -> dict[str, str | None]:
+    """A registry control's names as the resolver reports them: the first as the resolved name, the last as the
+    under-point text."""
+    return {"resolved_name": names[0] if names else None, "under_point_text": names[-1] if names else None}
+
+
 def denied_action_plan(entries: Sequence[DenyEntry], deny_controls: Mapping[str, Sequence[str]] | None = None
                        ) -> tuple[DenyProbe, ...]:
     """The denied-action test's list (6.8, L-XREF-13): every detection of every entry, then every `deny: true`
@@ -307,10 +313,8 @@ def denied_action_plan(entries: Sequence[DenyEntry], deny_controls: Mapping[str,
             sample = regex_sample(rx) if rx else None
             if sample:
                 probes.append(DenyProbe(e.name, kind, _click(resolved_name=sample, under_point_text=sample)))
-        names = e.control_names
         for g in sorted(e.geometry):
-            probes.append(DenyProbe(e.name, "geometry", _click(
-                target_kind=g, resolved_name=names[0] if names else None, under_point_text=names[-1] if names else None)))
+            probes.append(DenyProbe(e.name, "geometry", _click(target_kind=g, **_named(e.control_names))))
         if e.surface:
             probes.append(DenyProbe(e.name, "surface", _click(target_kind=e.surface)))
         end = next(iter(sorted(e.geometry)), e.surface)
@@ -320,9 +324,7 @@ def denied_action_plan(entries: Sequence[DenyEntry], deny_controls: Mapping[str,
     named = {g for e in entries for g in e.geometry}
     for ref, names in sorted((deny_controls or {}).items()):
         if ref not in named:
-            probes.append(DenyProbe(f"control:{ref}", "control", _click(
-                target_kind=ref, resolved_name=names[0] if names else None,
-                under_point_text=names[-1] if names else None)))
+            probes.append(DenyProbe(f"control:{ref}", "control", _click(target_kind=ref, **_named(names))))
     return tuple(probes)
 
 

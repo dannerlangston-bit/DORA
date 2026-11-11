@@ -47,6 +47,7 @@ Choices where the spec is silent or ambiguous (reported):
 """
 from __future__ import annotations
 
+import dataclasses
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -141,9 +142,7 @@ class Incident:
 
     @classmethod
     def _from(cls, r: Any) -> "Incident":
-        return cls(*(r[k] for k in ("incident_id", "run_id", "rig_id", "login_alias", "severity", "trigger", "opened_at",
-                                    "closed_at", "closed_by", "close_reason", "ticket_ref", "postmortem_ref",
-                                    "postmortem_due_at")))
+        return cls(*(r[f.name] for f in dataclasses.fields(cls)))
 
 
 @dataclass(frozen=True)
@@ -490,7 +489,8 @@ def unblock_login(store: Store, alias: str, *, by: str, role: str, reason: str, 
         if any(p["verdict"] == "unproven" and p["verified_by"] is None for p in proofs):
             raise SafetyRefused(f"login {alias} has an UNPROVEN proof no person has cleared; clear_proof first (6.6)")
         if len(proofs) >= 2 and all(p["verdict"] == "unproven" for p in proofs[-2:]) and role != SYSTEM_OWNER:
-            raise SafetyRefused("two UNPROVEN proofs in a row on this login: the system owner signs the re-enable (6.6)")
+            raise SafetyRefused("two UNPROVEN proofs in a row on this login: the system owner signs the re-enable "
+                                "(6.6)")
     run = _evidence(store, LOGIN_EVIDENCE[row["blocked_reason"]], build_id, row["blocked_at"])
     when = _when(at)
     with store.batch("human:reenable") as b:
@@ -513,7 +513,8 @@ def enable_rig(store: Store, rig_id: str, *, by: str, role: str, reason: str, ti
     open_ = store.query("SELECT incident_id FROM incidents WHERE rig_id = ? AND closed_at IS NULL "
                         "AND severity IN ('S1','S2')", (rig_id,))
     if open_:
-        raise SafetyRefused(f"rig {rig_id} stays stopped until incident {open_[0]['incident_id']} is closed (6.6, 6.12)")
+        raise SafetyRefused(f"rig {rig_id} stays stopped until incident {open_[0]['incident_id']} is closed "
+                            "(6.6, 6.12)")
     if row["disabled_reason"] == "unproven_twice" and role != SYSTEM_OWNER:
         raise SafetyRefused("two UNPROVEN proofs disabled this rig: the system owner signs the re-enable (6.6)")
     run = _evidence(store, RIG_EVIDENCE[row["disabled_reason"]], build_id, row["disabled_at"])

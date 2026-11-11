@@ -122,5 +122,6 @@ def test_the_plan_drives_every_detection_and_every_unnamed_deny_control():
 
 def test_a_surface_entry_hits_the_surface_and_its_controls_only():
     e = DenyEntry("s", surface="chat.room")
-    assert e.hit(title=None, labels=(), target_kind="chat.room") and e.hit(title=None, labels=(), target_kind="chat.room.input")
-    assert not e.hit(title=None, labels=(), target_kind="chat.roomy") and not e.hit(title=None, labels=(), target_kind=None)
+    def hit(kind: str | None) -> bool:
+        return e.hit(title=None, labels=(), target_kind=kind)
+    assert hit("chat.room") and hit("chat.room.input") and not hit("chat.roomy") and not hit(None)

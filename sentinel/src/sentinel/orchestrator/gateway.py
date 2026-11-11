@@ -62,16 +62,57 @@ Choices where the spec is ambiguous (reported):
    Explorer action is refused before any token is written (5.4.6 "drops all input from that moment"): a
    guarded key, Shift+click or deny-rectangle click as the attempted send it is, anything else `deny_profile`
    with `flag_abort` set, which the caller routes to `agent_flag_abort` or `ExplorerSession.order_stage`.
+9. Session safety (6.2 Label rules, 5.4.3 stage 4, SD-57). `SafetyContext.session` is the
+   `ports.SessionSafety` the Orchestrator sets and clears (attestation stage, last paper-mode assertion,
+   session kicked) and `SafetyContext.now` the monotonic time of the check. `Confirm and Send` needs stage
+   `a3_a8` for the A9 click itself (`Action.a9_check`) and `a3_a9` for every later click, a session that was
+   not kicked, and a paper-mode assertion no older than the two-minute timer of 6.4 (`PAPER_ASSERTION_CURRENT_S`,
+   equal to `identity.TIMER_S`): an older one means a scheduled read was missed or deferred, so it is not
+   current. A caller that does not pass `session` (SimulatedRig until the integrator wires
+   `set_session_safety`) is judged on the two booleans `attestation_passed` (stage `a3_a9`) and
+   `paper_assertion_current`; with `session` set the booleans are not read.
+10. Dismiss allowlist (6.2, 6.13 item 10, SD-65). The pinned set comes from `gateway/dismiss_allowlist.yaml`
+   through `gateway_config.load_dismiss_allowlist`, which is empty until Phase 0 records its read. An empty
+   allowlist refuses `Confirm and Send` (`deny_profile`), so no dialog is opened that no click could dismiss
+   and ticket flows stop before the dialog. `SafetyContext`'s default stays `{"Delete"}` (the label 6.2
+   expects; `Edit` only when Phase 0 observes it) for callers that do not load the file yet (SimulatedRig).
+11. The gated send (6.7). A click whose two labels are exactly `Send` consults `SafetyContext.send_gate` (a
+   `SendClearance`, implemented by `sendgate.SendGate`) before the never-tokenize check: when every gate of
+   6.7 holds, the click skips the never-tokenize list and the dialog allowlist, the flag re-check ignores
+   the Send deny rectangle (the hook passes it once for the `send_ok` token) but still refuses Shift and the
+   other rectangles, and the decision carries `send_ok`, after which the slow half commits the send to the
+   gate (it counts toward the caps and stays pending until declared). Anything else stays the never-tokenize
+   attempted send it was. With no gate (the policy disabled) nothing ever carries `send_ok`.
+12. Recovery-only arm and disarm (6.6 steps 1 and 5, 6.2 rule 1; 6.6 does not say when deny-all is lifted).
+   `HOOK_STATES` names the `(armed, deny_all)` pair of each phase: `running` armed; `kill_switch` deny-all;
+   `recovery` re-armed for the 6.6 recovery after the tree is killed and the hook host restarted, with
+   `SafetyContext.recovery_only` set so the slow half tokens only `recovery_admits` actions (scripted actions
+   of class `login`, which carry the secret steps, and the `cancel_all`, `working_orders_check` and
+   `positions_flat_check` teardown actions the proof's reads and the Cancel All need); `between_runs` not
+   armed, which the Orchestrator sets at the end of every run and after `revert_snapshot`. Every other rule
+   of the slow half still applies inside the recovery arm.
+13. Flow-ending results carry the rest of the flow (5.4, 5.4.3, 5.4.8 rule 3): when a drop or refusal ends a
+   scripted flow and the run goes on, `DropLedger.record` adds `rest_of_flow: not_run (step_failed:<step>)`.
+   An aborting result does not, because the run's unreached outcome covers those checkpoints (1.10).
+14. A `hook_host_dead` refusal is routed through `watchdog.hook_host_died` with the shard's budgets (5.4.2,
+   6.2, 10.2): deny-all, kill the tree, restart the hook host once per shard and relaunch, or the second time
+   `aborted_harness (reason: hook_lost)`. The closed action list of results.py has no `hook_host_died`
+   action, so `DropLedger.record` returns the Watchdog's own result and refuses to run without the budgets.
 """
 from __future__ import annotations
 
 import re
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import IntEnum
+from typing import TYPE_CHECKING, Protocol
 
 from . import alerts
-from .results import ControlResult, FindingSpec, Outcome, safety_abort_outcome
+from .results import ControlResult, FindingSpec, Outcome, SubsetOutcome, safety_abort_outcome
+
+if TYPE_CHECKING:                      # ports and budgets import this module; only the types are needed here
+    from .budgets import ShardBudgets
+    from .ports import SessionSafety
 
 # -- virtual keys (winuser.h) ------------------------------------------------------------------------------
 VK_BACK, VK_TAB, VK_RETURN, VK_SHIFT, VK_CONTROL, VK_MENU = 0x08, 0x09, 0x0D, 0x10, 0x11, 0x12
@@ -116,7 +157,15 @@ PER_RUN_LIMIT = 10
 NEVER_TOKENIZE_RE = re.compile(r"^(send|auto send|flatten|blast all|replace|submit)$", re.I)
 SEND_LIKE_RE = re.compile(r"send|submit|replace|flatten|blast|auto", re.I)
 CONFIRM_AND_SEND = "confirm and send"
-DISMISS_ALLOWLIST = frozenset({"Delete", "Edit"})      # pinned in Phase 0 (6.2); expected Delete and Edit
+SEND_LABEL = "Send"                                   # the only label the gated send token may click (6.7)
+# choice 10: the default for callers that do not load gateway/dismiss_allowlist.yaml yet; Edit only when observed
+DISMISS_ALLOWLIST = frozenset({"Delete"})
+A9_STAGE, CONFIRM_STAGE = "a3_a8", "a3_a9"           # SD-57: the A9 click itself, every later Confirm and Send
+PAPER_ASSERTION_CURRENT_S = 120.0                     # choice 9: the 6.4 two-minute timer (identity.TIMER_S)
+# choice 12: (armed, deny_all) per phase; `recovery` also sets SafetyContext.recovery_only
+HOOK_STATES = {"running": (True, False), "kill_switch": (False, True), "recovery": (True, False),
+               "between_runs": (False, False)}
+RECOVERY_TEARDOWN = frozenset({"cancel_all", "working_orders_check", "positions_flat_check"})
 
 # 5.4.4: the hook's codes split into safety and integrity
 HOOK_SAFETY = frozenset({"deny_all", "not_armed", "deny_rect", "shift_click_dialog", "dialog_not_ok",
@@ -264,8 +313,11 @@ class GatewayState:
         self.watcher_mono_ts = now
 
     def write_deny_rects(self, rects: list[DenyRect] | list[tuple[Rect, str]]) -> None:
-        """Rewrite `deny_rects` from a Watcher poll, each inflated by 12 px (5.4.2); more than 8 fails closed."""
+        """Rewrite `deny_rects` from a Watcher poll, each inflated by 12 px (5.4.2); more than 8 fails closed.
+        `Confirm and Send` is never a deny rectangle: it opens the dialog and the slow half guards it (5.4.6)."""
         items = [r if isinstance(r, DenyRect) else DenyRect(r[0], r[1]) for r in rects]
+        if any(d.label.strip().lower() == CONFIRM_AND_SEND for d in items):
+            raise GatewayError("Confirm and Send is never a deny rectangle (5.4.6)")
         if len(items) > DENY_RECT_SLOTS:
             raise GatewayError(f"{len(items)} send-like controls visible; deny_rects holds {DENY_RECT_SLOTS}")
         self.deny_rects = [DenyRect(d.rect.inflate(DENY_INFLATE_PX), d.label) for d in items]
@@ -294,10 +346,15 @@ class GatewayState:
 
     def issue_click(self, x: int, y: int, now: float, *, button: str = "left", dialog_ok: bool = False,
                     hold_ms: int | None = None, send_ok: bool = False) -> Token:
-        """A click (or a drag's press and release) token; a drag also opens `move_allow` (5.4.3 stage 5)."""
+        """A click (or a drag's press and release) token; a drag also opens `move_allow` (5.4.3 stage 5).
+
+        A `send_ok` token (the gated branch's single-use send token, 6.7) opens one pass through the Send deny
+        rectangle for its own button down; the token is then half consumed, so a second click is `no_token`."""
         expiry = TOKEN_EXPIRY_S if hold_ms is None else hold_ms / 1000 + DRAG_EXTRA_S
         t = Token(self._slot(), "click", x, y, button=button, expires=now + expiry, dialog_ok=dialog_ok,
                   send_ok=send_ok)
+        if send_ok:
+            self.send_rect_passed = False
         self.tokens[t.id] = t
         return t
 
@@ -516,6 +573,8 @@ class Action:
     flow_class: str | None = None
     teardown_action: str | None = None          # cancel_all | close_dialog | clear_ticket
     ambiguous: bool = False
+    a9_check: bool = False                      # the A9 click of the attestation: stage a3_a8 suffices (SD-57)
+    account_role: str | None = None             # golden | empty: the account the flow declares (4.7, 6.7)
 
     def __post_init__(self):
         if self.profile not in PROFILES:
@@ -530,23 +589,63 @@ class Action:
         return tuple(s.strip() for s in (self.resolved_name, self.under_point_text) if s and s.strip())
 
 
+class SendClearance(Protocol):
+    """The gated branch's send gate as the slow half consults it (6.7; `sendgate.SendGate` implements it)."""
+
+    def check(self, a: Action, ctx: SafetyContext) -> str | None:
+        """None when every 6.7 gate holds for this click on `Send` now; else the first failing gate. No effect."""
+
+    def commit(self, a: Action, ctx: SafetyContext) -> None:
+        """The slow half cleared the click with `send_ok`: count it toward the caps and hold it pending."""
+
+
 @dataclass(frozen=True)
 class SafetyContext:
     """What stage 4 reads: the flag and order dialog from a fresh synchronous enumeration (5.4.3).
 
     `order_stage` is the flow's sticky `order_stage` declaration (5.4.6 source 3): while it is held the
-    slow half applies the flag rules even if the enumeration and the detector see nothing yet."""
+    slow half applies the flag rules even if the enumeration and the detector see nothing yet. `session` and
+    `now` are the session's safety state and the time of the check (choice 9); `dialog_foreground` and
+    `dialog_read` say the Order Confirmation dialog is the foreground window and the Oracle read its numbers,
+    and `send_gate` is the gated branch's gate, None while the send policy is disabled (6.7, choice 11);
+    `recovery_only` is the recovery arm of 6.6 (choice 12)."""
 
     flag: Flag = Flag.CLEAR
     order_dialog_present: bool = False
     deny_rects: tuple[DenyRect, ...] = ()
     chords: tuple[Chord, ...] = ()
     dismiss_allowlist: frozenset[str] = DISMISS_ALLOWLIST
-    attestation_passed: bool = False
-    paper_assertion_current: bool = False
+    attestation_passed: bool = False            # read only without `session` (choice 9)
+    paper_assertion_current: bool = False       # read only without `session` (choice 9)
     deny_list_hit: str | None = None            # the Explorer deny list entry the target matches (explorer.py)
     hook_alive: bool = True
     order_stage: bool = False                   # the sticky order_stage declaration is held (5.4.6 source 3)
+    session: SessionSafety | None = None
+    now: float | None = None                    # monotonic seconds, the clock of `session.last_assertion_mono`
+    dialog_foreground: bool = False
+    dialog_read: bool = False
+    send_gate: SendClearance | None = None
+    recovery_only: bool = False
+
+    def attested(self, stage: str) -> bool:
+        """The session's attestation reached `stage` and the session was not kicked (SD-57, choice 9)."""
+        if self.session is None:
+            return self.attestation_passed
+        return not self.session.session_kicked and self.session.attested_through(stage)
+
+    def assertion_age(self) -> float | None:
+        """Seconds since the last paper-mode assertion; None when there is none or no clock (choice 9)."""
+        if self.session is None or self.session.last_assertion_mono is None or self.now is None:
+            return None
+        age = self.now - self.session.last_assertion_mono
+        return age if age >= 0 else None
+
+    def assertion_current(self) -> bool:
+        """The paper-mode assertion is current: no older than the 6.4 two-minute timer (choice 9)."""
+        if self.session is None:
+            return self.paper_assertion_current
+        age = self.assertion_age()
+        return age is not None and age <= PAPER_ASSERTION_CURRENT_S
 
 
 @dataclass(frozen=True)
@@ -554,7 +653,8 @@ class SlowDecision:
     """Stage 4's answer: refused with a reason, or cleared with `dialog_ok` for the click token.
 
     `flag_abort` marks the refusal of an agent or Explorer action while the flag is set or unknown (5.4.6):
-    the caller takes `agent_flag_abort` or `explorer.ExplorerSession.order_stage` for it, not a plain count."""
+    the caller takes `agent_flag_abort` or `explorer.ExplorerSession.order_stage` for it, not a plain count.
+    `send_ok` is the gated branch's single-use send token (6.7): the emitter passes it to `issue_click`."""
 
     refused: bool
     reason: str | None = None
@@ -563,10 +663,13 @@ class SlowDecision:
     attempted_send: bool = False
     unknown_dialog: bool = False
     flag_abort: bool = False
+    send_ok: bool = False
 
     def __post_init__(self):
         if self.refused and self.reason not in SLOW_REFUSALS:
             raise ValueError(f"not a slow-half refusal code: {self.reason!r}")
+        if self.send_ok and (self.refused or not self.dialog_ok):
+            raise ValueError("send_ok is set only on a cleared click that also carries dialog_ok (6.7)")
 
     @property
     def gate_class(self) -> str | None:
@@ -586,17 +689,44 @@ def _in_deny_rect(point: tuple[int, int] | None, rects: tuple[DenyRect, ...]) ->
     return next((d for d in rects if d.rect.contains(*point)), None)
 
 
-def _flag_rules(a: Action, ctx: SafetyContext) -> SlowDecision | None:
+def _flag_rules(a: Action, ctx: SafetyContext, *, send_ok: bool = False) -> SlowDecision | None:
     """The flag re-check's refusals (the hook's rule 2 applied in stage 4): a guarded key or blocked chord, a
-    Shift+click and a click in a deny rectangle. Each is an attempted send (5.4.3 stage 4, 6.2)."""
+    Shift+click and a click in a deny rectangle. Each is an attempted send (5.4.3 stage 4, 6.2). A click the
+    send gate cleared passes the Send rectangle, as its `send_ok` token does in the hook (6.7, choice 11)."""
     if a.keys and (a.mods & CHORD_MODS or any(Chord(a.mods, k) in ctx.chords or k in BLOCKED_VK for k in a.keys)):
         return _refuse("guarded_key_refused", "guarded key or blocked chord under the flag", send=True)
     if a.is_pointer:
         if "shift" in a.mods:
             return _refuse("shift_click_dialog", send=True)
-        hit = _in_deny_rect(a.point, ctx.deny_rects)
+        rects = tuple(d for d in ctx.deny_rects if not (send_ok and d.label == SEND_LABEL))
+        hit = _in_deny_rect(a.point, rects)
         if hit is not None:
             return _refuse("deny_rect", f"point in the deny rectangle of {hit.label!r}", send=True)
+    return None
+
+
+def recovery_admits(a: Action) -> bool:
+    """What the recovery-only arm tokens (choice 12): the scripted login of class `login` and the recovery
+    flow's `cancel_all`, `working_orders_check` and `positions_flat_check` teardown actions (6.6 step 5)."""
+    return a.profile == "scripted" and (a.flow_class == "login" or a.teardown_action in RECOVERY_TEARDOWN)
+
+
+def _confirm_refusal(a: Action, ctx: SafetyContext) -> SlowDecision | None:
+    """`Confirm and Send` (6.2 Label rules, 5.4.3 stage 4, SD-57): scripted only, never with an empty dismiss
+    allowlist (choice 10), only from an order-stage step, with the attestation stage the click needs and a
+    current paper-mode assertion (choice 9)."""
+    if a.profile != "scripted":
+        return _refuse("never_tokenize", "Confirm and Send under profile " + a.profile, send=True)
+    if not ctx.dismiss_allowlist:
+        return _refuse("deny_profile", "Confirm and Send with an empty dismiss allowlist: no dialog click could be "
+                                       "tokened until Phase 0 pins gateway/dismiss_allowlist.yaml (6.13 item 10)")
+    if not a.order_stage_step:
+        return _refuse("deny_profile", "Confirm and Send outside an order-stage step")
+    stage = A9_STAGE if a.a9_check else CONFIRM_STAGE
+    if not ctx.attested(stage):
+        return _refuse("deny_profile", f"Confirm and Send before attestation stage {stage} in this session")
+    if not ctx.assertion_current():
+        return _refuse("deny_profile", "Confirm and Send without a current paper-mode assertion")
     return None
 
 
@@ -604,6 +734,9 @@ def slow_half(a: Action, ctx: SafetyContext) -> SlowDecision:
     """Stage 4 of 5.4.3 (and the liveness check of stage 6), in the spec's order; first refusal wins."""
     if not ctx.hook_alive:
         return _refuse("hook_host_dead")
+    if ctx.recovery_only and not recovery_admits(a):
+        return _refuse("deny_profile", "recovery-only arm: only the scripted login and the recovery teardown "
+                                       "actions are tokened (6.6)")
     if a.ambiguous:
         return _refuse("deny_profile", "ambiguous name")
     labels = a.labels
@@ -614,15 +747,18 @@ def slow_half(a: Action, ctx: SafetyContext) -> SlowDecision:
     # order_stage declaration, which an order-stage step sets before its own events are emitted (6.2: "so
     # Enter is already blocked when the dialog appears"), including the step that clicks Confirm and Send.
     flag_up = ctx.flag != Flag.CLEAR or ctx.order_stage or a.order_stage_step
+    # the gated send (choice 11): a click on exactly `Send` asks the send gate before the never-tokenize list
+    send_click = pointer and len(labels) == 2 and all(s == SEND_LABEL for s in labels)
+    gate_says = ctx.send_gate.check(a, ctx) if send_click and ctx.send_gate is not None else "no send gate"
+    send_ok = send_click and gate_says is None
     # never-tokenize (exact list anywhere; the send-like regex outside the Order Confirmation dialog)
-    if pointer:
+    if pointer and not send_ok:
         if any(NEVER_TOKENIZE_RE.match(s) for s in labels):
-            return _refuse("never_tokenize", f"label {labels}", send=True)
+            return _refuse("never_tokenize", f"label {labels}" + (f"; {gate_says}" if send_click else ""), send=True)
         if confirm:
-            if a.profile != "scripted":
-                return _refuse("never_tokenize", "Confirm and Send under profile " + a.profile, send=True)
-            if not (a.order_stage_step and ctx.attestation_passed and ctx.paper_assertion_current):
-                return _refuse("deny_profile", "Confirm and Send outside an attested order-stage step")
+            hit = _confirm_refusal(a, ctx)
+            if hit is not None:
+                return hit
         elif not ctx.order_dialog_present and any(SEND_LIKE_RE.search(s) for s in labels):
             return _refuse("never_tokenize", f"send-like label {labels}", send=True)
         if a.profile == "scripted":
@@ -632,9 +768,10 @@ def slow_half(a: Action, ctx: SafetyContext) -> SlowDecision:
                 return _refuse("deny_profile", "Working Orders cancel or replace outside paper_send_ok")
         elif a.target_kind == "application_settings":
             return _refuse("deny_profile", "Application Settings under profile " + a.profile)
-    # dialog allowlist: while an order dialog is in front only exact dismiss labels are clickable
-    dialog_ok = False
-    if pointer and ctx.order_dialog_present:
+    # dialog allowlist: while an order dialog is in front only exact dismiss labels are clickable (a cleared
+    # send lifts it for its one click, 6.7)
+    dialog_ok = send_ok
+    if pointer and ctx.order_dialog_present and not send_ok:
         if labels and all(s in ctx.dismiss_allowlist for s in labels) and len(labels) == 2:
             dialog_ok = True
         elif any(SEND_LIKE_RE.search(s) for s in labels) or _in_deny_rect(a.point, ctx.deny_rects):
@@ -666,14 +803,16 @@ def slow_half(a: Action, ctx: SafetyContext) -> SlowDecision:
         return _refuse("deny_profile", f"{geometry} outside an order-stage step of a scripted flow")
     # flag re-check from the fresh enumeration (and the sticky declaration)
     if flag_up:
-        hit = _flag_rules(a, ctx)
+        hit = _flag_rules(a, ctx, send_ok=send_ok)
         if hit is not None:
             return hit
         if pointer:
             dialog_ok = dialog_ok or not ctx.order_dialog_present
     elif any(k in GUARDED_VK for k in a.keys) and not (a.profile == "scripted" and a.declared_guarded):
         return _refuse("guarded_key_refused", "Enter or Space not declared by the step")
-    return SlowDecision(False, dialog_ok=dialog_ok)
+    if send_ok and ctx.send_gate is not None:
+        ctx.send_gate.commit(a, ctx)
+    return SlowDecision(False, dialog_ok=dialog_ok, send_ok=send_ok)
 
 
 # -- the drop-log drainer and the thresholds --------------------------------------------------------------
@@ -743,20 +882,38 @@ class DropLedger:
         self.run_count = 0
         self.by_reason: Counter[tuple[str, str]] = Counter()
 
-    def record(self, drop: GatewayDrop, *, unit: str, order_stage: bool = False, exempt: bool = False,
-               probe_answered: bool = True, retried: bool = False) -> ControlResult:
-        """Apply 5.4.8 to one drop or refusal. `unit` is the flow id (or the agent or Explorer session id);
-        `order_stage` is whether an order-stage step is in force; `probe_answered` and `retried` decide the
-        single retry of an own-token integrity drop (5.4.3 stage 7)."""
+    def record(self, drop: GatewayDrop, *, unit: str, step_id: str | None = None, order_stage: bool = False,
+               exempt: bool = False, probe_answered: bool = True, retried: bool = False,
+               budgets: ShardBudgets | None = None) -> ControlResult:
+        """Apply 5.4.8 to one drop or refusal. `unit` is the flow id (or the agent or Explorer session id) and
+        `step_id` the step it blocked, for `rest_of_flow` (choice 13); `order_stage` is whether an order-stage
+        step is in force; `probe_answered` and `retried` decide the single retry of an own-token integrity drop
+        (5.4.3 stage 7); `budgets` are the shard's restart budgets, which a `hook_host_dead` refusal needs
+        (choice 14)."""
+        res = self._record(drop, unit=unit, step_id=step_id, order_stage=order_stage, exempt=exempt,
+                           probe_answered=probe_answered, retried=retried, budgets=budgets)
+        if res.run is None and res.has("end_flow") and res.step in ("blocked_by_gateway", "failed") \
+                and not any(o.selector == "rest_of_flow" for o in res.outcomes):
+            rest = SubsetOutcome("rest_of_flow", Outcome("not_run", f"step_failed:{step_id or 'unknown'}"))
+            res = replace(res, outcomes=res.outcomes + (rest,))
+        return res
+
+    def _record(self, drop: GatewayDrop, *, unit: str, step_id: str | None, order_stage: bool, exempt: bool,
+                probe_answered: bool, retried: bool, budgets: ShardBudgets | None) -> ControlResult:
         self.by_reason[(drop.mode, drop.reason)] += 1
         ev = {"reason": drop.reason, "decision": drop.decision, "gate_class": drop.gate_class, "mode": drop.mode}
         if exempt or drop.tag == "drill":
             return ControlResult("gateway", True, "running", detail="drill or self-test drop, exempt from counts",
                                  evidence=ev)
-        if drop.reason in UNCOUNTED or drop.reason == "hook_host_dead":
+        if drop.reason == "hook_host_dead":
+            if budgets is None:
+                raise ValueError("a hook_host_dead refusal goes through watchdog.hook_host_died: pass the shard's "
+                                 "budgets (5.4.2, choice 14)")
+            from .watchdog import hook_host_died    # watchdog imports rig, which imports this module
+            return hook_host_died(budgets, step_id=step_id)
+        if drop.reason in UNCOUNTED:
             return ControlResult("gateway", False, "running", step="blocked_by_gateway", step_reason=drop.reason,
-                                 detail="not counted (choice 3); hook_host_dead goes to the Watchdog (10.2)",
-                                 evidence=ev)
+                                 detail="not counted (choice 3)", evidence=ev)
         if drop.unknown_dialog:
             if order_stage:
                 run, un = safety_abort_outcome("running", "unknown_dialog_in_order_stage")

@@ -134,8 +134,11 @@ def test_send_ok_token_passes_the_send_rectangle_once():
     g.write_deny_rects([SEND])
     g.issue_click(920, 610, T, dialog_ok=True, send_ok=True)
     assert hook_decide(g, ev("button_down", 920, 610), T).allowed
-    g.issue_click(920, 610, T, dialog_ok=True, send_ok=True)
+    assert hook_decide(g, ev("button_down", 920, 610), T).reason == "no_token"      # a second click (6.7)
+    g.issue_click(920, 610, T, dialog_ok=True)                                     # not a send token
     assert hook_decide(g, ev("button_down", 920, 610), T).reason == "deny_rect"
+    g.issue_click(920, 610, T, dialog_ok=True, send_ok=True)                       # the next declared send
+    assert hook_decide(g, ev("button_down", 920, 610), T).allowed
 
 
 def test_moves_drag_window_and_release_tokens():

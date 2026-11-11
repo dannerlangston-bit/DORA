@@ -90,6 +90,10 @@ settle:                         # 3.5 settle rule
   park_mask_px: 16
   tooltip_delay_ms: 1000
   regression_factor: 2          # settle_regression when p50 > 2 x calibration p50
+  masked_live:                  # 7.9, 5.7: the frames Capture takes at masked_live checkpoints
+    frames: 5                   # 3 to 5 frames, the first being the settle frame
+    interval_ms: 250            # 0 to 1000 ms: over 1 to 2 s; the first three are the settled triple, so their
+                                # per-pixel median equals the settled frame outside masks (3.5)
 
 rerun:                          # 3.10 targeted re-run budget
   max_recaptures_diff: 2

@@ -342,13 +342,19 @@ def test_builds_and_fixed_in_build(store):
         store.register_build("branch-1998.3.0-7be42d0", **{**facts, "source_commit": "other"})
     store.register_build("branch-1998.2.0-1aa2b3c", **{**facts, "source_commit": "1aa2b3c"},
                          first_seen_at="2026-01-01T00:00:00+00:00")
-    with pytest.raises(StoreRefused):                       # fixed_in_build needs the build (8.3 CHECK)
-        record(store, "dec-000001", "fixed_in_build", "confirmed_bug", build_id="branch-1998.2.0-1aa2b3c")
-    with pytest.raises(StoreRefused):                       # ... and the older build it is newer than (L-DEC-08)
-        record(store, "dec-000001", "fixed_in_build", "confirmed_bug", fixed_in_build_id="branch-1998.3.0-7be42d0")
-    d = record(store, "dec-000001", "fixed_in_build", "confirmed_bug", build_id="branch-1998.2.0-1aa2b3c",
+    with pytest.raises(StoreRefused, match="SD-79"):        # fixed_in_build supersedes a confirm_bug (SD-79)
+        record(store, "dec-000001", "fixed_in_build", "confirmed_bug", build_id="branch-1998.2.0-1aa2b3c",
                fixed_in_build_id="branch-1998.3.0-7be42d0")
-    assert d.action == "fixed_in_build" and d.ticket == "TOS-1"
+    record(store, "dec-000001", "confirm_bug", "confirmed_bug", build_id="branch-1998.2.0-1aa2b3c")
+    with pytest.raises(StoreRefused):                       # fixed_in_build needs the build (8.3 CHECK)
+        record(store, "dec-000002", "fixed_in_build", "confirmed_bug", supersedes="dec-000001")
+    with pytest.raises(StoreRefused):                       # ... newer than the confirm_bug's build (L-DEC-08)
+        record(store, "dec-000002", "fixed_in_build", "confirmed_bug", supersedes="dec-000001",
+               fixed_in_build_id="branch-1998.2.0-1aa2b3c")
+    d = record(store, "dec-000002", "fixed_in_build", "confirmed_bug", supersedes="dec-000001",
+               fixed_in_build_id="branch-1998.3.0-7be42d0")
+    assert d.action == "fixed_in_build" and d.ticket == "TOS-1" and d.supersedes == "dec-000001"
+    assert store.get_decision("dec-000001").status == "superseded"
 
 
 # -- run completion (8.1, 8.3, 8.9) ---------------------------------------------------------------------------------

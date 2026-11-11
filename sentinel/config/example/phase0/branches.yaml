@@ -1,5 +1,9 @@
 # The chosen branch of each Phase 0 unknown (brief 1.11, decision records DR-01 to DR-07 of 11.8), and the
 # Phase 0 reads other files depend on (4.16). A placeholder: the reads below are not made yet.
+# An unknown not yet decided reads {branch: undecided, deadline: YYYY-MM-DD}; the run uses its 11.8 default until it
+# is decided, and L-XREF-15 warns once the deadline has passed (sentinel.branches).
+# Safety item 5 read as different lists the formats found: observed: ["paper: <regex>", "live: <regex>"].
+# Safety item 10 lists the Order Confirmation dialog's labels as observed; only those may be dismiss-allowlisted.
 schema_version: 1
 jab: {branch: A}              # DR-01 Java Access Bridge exposes names, roles and bounds
 data_fixture: {branch: A}     # DR-02 the test backend replays a frozen market-data fixture

@@ -1,0 +1,32 @@
+# Fixture reset flow Stage 1, the profile (7.6): after paper_mode_asserted, before the attestation that closes
+# settings_attested. Scripted only, no agent fallback. Its steps 1 to 8 run through the Stage 1 driver
+# (orchestrator/stage1.py run_stage1) over the rig's profile-reset write path: the safety rows read first, one
+# correction pass over Application Settings and Order Defaults, watchlists, alerts, saved orders, notes, studies,
+# scans, drawings and chart settings, then the profile checkpoint set. That set needs registry surfaces for the
+# Setup dialogs, the watchlist picker, the alert book, the studies list and the saved scans, which the example
+# registry does not have yet, so this flow carries no checkpoint step and adds nothing to a run's scope.
+schema_version: 2
+flow_id: flow.fixture-reset.profile
+title: Fixture reset Stage 1 - re-apply the pinned profile once before the attestation
+class: fixture_reset
+tier: 1
+owner: sentinel-fixtures
+persona: beginner
+surface: charts.flexible-grid.chart-cell
+surfaces: [charts.flexible-grid.chart-cell]
+requires: []
+workspace: ws.tier-a.beginner
+fixture: fx.rig-01.paper
+data_mode: frozen
+agent_fallback: disabled
+budget: {max_duration_s: 300, max_steps: 60}
+normalize: []
+preconditions:
+  - {id: p1, type: precondition, check: paper_mode}
+  - {id: p2, type: precondition, check: no_modal}
+steps:
+  - {id: f01, type: reset_input_state}
+  - {id: f02, type: teardown, action: reset_profile, note: "7.6 stage 1 steps 1 to 8 through stage1.run_stage1"}
+teardown:
+  - {id: t1, type: teardown, action: close_non_main_windows}
+  - {id: t2, type: reset_input_state}

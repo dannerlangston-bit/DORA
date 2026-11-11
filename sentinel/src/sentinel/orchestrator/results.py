@@ -18,6 +18,11 @@ unreached outcome of an aborted run is checked against 1.10: an `aborted_safety`
 checkpoints are `env_error` with the aborting gate and the run's abort reason, an `aborted_harness`
 run's are `harness_error` with its abort reason, an `aborted_budget` run's are `not_run (reason:
 budget)`.
+
+`PRECEDENCE`, `rank` and `outranks` are the 1.10 precedence over checkpoint outcomes (12.2): when two
+results apply to one checkpoint, the earlier in that order is the outcome and the later stays evidence.
+`step_failed` and `rest_of_flow` build the `not_run (reason: step_failed:<step>)` that every checkpoint a
+flow never reached after a `failed` or `blocked_by_gateway` step gets (2.6.1, 4.7, 5.2).
 """
 from __future__ import annotations
 
@@ -137,7 +142,8 @@ class SubsetOutcome:
     `selector` names which checkpoints: `all`, `shard`, `account_state` (4.5, 7.6), `account_state:golden`,
     `api_within` (N3), `frozen` (N4), `ocr_assertion` (5.10), `probe:<Pn>` (2.2.3), `in_progress` (the
     checkpoint being captured), `rest_of_flow`, `first_unreached` (10.1), `explorer_stage` (6.3 A10, 6.8),
-    `drill` (6.5), `pending_review` (10.7), `uncaptured` (10.7).
+    `drill` (6.5), `pending_review` (10.7), `uncaptured` (10.7), `workspace:<workspace id>` (the shard's
+    remaining census visits in that workspace, after three consecutive `env_error` visits there, 2.4).
     """
 
     selector: str
@@ -201,6 +207,37 @@ def _check_unreached(run: RunVerdict, u: Outcome) -> None:
     if not ok:
         raise TaxonomyError(f"unreached {u.outcome} ({u.reason}) does not carry the abort of a {run.status} "
                             f"({run.reason}) run (1.10)")
+
+
+# 1.10 and 12.2: a checkpoint ends in the first outcome of this order that applies. `app_alive` stands for the app
+# failure, `assertion_failed (assertion: app_alive)`, which ranks second; `unregistered_surface` never competes.
+PRECEDENCE = ("env_error", "app_alive", "harness_error", "not_run", "not_comparable", "not_settled",
+              "landmark_missing", "invariant_violation", "assertion_failed", "needs_baseline", "collateral",
+              "needs_human", "intended", "noise", "identical")
+
+
+def rank(o: Outcome) -> int:
+    """The outcome's place in the 1.10 order, 0 first (module docstring)."""
+    if o.outcome == "unregistered_surface":
+        raise ValueError("unregistered_surface is a checkpoint of its own and never competes (1.10)")
+    if o.outcome == "assertion_failed" and o.reason == "assertion:app_alive":
+        return PRECEDENCE.index("app_alive")
+    return PRECEDENCE.index(o.outcome)
+
+
+def outranks(a: Outcome, b: Outcome) -> bool:
+    """True when `a` comes strictly before `b` in the 1.10 order, so `a` is the outcome and `b` evidence."""
+    return rank(a) < rank(b)
+
+
+def step_failed(step_id: str) -> Outcome:
+    """`not_run (reason: step_failed:<step>)`: a checkpoint the flow never reached after the step failed (2.6.1)."""
+    return Outcome("not_run", f"step_failed:{step_id}")
+
+
+def rest_of_flow(step_id: str) -> SubsetOutcome:
+    """The rest of the flow after a `failed` or `blocked_by_gateway` step (2.6.1, 4.7, 5.4.8 choice 13)."""
+    return SubsetOutcome("rest_of_flow", step_failed(step_id))
 
 
 def safety_abort_outcome(gate: str, reason: str, detail: str | None = None) -> tuple[RunVerdict, Outcome]:

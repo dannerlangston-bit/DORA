@@ -138,13 +138,14 @@ def test_s04_fixed_in_build_must_name_a_newer_build(store):
     facts = dict(channel="branch", pipeline_artifact_url="https://ci/1", installer_sha256="9" * 64)
     store.register_build("branch-1998.3.0-7be42d0", source_commit="7be42d0",
                          first_seen_at="2026-11-09T10:00:00+00:00", **facts)
+    record(store, "dec-000001", "confirm_bug", "confirmed_bug", build_id="branch-1998.3.0-7be42d0")
     with pytest.raises(REFUSED):
-        record(store, "dec-000001", "fixed_in_build", "confirmed_bug", build_id="branch-1998.3.0-7be42d0",
-               fixed_in_build_id="branch-1998.3.0-7be42d0")
+        record(store, "dec-000002", "fixed_in_build", "confirmed_bug", build_id="branch-1998.3.0-7be42d0",
+               fixed_in_build_id="branch-1998.3.0-7be42d0", supersedes="dec-000001")
     store.register_build("branch-1998.3.1-8aa0b11", source_commit="8aa0b11",
                          first_seen_at="2026-11-10T10:00:00+00:00", **facts)
     d = record(store, "dec-000002", "fixed_in_build", "confirmed_bug", build_id="branch-1998.3.0-7be42d0",
-               fixed_in_build_id="branch-1998.3.1-8aa0b11")
+               fixed_in_build_id="branch-1998.3.1-8aa0b11", supersedes="dec-000001")
     assert d.action == "fixed_in_build"
 
 

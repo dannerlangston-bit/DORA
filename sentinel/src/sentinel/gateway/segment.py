@@ -57,6 +57,12 @@ Choices where the spec is silent or ambiguous (reported):
    `foreign_process`, `drill`, `console`), so the drainer can name `untokened_injected` and the drill tag. A
    control record (event type `control`: the hook host's own `hook_reinstalled` log, aux 1 when the reinstall
    worked) has origin 0 and no injected flag.
+6. Token lifecycle on drops and expiry, as `orchestrator.gateway` choice 17 (5.4.2, 5.4.3 stage 7, 5.4.4, 5.4.5).
+   An armed token past its `expires_mono_ts` is dead: it is not pending for the move rule (`_pending`). A half
+   consumed token stays pending until its up. A rule 1 or rule 2 drop of the emitter's button down, key down or
+   wheel writes the token rule 3 would have used as `dropped` with the reason (`_spend`), so stage 7 reads the
+   safety reason. Slots are reused as the slow half's picture says: `publish` frees every slot whose token
+   `GatewayState` no longer holds, and `GatewayState` lets an armed token go once it has expired.
 """
 from __future__ import annotations
 
@@ -99,7 +105,6 @@ KIND_EMPTY, KIND_BUTTON, KIND_KEY, KIND_WHEEL, KIND_PROBE = 0, 1, 2, 3, 4
 TF_DIALOG_OK, TF_SECRET, TF_RELEASE, TF_SEND_OK = 1, 2, 4, 8
 STATES = ("armed", "half_consumed", "consumed", "dropped", "expired")
 ARMED, HALF_CONSUMED, CONSUMED, DROPPED, EXPIRED = range(5)
-LIVE = (ARMED, HALF_CONSUMED)
 
 # -- the rest of the slow half's picture ----------------------------------------------------------------------
 OFF_MOVE_ALLOW = OFF_TOKENS + TOKEN_SLOTS * TOKEN_SIZE  # 768
@@ -650,6 +655,42 @@ def _inside(x: int, y: int, rx: int, ry: int, rw: int, rh: int) -> bool:
     return rx <= x < rx + rw and ry <= y < ry + rh
 
 
+def _pending(t: TokenSlot, now_ns: int) -> bool:
+    """Still pending at `now_ns` (choice 6): half consumed, or armed and unexpired; an armed token past its expiry
+    is dead (5.4.2, 5.4.5)."""
+    return t.state == HALF_CONSUMED or (t.state == ARMED and now_ns <= t.expires_ns)
+
+
+def _match(toks: list[TokenSlot], e: EventLike, now_ns: int) -> tuple[str | None, TokenSlot | None]:
+    """The token rule 3 acts on for the emitter's button down, key down or wheel event (5.4.4), the first in issue
+    order (choice 3), or the reason none matches (`no_token`, `token_mismatch_coords`). Moves, ups and every other
+    origin match none here."""
+    if e.origin != "emitter" or e.type not in ("button_down", "key_down", "wheel"):
+        return "no_token", None
+    if e.type == "key_down":
+        keys = [t for t in toks if t.kind == KIND_KEY and not t.release and t.button_or_vk == e.vk
+                and t.state == ARMED]
+        return (None, keys[0]) if keys else ("no_token", None)
+    if e.type == "button_down":
+        code = BUTTON_CODE.get(e.button or "", -1)
+        cands = [t for t in toks if t.kind == KIND_BUTTON and not t.release and t.button_or_vk == code
+                 and t.state == ARMED]
+    else:
+        sign = 1 if e.delta > 0 else -1
+        cands = [t for t in toks if t.kind == KIND_WHEEL and t.state == ARMED and t.sign == sign
+                 and now_ns <= t.expires_ns]
+    if not cands:
+        return "no_token", None
+    near = [t for t in cands if _near(t, e)]
+    return (None, near[0]) if near else ("token_mismatch_coords", None)
+
+
+def _spend(buf: Any, e: EventLike, now_ns: int, reason: str, toks: list[TokenSlot]) -> Decision:
+    """A rule 1 or rule 2 drop (choice 6): the token the event would have used is spent `dropped` with the reason."""
+    t = _match(toks, e, now_ns)[1]
+    return _commit(buf, e, now_ns, Decision(False, reason, t.id if t else None), t, DROPPED if t else None)
+
+
 def decide_from_segment(buf: Any, e: EventLike, now_ns: int, *, deny_all: bool = False) -> Decision:
     """The hook callback (5.4.4; 6.2 rules 1 to 4) over the segment: read the slow half's picture under the
     seqlock, decide as `orchestrator.gateway.hook_decide` does, write the token's new state and at most one
@@ -666,10 +707,11 @@ def decide_from_segment(buf: Any, e: EventLike, now_ns: int, *, deny_all: bool =
                       and now_ns <= t.expires_ns), None)
         if probe is not None:                                                # choice 2: answer the probe
             _I64.pack_into(buf, OFF_LAST_PROBE, now_ns)
-    if deny_all or seg_deny_all:                                             # rule 1
-        return _commit(buf, e, now_ns, Decision(False, "deny_all", probe.id if probe else None), probe, CONSUMED)
-    if not armed:
-        return _commit(buf, e, now_ns, Decision(False, "not_armed", probe.id if probe else None), probe, CONSUMED)
+    if deny_all or seg_deny_all or not armed:                                # rule 1
+        reason = "deny_all" if deny_all or seg_deny_all else "not_armed"
+        if probe is not None:
+            return _commit(buf, e, now_ns, Decision(False, reason, probe.id), probe, CONSUMED)
+        return _spend(buf, e, now_ns, reason, toks)
     if e.origin == "console":                                                # rule 4
         return _commit(buf, e, now_ns, Decision(False, "foreign_input"), None, None)
     if now_ns - watcher_ns > WATCHER_STALE_NS:
@@ -681,34 +723,39 @@ def decide_from_segment(buf: Any, e: EventLike, now_ns: int, *, deny_all: bool =
                 mods.add(MODIFIER_VK[e.vk])
             if mods & CHORD_MODS or (set(e.mods) <= MOD_BITS.keys()
                                      and (mod_bits(e.mods), e.vk) in _chords(snap, chord_count)):
-                return _commit(buf, e, now_ns, Decision(False, "blocked_chord_dialog"), None, None)
+                return _spend(buf, e, now_ns, "blocked_chord_dialog", toks)
             if e.vk is not None and 0 <= e.vk < 256 and snap[OFF_BLOCKED_VK + (e.vk >> 3)] & (1 << (e.vk & 7)):
-                return _commit(buf, e, now_ns, Decision(False, "blocked_key_dialog"), None, None)
+                return _spend(buf, e, now_ns, "blocked_key_dialog", toks)
         if e.type == "button_down" and "shift" in e.mods:
-            return _commit(buf, e, now_ns, Decision(False, "shift_click_dialog"), None, None)
-    tokened = e.origin == "emitter"                                          # rule 3
-    if e.type == "move":
+            return _spend(buf, e, now_ns, "shift_click_dialog", toks)
+    if e.type == "move":                                                     # rule 3
         active, until, bx, by, bw, bh = _MOVE_ALLOW.unpack_from(snap, OFF_MOVE_ALLOW)
+        pid = probe.id if probe else None
         if active and now_ns <= until and _inside(e.x, e.y, bx, by, bw, bh):
-            return _commit(buf, e, now_ns, Decision(True, token_id=probe.id if probe else None), probe, CONSUMED)
-        if not any(t.state in LIVE and not t.release and t.kind != KIND_PROBE for t in toks):
-            return _commit(buf, e, now_ns, Decision(True, token_id=probe.id if probe else None), probe, CONSUMED)
-        return _commit(buf, e, now_ns, Decision(False, "move_outside_allow", probe.id if probe else None), probe,
-                       CONSUMED)
-    if not tokened:
-        toks = []
+            return _commit(buf, e, now_ns, Decision(True, token_id=pid), probe, CONSUMED)
+        if not any(_pending(t, now_ns) and not t.release and t.kind != KIND_PROBE for t in toks):
+            return _commit(buf, e, now_ns, Decision(True, token_id=pid), probe, CONSUMED)
+        return _commit(buf, e, now_ns, Decision(False, "move_outside_allow", pid), probe, CONSUMED)
+    if e.type in ("button_up", "key_up"):
+        kind = KIND_BUTTON if e.type == "button_up" else KIND_KEY
+        val = BUTTON_CODE.get(e.button or "", -1) if e.type == "button_up" else e.vk
+        mine = toks if e.origin == "emitter" else []
+        for t in mine:
+            if t.kind == kind and not t.release and t.state == HALF_CONSUMED and t.button_or_vk == val:
+                return _commit(buf, e, now_ns, Decision(True, token_id=t.id, late_up=now_ns > t.expires_ns), t,
+                               CONSUMED)
+        for t in mine:
+            if t.kind == kind and t.release and t.state == ARMED and t.button_or_vk == val:
+                return _commit(buf, e, now_ns, Decision(True, token_id=t.id), t, CONSUMED)
+        return _commit(buf, e, now_ns, Decision(False, "no_token"), None, None)
+    miss, t = _match(toks, e, now_ns)                                        # button down, key down, wheel
+    if t is None:
+        return _commit(buf, e, now_ns, Decision(False, miss or "no_token"), None, None)
+    if e.type == "wheel":
+        return _commit(buf, e, now_ns, Decision(True, token_id=t.id), t, CONSUMED)
+    if now_ns > t.expires_ns:
+        return _commit(buf, e, now_ns, Decision(False, "token_expired", t.id), t, EXPIRED)
     if e.type == "button_down":
-        code = BUTTON_CODE.get(e.button or "", -1)
-        cands = [t for t in toks if t.kind == KIND_BUTTON and not t.release and t.button_or_vk == code
-                 and t.state == ARMED]
-        if not cands:
-            return _commit(buf, e, now_ns, Decision(False, "no_token"), None, None)
-        near = [t for t in cands if _near(t, e)]
-        if not near:
-            return _commit(buf, e, now_ns, Decision(False, "token_mismatch_coords"), None, None)
-        t = near[0]
-        if now_ns > t.expires_ns:
-            return _commit(buf, e, now_ns, Decision(False, "token_expired", t.id), t, EXPIRED)
         for i in range(deny_count):
             rx, ry, rw, rh, is_send = _DENY_RECT.unpack_from(snap, OFF_DENY_RECTS + i * _DENY_RECT.size)
             if _inside(e.x, e.y, rx, ry, rw, rh):
@@ -718,35 +765,6 @@ def decide_from_segment(buf: Any, e: EventLike, now_ns: int, *, deny_all: bool =
                 return _commit(buf, e, now_ns, Decision(False, "deny_rect", t.id), t, DROPPED)
         if flag != FLAG_CLEAR and not t.flags & TF_DIALOG_OK:
             return _commit(buf, e, now_ns, Decision(False, "dialog_not_ok", t.id), t, DROPPED)
-        return _commit(buf, e, now_ns, Decision(True, token_id=t.id), t, HALF_CONSUMED)
-    if e.type in ("button_up", "key_up"):
-        kind = KIND_BUTTON if e.type == "button_up" else KIND_KEY
-        val = BUTTON_CODE.get(e.button or "", -1) if e.type == "button_up" else e.vk
-        for t in toks:
-            if t.kind == kind and not t.release and t.state == HALF_CONSUMED and t.button_or_vk == val:
-                return _commit(buf, e, now_ns, Decision(True, token_id=t.id, late_up=now_ns > t.expires_ns), t,
-                               CONSUMED)
-        for t in toks:
-            if t.kind == kind and t.release and t.state == ARMED and t.button_or_vk == val:
-                return _commit(buf, e, now_ns, Decision(True, token_id=t.id), t, CONSUMED)
-        return _commit(buf, e, now_ns, Decision(False, "no_token"), None, None)
-    if e.type == "wheel":
-        sign = 1 if e.delta > 0 else -1
-        cands = [t for t in toks if t.kind == KIND_WHEEL and t.state == ARMED and t.sign == sign
-                 and now_ns <= t.expires_ns]
-        if not cands:
-            return _commit(buf, e, now_ns, Decision(False, "no_token"), None, None)
-        near = [t for t in cands if _near(t, e)]
-        if not near:
-            return _commit(buf, e, now_ns, Decision(False, "token_mismatch_coords"), None, None)
-        return _commit(buf, e, now_ns, Decision(True, token_id=near[0].id), near[0], CONSUMED)
-    # key_down
-    cands = [t for t in toks if t.kind == KIND_KEY and not t.release and t.button_or_vk == e.vk and t.state == ARMED]
-    if not cands:
-        return _commit(buf, e, now_ns, Decision(False, "no_token"), None, None)
-    t = cands[0]
-    if now_ns > t.expires_ns:
-        return _commit(buf, e, now_ns, Decision(False, "token_expired", t.id), t, EXPIRED)
     return _commit(buf, e, now_ns, Decision(True, token_id=t.id), t, HALF_CONSUMED)
 
 

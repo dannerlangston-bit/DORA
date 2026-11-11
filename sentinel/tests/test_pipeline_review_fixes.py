@@ -204,3 +204,32 @@ def test_an_unsettled_candidate_stores_no_candidate_pixels_as_the_base(tmp_path)
     assert ev.classified.outcome == "not_settled"
     assert ev.images()[0] is None and set(out) == {"candidate"} and [a.side for a in stored] == ["candidate"]
 
+
+def test_a_harness_error_blocked_surface_is_not_compared_and_leaves_the_coverage_percent(tmp_path):
+    """pipeline:6 (2.12, 9.2): a tier-1 surface whose checkpoints all ended `harness_error` is a `blocked` cell like
+    one blocked by `env_error`: it is in the Not compared column and out of the comparable scope, so the tier row
+    adds up and the percent is the same for both."""
+    from sentinel.demo import operator_stop_scenario
+    from sentinel.pipeline.config import SentinelConfig
+    from sentinel.pipeline.orchestration import RigScript
+    from sentinel.report.model import coverage_rows
+    sc = dataclasses.replace(operator_stop_scenario(TODAY), rig=RigScript(), name="coverage")
+    r = pipeline_run.run_pipeline(EXAMPLE, sc, tmp_path, TODAY)
+    cfg = SentinelConfig.load(tmp_path / "config" / sc.run_id)
+    surface = "trade.active-trader.ladder"
+    assert any(o.surface_id == surface for o in r.outcomes)
+
+    def row(outcome: str) -> tuple[dict, tuple[str, ...]]:
+        kw = dict(reason="hook_lost") if outcome == "harness_error" else dict(reason="kill_switch", gate="running")
+        outs = [dataclasses.replace(o, outcome=outcome, **kw) if o.surface_id == surface else o for o in r.outcomes]
+        cov = pipeline_run.coverage_summary(cfg, r.plan, outs, sc.run_id)
+        return cov["tiers"][1], dict(enumerate(coverage_rows(cov)))[0]
+
+    env_tier, env_row = row("env_error")
+    harness_tier, harness_row = row("harness_error")
+    assert harness_tier["not_compared"] == {"harness_error": 1}
+    assert harness_row[3] == env_row[3]                   # the same Covered percent of comparable scope
+    assert harness_row[4] == "1 (harness_error: 1)"
+    in_scope, covered = int(harness_tier["in_scope"]), int(harness_tier["covered"])
+    assert in_scope == covered + 1 + sum(harness_tier["not_run"].get(k, 0) for k in harness_tier["not_run"]
+                                         if k != "scope")

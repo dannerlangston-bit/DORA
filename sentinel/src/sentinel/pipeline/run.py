@@ -183,7 +183,7 @@ from ..records import (FINDING_CATEGORIES, PERSONAS, CheckpointOutcome, Decision
                        Signature, StepEvent, StepOutcome)
 from ..report import ReportContext, ReportInputs, render_report_markdown, write_run_report
 from ..report.cluster import Member, cluster_members
-from ..report.model import NOT_COMPARED, proof_severity, worst_proof
+from ..report.model import proof_severity, worst_proof
 from ..scope import (DependencyIndex, Manifest, PlannedCheckpoint, Rig, ScopeConfigError, ScopePlan, classes_in,
                      compute_scope)
 from ..store import ArtifactStore, Store
@@ -1212,10 +1212,9 @@ def coverage_summary(cfg: SentinelConfig, plan: ScopePlan, outcomes: Sequence[Ch
             continue
         reasons = [c.reason for c in cells if c.state == "not_run" and c.reason and c.reason != "scope"]
         blocked = [r for r in reasons if r.startswith("blocked:")]
-        if blocked:                 # a harness_error blocks no comparison column: run health counts it (9.11)
+        if blocked:                 # 2.12: every blocking outcome alike is not compared and leaves the percent
             k = blocked[0].split(":", 1)[1]
-            if k in NOT_COMPARED:
-                t["not_compared"][k] = t["not_compared"].get(k, 0) + 1
+            t["not_compared"][k] = t["not_compared"].get(k, 0) + 1
         elif reasons:
             k = reasons[0].split(":", 1)[0]
             t["not_run"][k] = t["not_run"].get(k, 0) + 1

@@ -131,7 +131,6 @@ from __future__ import annotations
 
 import hashlib
 import importlib
-import itertools
 import pkgutil
 import re
 from dataclasses import dataclass, field
@@ -1715,15 +1714,15 @@ class _Linter:
                 return f"limit price {m.group(1)} is {distance / last:.0%} from the last price; at least {need:g} percent"
             return None
         if sym.get("asset") == "future":
-            need = _num(sp.get("tick_distance_futures"))
-            if need is None:
+            min_ticks = _num(sp.get("tick_distance_futures"))
+            if min_ticks is None:
                 return "policy/send_policy.yaml declares no tick_distance_futures for a futures send (6.7)"
             try:
                 ticks = distance / float(tick_size(_s(sym.get("symbol")), RuleConfig(), fx))
             except ValueError:
                 return f"no tick size for {sym.get('symbol')}"
-            if ticks < need:
-                return f"limit price {m.group(1)} is {ticks:g} ticks from the last price; at least {need:g}"
+            if ticks < min_ticks:
+                return f"limit price {m.group(1)} is {ticks:g} ticks from the last price; at least {min_ticks:g}"
             return None
         return f"symbol {sym.get('symbol')} is {sym.get('asset')}; paper_send_ok sends 1 share or 1 futures contract"
 

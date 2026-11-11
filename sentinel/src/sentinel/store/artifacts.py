@@ -63,7 +63,9 @@ EXTENSIONS = {
     "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/bmp": "bmp", "video/mp4": "mp4",
     "application/json": "json", "application/x-ndjson": "jsonl", "text/csv": "csv", "text/plain": "txt",
 }
-_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"BM", b"II*\x00", b"MM\x00*")
+_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"II*\x00", b"MM\x00*")
+_BMP_DIB_SIZES = (12, 40, 52, 56, 64, 108, 124)       # the BITMAP*HEADER sizes a BMP file's second header has
+MAGIC_BYTES = 32                                      # how many leading bytes `has_image_magic` reads
 MANIFEST = "manifest.json"
 QUARANTINE_MARKER = "QUARANTINED.json"
 
@@ -174,15 +176,23 @@ def _read_back(path: Path) -> bytes:
     return path.read_bytes()
 
 
+def _bmp_header(head: bytes) -> bool:
+    """A BMP file header, not just its two letters (a text line can start with "BM"): reserved bytes zero and a
+    known DIB header size after the 14-byte file header."""
+    return (head[:2] == b"BM" and len(head) >= 18 and head[6:10] == bytes(4)
+            and int.from_bytes(head[14:18], "little") in _BMP_DIB_SIZES)
+
+
 def has_image_magic(head: bytes) -> bool:
-    """True when the leading bytes are those of an image or video file (PNG, JPEG, GIF, BMP, TIFF, WebP, MP4)."""
-    return (head.startswith(_IMAGE_MAGIC) or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")
+    """True when the leading bytes (`MAGIC_BYTES` of them) are those of an image or video file (PNG, JPEG, GIF, BMP,
+    TIFF, WebP, MP4)."""
+    return (head.startswith(_IMAGE_MAGIC) or _bmp_header(head) or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")
             or head[4:8] == b"ftyp")
 
 
 def is_visual(data: bytes, kind: str, media_type: str) -> bool:
     """True for anything that may show the screen: image or video media type, a visual kind, or image bytes."""
-    return (media_type.startswith(("image/", "video/")) or kind in VISUAL_KINDS or has_image_magic(data[:16])
+    return (media_type.startswith(("image/", "video/")) or kind in VISUAL_KINDS or has_image_magic(data[:MAGIC_BYTES])
             or _dimensions(data) != (None, None))      # any other format Pillow reads is a picture too
 
 

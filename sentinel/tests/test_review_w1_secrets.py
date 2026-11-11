@@ -438,6 +438,37 @@ def test_secrets_9_a_run_never_falls_back_to_an_empty_redaction_list(tmp_path):
                 lambda s: "undeclared")
 
 
+# == secrets:10: a text artifact that starts with "BM" is text ===============================================
+
+def test_secrets_10_text_starting_with_bm_is_scanned_and_a_real_bmp_is_still_an_image(tmp_path):
+    """6.9, 8.4: a CSV export or log slice whose first bytes are "BM" (a BMY quote) is a text artifact: the put hook
+    scans it and the teardown scan reads it; a real BMP file is still recognised as an image."""
+    import io
+
+    import pytest
+    from PIL import Image
+
+    from sentinel.store import ArtifactStore
+    from sentinel.store.artifacts import Redaction, SecretLeaked, has_image_magic, is_visual
+    from sentinel.store.secret_scan import SecretScanner, scan_run
+    secrets = {"vault://x#password": "hunter2-Pa55"}
+    data = b"BMY,100,52.10\nnote,hunter2-Pa55\n"
+    arts = ArtifactStore(tmp_path / "set", "runs/r1", scanner=SecretScanner(secrets))
+    for header in (None, Redaction("redaction-1-x")):
+        with pytest.raises(SecretLeaked):
+            arts.put(data, name="export.csv", kind="export", media_type="text/csv", redaction=header)
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "log_slice.txt").write_bytes(b"BMY quote refresh\nlogin typed hunter2-Pa55\n")
+    res = scan_run(sqlite3.connect(":memory:"), ArtifactStore(tmp_path / "s2", "runs/r2"), [reports], secrets,
+                   run_id="r2")
+    assert res.run_reason == "secret_leaked" and res.evidence["files"] == 1
+    buf = io.BytesIO()
+    Image.new("RGB", (4, 4)).save(buf, format="BMP")
+    assert has_image_magic(buf.getvalue()[:32]) and is_visual(buf.getvalue(), "export", "application/octet-stream")
+    assert not has_image_magic(data[:32])
+
+
 def test_secrets_6_scan_run_reads_a_ledger_tail_and_in_memory_texts(tmp_path):
     """6.9 choice 1: a shared results.jsonl is scanned from the offset where this run began (an earlier run's lines
     are not this run's), and text the run has not written yet (the report's inputs) is scanned from memory."""

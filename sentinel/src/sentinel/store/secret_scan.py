@@ -46,7 +46,7 @@ from typing import Any, Iterator, Mapping, Sequence
 
 from ..orchestrator import alerts
 from ..orchestrator.results import ControlResult, FindingSpec, harness_abort_outcome
-from .artifacts import ArtifactStore, has_image_magic
+from .artifacts import MAGIC_BYTES, ArtifactStore, has_image_magic
 from .store import StoreError
 
 CHUNK = 8 * 1024 * 1024
@@ -188,7 +188,7 @@ def _file_hits(scanner: SecretScanner, roots: Sequence[Path | FileTail]) -> tupl
                 raise FileNotFoundError(f"{p} does not exist")
             with open(p, "rb") as f:
                 f.seek(start)
-                if has_image_magic(f.read(16)):
+                if has_image_magic(f.read(MAGIC_BYTES)):
                     continue                                    # choice 2
             files += 1
             size += max(0, p.stat().st_size - start)

@@ -204,13 +204,13 @@ def test_d07_timeout_reason_is_not_a_condition_that_already_recovered():
     frames = [Frame(0, img), Frame(250, img), Frame(500, img),
               Frame(750, with_anchor), Frame(1000, with_anchor), Frame(1250, with_anchor)]
     r = settle(frames, spec)
-    assert not r.settled and r.reason == "timeout", (r.reason, r.detail)
+    assert not r.settled and r.reason == "frames_unstable", (r.reason, r.detail)
     assert "anchor ok-button" in r.detail and "recovered" in r.detail
     still = settle(frames[:3], spec)                     # still missing at the end: the condition stands
     assert still.reason == "anchor_missing"
 
 
-def test_d07_recovered_frame_instability_is_a_timeout():
+def test_d07_recovered_frame_instability_is_frames_unstable():   # SD-26: timeout only without frames
     """The same stale value after a recovered run: frames differ once, then two identical frames remain
     before max wait. Condition 5 holds at the end, so the reason is `timeout`, not `frames_unstable`."""
     a = np.full((40, 40, 3), 30, np.uint8)
@@ -218,7 +218,7 @@ def test_d07_recovered_frame_instability_is_a_timeout():
     b[5:9, 5:9] = 200
     spec = SettleSpec(max_wait_ms=750)
     r = settle([Frame(0, a), Frame(250, b), Frame(500, b), Frame(1000, b)], spec)
-    assert not r.settled and r.reason == "timeout", (r.reason, r.detail)
+    assert not r.settled and r.reason == "frames_unstable", (r.reason, r.detail)
     flicker = settle([Frame(0, a), Frame(250, b), Frame(500, a)], spec)
     assert flicker.reason == "frames_unstable"
 

@@ -169,7 +169,7 @@ def test_clean_runs_pass_every_gate_page_nobody_and_prove_no_orders_sent(runs):
     assert alerts(out) == [] and r.proof == "PROVEN: no orders sent"
     (run,) = orchestrator(out)
     assert {s["verdict"] for s in run["shards"]} == {"complete"} and len(run["shards"]) == len(r.shards) == 4
-    stage2 = {"ondemand", "delay_badge", "connectivity", "alerts", "prices", "pinned_quote", "symbols"}   # 7.6
+    stage2 = {"ondemand", "delay_badge", "connectivity", "alerts", "prices", "pinned_quote", "symbol_precheck"}
     assert all([c for c in dict.fromkeys(g["control"] for g in s["gates"]) if c not in stage2][:8] == [
         "preflight", "launch", "login", "paper_mode", "attestation", "workspace", "fixture", "canary_flow"]
         for s in run["shards"])

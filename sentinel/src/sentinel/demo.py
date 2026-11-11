@@ -42,6 +42,7 @@ included.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import html
 import shutil
@@ -66,7 +67,8 @@ from .store import Store
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "example"
 SCENARIOS = ("flexgrid-ladder", "clean-pr", "backend-only", "ui-no-manifest", "nightly-canary", "decision-inheritance",
              "wrong-number", "paper-mode-mismatch", "attempted-send", "app-crash", "config-invalid", "expired-mask",
-             "operator-stop", "redaction-miss")
+             "operator-stop", "redaction-miss", "popups", "fingerprint-mismatch", "clamped-gadget", "fixed-reopens",
+             "occluded-capture")
 AT = "charts.flexible-grid.active-trader-cell"
 LADDER = "trade.active-trader.ladder"
 STOCK_FLOW = "flow.trade.order-ticket.stock.limit"
@@ -117,7 +119,8 @@ build:
     return f"builds/{bid}.yaml", text
 
 
-def _branch_build(sha7: str, pr: int, branch: str, base_sha7: str = "2c91ae4") -> tuple[str, str]:
+def _branch_build(sha7: str, pr: int, branch: str, base_sha7: str = "2c91ae4",
+                  built_at: str = "2026-11-10T10:24:00-05:00") -> tuple[str, str]:
     bid = f"branch-1998.3.0-{sha7}"
     base = f"main-1998.3.0-{base_sha7}"
     text = f"""schema_version: 1
@@ -133,7 +136,7 @@ build:
     uri: artifactory://tos-desktop/branch/{sha7}/thinkorswim-win64.zip
     sha256: "sha256:{hashlib.sha256(bid.encode()).hexdigest()}"
   install_method: artifact
-  built_at: 2026-11-10T10:24:00-05:00
+  built_at: {built_at}
 build_pair:
   pair_id: pr-{bid}-vs-{base}
   run_type: pr
@@ -183,7 +186,9 @@ entries:
 def flexgrid_scenario(today: date, *, seq: int = 1, sha7: str = "7be42d0") -> Scenario:
     """PR 4812 of 1.11: Flexible Grid cell chrome; the Active Trader ladder overlaps its order strip."""
     cand = f"branch-1998.3.0-{sha7}"
-    overlay = dict([_main_build(), _branch_build(sha7, 4812, "feature/TOS-48120-flexgrid-chrome")])
+    later = "2026-11-10T12:58:00-05:00"          # a later push builds later (builds.first_seen_at orders them)
+    overlay = dict([_main_build(), _branch_build(sha7, 4812, "feature/TOS-48120-flexgrid-chrome",
+                                                 **({"built_at": later} if seq > 1 else {}))])
     overlay[f"manifests/{cand}.yaml"] = _manifest_4812(cand)
     overlay["manifests/mocks/tos-48120-grid-3x3.png"] = _mock_png()
     return Scenario("flexgrid-ladder", f"run-{today.isoformat()}-pr-4812-{seq:02d}",
@@ -346,6 +351,8 @@ PR_SCENARIOS: dict[str, Callable[[date], Scenario]] = {
     "paper-mode-mismatch": paper_mode_scenario, "attempted-send": attempted_send_scenario,
     "app-crash": app_crash_scenario, "operator-stop": lambda d: operator_stop_scenario(d),
     "redaction-miss": lambda d: redaction_miss_scenario(d),
+    "popups": lambda d: popups_scenario(d), "fingerprint-mismatch": lambda d: fingerprint_mismatch_scenario(d),
+    "clamped-gadget": lambda d: clamped_gadget_scenario(d), "occluded-capture": lambda d: occluded_scenario(d),
 }
 
 S03_CHECKPOINT = f"flow/trade.order-entry.stock/{STOCK_FLOW}/s03"
@@ -898,13 +905,145 @@ def demo_redaction_miss(out: Path, today: date = DEFAULT_TODAY, config: Path = E
     return [r]
 
 
+def popups_scenario(today: date) -> Scenario:
+    """PR 4851's pricing change, with the Message Center and an unknown window popping up during the ticket flow."""
+    return dataclasses.replace(wrong_number_scenario(today), name="popups", run_id=f"run-{today.isoformat()}-pr-4861-01",
+                               rig=RigScript(popups=(("s04", "Message Center"), ("s05", "Untitled Tool Window"))))
+
+
+def fingerprint_mismatch_scenario(today: date) -> Scenario:
+    """PR 4823 (the chart header change) whose base half ran with another rasterizer (a different render probe)."""
+    return dataclasses.replace(clean_scenario(today), name="fingerprint-mismatch",
+                               run_id=f"run-{today.isoformat()}-pr-4862-01",
+                               rig=RigScript(base_fingerprint=(("render_probe_hash", "0badc0ffee000000"),)))
+
+
+def clamped_gadget_scenario(today: date) -> Scenario:
+    """PR 4854 (the Active Trader cell host, no visible change) on builds whose cell is at least 400 px tall."""
+    sc = app_crash_scenario(today)
+    clamp = ((AT, 0, 400),)
+    return dataclasses.replace(sc, name="clamped-gadget", run_id=f"run-{today.isoformat()}-pr-4863-01", rig=RigScript(),
+                               candidate=dataclasses.replace(sc.candidate, minimums=clamp),
+                               base=dataclasses.replace(sc.base, minimums=clamp))
+
+
+def occluded_scenario(today: date) -> Scenario:
+    """PR 4851's pricing change with a foreign window over the screen while s03 and s06 are captured."""
+    return dataclasses.replace(wrong_number_scenario(today), name="occluded-capture",
+                               run_id=f"run-{today.isoformat()}-pr-4864-01",
+                               rig=RigScript(occluded=(S03_CHECKPOINT, f"flow/trade.order-entry.stock/{STOCK_FLOW}/s06")))
+
+
+def demo_popups(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                ) -> list[RunResult]:
+    r = run_pipeline(config, popups_scenario(today), out, today, **_rev(reviewer))
+    story = [
+        "The stock ticket flow of PR 4851 runs while two windows pop up: the Message Center before s04 and a tool",
+        "window nobody catalogued before s05. The popup sentinel sweeps the app's windows before every step and",
+        "every capture (4.10, 7.8):",
+        "- the Message Center matches POP-06 (dismissable, allowed while running): Escape goes through the input",
+        "  guard like any scripted key and the flow goes on;",
+        "- the tool window matches nothing: it is closed (WM_CLOSE), an unknown_popup finding carries a proposed",
+        "  catalog entry for the registry owner, and the flow is quarantined for later runs.",
+        "Every hit is a popup step event with its screenshot, and POP-06's rate on this build (one per run, none on",
+        "the base) is a popup_rate_increase finding.",
+    ]
+    _write_summary(out, "Scenario popups: a catalog popup dismissed, an unknown window closed", story, [r],
+                   _safety_lines(r))
+    return [r]
+
+
+def demo_fingerprint_mismatch(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                              ) -> list[RunResult]:
+    r = run_pipeline(config, fingerprint_mismatch_scenario(today), out, today, **_rev(reviewer))
+    story = [
+        "PR 4823's run, but the base half of every shard rendered with another rasterizer: its render probe hash",
+        "differs while the Windows build is the same. Before the second half's first capture the pair check compares",
+        "the two fingerprints field by field (4.12, L-FPR-03): they differ, so nothing is compared. Every checkpoint",
+        "is not_comparable (fingerprint_mismatch) naming the field, the run is complete_with_env_errors, and the",
+        "morning note says a rasterization change happened inside the same Windows build (L-FPR-05).",
+    ]
+    _write_summary(out, "Scenario fingerprint-mismatch: two halves that cannot be compared", story, [r],
+                   _safety_lines(r))
+    return [r]
+
+
+def demo_clamped_gadget(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                        ) -> list[RunResult]:
+    r = run_pipeline(config, clamped_gadget_scenario(today), out, today, **_rev(reviewer))
+    story = [
+        "PR 4854 changes the Active Trader cell's host class with no visible change. On both builds the cell will",
+        "not go below 400 px tall. The sweep asks for its usual sizes; at 360 and 320 px the cell stays at 400.",
+        "Each step is measured (2.5.1): a size above the request that matches the gadget's minimum is size_clamped,",
+        "a pass, not a failure. Both builds clamp the same way, so the sweep is identical, and Run health shows the",
+        "achieved minimum, clamped on height. A build that moved the minimum would show up as a finding.",
+    ]
+    _write_summary(out, "Scenario clamped-gadget: a sweep step the gadget will not take", story, [r], _safety_lines(r))
+    return [r]
+
+
+def demo_occluded_capture(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                          ) -> list[RunResult]:
+    r = run_pipeline(config, occluded_scenario(today), out, today, **_rev(reviewer))
+    story = [
+        "While the stock ticket flow's s03 and s06 are captured, a Notepad window covers the screen. Before the settle",
+        "loop Capture samples an 8 x 8 grid over the target window (3.4): a sample owned by a process outside the",
+        "thinkorswim tree means the capture would show someone else's pixels. Those checkpoints are env_error",
+        "(occluded) naming the program, a foreign_window event is logged, and the first sighting of notepad.exe",
+        "raises one hardening finding and one alert for the run. The rest of the run is compared as usual.",
+    ]
+    _write_summary(out, "Scenario occluded-capture: a foreign window over the target", story, [r], _safety_lines(r))
+    return [r]
+
+
+def demo_fixed_reopens(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                       ) -> list[RunResult]:
+    from .pipeline.config import SentinelConfig, materialize
+    from .pipeline.run import _register
+    from .records import Decision
+    r1 = run_pipeline(config, flexgrid_scenario(today), out, today, **_rev(reviewer))
+    cand2 = "branch-1998.3.0-9c4f1e7"
+    with Store(out / "sentinel.db") as store:
+        at = f"{today.isoformat()}T11:20:00-05:00"
+        bugs = record_decisions(store, r1, lambda o: o.outcome == "invariant_violation", action="confirm_bug",
+                                decided_by="jdoe", ticket="TOS-48391", cluster_id="cl-4812-overlap", at=at,
+                                reason="Ladder viewport overlaps the order strip at 360 px cell height")
+        sc2 = flexgrid_scenario(today, seq=2, sha7="9c4f1e7")
+        cfg2 = SentinelConfig.load(materialize(config, sc2.overlay, out / "config" / f"{sc2.run_id}-pre"))
+        _register(store, cfg2, [cand2])         # the fix build, as its own run will register it
+        fixed = []
+        for k, b in enumerate(bugs, 1):          # the Jira poller: TOS-48391 resolved, fixed in the next build (9.9)
+            nxt = store.conn.execute("SELECT COALESCE(MAX(decision_id), 0) + 1 FROM decisions").fetchone()[0]
+            d = Decision(f"dec-{nxt:06d}", "fixed_in_build", "confirmed_bug", b.signature, decided_by="jira.poller",
+                         ticket="TOS-48391", reason="TOS-48391 resolved in " + cand2, run_id=r1.run_id,
+                         source="jira_sync", role="ticket_resolver", decided_at=at)
+            fixed.append(store.record_decision(d, run_id=r1.run_id, supersedes=b.decision_id,
+                                               build_id=flexgrid_scenario(today).candidate.build_id,
+                                               fixed_in_build_id=cand2))
+    r2 = run_pipeline(config, sc2, out, today, **_rev(reviewer))
+    story = [
+        "PR 4812 runs, the overlap is confirmed as a bug (TOS-48391), and Jira resolves the ticket as fixed in the",
+        f"next build ({cand2}): each confirm_bug becomes a fixed_in_build decision for that build (9.9, SD-79).",
+        "The next build is pushed, but the overlap is still there. After the second run Sentinel checks every fixed",
+        "signature against what the run compared (L-DEC-08): the overlap came back on a build at or after the fix, so",
+        "each fixed_in_build decision is reopened, its finding stays open, and a Jira transition back to open is",
+        "queued. Run health lists the reopened fixes; a fix reopened twice is marked suspect.",
+    ]
+    _write_summary(out, "Scenario fixed-reopens: a fix that did not fix", story, [r1, r2],
+                   [f"Decisions: confirm_bug {', '.join(d.decision_id for d in bugs)}; fixed_in_build "
+                    f"{', '.join(d.decision_id for d in fixed)}."])
+    return [r1, r2]
+
+
 DEMOS: dict[str, Callable[..., list[RunResult]]] = {
     "flexgrid-ladder": demo_flexgrid_ladder, "clean-pr": demo_clean_pr, "backend-only": demo_backend_only,
     "ui-no-manifest": demo_ui_no_manifest, "nightly-canary": demo_nightly_canary,
     "decision-inheritance": demo_decision_inheritance, "wrong-number": demo_wrong_number,
     "paper-mode-mismatch": demo_paper_mode_mismatch, "attempted-send": demo_attempted_send,
     "app-crash": demo_app_crash, "config-invalid": demo_config_invalid, "expired-mask": demo_expired_mask,
-    "operator-stop": demo_operator_stop, "redaction-miss": demo_redaction_miss,
+    "operator-stop": demo_operator_stop, "redaction-miss": demo_redaction_miss, "popups": demo_popups,
+    "fingerprint-mismatch": demo_fingerprint_mismatch, "clamped-gadget": demo_clamped_gadget,
+    "fixed-reopens": demo_fixed_reopens, "occluded-capture": demo_occluded_capture,
 }
 
 # One sentence per scenario for out/index.html: what it demonstrates, and what a tester should check.
@@ -952,6 +1091,27 @@ INDEX = {
     "redaction-miss": ("An account id appears outside the redaction anchors on the candidate only (3.6, 6.10).",
                        "the redaction stage masks it and stores a tier-1 redaction_miss finding (candidate only), the "
                        "Run health row counts the boxes, and the check still passes."),
+    "popups": ("Two windows pop up during the stock ticket flow: the Message Center (a catalog popup) and a window "
+               "the catalog does not know (4.10, 7.8).",
+               "the Message Center is dismissed with Escape through the input guard and the run goes on; the unknown "
+               "window is closed, listed as an unknown_popup finding with a proposed catalog entry, and its flow is "
+               "quarantined; a popup_rate_increase finding counts POP-06."),
+    "fingerprint-mismatch": ("The base half of every shard was rendered by another rasterizer: its render probe hash "
+                             "differs (4.12, L-FPR-05).",
+                             "every checkpoint is not_comparable (fingerprint_mismatch) with the field named, nothing "
+                             "is compared, and Run health says a rasterization change happened inside one Windows "
+                             "build."),
+    "clamped-gadget": ("The Active Trader cell will not shrink below 400 px tall on either build; the sweep asks for "
+                       "smaller sizes anyway (2.5.1).",
+                       "the small steps are size_clamped (passed, not failures), the sweep is identical on both "
+                       "builds, and Run health shows the achieved minimum, clamped on height."),
+    "fixed-reopens": ("A bug is confirmed, Jira marks it fixed in the next build, and the next build still shows it "
+                      "(9.9).",
+                      "after the second run the fixed_in_build decisions are reopened, a ticket transition is queued, "
+                      "and Run health lists the reopened fixes."),
+    "occluded-capture": ("A program outside thinkorswim covers the screen while two checkpoints are captured (3.4).",
+                         "those checkpoints are env_error (occluded) naming notepad.exe, one hardening finding and one "
+                         "alert for the program, and the rest of the run is compared."),
     "expired-mask": ("An expired mask stops applying at run start and the run goes on (4.1, 4.8).",
                      "the run is complete, Run health lists \"mask expired: msk.ps.last-update-01\" and the store "
                      "holds a mask_expired finding."),

@@ -10,6 +10,7 @@ import pytest
 from sentinel import invariants as inv
 from sentinel.demo import EXAMPLE, clean_scenario, config_invalid_scenario
 from sentinel.diff.settle import settle
+from sentinel.evaluation import settle_spec_for
 from sentinel.pipeline.config import SentinelConfig
 from sentinel.pipeline.reviewer import (SIMULATED_MODEL_ID, ModelReviewerAdapter, ReviewRequest, SimulatedReviewer,
                                         to_review, validate)
@@ -81,7 +82,7 @@ def test_frames_settle_unless_the_build_keeps_them_moving(cfg):
     cp = sweep(480, 360)
     first = SimApp(SimBuild("b")).capture(cp, "base")
     reg = SimApp.registry(cp, first.screen, first.info, cfg.regions[f"sweep/{AT}/flexgrid/480x360"])
-    spec = SimApp.settle_spec(reg, (472, 352))
+    spec = settle_spec_for(cfg, cp, regfile=reg, park=(472, 352), template=lambda i, p: None)   # 3.5
     ok = settle(first.frames, spec)
     assert ok.settled and ok.time_to_settle_ms == 750 and ok.capture_t_ms == 250
     bad = settle(SimApp(SimBuild("b", unsettled=frozenset({cp.checkpoint_id}))).capture(cp, "base").frames, spec)

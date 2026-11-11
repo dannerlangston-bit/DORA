@@ -16,10 +16,10 @@ that held at the end ("whichever held at timeout", 4.7 `wait_for`): `unexpected_
 `anchor_missing` (conditions 2 and 3, the control or anchor named in `detail`),
 `anti_anchor_present`, or `frames_unstable`. A condition that failed earlier and holds again by
 the end is not the reason: conditions 1 to 4 recover on a frame that passes them, and condition 5
-on a frame identical to the one before it. `timeout` is the remaining case: the condition failing
-at the end was the parking condition (1), which has no code of its own, or nothing was failing
-any more but too few frames arrived to form the triple; `detail` names the last failing condition
-either way (marked recovered when it no longer held). Frames closer than 250 ms to the previous
+on a frame identical to the one before it. Nothing failing any more but too few frames to form the
+triple is `frames_unstable` (SD-26: `timeout` only when no frame was obtained); the parking
+condition (1), which has no code of its own, failing at the end keeps `timeout`; `detail` names the
+last failing condition either way (marked recovered when it no longer held). Frames closer than 250 ms to the previous
 frame of the run are skipped, never compared.
 
 Frames are RGB like every capture (an `mss` grab, BGRA, is converted by the platform side);
@@ -207,14 +207,14 @@ def settle(frames: Iterable[Frame], spec: SettleSpec, params: Mapping[str, Any] 
             first = run[0]
             return SettleResult(True, first.image, first.t_ms, run[-1].t_ms, None, None, None, run[-1].t_ms)
     elapsed = last.t_ms if last is not None else 0
-    if last_fail is None or last_fail[0] == "park":
-        if last_fail is not None:
-            detail = last_fail[1]
-        elif prior_fail is not None:
-            detail = f"{prior_fail[1]} (recovered; fewer than {need} frames {interval} ms apart within {max_wait} ms)"
-        else:
-            detail = f"fewer than {need} frames {interval} ms apart within {max_wait} ms"
-        reason = "timeout"
+    if last is None:                              # SD-26: timeout only when no frame was obtained
+        reason, detail = "timeout", f"no frame obtained within {max_wait} ms"
+    elif last_fail is None:                       # SD-26: too few frames to form the triple
+        reason = "frames_unstable"
+        detail = (f"{prior_fail[1]} (recovered; " if prior_fail is not None else "(") + \
+            f"fewer than {need} frames {interval} ms apart within {max_wait} ms)"
+    elif last_fail[0] == "park":
+        reason, detail = "timeout", last_fail[1]
     else:
         reason, detail = last_fail
     return SettleResult(False, None, None, None, reason, detail, last.image if last is not None else None, elapsed)

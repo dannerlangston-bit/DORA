@@ -51,7 +51,7 @@ import numpy as np
 from .. import invariants as inv
 from .. import synth
 from ..diff.regions import Landmark, Region, RegionsFile, Rect, FloorException
-from ..diff.settle import Anchor, Frame, SettleSpec
+from ..diff.settle import Frame
 from ..scope import PlannedCheckpoint
 
 FRAME_MS = 250                                   # 3.5 frame interval
@@ -744,15 +744,3 @@ class SimApp:
         rf.validate()
         return rf
 
-    @staticmethod
-    def settle_spec(regfile: RegionsFile, park: tuple[int, int]) -> SettleSpec:
-        """Settle parameters (3.5): the landmark as must-see anchor, masks ignored, the parking point."""
-        anchors = []
-        for lm in regfile.landmarks:          # searched near where the landmark was cut, as 3.7 searches
-            th, tw = lm.template.shape[:2]
-            ex, ey = lm.expected or (0, 0)
-            anchors.append(Anchor(lm.id, template=lm.template, search=Rect(max(0, ex - 40), max(0, ey - 40),
-                                                                           tw + 80, th + 80)))
-        masks = [r.rect.offset(*regfile.landmark(r.landmark).expected) for r in regfile.regions
-                 if r.type == "mask" and regfile.landmark(r.landmark).expected is not None]
-        return SettleSpec(anchors=anchors, ignore=masks, park=park)

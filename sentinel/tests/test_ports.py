@@ -60,6 +60,12 @@ class FakeDesktop:
     def input_desktop(self):
         return "Default"
 
+    def close_window(self, hwnd):                   # the popup sentinel's WM_CLOSE (4.10, 7.8)
+        return True
+
+    def foreground_window(self):                    # 7.8 hardening, before every input batch
+        return P.WindowInfo(1, 2, "SunAwtFrame", "Main")
+
 
 class FakePlanner:
     def plan(self, step, points, flag, now):

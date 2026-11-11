@@ -152,6 +152,12 @@ from ..capture.capture import (ForeignWindowLog, TargetWindow, capture_meta, cho
 from ..capture.sweep import SizeLadder, compare_minimums, minimums_summary, size_step_event
 from ..orchestrator.version_read import DEFAULT_TITLE_REGEX
 from ..orchestrator import fixture_checks
+from ..store.lifecycle import expire_due, expiring_within, export_decisions, first_seen, suspect_decisions, verify_fixes
+from ..store.mirror import apply_renames, load_config_mirror
+from ..store.store import Roster
+from ..evaluation import (b_input_reason, declares_new_surface, flake_event, recapture_plan, rerun_stability,
+                          settle_base, settle_spec_for, take_recaptures)
+from ..review_queue import global_shift_stop, order as review_order
 from ..orchestrator.popups import (BuildCounts, PopupContext, PopupSentinel, dismiss_action, popup_event,
                                    popup_rate_findings)
 from .orchestration import popup_catalog
@@ -165,7 +171,7 @@ from ..diff.phash import phash
 from ..egress import EgressAllowlist, EgressGate, reconcile
 from ..synth import THEME
 from ..diff.regions import Rect as RedactRect, RegionsFile, effective_registry, locate, park_rect
-from ..diff.settle import Recapture, RerunBudget, SettleResult, diff_stability, settle
+from ..diff.settle import RerunBudget, SettleResult, Stability, settle
 from ..lint.repo import Repo
 from ..lint.rules import EXPIRY_KINDS, ExpiredRecord, Violation, check_pair
 from ..lint.runstart import expiring_soon, lint_at_run_start, lint_manifest
@@ -297,6 +303,7 @@ class Evaluated:
     app_uptime_s: int | None = None                # 10.2: the app's age when the checkpoint was captured
     app_restart_count: int | None = None
     window: Any = None                             # the target window Capture chose (3.4 rule 3), for CaptureMeta
+    flake: list = field(default_factory=list)      # the settled re-captures of an unstable re-run (3.10 step 5)
 
     @property
     def storable(self) -> bool:
@@ -612,7 +619,7 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
              primitive: str | None, entry_ref: str | None, recapture: Callable[[], Capture],
              recapturable: bool = True, store: Store | None = None, synthetic: bool = False,
              absent_reason: str | None = None, injected: bool = False, oracle: FlowOracle | None = None,
-             rescued: bool = False) -> Evaluated:
+             rescued: bool = False, base_recapture: Callable[[], Capture] | None = None) -> Evaluated:
     """5.17 from capture to classification for one checkpoint; PR checkpoints and canary mutants alike.
     An `injected` candidate (a canary mutant, 10.3 Injection) is already a settled capture: the settle
     loop, a capture-time gate, does not run on it. With `oracle`, a flow checkpoint's assertions are
@@ -623,21 +630,30 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
     if rule_rects := invariant_rule_regions(reg, placed):     # 2.7: INV-03 and INV-04 read the rule regions
         rules = dataclasses.replace(rules, rule_regions=rule_rects)
     park = _park(cand)
-    spec = SimApp.settle_spec(reg, park)
+    # 3.5: the checkpoint's settle parameters; the sim's renders hold no registry PNG, so surface templates are left out
+    spec = settle_spec_for(run.cfg, cp, regfile=reg, park=park, template=lambda i, p: None, params=run.params)
     fkw: dict[str, Any] = dict(manifest=x, primitive=primitive, manifest_entry_ref=entry_ref,
                                manifest_entries=run.entries, manifest_tickets=run.tickets, build_pair_id=run.pair_id,
                                rescued=rescued)
     s_c = settle(cand.frames, spec, run.params) if not injected else _as_settled(cand)
-    s_b = settle(base.frames, spec, run.params) if base is not None else None
+    # 3.11 row 9, SD-07: a base that does not settle is re-captured once; only a second failure leaves B absent
+    bc = settle_base(lambda: base.frames, spec, run.params, recapturable=recapturable) if base is not None else None
+    s_b = bc.result if bc is not None else None
     res, comparison = None, None
     recaps = 0
+    flake: list[Capture] = []
     red: RedactionResult | None = None                  # 3.6: only redacted images are diffed or stored
     if not s_c.settled:
         red = run.redact(cp, None, cand, None, s_c.last_frame if s_c.last_frame is not None else cand.screen.image)
         facts = Facts(not_settled=Condition(s_c.reason, side="candidate", detail=s_c.detail), **fkw)
-    elif base is None or (s_b is not None and not s_b.settled):
+    elif base is None or (bc is not None and not bc.settled):
         red = run.redact(cp, None, cand, None, s_c.capture)
-        facts = Facts(base="absent", base_reason=absent_reason or "base_not_settled", **fkw)
+        new_surface = declares_new_surface(run.manifest, cp.surface_id)
+        if bc is not None:                               # 3.11 input B from the base side's capture attempts
+            facts = Facts(**b_input_reason(bc.evidence(), new_surface=new_surface).facts, **fkw)
+        else:
+            facts = Facts(base="absent", base_reason=absent_reason or ("new_surface" if new_surface
+                                                                        else "base_not_settled"), **fkw)
         comparison = inv.compare(None, cand.models, rules)
     elif (red := run.redact(cp, base, cand, s_b.capture, s_c.capture)).terminal is not None:
         t = red.terminal                                # a redaction landmark on one side only: nothing is stored
@@ -658,11 +674,13 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
         else:
             inv_ids, inv_stab, inv_cause = (), None, None
             stab, cause = None, None
-            budget_ok = run.budget.take() if (run.budget and (comparison.fired or res.level == "above")
-                                              and recapturable) else True
+            # 3.10: the re-capture plan takes the run budget's unit itself (one per checkpoint that re-runs)
+            trigger = "invariant" if comparison.fired else "diff" if res.level == "above" else None
+            plan = recapture_plan(trigger, data_mode=cp.data_mode, recapturable=recapturable, budget=run.budget,
+                                  params=run.params) if trigger is not None else None
             if comparison.fired:
-                if not recapturable or not budget_ok:
-                    p = inv.confirm(comparison, None, cause="not_recapturable" if not recapturable else "budget")
+                if plan.unknown_cause is not None:
+                    p = inv.confirm(comparison, None, cause=plan.unknown_cause)
                 else:
                     again = recapture()
                     recaps = 1
@@ -678,15 +696,16 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
                                          system_masks=[park_rect(park)],
                                          context=DiffContext(run.run_id, cp.checkpoint_id, cp.tier, synthetic=synthetic),
                                          params=run.params).level == "above"
-                    if recapturable and budget_ok:
-                        again = [recapture(), recapture()]
-                        recaps = 2
-                        st = diff_stability(red.candidate, [Recapture(True, a.screen.image) for a in again], above,
-                                            params=run.params)
-                    else:
-                        st = diff_stability(red.candidate, [], above, recapturable=recapturable, budget_ok=budget_ok,
-                                            params=run.params)
+                    taken = take_recaptures(plan.candidate, recapture, spec, frames=lambda c: c.frames,
+                                            params=run.params) if plan.candidate else ()
+                    base_taken = take_recaptures(plan.base, base_recapture, spec, frames=lambda c: c.frames,
+                                                 params=run.params) if plan.base and base_recapture else ()
+                    recaps = len(taken)
+                    st = rerun_stability(plan, red.candidate, taken, above, base_first=red.base,
+                                         base_taken=base_taken, params=run.params)
                     stab, cause = st.stability, st.cause
+                    if st.stability == "unstable":        # 3.10 step 5: the re-captures are kept for the flake row
+                        flake = [t.source for t in taken if t.recapture.settled]
             fix = None
             if res.threshold_source == "uncalibrated":
                 fix = "no calibrated floor for this fingerprint (3.9); threshold 0"
@@ -711,6 +730,7 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
     classified = classify(facts)
     ev = Evaluated(cp, base, cand, reg, facts, classified, res, comparison, recaptures=recaps,
                    settle_ms=s_c.time_to_settle_ms, oracle=checks[0], oracle_base=checks[1], redaction=red)
+    ev.flake = flake
     ev.facts_category = classified.outcome
     cand_lm = {k: m[1].pos for k, m in (res.landmarks.items() if res else []) if m[1].found}
     h, w = cand.screen.image.shape[:2]
@@ -733,7 +753,7 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
     if store is not None and not synthetic and ev.phash and ev.region:
         look = store.lookup_decisions(Signature(cp.checkpoint_id, ev.region, ev.phash, ev.category),
                                       at=run.now.isoformat(), run_id=run.run_id, manifest_entries=run.entries,
-                                      manifest_tickets=run.tickets)
+                                      manifest_tickets=run.tickets, candidate_build=run.cand_app.build.build_id)
         ev.related = [{"decision_id": m.decision.decision_id, "hamming": m.distance} for m in look.related]
         if look.applicable and not look.frozen:      # a frozen signature inherits nothing (9.7)
             facts = dataclasses.replace(facts, decisions=tuple(look.applicable))     # with each one's build pair
@@ -950,8 +970,8 @@ def _overlay(img: np.ndarray, rects: Iterable[inv.Rect]) -> np.ndarray:
 class _Writer:
     """Turns evaluated checkpoints into the records of 4.13 and their artifacts (8.4)."""
 
-    def __init__(self, run: _Run, arts: ArtifactStore, today: date, clock: str):
-        self.run, self.arts, self.today, self.clock = run, arts, today, clock
+    def __init__(self, run: _Run, arts: ArtifactStore, today: date, clock: str, store: Store | None = None):
+        self.run, self.arts, self.today, self.clock, self.store = run, arts, today, clock, store
         tag = run.run_id.split("-pr-")[-1].replace("-", "") if "-pr-" in run.run_id else \
             hashlib.sha256(run.run_id.encode()).hexdigest()[:6]
         self.tag, self.n = tag, 0
@@ -1025,6 +1045,14 @@ class _Writer:
         if cp.data_mode == "masked_live":
             out += self._masked_live(ev)
         return out
+
+    def flake_capture(self, ev: Evaluated, cap: Capture, k: int) -> str:
+        """One capture of an unstable re-run, redacted and stored (3.10 step 5: both or all are kept); its sha256."""
+        red = self.run.redact(ev.cp, None, cap, None, cap.screen.image, count=False)
+        img = red.candidate if red.terminal is None and red.candidate is not None else ev.images()[1]
+        return self.arts.put(_png(img), name=f"{self.run.run_id}/{ev.cp.checkpoint_id}/rerun-{k}.png", kind="capture",
+                             media_type="image/png", redaction=self.run.red_header, checkpoint_id=ev.cp.checkpoint_id,
+                             side="candidate", captured_at=_ts(self.today, self.clock, 600)).sha256
 
     def _masked_live(self, ev: Evaluated) -> list[StoredArtifact]:
         """The masked_live frames of the candidate (7.9): the settled triple and the later frames of the live
@@ -1117,7 +1145,8 @@ class _Writer:
             if kind not in load().finding_kinds:
                 kind = "collateral"
             findings.append(Finding(
-                finding_id=fid, run_id=self.run.run_id, kind=kind, description=desc, first_seen_run_id=self.run.run_id,
+                finding_id=fid, run_id=self.run.run_id, kind=kind, description=desc,
+                first_seen_run_id=self.run.run_id,
                 checkpoint_id=cp.checkpoint_id, tier=cp.tier, region_id=ev.region, primitive=c.primitive,
                 manifest_entry_ref=c.manifest_entry_ref, phash=ev.phash, category=_category(ev), evidence=evidence,
                 severity=sev, side=c.side, step_id=cp.step_id, decision_ref=c.decision_ref,
@@ -1127,6 +1156,8 @@ class _Writer:
                 findings.append(dataclasses.replace(f, created_at=_ts(self.today, self.clock, 900), tier=cp.tier))
         for f in ev.redaction.findings if ev.redaction is not None else ():     # 3.6: never the primary finding
             findings.append(dataclasses.replace(f, created_at=_ts(self.today, self.clock, 900)))
+        if self.store is not None:                      # 9.2 novelty: the run that first showed the signature
+            findings = [dataclasses.replace(f, first_seen_run_id=first_seen(self.store, f)) for f in findings]
         return o, findings, stored
 
 
@@ -1317,6 +1348,29 @@ def _churn_rows(today: date, cfg: SentinelConfig, planned: Sequence[PlannedCheck
         t.ref.rsplit("/", 1)[-1]) <= soon]
     if tasks:
         rows.append(["Reseed tasks", "; ".join(f"{t.ref}: {t.detail}" for t in tasks)])
+    return rows
+
+
+def _decision_rows(store: Store, verified: Any, at: str) -> list[list[str]]:
+    """Run health's decision lines (9.5, 9.9): fixes whose signature returned, suspect decisions, decisions
+    expiring within seven days, open proposals and tickets the poller could not find."""
+    rows = []
+    if verified.reopened:
+        rows.append(["Fixes reopened", "; ".join(f"{r.decision_id} (reopened {r.reopen_count}x"
+                                                 + (", suspect)" if r.suspect else ")") for r in verified.reopened)])
+    suspect = suspect_decisions(store)
+    if suspect:
+        rows.append(["Suspect decisions", "; ".join(d.decision_id for d in suspect)])
+    soon = expiring_within(store, at)
+    if soon:
+        rows.append(["Decisions expiring within 7 days", "; ".join(f"{d.decision_id} ({d.action})" for d in soon)])
+    proposals = store.query("SELECT proposal_id, action FROM proposals WHERE state = 'proposed' ORDER BY proposal_id")
+    if proposals:
+        rows.append(["Open proposals", "; ".join(f"{p['proposal_id']} ({p['action']})" for p in proposals)])
+    missing = store.query("SELECT natural_key, evidence_json FROM findings WHERE evidence_json LIKE '%triage_note%'")
+    if missing:                                        # 9.9: the poller's 404 note on the decision's finding
+        rows.append(["Tickets not found", "; ".join(f"{d['natural_key']}: {json.loads(d['evidence_json'])['triage_note']}"
+                                                    for d in missing)])
     return rows
 
 
@@ -1686,7 +1740,7 @@ class _ShardWork:
         fields = (r.evidence or {}).get("fields") if r.control in ("fingerprint_pair", "fingerprint_reread") else None
         note = mismatch_note(fields) if fields else None
         if note:                                         # L-FPR-05: the morning report's sentence
-            row = ["Fingerprint", f"{st.shard_id}: {note} (differing: {', '.join(fields)})"]
+            row = ["Fingerprint", f"{note} (differing: {', '.join(fields)})"]
             if row not in self.health_rows:
                 self.health_rows.append(row)
         self.persist(st, r, flow_id or st.last_flow)
@@ -1835,8 +1889,8 @@ class _ShardWork:
             st.last_flow = u.unit_id
         hooks = UnitHooks(before_step=lambda step: self._before_step(st, u, step),
                           after_step=lambda step: self._after_step(st))
-        u = dataclasses.replace(u, doc=_LiveTeardown(u.doc, st.rig))
-        r = run_unit(u, st.ports, st.ladder, planner, st.exec, hooks=hooks, failures=st.failures, faults=self.faults,
+        live = dataclasses.replace(u, doc=_LiveTeardown(u.doc, st.rig))
+        r = run_unit(live, st.ports, st.ladder, planner, st.exec, hooks=hooks, failures=st.failures, faults=self.faults,
                      streak=st.streak if u.kind == "census" and cps and cps[0].test_kind == "census" else None)
         self._absorb(st, u, r, cps)
 
@@ -2015,8 +2069,9 @@ class _ShardWork:
         if cp.test_kind == "sweep" and self._size_step(st, cp, base_cap, cand_cap, rest):
             return None
         att = self.plan.attribution.get(cp.surface_id)
-        ticks = iter(range(3, 9))
+        ticks, bticks = iter(range(3, 9)), iter(range(9, 15))
         ev = evaluate(self.run, cp, base_cap, cand_cap, x=self.plan.x_input(cp.surface_id),
+                      base_recapture=lambda: self.run.capture(cp, "base", tick=next(bticks)),
                       primitive=att.primitive if att else None, entry_ref=att.entry_id if att else None,
                       recapture=lambda: self.run.capture(cp, "candidate", tick=next(ticks)),
                       recapturable=_recapturable(self.cfg, cp), store=self.store, oracle=self.oracle, rescued=rescued)
@@ -2539,6 +2594,9 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         raise PairRefused(refused)
     start = run_start(repo, scenario.candidate.build_id, today)
     with Store(out / "sentinel.db", strict_records=True) as store:      # L-OUT-02: every record is complete
+        oncall = repo.one("oncall")
+        if oncall is not None and isinstance(oncall.data, dict):        # L-DEC-01: who may decide (ops/oncall.yaml)
+            store.set_roster(Roster.from_oncall(oncall.data))
         if start.errors:
             errs = [v.line() for v in start.errors]
             rules = sorted({v.rule for v in start.errors})
@@ -2575,7 +2633,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         scanner = SecretScanner(secrets)
         arts = ArtifactStore(out / "artifacts", f"runs/{scenario.run_id}", scanner=scanner)
         leak: ControlResult | None = None                 # the first results batch the upload check stopped
-        writer = _Writer(run, arts, today, scenario.clock)
+        writer = _Writer(run, arts, today, scenario.clock, store)
         used = sorted({rig_of[cp.checkpoint_id] for cp in planned})
         shard_of = {r: f"{scenario.run_id}/{i}" for i, r in enumerate(used, 1)}
         scope_entries = [ScopeEntry(cp.checkpoint_id, cp.workspace_id, cp.persona, cp.tier, cp.data_mode,
@@ -2593,6 +2651,11 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         store.begin_run(_run_plan(scenario.run_id, "pr", cfg.root, scope_entries, shards, started,
                                   mtext.read_text() if mtext.exists() else None, scenario.pr, scenario.author, pair_id,
                                   {f: scripted_flow(d, f, scenario.rig) for f, d in cfg.flow_docs.items()}))
+        commit = tree_sha256(cfg.root)[:12]               # 8.3, 8.5: renames and the config commit's registry mirror
+        renames = repo.one("renames")
+        apply_renames(store, renames.data if renames is not None else None, commit)
+        redaction = repo.one("redaction")
+        load_config_mirror(store, commit, cfg.regions, cfg.masks, redaction.data if redaction is not None else None)
         work = _ShardWork(run, cfg, scenario, out, oracle, store, planned, plan, today)
         rev = reviewer or SimulatedReviewer()
         gate = egress_gate(cfg.root, store, scenario.run_id)   # 6.10: one gate per run for every outbound call
@@ -2612,15 +2675,15 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         evals = work.evals
         shift = global_shift_prepass([ev.diff.signal for ev in evals if ev.diff is not None and ev.diff.signal is not None],
                                      params=run.params)
-        if shift.raised:                       # 3.7 granularity 0: one needs_human (global_shift) cluster
-            for ev in evals:
-                if ev.cp.checkpoint_id in shift.collapse:
-                    ev.facts = dataclasses.replace(ev.facts, global_shift=True)
-                    ev.classified = classify(ev.facts)
-            gf = shift.finding(scenario.run_id)
-            if gf is not None:
-                store.write_finding(dataclasses.replace(gf, created_at=started))
-        calls = _review_pass(run, evals, rev, scenario.reviewer_cap, gate)
+        # 3.7 granularity 0: one needs_human (global_shift) cluster, and no Reviewer call for the run
+        stop = global_shift_stop(shift, {ev.cp.checkpoint_id: ev.facts for ev in evals})
+        for ev in evals:
+            if ev.cp.checkpoint_id in stop.facts:
+                ev.facts, ev.classified = stop.facts[ev.cp.checkpoint_id], stop.classified[ev.cp.checkpoint_id]
+        gf = shift.finding(scenario.run_id)
+        if gf is not None:
+            store.write_finding(dataclasses.replace(gf, created_at=started))
+        calls = [] if stop.stopped else _review_pass(run, evals, rev, scenario.reviewer_cap, gate)
         for f in list(plan.findings) + work.sweep_minimums()[1] + work.popup_findings():
             store.write_finding(dataclasses.replace(f, created_at=f.created_at or started))
         for f in _expired_findings(scenario.run_id, start.expired, run.expiry_notices, run.expired_exceptions,
@@ -2633,6 +2696,11 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                 leak = check_upload(scanner, batch, location=f"results batch {ev.cp.checkpoint_id}")
             work.session_context(ev)                     # L-OUT-06: the stamp is one of its session's assertions
             work.write_record(o, findings=fs, artifacts=stored, shard_id=shard_of[rig_of[ev.cp.checkpoint_id]])
+            if ev.flake:                                 # 3.10 step 5: the unstable re-run's captures, redacted
+                shas = [writer.flake_capture(ev, c, k) for k, c in enumerate([ev.cand] + list(ev.flake))]
+                fe = flake_event(Stability("unstable", recaptures=len(ev.flake)), shas, region_id=ev.region)
+                if fe is not None:
+                    store.write_flake_event(scenario.run_id, ev.cp.checkpoint_id, created_at=started, **fe)
             for side, chk in (("candidate", ev.oracle), ("base", ev.oracle_base)):   # SD-09: every extraction
                 if chk is not None:
                     store.write_extractions(to_rows(chk.verdict.results, run_id=scenario.run_id,
@@ -2715,6 +2783,14 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
             runrec = store.end_run(RunOutcome(scenario.run_id, "pr", status, last_gate, reason=reason,
                                               started_at=started, ended_at=_ts(today, scenario.clock, int(wall))),
                                    summary=summary)
+        verified = verify_fixes(store, scenario.run_id, candidate_build=scenario.candidate.build_id, at=started)
+        for re_ in verified.reopened:                    # 9.9: each reopen's outbox job payload, as its artifact
+            arts.put(re_.payload, name=f"{scenario.run_id}/outbox/{re_.decision_id}.json", kind="request",
+                     media_type="application/json")
+        rows = _decision_rows(store, verified, started)
+        if rows:
+            summary.setdefault("health_rows", []).extend(rows)
+            store.update_summary(scenario.run_id, summary)
         held = activity_quarantined(open_quarantines(store), "report_publication")      # 6.9: no report publishes
         if secret is not None:
             result = _withheld(store, plan, scenario, runrec, out, str(secret.detail or secret.run_reason))
@@ -2758,7 +2834,7 @@ def _review_pass(run: _Run, evals: list[Evaluated], rev: ReviewerAdapter, cap: i
         members.append(Member(rec, f, ev.category, 0, ev.region, c.decision_ref))
         by_id[ev.cp.checkpoint_id] = ev
     calls: list[dict] = []
-    for cl in cluster_members(members):
+    for cl in review_order(cluster_members(members)):     # 3.15: lowest tier, then area, then checkpoint id
         evs = [by_id[m.checkpoint_id] for m in cl.unsuppressed]
         if not evs:
             continue
@@ -3289,6 +3365,12 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                                    1 if report.state != "ok" else 0, "slack": {"queued": 0}}}
         if expired_findings:
             health["expired"] = [f.evidence["raw_values"]["run_health"] for f in expired_findings]
+        expiry = expire_due(store, started)               # 9.6, 9.7: the Nightly ends what is due
+        soon = expiring_within(store, started)
+        if expiry.expired or soon:
+            health["decisions"] = {"expired": [e.decision_id for e in expiry.expired],
+                                   "expiring_7d": [d.decision_id for d in soon]}
+        export_decisions(store, out / "decisions")       # 4.14: the nightly export for review in git
         egress = nightly_reconcile(store, cfg.root, now)          # 6.10: the day's egress rows against the allowlist
         if egress is not None:
             work._note(st, egress)

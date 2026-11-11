@@ -33,8 +33,10 @@ Choices where the spec is ambiguous (reported to the coordinator):
   with L-RGN-08 rather than mirrored as an ordinary region; a `money_role` alone makes the region a money cell.
 - `masks.created_by` is the requester of the linked request_mask decision when the store has it, else the record's
   `created_by`; `critical_panel` is the mask region's panel; `decision_id` is set when the decision exists.
-- Linking the same mask again is a no-op (a reloaded commit); a different mask for a linked decision is refused.
-  The finding moves to noise at the merge (8.3 action table "open until merge, then noise").
+- Linking the same mask again is a no-op (a reloaded commit); `link_mask` refuses a different mask for a linked
+  decision, and the mirror load lists such a mask, or one naming a revoked or non-request_mask decision, in
+  `unlinked` instead of failing the load. The finding moves to noise at the merge (8.3 action table "open until
+  merge, then noise").
 - The prefilled mask of a request is the finding region's landmark and rect unless `rect` (`{landmark, rect}`)
   says otherwise; a finding on a grid cell needs `rect`. The request is refused when the mask raises any panel of
   its landmark over budget; `mask_share` is the share the mask adds to that panel.
@@ -74,7 +76,7 @@ class MirrorResult:
     regions: int = 0
     masks: int = 0
     linked: tuple[str, ...] = ()               # request_mask decisions whose mask_ref this load set
-    unlinked: tuple[str, ...] = ()             # mask ids whose decision_ref names no request_mask decision here
+    unlinked: tuple[str, ...] = ()             # mask ids whose decision_ref names no active request_mask free to link
 
 
 @dataclass(frozen=True)
@@ -120,9 +122,9 @@ def _region_row(checkpoint_id: str, commit: str, r: Mapping[str, Any], tolerance
 
 
 def _calibrated(store: Store, checkpoint_id: str, region_id: str) -> tuple[Any, Any]:
-    r = store.query("SELECT min(hamming_tolerance), max(exact_fallback) FROM calibration_floors WHERE checkpoint_id = ? "
-                    "AND region_id = ? AND superseded_at IS NULL AND hamming_tolerance IS NOT NULL",
-                    (checkpoint_id, region_id))
+    r = store.query("SELECT min(hamming_tolerance), max(exact_fallback) FROM calibration_floors "
+                    "WHERE checkpoint_id = ? AND region_id = ? AND superseded_at IS NULL "
+                    "AND hamming_tolerance IS NOT NULL", (checkpoint_id, region_id))
     return (r[0][0], r[0][1]) if r else (None, None)
 
 
@@ -195,7 +197,8 @@ def load_config_mirror(store: Store, commit: str, registry: Mapping[str, Mapping
             "created_by_kind": "human", "created_at": _ts(_field(m, "created_at")),
             "expires_at": _ts(_field(m, "expires_at")), "critical_panel": region.get("panel"),
             "decision_id": None if d is None else d["decision_id"]}))
-        if d is not None and d["action"] == "request_mask":
+        if (d is not None and d["action"] == "request_mask" and d["status"] == "active"
+                and d["mask_ref"] in (None, mask_id)):
             links.append((d, mask_id))
         else:
             unlinked.append(mask_id)

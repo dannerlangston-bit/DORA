@@ -419,7 +419,8 @@ def test_a_signature_seen_five_days_ago_ranks_after_a_new_one(s):
 ONCALL = {"schema_version": 1,
           "roles": [{"role": "system_owner", "person": "olga", "deputy": "sam"},
                     {"role": "risk_owner", "person": "rita", "deputy": "rob"}],
-          "flow_owners": [{"tier": 1, "person": "fay", "deputy": "fred"}, {"tier": 2, "person": "gus", "deputy": "gina"}],
+          "flow_owners": [{"tier": 1, "person": "fay", "deputy": "fred"},
+                          {"tier": 2, "person": "gus", "deputy": "gina"}],
           "rotations": [{"rotation": "triage", "person": "tess", "from": "2026-11-09", "to": "2026-11-15"},
                         {"rotation": "harness_oncall", "person": "hank", "from": "2026-11-09", "to": "2026-11-15"}],
           "triage_roster": ["alice", "bob"]}

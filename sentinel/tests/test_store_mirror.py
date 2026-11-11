@@ -55,8 +55,8 @@ def regions_doc(**changes) -> dict:
 REDACTION = {"schema_version": 1, "owner": "security-contact",
              "landmarks": [{"id": "lm.title", "template": "x.png"}, {"id": "lm.other", "template": "y.png"}],
              "regions": [
-                 {"id": "rgn.redact.account", "type": "redaction", "landmark": "lm.title", "panel": "order_confirmation",
-                  "rect": rect(24, 24, 120, 16), "identity_field": True},
+                 {"id": "rgn.redact.account", "type": "redaction", "landmark": "lm.title",
+                  "panel": "order_confirmation", "rect": rect(24, 24, 120, 16), "identity_field": True},
                  {"id": "rgn.redact.note", "type": "redaction", "landmark": "lm.title", "panel": "order_confirmation",
                   "rect": rect(300, 100, 50, 20)},                                  # 1000 px, counts
                  {"id": "rgn.redact.elsewhere", "type": "redaction", "landmark": "lm.other",
@@ -214,6 +214,18 @@ def test_a_request_mask_acts_once_its_mask_merges(s):
         link_mask(s, "dec-000002", "msk.cost-01")
     # the request ends with its mask (9.6), not at its own 30 days
     assert [e.why for e in expire_due(s, "2026-12-02T00:00:00+00:00").expired] == ["mask expired"]
+
+
+def test_a_mask_naming_a_revoked_request_loads_unlinked(s):
+    load_config_mirror(s, COMMIT, {FLOW: regions_doc()})
+    finding(s, "F-sym", "rgn.confirm.symbol")
+    d = s.record_decision(decision("dec-000001", "request_mask", "rgn.confirm.symbol"), run_id=RUN, finding_id="F-sym")
+    s.revoke_decision(d.decision_id, by="tess", reason="mask_budget_exceeded")
+    merged = regions_doc(rgn_confirm_symbol={"type": "mask", "mask_ref": "msk.symbol-01"})
+    r = load_config_mirror(s, "c2", {FLOW: merged}, [mask("msk.symbol-01", "rgn.confirm.symbol", d.decision_id)])
+    assert (r.masks, r.linked, r.unlinked) == (1, (), ("msk.symbol-01",))
+    assert s.query("SELECT mask_ref FROM decisions WHERE decision_id = 1")[0][0] is None
+    assert s.get_finding("F-sym").triage_state == "open"
 
 
 # -- renames (8.3, gap G33) -----------------------------------------------------------------------------------------

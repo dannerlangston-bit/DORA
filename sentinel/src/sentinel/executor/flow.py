@@ -402,7 +402,8 @@ def _steps(u: _Unit) -> None:
         else:
             r = _step(u, step, i)
         u.record(r)
-        last_rescued = r.rescued
+        # 5.5: the checkpoint reached after a rescued step is captured after normalize and flagged rescued
+        last_rescued = False if kind == "checkpoint" else last_rescued or r.rescued
         if u.stopped:
             u.ended_by = sid
             return

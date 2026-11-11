@@ -222,6 +222,7 @@ class ReviewItem:
     mask_version: str = ""
     redaction_version: str = ""
     registry_version: str = ""
+    artifact_sha256: str | None = None   # the stored, redacted capture the candidate crop was cut from (6.10, 8.3)
 
     def __post_init__(self) -> None:
         if self.task not in TASKS:

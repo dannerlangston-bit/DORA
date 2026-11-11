@@ -260,7 +260,7 @@ def test_a_redaction_landmark_on_one_side_only_stores_nothing(tmp_path, monkeypa
     (o,) = [o for o in r.outcomes if o.checkpoint_id == target]
     assert (o.outcome, o.reason) == ("landmark_missing", "redaction_landmark:lm.position-statement-header")
     assert o.artifacts in (None, {})
-    manifest = (tmp_path / "artifacts" / "manifest.json").read_text()
+    manifest = (tmp_path / "artifacts" / "runs" / sc.run_id / "manifest.json").read_text()
     assert target not in manifest
 
 

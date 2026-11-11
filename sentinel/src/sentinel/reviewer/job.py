@@ -63,6 +63,7 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 from ..classify import ROUTING_THRESHOLD, Review
+from ..egress import row_context
 from ..pipeline.reviewer import CLOSEST_ORDER
 from .budget import SpendLedger, cost_usd, rank_for_cap
 from .config import RUN_KINDS, ReviewerConfig
@@ -483,6 +484,14 @@ class ReviewerJob:
     # -- synchronous path -----------------------------------------------------------------------
 
     def _sync_item(self, item: ReviewItem, acc: _Acc | None = None) -> Verdict:
+        """One item on the synchronous path. Its requests carry the item's egress row fields (6.10, 8.3, 8.9): the
+        checkpoint, the redaction version, the stored capture its crops came from, and that the payload is an
+        image, so the gate refuses it without a redaction version; set here, in the thread that sends."""
+        with row_context(checkpoint_id=item.checkpoint_ids[0], redaction_version=item.redaction_version or None,
+                         artifact_sha256=item.artifact_sha256, image=bool(item.steps) or None):
+            return self._sync_item_sent(item, acc)
+
+    def _sync_item_sent(self, item: ReviewItem, acc: _Acc | None) -> Verdict:
         params = self.prompt.params(item)
         if acc is None:
             acc = self._new_acc(params)

@@ -25,6 +25,9 @@ Choices where 8.4 is silent:
   redaction-version header of the 8.2 `PUT /v1/artifacts/{sha256}` request.
 - Text artifacts (logs, exports, ledgers, reviewer requests) are accepted without a redaction header: 8.4 sends
   them through the plaintext scan instead (6.9). Their redaction version is recorded when given.
+- Every set has its own directory (`ArtifactStore.at(root, set_path)` opens `<root>/<set_path>/`), so a set's
+  root holds that set alone, and `quarantine/` lies outside every set: `quarantine` refuses a quarantine root
+  inside the set it moves.
 - Quarantine moves every file of the set (objects, manifest, ledgers under `shards/`), since a leaked secret can
   sit in a ledger as well as in an object. A file already in the quarantine directory with the same bytes is
   dropped; one with other bytes keeps both, the moved copy under the next free `<name>.<n>`.
@@ -60,7 +63,9 @@ EXTENSIONS = {
     "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/bmp": "bmp", "video/mp4": "mp4",
     "application/json": "json", "application/x-ndjson": "jsonl", "text/csv": "csv", "text/plain": "txt",
 }
-_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"BM", b"II*\x00", b"MM\x00*")
+_IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"II*\x00", b"MM\x00*")
+_BMP_DIB_SIZES = (12, 40, 52, 56, 64, 108, 124)       # the BITMAP*HEADER sizes a BMP file's second header has
+MAGIC_BYTES = 32                                      # how many leading bytes `has_image_magic` reads
 MANIFEST = "manifest.json"
 QUARANTINE_MARKER = "QUARANTINED.json"
 
@@ -171,15 +176,23 @@ def _read_back(path: Path) -> bytes:
     return path.read_bytes()
 
 
+def _bmp_header(head: bytes) -> bool:
+    """A BMP file header, not just its two letters (a text line can start with "BM"): reserved bytes zero and a
+    known DIB header size after the 14-byte file header."""
+    return (head[:2] == b"BM" and len(head) >= 18 and head[6:10] == bytes(4)
+            and int.from_bytes(head[14:18], "little") in _BMP_DIB_SIZES)
+
+
 def has_image_magic(head: bytes) -> bool:
-    """True when the leading bytes are those of an image or video file (PNG, JPEG, GIF, BMP, TIFF, WebP, MP4)."""
-    return (head.startswith(_IMAGE_MAGIC) or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")
+    """True when the leading bytes (`MAGIC_BYTES` of them) are those of an image or video file (PNG, JPEG, GIF, BMP,
+    TIFF, WebP, MP4)."""
+    return (head.startswith(_IMAGE_MAGIC) or _bmp_header(head) or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")
             or head[4:8] == b"ftyp")
 
 
 def is_visual(data: bytes, kind: str, media_type: str) -> bool:
     """True for anything that may show the screen: image or video media type, a visual kind, or image bytes."""
-    return (media_type.startswith(("image/", "video/")) or kind in VISUAL_KINDS or has_image_magic(data[:16])
+    return (media_type.startswith(("image/", "video/")) or kind in VISUAL_KINDS or has_image_magic(data[:MAGIC_BYTES])
             or _dimensions(data) != (None, None))      # any other format Pillow reads is a picture too
 
 
@@ -199,6 +212,12 @@ class ArtifactStore:
     `baselines/<lineage>/<build_id>`, `eval/<version>`, or the shard id on the rig). `scanner` turns on the
     plaintext check of every non-image put (6.9).
     """
+
+    @classmethod
+    def at(cls, root: str | os.PathLike, set_path: str, *, scanner: TextScanner | None = None) -> "ArtifactStore":
+        """The set `set_path` in its own directory under an artifact root, `<root>/<set_path>/` (8.4: the control
+        host's `runs/<run_id>/`), so one set's quarantine never moves or blocks another set's files."""
+        return cls(Path(root) / set_path, set_path, scanner=scanner)
 
     def __init__(self, root: str | os.PathLike, set_path: str, *, scanner: TextScanner | None = None):
         self.root = Path(root)
@@ -338,8 +357,12 @@ class ArtifactStore:
 
         The marker is written first, so puts and reads are refused from that moment even if the move stops half
         way. With `store`, every `artifact_sets` row of this set not yet quarantined gets `quarantined_at` (8.4,
-        SD-82). Returns the quarantine directory; quarantining a quarantined set moves whatever is left.
+        SD-82). Returns the quarantine directory; quarantining a quarantined set moves whatever is left. Raises
+        ArtifactError, moving nothing, when `quarantine_root` lies inside this set's root (8.4: a sibling of the sets).
         """
+        if Path(quarantine_root).resolve().is_relative_to(self.root.resolve()):
+            raise ArtifactError(f"quarantine root {quarantine_root} lies inside set {self.set_path}'s directory "
+                                f"{self.root}; quarantine/ is outside every set (8.4)")
         ts = datetime.fromisoformat(at or now())
         stamp = (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).isoformat(
             timespec="seconds")

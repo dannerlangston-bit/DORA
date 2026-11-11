@@ -8,8 +8,9 @@
   host or Slack (6.10: only text and links go there) is refused before connecting: a `refused` row with its
   reason is written to `egress_log`, a `harness_error` finding (S3) is raised on the run, and `EgressRefused` is
   raised. Otherwise the request is sent and one `sent` row (with the HTTP status and request id) or `failed` row
-  (no response) is written. `context(...)` sets row fields (checkpoint, artifact hash, redaction version, model
-  id, purpose) for the requests made inside it, so a transport that cannot see them still logs them.
+  (no response) is written. `context(...)` (or `row_context(...)`, without a gate at hand) sets row fields
+  (checkpoint, artifact hash, redaction version, model id, purpose, image) for the requests made inside it, so a
+  transport that cannot see them still logs them and the gate applies its image checks.
 - `reconcile(rows, allowlist, firewall_log)` is the pure Nightly comparison: a `sent` row to a host outside the
   allowlist, or a firewall-permitted connection from a harness process with no matching row, is S1 and re-marks
   the runs concerned `aborted_harness (reason: egress_unlogged)`; a firewall block of a harness process is a
@@ -27,6 +28,12 @@ Choices where the spec is ambiguous (reported):
 4. Reconciliation matches a firewall-permitted harness connection to a `sent` or `failed` row of the same host
    (and run, when both name one) within `window_s` seconds (default 60; the rig clocks are within 2 s, R7). A
    firewall entry without a run id raises the S1 finding but re-marks no run.
+5. A config without `policy/egress_allowlist.yaml` (which L-XREF-19 accepts) has the empty allowlist
+   (`EgressAllowlist.empty`): the harness HTTP client refuses every host, as the lint's choice 1 assumes, and the
+   Nightly reconciliation compares the day's rows with it, so any `sent` row is to a host outside the allowlist.
+6. A live client built without a run's gate (`reviewer.AnthropicTransport.from_env` with no `gate`) is not left
+   ungated: it gets `refuse_all()`, a gate over the empty allowlist whose rows and findings go to the log
+   (`LogSink`), since there is no run or store to write them to. Every request is refused before connecting.
 """
 from __future__ import annotations
 
@@ -34,6 +41,7 @@ import contextlib
 import contextvars
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -52,6 +60,21 @@ MODEL_PURPOSES = frozenset({"review", "batch_review", "agent_step", "explorer_st
 TEXT_ONLY_PURPOSES = frozenset({"pr_comment", "slack"})          # 6.10, 8.7: images never go to the PR host or Slack
 ROW_FIELDS = ("purpose", "checkpoint_id", "artifact_sha256", "redaction_version", "model_id", "image")
 _CONTEXT: contextvars.ContextVar[Mapping[str, Any]] = contextvars.ContextVar("sentinel_egress_context", default={})
+log = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def row_context(**fields: Any) -> Iterator[None]:
+    """Row fields for the requests made inside the block, in this thread or task (a context variable), whatever gate
+    sends them; an inner value wins over an outer one, and None leaves the outer value."""
+    bad = set(fields) - set(ROW_FIELDS)
+    if bad:
+        raise ValueError(f"unknown egress row fields {sorted(bad)}")
+    token = _CONTEXT.set({**_CONTEXT.get(), **{k: v for k, v in fields.items() if v is not None}})
+    try:
+        yield
+    finally:
+        _CONTEXT.reset(token)
 
 
 class AllowlistError(ValueError):
@@ -141,6 +164,11 @@ class EgressAllowlist:
     def load(path: str | Path) -> "EgressAllowlist":
         return EgressAllowlist.from_dict(yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {})
 
+    @staticmethod
+    def empty() -> "EgressAllowlist":
+        """No host at all: the allowlist of a config without `policy/egress_allowlist.yaml` (choice 5)."""
+        return EgressAllowlist((), "", "", "")
+
     def entry(self, host: str, port: int = 443) -> AllowedHost | None:
         h = normalize_host(host)
         return next((e for e in self.hosts if e.host == h and e.port == port), None)
@@ -152,6 +180,8 @@ class EgressAllowlist:
 
     def refusal(self, host: str, purpose: str, port: int = 443) -> str | None:
         """Why a request would be refused, or None when the allowlist permits it (6.10)."""
+        if not self.hosts:
+            return f"destination not allowlisted: {normalize_host(host)} (no signed allowlist: every host is refused)"
         if not self.allows_host(host):
             return f"destination not allowlisted: {normalize_host(host)}"
         e = self.entry(host, port)
@@ -170,6 +200,23 @@ class EgressSink(Protocol):
     def write_finding(self, finding: Finding, *, synthetic: bool = False) -> None: ...
 
 
+class LogSink:
+    """An `EgressSink` with no store, for a gate that belongs to no run (choice 6): each row and finding is logged
+    (ERROR for a refusal, INFO otherwise) and nothing is written."""
+
+    def __init__(self) -> None:
+        self.rows: list[EgressRow] = []
+
+    def log_egress(self, row: EgressRow) -> int:
+        self.rows.append(row)
+        log.log(logging.ERROR if row.status == "refused" else logging.INFO, "egress %s to %s for %s%s", row.status,
+                row.destination, row.purpose, f": {row.refusal_reason}" if row.refusal_reason else "")
+        return len(self.rows)
+
+    def write_finding(self, finding: Finding, *, synthetic: bool = False) -> None:
+        log.error("egress finding %s: %s", finding.kind, finding.description)
+
+
 class EgressGate:
     """The harness HTTP client's policy point (module docstring). `run_id` and `shard_id` go on every row; a
     refusal's `harness_error` finding is written to the store when the gate has a run, and kept in `findings`."""
@@ -183,16 +230,9 @@ class EgressGate:
 
     @contextlib.contextmanager
     def context(self, **fields: Any) -> Iterator[None]:
-        """Row fields for the requests made inside the block, in this thread or task (a context variable); an inner
-        value wins over an outer one."""
-        bad = set(fields) - set(ROW_FIELDS)
-        if bad:
-            raise ValueError(f"unknown egress row fields {sorted(bad)}")
-        token = _CONTEXT.set({**_CONTEXT.get(), **{k: v for k, v in fields.items() if v is not None}})
-        try:
+        """Row fields for the requests made inside the block (`row_context`)."""
+        with row_context(**fields):
             yield
-        finally:
-            _CONTEXT.reset(token)
 
     @contextlib.contextmanager
     def default_context(self, **fields: Any) -> Iterator[None]:
@@ -251,6 +291,11 @@ class EgressGate:
         self._row(host, p, "sent", nbytes, ctx, response_status=status_of(response),
                   request_id=request_id_of(response))
         return response
+
+
+def refuse_all() -> EgressGate:
+    """A gate over the empty allowlist with a `LogSink`: every request is refused before connecting (choice 6)."""
+    return EgressGate(EgressAllowlist.empty(), LogSink())
 
 
 # -- Nightly reconciliation (6.10) --------------------------------------------------------------------------------
@@ -336,4 +381,5 @@ def reconcile(rows: Sequence[EgressRow], allowlist: EgressAllowlist, firewall_lo
 
 
 __all__ = ["AllowedHost", "AllowlistError", "EgressAllowlist", "EgressGate", "EgressRefused", "EgressSink",
-           "FirewallEntry", "MODEL_PURPOSES", "Reconciliation", "allowlist_problems", "normalize_host", "reconcile"]
+           "FirewallEntry", "LogSink", "MODEL_PURPOSES", "Reconciliation", "allowlist_problems", "normalize_host",
+           "reconcile", "refuse_all", "row_context"]

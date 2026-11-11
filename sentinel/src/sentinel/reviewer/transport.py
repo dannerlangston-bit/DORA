@@ -13,11 +13,13 @@ the process environment into every request, so `from_env` refuses to build a cli
 (`UnsafeEnvironment`, logged by name, never by value), passes an explicit empty `default_headers`, and checks the
 built client carries no custom header. Tests use a fake transport.
 
-Egress (6.10): given an `egress.EgressGate`, the client sends through an HTTP client whose every request, retries
-included, is checked against the signed allowlist before connecting and logged to `egress_log` (`sent` with the
-HTTP status and request id, `failed` without a response, `refused` with the reason and a `harness_error`
-finding). Redirects are not followed, so no request reaches a host the gate did not see. A refusal is neither
-wrapped nor retried by the SDK and becomes `TransportError("client", "egress refused: ...")`. The purpose of each
+Egress (6.10): the client always sends through an HTTP client whose every request, retries included, goes through
+an `egress.EgressGate`: the run's gate checks it against the signed allowlist before connecting and logs it to
+`egress_log` (`sent` with the HTTP status and request id, `failed` without a response, `refused` with the reason
+and a `harness_error` finding). Without a gate the client gets `egress.refuse_all()`, which refuses every request
+(egress choice 6), so no request ever leaves unchecked and unlogged. Redirects are not followed, so no request
+reaches a host the gate did not see. A refusal is neither wrapped nor retried by the SDK and becomes
+`TransportError("client", "egress refused: ...")`. The purpose of each
 call is `review` (messages), `batch_review` (batches) or `model_check` (models), unless the caller's
 `gate.context(purpose=...)` says otherwise (preflight N2, for example); the model id goes on the row too.
 
@@ -202,9 +204,10 @@ class AnthropicTransport:
         """A live transport, only with `allow_network=True` and `ANTHROPIC_API_KEY` set. `base_url` is the
         reviewer config's `endpoint_base_url`; without one the client is pinned to `DEFAULT_BASE_URL`, never
         to an endpoint named by the process environment. Refuses (`UnsafeEnvironment`) while a variable of
-        `HEADER_ENV` is set in `env` or in the process environment, which the SDK reads directly. With `gate`,
-        every request goes through it (6.10); `http_transport` is the `httpx2` transport under the gated client
-        (default: the SDK's network transport with its proxy settings)."""
+        `HEADER_ENV` is set in `env` or in the process environment, which the SDK reads directly. Every request
+        goes through `gate` (the run's `egress.EgressGate`, 6.10), or through `egress.refuse_all()` without one, so
+        nothing is sent ungated; `http_transport` is the `httpx2` transport under the gated client (default: the
+        SDK's network transport with its proxy settings)."""
         env = os.environ if env is None else env
         if not allow_network:
             raise NetworkNotAllowed("live Reviewer calls need allow_network=True")
@@ -222,9 +225,11 @@ class AnthropicTransport:
         kwargs: dict[str, Any] = {"api_key": key, "base_url": base_url or DEFAULT_BASE_URL, "default_headers": {}}
         if "open_telemetry" in inspect.signature(anthropic.Anthropic.__init__).parameters:
             kwargs["open_telemetry"] = False             # no span, so no env switch can export request content
-        if gate is not None:
-            gated, _ = _gated_types(anthropic)
-            kwargs["http_client"] = gated(gate, **({"transport": http_transport} if http_transport else {}))
+        if gate is None:
+            from ..egress import refuse_all
+            gate = refuse_all()
+        gated, _ = _gated_types(anthropic)
+        kwargs["http_client"] = gated(gate, **({"transport": http_transport} if http_transport else {}))
         client = anthropic.Anthropic(**kwargs)
         if getattr(client, "_custom_headers", None):
             raise UnsafeEnvironment(f"the client carries headers it was not given: {sorted(client._custom_headers)}")

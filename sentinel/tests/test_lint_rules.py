@@ -331,6 +331,22 @@ def tree(tmp_path) -> Path:
     return root
 
 
+
+def test_xref_02_money_cell_only_where_an_order_panel_shows(tree):
+    """SD-28: a tier-1 surface needs a money cell only when its regions show an order panel."""
+    import yaml
+    path = tree / "regions/flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/cp2.yaml"
+    if not path.exists():
+        path = next((tree / "regions/flow/dialog.order-confirmation").rglob("*.yaml"))
+    doc = yaml.safe_load(path.read_text())
+    for r in doc["regions"]:
+        r.pop("money_cell", None)
+        r.pop("money_role", None)
+    path.write_text(yaml.safe_dump(doc, sort_keys=False))
+    hits = [v for v in lint(tree, today=TODAY).violations if v.rule == "L-XREF-02"]
+    assert any("dialog.order-confirmation" in v.message and "order panel" in v.message for v in hits)
+    assert not any("position-statement" in v.message and "money_cell" in v.message for v in hits)
+
 def test_template_size_and_format(tree):
     from PIL import Image
     Image.new("RGB", (10, 10)).save(tree / "registry/templates/trade/qty-field.png", format="PNG")

@@ -323,7 +323,7 @@ RULES: dict[str, Rule] = {r.id: r for r in (
     Rule("L-DEC-07", "error", "a waiver of invariant_violation or assertion_failed expires within 30 days", _ON_WRITE),
     Rule("L-DEC-08", "error", "fixed_in_build names a newer build; the finding closes or reopens on later runs", _ON_WRITE),
     Rule("L-XREF-01", "warn", "every surface is reached by a census workspace or a flow checkpoint"),
-    Rule("L-XREF-02", "error", "every tier-1 surface has a flow with assertions and a regions file with a money cell"),
+    Rule("L-XREF-02", "error", "every tier-1 surface has a flow with assertions; one showing an order panel has a money cell"),
     Rule("L-XREF-03", "error", "masked_live checkpoints have a rule or mask region; frozen ones no must_change_within_s"),
     Rule("L-XREF-04", "error", "checkpoint ids referenced by regions files, mutants and calibration files are defined or "
          "retired"),
@@ -2436,6 +2436,8 @@ class _Linter:
         census = {c.surface for c in self.defined.values() if c.kind == "census"}
         money = {c.surface for cid, c in self.defined.items()
                  if any(x.get("money_cell") is True and x.get("type") in ("diff", "freeze") for x in self.region_map(cid).values())}
+        order_panel = {c.surface for cid, c in self.defined.items()     # SD-28: money cells exist only on order panels
+                       if any(x.get("panel") in MONEY_PANELS for x in self.region_map(cid).values())}
         asserting: set[str] = set()
         for doc in self.flows.values():
             fl = _d(doc.data)
@@ -2449,8 +2451,9 @@ class _Linter:
             if s.get("tier") == 1 and s.get("kind") != "probe":
                 if sid not in asserting:
                     self.add("L-XREF-02", f, f"tier-1 surface {sid} has no flow with an assert step or expect entries")
-                if sid not in money:
-                    self.add("L-XREF-02", f, f"tier-1 surface {sid} has no regions file with a diff or freeze money_cell region")
+                if sid in order_panel and sid not in money:
+                    self.add("L-XREF-02", f, f"tier-1 surface {sid} shows an order panel but has no regions file with a "
+                                             "diff or freeze money_cell region")
         for cid, c in self.defined.items():
             rmap = self.region_map(cid)
             where = self.regions[cid].rel if cid in self.regions else c.file

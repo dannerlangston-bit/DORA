@@ -3267,7 +3267,7 @@ The per-file rules above catch local errors. The cross-file rules below run afte
 | Rule | Check | Severity |
 |---|---|---|
 | L-XREF-01 | every surface in the registry is reached by at least one census workspace or one flow checkpoint; otherwise the coverage matrix will show it as `not_run` forever | warn |
-| L-XREF-02 | every tier-1 surface has at least one flow with an `assert` step or `expect` entries and a regions file with at least one `money_cell` region, of type `diff` or `freeze` (L-RGN-04) | error |
+| L-XREF-02 | every tier-1 surface has at least one flow with an `assert` step or `expect` entries; a tier-1 surface whose regions show an order panel (`order_confirmation` or `order_ticket`, SD-28) also has a regions file with at least one `money_cell` region of type `diff` or `freeze` (L-RGN-04) | error |
 | L-XREF-03 | every `masked_live` checkpoint has a `rule` or `mask` region; every `frozen` checkpoint has no `must_change_within_s` rule | error |
 | L-XREF-04 | every `checkpoint_id` referenced by a regions file, the mutant catalog or a calibration file exists in a flow or census definition, or in `flows/RENAMES.yaml` as retired; `"*"` on an `aa_control` mutant entry stands for every bound checkpoint and is accepted (L-MUT-01) | error |
 | L-XREF-05 | every critical checkpoint has its behavioral mutants in `canaries/mutants.yaml` (L-MUT-03), and every tier-1 checkpoint a calibration entry for the canonical calibration key (4.12); missing calibration is `warn` until the first Calibration run, then `error` | warn, then error |
@@ -5508,8 +5508,8 @@ CREATE TABLE decisions (
   revoked_at TEXT, revoked_by TEXT, revoke_reason TEXT,
   source_finding_id INTEGER REFERENCES findings(finding_id),
   bbox_q4           TEXT,                   -- x,y,w,h of the largest component quantized to 4 px: the fallback key at or below noise spread (4.14)
-  role              TEXT CHECK (role IS NULL OR role IN ('system_owner','triage_rotation','flow_owner','pr_author',
-                                                         'jira_resolver')),   -- 9.12, L-DEC-01
+  role              TEXT CHECK (role IS NULL OR role IN ('triage_rotation','flow_owner','system_owner',
+                                                         'release_manager','pr_author','ticket_resolver')),   -- 4.14, 9.12, L-DEC-01
   reopen_count      INTEGER NOT NULL DEFAULT 0 CHECK (reopen_count >= 0),   -- fixed_in_build signatures that returned (4.14)
   CHECK ((action IN ('confirm_bug','fixed_in_build') AND verdict = 'confirmed_bug')
       OR (action IN ('mark_intended','approve_baseline') AND verdict = 'intended')

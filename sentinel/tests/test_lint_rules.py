@@ -344,10 +344,11 @@ def test_workspace_hash_mismatch(tree):
 
 def test_secret_in_any_file(tree):
     p = tree / "policy/release_gate.yaml"
+    line = len(p.read_text().splitlines()) + 1
     p.write_text(p.read_text() + "api_token: AbC9dEf1GhI2jKl3MnO4pQr5\n")
     (tree / "notes.md").write_text("password: hunter2\n")
     found = {(v.file, v.path) for v in lint(tree, today=TODAY).violations if v.rule == "L-XREF-07"}
-    assert ("policy/release_gate.yaml", "line 5") in found and ("notes.md", "line 1") in found
+    assert ("policy/release_gate.yaml", f"line {line}") in found and ("notes.md", "line 1") in found
 
 
 def test_credential_pattern_spares_ids_and_vault_refs():

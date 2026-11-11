@@ -28,11 +28,19 @@ def test_example_lints_clean(phase):
 def test_every_example_file_is_read():
     """No YAML file of the example is silently outside the 4.1 layout the lint reads."""
     repo = Repo.load(EXAMPLE)
-    ignored = {"policy/release_gate.yaml"}            # read by the Reporter and the release gate, not linted
     for p in EXAMPLE.rglob("*.yaml"):
         rel = p.relative_to(EXAMPLE).as_posix()
-        assert rel in repo.docs or rel in ignored, rel
-    assert {kind for kind, _ in LAYOUT} - {d.kind for d in repo.docs.values()} == {"taxonomy"}
+        assert rel in repo.docs, rel
+    missing = {kind for kind, _ in LAYOUT} - {d.kind for d in repo.docs.values()} - {"taxonomy"}
+    assert missing <= EXAMPLE_PENDING, sorted(missing - EXAMPLE_PENDING)
+
+
+# 4.16 kinds the example does not hold yet; the build packages that own each file add it (shrink this set as they land)
+EXAMPLE_PENDING = frozenset({
+    "default_order_hotkeys", "dismiss_allowlist", "explorer_deny_list", "egress_allowlist", "computer_use_ruling",
+    "budgets", "reporting", "authorization", "windows", "oncall", "credential_rotation", "process_allowlist",
+    "measured_sizes", "palette", "soak", "calibration", "eval_report",
+})
 
 
 def test_skipped_rules_carry_reasons():

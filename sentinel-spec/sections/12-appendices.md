@@ -381,7 +381,7 @@ One catalog file, `sentinel-config/canaries/mutants.yaml`, with the entry schema
 | M03 | `swapped_digit` | `flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07` | Quantity 100 -> 108 by glyph transplant | `assertion_failed (assertion: qty)` | yes |
 | M04 | `swapped_digit` | `flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07` | One digit of Buying Power Effect | `assertion_failed (assertion: R02)` | yes |
 | M05 | `swapped_digit` | `flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07` | Price 150.25 -> 150.52 | `assertion_failed (assertion: price)`; R01 fires on the cost as well | yes |
-| M06 | `swapped_label` | `flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07` | SELL transplanted over BUY | `assertion_failed (assertion: side)` || no |
+| M06 | `swapped_label` | `flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07` | SELL transplanted over BUY | `assertion_failed (assertion: side)` | no |
 | M07 | `color_swap` | `census/monitor.activity.position-statement/ws.tier-a.active-trader` | Swap red and green channels in the P/L Open column | `invariant_violation (reason: INV-15)` || no |
 | M08 | `shifted_panel` | `sweep/trade.active-trader.ladder/flexgrid/480x360` | Translate the ladder 12 px right into its neighbor | `invariant_violation (reason: INV-01)` || no |
 | M09 | `shifted_panel` | `census/monitor.activity.position-statement/ws.tier-a.active-trader` | Translate the grid 8 px down | `collateral` on the grid region with a `layout_shift` finding | no |

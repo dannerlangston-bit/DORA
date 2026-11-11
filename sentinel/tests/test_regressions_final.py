@@ -18,7 +18,7 @@ from sentinel.orchestrator.simrig import MemorySink, SimScenario, SimulatedRig, 
 from sentinel.pipeline.orchestration import login_alias, login_label
 from sentinel.pipeline.run import NightlyScenario, run_nightly, run_pipeline
 from sentinel.pipeline.sim import SimBuild
-from sentinel.records import CheckpointOutcome, RunOutcome
+from sentinel.records import CheckpointOutcome, DeclaredSend, RunOutcome
 from sentinel.report import render_pr_comment
 from sentinel.report.model import login_phrase, not_run_line, orders_sent_note
 from sentinel.store import ImportConflict, PostRunProof, RunPlan, ShardPlan, Store, StoreRefused
@@ -204,7 +204,9 @@ def test_every_proof_verdict_round_trips_through_its_8_3_row():
     book = OrderBook(position_rows=0, net_liq=2500.0)
     sent = OrderBook(working=(OrderRow("o-1", "working"),), position_rows=0, net_liq=2500.0)
     proofs = [post_run_proof(ProofInputs(book, book)),
-              post_run_proof(ProofInputs(book, sent, declared_sends=frozenset({"o-1"}))),
+              post_run_proof(ProofInputs(book, OrderBook(canceled=(OrderRow("o-1", "canceled", "CANCELED"),), position_rows=0, net_liq=2500.0),
+                                         declared_sends=(DeclaredSend("run", "run/1", "flow.paper.send", "s03", "o-1",
+                                                                      "2026-11-10T14:00:00+00:00"),))),
               post_run_proof(ProofInputs(None, None, session="never", tokens_issued=0)),
               post_run_proof(ProofInputs(book, None)),
               post_run_proof(ProofInputs(book, sent, cancel_all="failed"))]

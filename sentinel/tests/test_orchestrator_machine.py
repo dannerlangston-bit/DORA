@@ -99,7 +99,8 @@ def test_live_identity_runs_the_kill_switch_and_stays_aborted_safety():
     assert (report.verdict.status, report.verdict.reason) == ("aborted_safety", "live_identity")
     assert filled(sink) == {("env_error", "live_identity", "paper_mode_asserted")}
     assert report.kill_switch is not None and rig.gw.deny_all and "kill_process_tree" in rig.calls
-    assert report.proof.verdict == UNPROVEN and report.proof.reason == "snapshot_missing"
+    assert report.proof.verdict == UNPROVEN and report.proof.reason == "session_unavailable"   # SD-64: no recovery login
+    assert rig.calls.count("login") == 1
 
 
 def test_paper_mode_mismatch_and_unreadable_identity():

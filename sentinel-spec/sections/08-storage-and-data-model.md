@@ -84,7 +84,7 @@ INSERT INTO outcome_reasons (outcome, reason, parametric, detail_means, owner_se
  ('not_settled','anti_anchor_present',0,NULL,'3.5'), ('not_settled','timeout',0,NULL,'3.5'),
  ('not_settled','unexpected_window',1,'title of the thinkorswim window still present at max wait','3.4'),
  ('not_settled','unstable',0,NULL,'10.5'), ('not_settled','aa_drift',0,NULL,'10.6'),
- ('not_comparable','fingerprint_mismatch',1,'the differing match-class field names; data_epoch, bounds source and render_probe_hash are fields (7.4)','3.3'),
+ ('not_comparable','fingerprint_mismatch',0,'the differing match-class field names, never empty; data_epoch, bounds source and render_probe_hash are fields (7.4)','3.3'),
  ('not_comparable','window_mismatch',0,NULL,'3.4'), ('not_comparable','surface_mismatch',0,NULL,'3.4'),
  ('landmark_missing','landmark',1,'landmark id and the side it was missing on','3.8'),
  ('landmark_missing','locator',1,'step id whose locator failed on every rung','5.5'),
@@ -140,7 +140,7 @@ INSERT INTO outcome_reasons (outcome, reason, parametric, detail_means, owner_se
  ('aborted_budget','wall_clock',0,NULL,'11.2'), ('aborted_budget','app_restart_budget',0,NULL,'10.2'),
  ('aborted_budget','pool_saturated',0,NULL,'11.2'), ('aborted_budget','rate_cap',0,NULL,'6.4'),
  ('aborted_budget','dollar_cap',0,NULL,'11.4'), ('aborted_budget','superseded',0,NULL,'11.2'),
- ('aborted_harness','config_invalid',0,NULL,'4.15'),
+ ('aborted_harness','config_invalid',0,NULL,'4.15'), ('aborted_harness','bounds_source_unavailable',0,NULL,'5.9'),
  ('aborted_harness','preflight',1,'H item of 12.7; rendered preflight.<item> as 12.7 writes it','12.7'),
  ('aborted_harness','dead_man',0,NULL,'10.2'), ('aborted_harness','orchestrator_restart_budget',0,NULL,'10.2'),
  ('aborted_harness','start_failed',0,NULL,'11.2'),
@@ -188,8 +188,30 @@ CREATE TABLE rigs (
   role         TEXT NOT NULL CHECK (role IN ('pool','nightly','explorer')),   -- fleet of 11.2
   login_alias  TEXT NOT NULL REFERENCES logins(login_alias),
   snapshot_id  TEXT NOT NULL,
-  active       INTEGER NOT NULL DEFAULT 1
+  active       INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
+  disabled_reason TEXT, disabled_at TEXT,   -- a safety action took the rig out of service (6.12)
+  enabled_by TEXT, enabled_at TEXT,         -- re-enabled by a human (6.12)
+  reassigned_by TEXT, reassigned_at TEXT,   -- the operator who moved this rig's login to a spare after a re-snapshot (11.2)
+  CHECK ((disabled_at IS NULL) = (disabled_reason IS NULL)),
+  CHECK ((enabled_by IS NULL) = (enabled_at IS NULL)),
+  CHECK ((reassigned_by IS NULL) = (reassigned_at IS NULL)),
+  CHECK (enabled_by IS NULL OR enabled_by NOT IN ('reviewer','system','orchestrator','reporter'))
 );
+
+CREATE UNIQUE INDEX ux_rig_login_active ON rigs(login_alias) WHERE active = 1;   -- a login is never on two rigs at once (11.2, 11.3)
+
+-- 11.3: the Explorer login never does scripted work; pool and nightly rigs run scripted logins only
+CREATE TRIGGER trg_rig_login_kind_ins BEFORE INSERT ON rigs
+WHEN (NEW.role = 'explorer') <> ((SELECT kind FROM logins l WHERE l.login_alias = NEW.login_alias) = 'explorer')
+BEGIN SELECT RAISE(ABORT, 'rig role and login kind disagree: explorer rigs run the explorer login, pool and nightly rigs scripted ones'); END;
+
+CREATE TRIGGER trg_rig_login_kind_upd BEFORE UPDATE OF role, login_alias ON rigs
+WHEN (NEW.role = 'explorer') <> ((SELECT kind FROM logins l WHERE l.login_alias = NEW.login_alias) = 'explorer')
+BEGIN SELECT RAISE(ABORT, 'rig role and login kind disagree: explorer rigs run the explorer login, pool and nightly rigs scripted ones'); END;
+
+CREATE TRIGGER trg_login_kind_rigs BEFORE UPDATE OF kind ON logins
+WHEN EXISTS (SELECT 1 FROM rigs r WHERE r.login_alias = NEW.login_alias AND (r.role = 'explorer') <> (NEW.kind = 'explorer'))
+BEGIN SELECT RAISE(ABORT, 'rig role and login kind disagree: explorer rigs run the explorer login, pool and nightly rigs scripted ones'); END;
 
 CREATE TABLE builds (
   build_id              TEXT PRIMARY KEY,   -- as read from the main window title
@@ -217,8 +239,8 @@ CREATE TABLE runs (
   run_type          TEXT NOT NULL CHECK (run_type IN ('pr','merge','rc','nightly','calibration')),
   pair_id           INTEGER REFERENCES build_pairs(pair_id),   -- NULL for nightly
   lifecycle         TEXT NOT NULL CHECK (lifecycle IN ('queued','running','finished')),
-  outcome           TEXT CHECK (outcome IN ('complete','complete_with_env_errors',
-                      'aborted_safety','aborted_budget','aborted_harness')),
+  outcome           TEXT CHECK (outcome IN ('complete','complete_with_env_errors','aborted_safety','aborted_budget',
+                                            'aborted_harness')),
   abort_reason      TEXT,
   abort_detail      TEXT,
   config_commit     TEXT NOT NULL,          -- sentinel-config commit, both sides
@@ -237,6 +259,12 @@ CREATE TABLE runs (
                       CHECK (review_state IN ('unreviewed','partial','reviewed')),
   check_override_by TEXT, check_override_reason TEXT,   -- 9.6 Override check, system owner only
   summary_json      TEXT,                   -- counts, coverage matrix, run health, detector state; written at teardown
+  base_commit_distance INTEGER CHECK (base_commit_distance BETWEEN 0 AND 20),   -- PR runs: merge base to the base build's commit (L-BLD-04)
+  authorization_sha256 TEXT,                -- hash of the signed authorization document of authorization_ref (6.12)
+  diff_params_sha256 TEXT,                  -- diff engine parameters the run used (3.7)
+  reviewer_version_sha256 TEXT,             -- model id, prompt hash and few-shot version tuple (3.13, 10.4)
+  requeue_of        TEXT REFERENCES runs(run_id),   -- the run this one re-queues (10.7, 11.2)
+  pr_committers_json TEXT,                  -- the PR host's committer list for the two-person rule (9.6)
   FOREIGN KEY (outcome, abort_reason) REFERENCES outcome_reasons(outcome, reason),
   CHECK ((lifecycle = 'finished') = (outcome IS NOT NULL)),
   CHECK (outcome IS NULL OR outcome NOT LIKE 'aborted_%' OR abort_reason IS NOT NULL),
@@ -318,11 +346,11 @@ CREATE TABLE outcomes (
   shard_id            TEXT REFERENCES shards(shard_id),
   side                TEXT CHECK (side IN ('candidate','base','both')),   -- the side a landmark_missing, not_settled or base-step failure was observed on
   gate                TEXT,                 -- env_error only: an Orchestrator gate of 5.2, preflight.<item> of 12.7, connectivity, rig_lost; on an unreached checkpoint of an aborted_safety run, the aborting gate
-  outcome             TEXT NOT NULL CHECK (outcome IN (
-                        'identical','noise','intended','collateral','needs_human',
-                        'invariant_violation','assertion_failed','not_settled','not_comparable',
-                        'landmark_missing','env_error','harness_error','not_run',
-                        'unregistered_surface','needs_baseline')),
+  outcome             TEXT NOT NULL CHECK (outcome IN ('identical','noise','intended','collateral','needs_human',
+                                                       'invariant_violation','assertion_failed','not_settled',
+                                                       'not_comparable','landmark_missing','env_error',
+                                                       'harness_error','not_run','unregistered_surface',
+                                                       'needs_baseline')),
   reason              TEXT,                 -- from outcome_reasons
   reason_detail       TEXT,                 -- step id, landmark id, decision id, probe id, all fired invariant ids, assertion id and values, differing fingerprint fields
   rescued             INTEGER NOT NULL DEFAULT 0 CHECK (rescued IN (0,1)),   -- reached through passed_via_agent_fallback (5.5)
@@ -347,6 +375,8 @@ CREATE TABLE outcomes (
   synthetic           INTEGER NOT NULL DEFAULT 0 CHECK (synthetic IN (0,1)),   -- 1 for canary mutants
   captured_at         TEXT,
   recorded_at         TEXT NOT NULL,
+  outcome_id          TEXT UNIQUE,          -- oc-<run_id>-<seq> (4.13)
+  profile_id          TEXT,                 -- the login's entitlement profile (2.12 coverage column)
   PRIMARY KEY (run_id, checkpoint_id),
   FOREIGN KEY (outcome, reason) REFERENCES outcome_reasons(outcome, reason),
   CHECK (outcome <> 'identical' OR reason IS NULL),
@@ -396,13 +426,106 @@ WHEN NEW.outcome = 'complete' AND (
      EXISTS (SELECT 1 FROM outcomes o WHERE o.run_id = NEW.run_id AND o.synthetic = 0 AND o.outcome = 'env_error')
   OR EXISTS (SELECT 1 FROM outcomes o WHERE o.run_id = NEW.run_id AND o.outcome = 'harness_error'
              AND o.reason IN ('store_write_failed','artifact_persist_failed','redaction_version_missing'))
+  OR EXISTS (SELECT 1 FROM outcomes o WHERE o.run_id = NEW.run_id AND o.synthetic = 0
+             AND o.outcome = 'not_comparable' AND o.reason = 'fingerprint_mismatch')   -- 1.10 per run
+  OR EXISTS (SELECT 1 FROM post_run_proofs p WHERE p.run_id = NEW.run_id AND p.verdict = 'unproven' AND p.verified_by IS NULL)   -- 6.6
   OR (SELECT count(*) FROM outcomes o WHERE o.run_id = NEW.run_id AND o.synthetic = 0) < NEW.scope_count
   OR EXISTS (SELECT 1 FROM shards s WHERE s.run_id = NEW.run_id AND s.state <> 'imported')
   OR EXISTS (SELECT 1 FROM outcomes o WHERE o.run_id = NEW.run_id AND (
         (o.cand_capture_sha256 IS NOT NULL AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.sha256 = o.cand_capture_sha256))
      OR (o.base_capture_sha256 IS NOT NULL AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.sha256 = o.base_capture_sha256))
      OR (o.heatmap_sha256 IS NOT NULL AND NOT EXISTS (SELECT 1 FROM artifacts a WHERE a.sha256 = o.heatmap_sha256)))))
-BEGIN SELECT RAISE(ABORT, 'run cannot be complete: env_error, store failure, missing outcome, unimported shard or missing artifact'); END;
+BEGIN SELECT RAISE(ABORT, 'run cannot be complete: env_error, store failure, fingerprint mismatch, unproven proof, missing outcome, unimported shard or missing artifact'); END;
+
+-- The checkpoints a run is asked to visit, with the persona of the visit (4.13 checkpoint_outcome.persona).
+-- runs.scope_count is the count of these rows. With trg_run_complete_scope a run is complete only when every one
+-- of them, by id, has an outcome (8.1), and the import of 8.2 can fill the silent ones.
+CREATE TABLE run_scope (
+  run_id        TEXT NOT NULL REFERENCES runs(run_id),
+  checkpoint_id TEXT NOT NULL REFERENCES checkpoints(checkpoint_id),
+  persona       TEXT NOT NULL,
+  PRIMARY KEY (run_id, checkpoint_id)
+) WITHOUT ROWID;
+
+-- The 4.13 outcome record as written, so the store hands back the whole record (persona, classification,
+-- diff regions: fields no column above holds). The `outcomes` columns stay the truth for the later changes.
+CREATE TABLE outcome_records (
+  run_id        TEXT NOT NULL,
+  checkpoint_id TEXT NOT NULL,
+  record_json   TEXT NOT NULL,
+  PRIMARY KEY (run_id, checkpoint_id),
+  FOREIGN KEY (run_id, checkpoint_id) REFERENCES outcomes(run_id, checkpoint_id)
+) WITHOUT ROWID;
+
+CREATE TRIGGER trg_outcome_record_immutable BEFORE UPDATE ON outcome_records
+BEGIN SELECT RAISE(ABORT, 'outcome is immutable'); END;
+
+CREATE TRIGGER trg_outcome_record_keep BEFORE DELETE ON outcome_records
+BEGIN SELECT RAISE(ABORT, 'outcome is immutable'); END;
+
+-- 4.13: "Nothing else is ever rewritten." The triggers above guard outcome, reason, reason_detail, review_state
+-- and the evidence columns; these guard every other column, and deletion.
+CREATE TRIGGER trg_outcome_keep BEFORE DELETE ON outcomes
+BEGIN SELECT RAISE(ABORT, 'outcome is immutable'); END;
+
+CREATE TRIGGER trg_outcome_columns_immutable BEFORE UPDATE OF run_id, checkpoint_id, shard_id, side, gate, rescued,
+  base_source_run_id, data_epoch_id, paper_asserted_at, cand_rig_id, base_rig_id, settle_ms, shift_dx, shift_dy,
+  threshold_source, recaptures, stability, stability_cause, manifest_entry, primitive, recorded_at, outcome_id,
+  profile_id ON outcomes
+BEGIN SELECT RAISE(ABORT, 'outcome is immutable'); END;
+
+-- The first later change of 4.13: decision_ref is set when a decision suppresses the finding, once.
+CREATE TRIGGER trg_outcome_decision_ref BEFORE UPDATE OF decision_id ON outcomes
+WHEN OLD.decision_id IS NOT NULL AND NEW.decision_id IS NOT OLD.decision_id
+BEGIN SELECT RAISE(ABORT, 'decision_ref is set once (4.13)'); END;
+
+-- The review id moves only with the pending -> done transition (4.13 second and third later changes).
+CREATE TRIGGER trg_outcome_review_ref BEFORE UPDATE OF review_id ON outcomes
+WHEN NEW.review_id IS NOT OLD.review_id
+ AND NOT (OLD.review_state = 'pending' AND NEW.review_state = 'done')
+BEGIN SELECT RAISE(ABORT, 'review_id is set only when the review ends (4.13)'); END;
+
+-- F65: every env_error names its gate, from the gates list of taxonomy.yaml (4.13).
+CREATE TRIGGER trg_outcome_env_gate BEFORE INSERT ON outcomes
+WHEN NEW.outcome = 'env_error' AND (NEW.gate IS NULL OR NEW.gate NOT IN ('provisioned','launched','authenticated',
+                                                                         'paper_mode_asserted','settings_attested',
+                                                                         'workspace_loaded','fixture_verified',
+                                                                         'canary_flow_passed','running','teardown',
+                                                                         'reported','connectivity','rig_lost',
+                                                                         'preflight.R1','preflight.R2','preflight.R3',
+                                                                         'preflight.R4','preflight.R5','preflight.R6',
+                                                                         'preflight.R7','preflight.B1','preflight.B2',
+                                                                         'preflight.B3','preflight.H1','preflight.H2',
+                                                                         'preflight.H3','preflight.H4','preflight.H5',
+                                                                         'preflight.H6','preflight.H7','preflight.H8',
+                                                                         'preflight.H9','preflight.H10',
+                                                                         'preflight.N1','preflight.N2','preflight.N3',
+                                                                         'preflight.N4','preflight.N5','preflight.N6',
+                                                                         'preflight.N7','preflight.G1','preflight.G2',
+                                                                         'preflight.G3','preflight.G4',
+                                                                         'preflight.G5'))
+BEGIN SELECT RAISE(ABORT, 'env_error needs a gate from taxonomy.yaml (F65)'); END;
+
+-- SD-78: fingerprint_mismatch is a plain reason whose reason_detail, the differing field names, is never empty.
+CREATE TRIGGER trg_outcome_fingerprint_detail BEFORE INSERT ON outcomes
+WHEN NEW.outcome = 'not_comparable' AND NEW.reason = 'fingerprint_mismatch'
+ AND (NEW.reason_detail IS NULL OR trim(NEW.reason_detail) = '')
+BEGIN SELECT RAISE(ABORT, 'fingerprint_mismatch names the differing fields in reason_detail (SD-78)'); END;
+
+-- 8.1 and 8.3: a run is complete only when every scoped checkpoint, by id, has a non-synthetic outcome.
+CREATE TRIGGER trg_run_complete_scope BEFORE UPDATE OF outcome ON runs
+WHEN NEW.outcome = 'complete' AND EXISTS (
+  SELECT 1 FROM run_scope s WHERE s.run_id = NEW.run_id AND NOT EXISTS (
+    SELECT 1 FROM outcomes o WHERE o.run_id = s.run_id AND o.checkpoint_id = s.checkpoint_id AND o.synthetic = 0))
+BEGIN SELECT RAISE(ABORT, 'run cannot be complete: a scoped checkpoint has no outcome'); END;
+
+-- 6.6 and 8.2: `complete` also needs no ORDERS SENT post-run proof and no shard that ended worse than complete (the
+-- run outcome is the worst of the shards'); trg_run_complete holds the 1.10 conditions.
+CREATE TRIGGER trg_run_complete_env BEFORE UPDATE OF outcome ON runs
+WHEN NEW.outcome = 'complete' AND (
+     EXISTS (SELECT 1 FROM post_run_proofs p WHERE p.run_id = NEW.run_id AND p.verdict = 'orders_sent')
+  OR EXISTS (SELECT 1 FROM shards s WHERE s.run_id = NEW.run_id AND s.shard_outcome <> 'complete'))
+BEGIN SELECT RAISE(ABORT, 'run cannot be complete: an orders-sent post-run proof or a shard worse than complete'); END;
 ```
 
 The immutability triggers make every outcome other than a pending `needs_human` final at write time, and they are how the `unreviewed` report of 10.7 Degraded modes works: a diff above threshold that awaits the Reviewer is written as `needs_human` with `review_state: pending`; the asynchronous Reviewer job may later set `intended`, `collateral` or `noise` (`noise` only through A/A), or leave `needs_human` with reason `reviewer_no_match` (which is also the outcome of a declared removed surface the Reviewer does not confirm, 3.11 row 25a) or `reviewer_uncertain`, as 3.11's table gives, and in every case sets `review_state: done` with the review id (4.13, 3.11). A pending row that never gets a verdict also ends its review, the third later change 4.13 allows: when the per-run spend ceiling ends the run its reason becomes `reviewer_cap` with `cause: dollar_cap` in `reason_detail`, and when the Reviewer job gives up on it the reason stays `reviewer_unavailable`; both keep `needs_human`, set `review_state: done` with no review id, and are the second branch of `trg_outcome_immutable` (10.7, 11.4). If a human decision already exists on the item when the verdict lands (a `decisions` row whose finding is the item's), the Reporter stores the `reviews` row and sets `review_state: done` without touching `outcome` or `reason`: the verdict is an annotation only and never changes the outcome or the decision (10.7). Nothing else is ever rewritten. The run trigger is the rule that a run never reports `complete` while any shard is unimported, any scoped checkpoint has no outcome, any outcome names an artifact the central tree lacks, or any checkpoint is `env_error` or a store-failure `harness_error`. Rows of a shard attempt that was superseded (a lost rig that returned after its shard was re-queued, 10.7) are kept for diagnosis in a table of the same shape and never read by the Reporter's counts:
@@ -426,11 +549,13 @@ CREATE TABLE step_events (
   mode              TEXT NOT NULL CHECK (mode IN ('scripted','agent','explorer','system')),
   action            TEXT NOT NULL,          -- click, dblclick, rclick, drag, wheel, key_chord, type, secret, wait,
                                             -- capture, popup, relogin, reset_input_state, relaunch, resume,
-                                            -- watchdog_hang, watchdog_crash, kill_switch
+                                            -- watchdog_hang, watchdog_crash, kill_switch, gateway_decision, size_step,
+                                            -- probe, oracle_source_fallback, focus_correction, hook_reinstalled,
+                                            -- foreign_window, export, clipboard, recovery_login, explorer_action
   locator_level     TEXT CHECK (locator_level IN ('jab','image','ocr','agent')),
   attempt           INTEGER NOT NULL DEFAULT 1,   -- 2 = the single permitted retry
-  step_outcome      TEXT CHECK (step_outcome IN ('passed','passed_after_retry',
-                      'passed_via_agent_fallback','failed','blocked_by_gateway')),
+  step_outcome      TEXT CHECK (step_outcome IN ('passed','passed_after_retry','passed_via_agent_fallback','failed',
+                                                 'blocked_by_gateway')),
   target_text       TEXT,                   -- as script or model stated it; '<redacted:login.password>'
   screen_x INTEGER, screen_y INTEGER, win_x INTEGER, win_y INTEGER,
   keys              TEXT,
@@ -450,8 +575,32 @@ CREATE TABLE step_events (
   reason            TEXT,                   -- retry or fallback reason, Watchdog event id
   app_uptime_s INTEGER, app_restart_count INTEGER,
   duration_ms       INTEGER,
+  expected_outcome  TEXT,                   -- Explorer: the outcome the model stated before acting (2.9, 6.2)
+  rect_w INTEGER, rect_h INTEGER,           -- target rect size at the click point (6.2)
+  usage_json        TEXT,                   -- the model response's usage block, agent and explorer modes (11.4)
+  injected          INTEGER NOT NULL DEFAULT 0 CHECK (injected IN (0,1)),   -- the hook saw the injected flag (5.4.8)
+  token_id          INTEGER,                -- the gateway token the event consumed (5.4.3)
   UNIQUE (shard_id, seq),
-  CHECK (gate_decision NOT IN ('dropped','refused') OR gate_reason IS NOT NULL)
+  CHECK (gate_decision NOT IN ('dropped','refused') OR gate_reason IS NOT NULL),
+  CHECK (action <> 'secret' OR (target_text IS NOT NULL AND target_text LIKE '<redacted:%>'))   -- a secret is never stored (6.2, 6.9)
+);
+
+CREATE TABLE oracle_extractions (           -- 2.8.1: every Oracle extraction is stored; rules can re-run over these rows
+  extraction_id     INTEGER PRIMARY KEY,
+  run_id            TEXT NOT NULL REFERENCES runs(run_id),
+  checkpoint_id     TEXT NOT NULL REFERENCES checkpoints(checkpoint_id),
+  side              TEXT NOT NULL CHECK (side IN ('candidate','base')),
+  assertion_id      TEXT NOT NULL,          -- flow assertion id, or rule.<region_id>.<field> for a rule region
+  region_id         TEXT,
+  field             TEXT NOT NULL,
+  source            TEXT NOT NULL CHECK (source IN ('ocr','export','jab','api')),   -- the 4.7 assertion source enum
+  text              TEXT,                   -- raw text read; rows separated by newlines
+  value             TEXT,                   -- the parsed value
+  confidence        REAL CHECK (confidence IS NULL OR confidence BETWEEN 0 AND 100),
+  second_pass       INTEGER NOT NULL DEFAULT 0 CHECK (second_pass IN (0,1)),   -- the 2x OCR re-read (2.8.1)
+  crop_sha256       TEXT,
+  read_at           TEXT NOT NULL,
+  UNIQUE (run_id, checkpoint_id, side, assertion_id, field, source, second_pass)
 );
 ```
 
@@ -470,13 +619,22 @@ CREATE TABLE reviews (
   request_sha256   TEXT NOT NULL,           -- canonical JSON of all inputs, stored as an artifact
   response_json    TEXT NOT NULL,           -- structured output as returned (3.13)
   verdict          TEXT NOT NULL CHECK (verdict IN ('matches_manifest','partially_matches_manifest',
-                     'does_not_match_manifest','no_visible_difference','cannot_judge')),
+                                                    'does_not_match_manifest','no_visible_difference',
+                                                    'cannot_judge')),
   mapped_outcome   TEXT NOT NULL CHECK (mapped_outcome IN ('intended','collateral','noise','needs_human')),
   confidence       REAL NOT NULL,
   votes            INTEGER NOT NULL DEFAULT 1,     -- majority vote at borderline (3.12)
   latency_ms INTEGER, input_tokens INTEGER, output_tokens INTEGER, cost_usd REAL,
   batch_id         TEXT,
   created_at       TEXT NOT NULL,
+  response_model   TEXT,                    -- the model the response named, kept beside model_id when the endpoint aliases (3.13)
+  registry_version TEXT,                    -- Surface Registry version of the inputs (3.13)
+  request_ids_json TEXT,                    -- the vendor request id of every call, votes included (3.13)
+  cache_read_tokens INTEGER,
+  votes_json       TEXT,                    -- each vote's verdict and confidence at borderline (3.12)
+  task             TEXT CHECK (task IS NULL OR task IN ('manifest_match','describe_collateral',
+                                                        'manifest_visibility')),   -- 3.13 tasks A to C
+  intent           TEXT,                    -- the declared intent the item was judged against (3.13)
   UNIQUE (run_id, checkpoint_id, diff_hash, model_id, prompt_hash)
 );
 
@@ -485,16 +643,20 @@ CREATE TABLE findings (
   natural_key      TEXT NOT NULL UNIQUE,    -- run, checkpoint, kind, region or step, invariant or assertion id
   run_id           TEXT NOT NULL REFERENCES runs(run_id),
   checkpoint_id    TEXT REFERENCES checkpoints(checkpoint_id),
-  kind             TEXT NOT NULL CHECK (kind IN ('collateral','intended','needs_human',
-                     'invariant_violation','assertion_failed','landmark_missing','needs_baseline',
-                     'unregistered_surface','dependency_map_gap','manifest_missing','unknown_popup',
-                     'locator_failure','app_crash','gateway_integrity','layout_shift','landmark_moved','color_shift',
-                     'window_geometry_changed','settle_regression','global_rendering_shift',
-                     'intended_change_not_observed','missed_in_pr_run','popup_rate_increase',
-                     'memory_warning','new_log_signature','hardening','explorer_candidate','explorer_order_stage',
-                     'jab_tree_changed','mask_budget_exceeded','mask_expired','floor_exception_expired',
-                     'invariant_exception_expired','flow_maintenance_needed','redaction_miss','secret_leaked',
-                     'harness_error','orphaned_baseline','canary_miss','artifact_missing')),
+  kind             TEXT NOT NULL CHECK (kind IN ('collateral','intended','needs_human','invariant_violation',
+                                                 'assertion_failed','landmark_missing','needs_baseline',
+                                                 'unregistered_surface','dependency_map_gap','manifest_missing',
+                                                 'unknown_popup','popup_rate_increase','locator_failure','app_crash',
+                                                 'explorer_candidate','layout_shift','landmark_moved','color_shift',
+                                                 'window_geometry_changed','global_rendering_shift',
+                                                 'settle_regression','gateway_integrity','new_log_signature',
+                                                 'jab_tree_changed','mask_budget_exceeded','mask_expired',
+                                                 'floor_exception_expired','invariant_exception_expired',
+                                                 'redaction_miss','secret_leaked','explorer_order_stage',
+                                                 'missed_in_pr_run','artifact_missing','orphaned_baseline',
+                                                 'canary_miss','intended_change_not_observed',
+                                                 'flow_maintenance_needed','harness_error','memory_warning',
+                                                 'hardening')),
                      -- equals the finding vocabulary of 4.13; generated from taxonomy.yaml finding_kinds
   tier             INTEGER CHECK (tier IN (1,2,3)),
   severity         TEXT CHECK (severity IN ('S1','S2','S3')),   -- invariants, 2.7
@@ -505,18 +667,25 @@ CREATE TABLE findings (
   primitive        TEXT,                    -- hosting primitive consumed
   manifest_entry   TEXT,                    -- manifest entry that touched it
   phash            BLOB,                    -- 8 bytes, anchored crop
-  category         TEXT CHECK (category IN ('intended','collateral','noise','needs_human',
-                     'invariant_violation','assertion_failed')),
+  category         TEXT CHECK (category IN ('intended','collateral','noise','needs_human','invariant_violation',
+                                            'assertion_failed')),
   cluster_id       TEXT,
   description      TEXT NOT NULL,
   evidence_json    TEXT NOT NULL,           -- artifact hashes, step_events range, raw and expected values, candidate flow path
   decision_id      INTEGER,                 -- the decision this finding inherited or produced
   ticket_ref       TEXT,
-  triage_state     TEXT NOT NULL DEFAULT 'open' CHECK (triage_state IN ('open','confirmed_bug',
-                     'intended','noise','agent_mistake','expected_behavior','fixed_pending_verify','closed')),
+  triage_state     TEXT NOT NULL DEFAULT 'open' CHECK (triage_state IN ('open','confirmed_bug','intended','noise',
+                                                                        'agent_mistake','expected_behavior',
+                                                                        'fixed_pending_verify','closed')),
   synthetic        INTEGER NOT NULL DEFAULT 0 CHECK (synthetic IN (0,1)),
   first_seen_run_id TEXT,
-  created_at       TEXT NOT NULL
+  created_at       TEXT NOT NULL,
+  detail           TEXT,                    -- what the finding's reason points at, e.g. static_impact (1.8, 2.10)
+  closed_at        TEXT,                    -- starts the 180-day release of its evidence (8.6)
+  contested        INTEGER NOT NULL DEFAULT 0 CHECK (contested IN (0,1)),   -- conflicting decisions on the signature (9.7)
+  held             INTEGER NOT NULL DEFAULT 0 CHECK (held IN (0,1)),        -- held from the report: Explorer, not reproduced (2.9)
+  explorer_json    TEXT,                    -- the 4.13 explorer block of an explorer_candidate finding
+  CHECK (explorer_json IS NULL OR kind = 'explorer_candidate')
 );
 
 CREATE TABLE decisions (
@@ -526,10 +695,10 @@ CREATE TABLE decisions (
   phash             BLOB NOT NULL,          -- 64-bit perceptual hash of the anchored crop (3.7)
   hamming_tolerance INTEGER NOT NULL DEFAULT 8 CHECK (hamming_tolerance BETWEEN 0 AND 64),   -- 6 for tier 1; calibration may lower (9.7)
   category          TEXT NOT NULL CHECK (category IN ('intended','collateral','noise','needs_human',
-                      'invariant_violation','assertion_failed')),
-  action            TEXT NOT NULL CHECK (action IN ('confirm_bug','mark_intended','request_mask',
-                      'noise_signature','agent_mistake','expected_behavior','approve_baseline',
-                      'reject_baseline','fixed_in_build')),                          -- the UI action of 4.14 and 9.6
+                                                      'invariant_violation','assertion_failed')),
+  action            TEXT NOT NULL CHECK (action IN ('confirm_bug','mark_intended','request_mask','noise_signature',
+                                                    'agent_mistake','expected_behavior','approve_baseline',
+                                                    'reject_baseline','fixed_in_build')),                          -- the UI action of 4.14 and 9.6
   verdict           TEXT NOT NULL CHECK (verdict IN ('confirmed_bug','intended','noise')),   -- the stored effect
   source            TEXT NOT NULL CHECK (source IN ('report_ui','pr_comment','jira_sync','explorer_triage')),
   decided_by        TEXT NOT NULL,          -- SSO identity of a human; for jira_sync the ticket's resolver
@@ -545,13 +714,18 @@ CREATE TABLE decisions (
   fixed_in_build_id TEXT REFERENCES builds(build_id),   -- fixed_in_build: next run asserts the signature is gone
   cluster_id        TEXT,                   -- written per member signature when decided as a cluster
   expires_at        TEXT,                   -- noise_signature, request_mask and waivers: default 30 days
-  status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','expired','superseded','reopened','revoked')),   -- 4.14
+  status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','expired','superseded','reopened',
+                                                                     'revoked')),   -- 4.14
   supersedes_decision_id INTEGER REFERENCES decisions(decision_id),
   revoked_at TEXT, revoked_by TEXT, revoke_reason TEXT,
   source_finding_id INTEGER REFERENCES findings(finding_id),
+  bbox_q4           TEXT,                   -- x,y,w,h of the largest component quantized to 4 px: the fallback key at or below noise spread (4.14)
+  role              TEXT CHECK (role IS NULL OR role IN ('system_owner','triage_rotation','flow_owner','pr_author',
+                                                         'jira_resolver')),   -- 9.12, L-DEC-01
+  reopen_count      INTEGER NOT NULL DEFAULT 0 CHECK (reopen_count >= 0),   -- fixed_in_build signatures that returned (4.14)
   CHECK ((action IN ('confirm_bug','fixed_in_build') AND verdict = 'confirmed_bug')
       OR (action IN ('mark_intended','approve_baseline') AND verdict = 'intended')
-      OR (action IN ('noise_signature','agent_mistake','expected_behavior','request_mask') AND verdict = 'noise')
+      OR (action IN ('request_mask','noise_signature','agent_mistake','expected_behavior') AND verdict = 'noise')
       OR (action = 'reject_baseline' AND verdict IN ('confirmed_bug','noise'))),   -- the 4.14 and 9.6 mapping; request_mask is inert until mask_ref is set
   CHECK (action NOT IN ('mark_intended','fixed_in_build') OR ticket_ref IS NOT NULL),   -- L-DEC-02 at write time
   CHECK (action <> 'reject_baseline' OR verdict <> 'confirmed_bug' OR ticket_ref IS NOT NULL),
@@ -580,6 +754,18 @@ CREATE TRIGGER trg_decision_not_synthetic BEFORE INSERT ON decisions
 WHEN NEW.source_finding_id IS NOT NULL
  AND (SELECT synthetic FROM findings f WHERE f.finding_id = NEW.source_finding_id) = 1
 BEGIN SELECT RAISE(ABORT, 'synthetic findings never produce decisions'); END;
+
+-- request_mask acts once its mask file lands: mask_ref goes from NULL to a value once (4.14)
+CREATE TRIGGER trg_decision_mask_ref BEFORE UPDATE OF mask_ref ON decisions
+WHEN NEW.mask_ref IS NOT OLD.mask_ref
+ AND NOT (OLD.mask_ref IS NULL AND NEW.mask_ref IS NOT NULL AND OLD.action = 'request_mask')
+BEGIN SELECT RAISE(ABORT, 'mask_ref is set once, on a request_mask decision (4.14)'); END;
+
+-- a confirm_bug written while Jira was unreachable gets its ticket from the outbox once (L-DEC-02, 9.9)
+CREATE TRIGGER trg_decision_ticket_ref BEFORE UPDATE OF ticket_ref ON decisions
+WHEN NEW.ticket_ref IS NOT OLD.ticket_ref
+ AND NOT (OLD.ticket_ref IS NULL AND NEW.ticket_ref IS NOT NULL AND OLD.action = 'confirm_bug')
+BEGIN SELECT RAISE(ABORT, 'ticket_ref is filled once, on a confirm_bug decision written without one (9.9)'); END;
 ```
 
 A decision is never deleted and never edited in place: a revoke sets `revoked_at`, `revoked_by` and `revoke_reason` together and moves `status` to `revoked` (4.14); a replacement is a new row whose `supersedes_decision_id` points at the old one, which the writer marks `superseded`. The CHECK constraints allow revocation fields only on a revoked row, always all three together. Every action maps to one stored verdict and one effect; 9.6 One-click actions and who may perform them shows the same table from the user's side.
@@ -648,9 +834,13 @@ CREATE TABLE regions (                      -- mirror of the Region Registry at 
   landmark_id     TEXT NOT NULL,
   dx INTEGER NOT NULL, dy INTEGER NOT NULL, w INTEGER NOT NULL, h INTEGER NOT NULL,
   hamming_tolerance INTEGER CHECK (hamming_tolerance BETWEEN 0 AND 64),   -- lowered by calibration (9.7); NULL = default
+  money_role      TEXT CHECK (money_role IS NULL OR money_role IN ('qty','price','bp_effect','max_loss','send',
+                                                                   'cancel','delete')),   -- 4.8 (SD-28)
+  exact_fallback  INTEGER NOT NULL DEFAULT 0 CHECK (exact_fallback IN (0,1)),   -- tolerance at or below noise spread: pHash equality plus the 4 px box (4.14, 9.7)
   PRIMARY KEY (checkpoint_id, region_id, config_commit),
   CHECK (money_cell = 0 OR kind IN ('diff','freeze')),   -- L-RGN-04: a money cell is always pixel-diffed, never rule-only or masked
-  CHECK (identity_field = 0 OR kind = 'redaction')
+  CHECK (identity_field = 0 OR kind = 'redaction'),
+  CHECK (money_cell = (money_role IS NOT NULL))           -- a money cell is exactly a region with a money role (4.8, SD-28)
 );
 
 CREATE TABLE masks (                        -- mirror of mask records at a config commit
@@ -698,76 +888,123 @@ CREATE TABLE flake_stats (                  -- rolling 30 days, refreshed by the
   last_flip_run_id TEXT,
   quarantined      INTEGER NOT NULL DEFAULT 0 CHECK (quarantined IN (0,1)),
   quarantine_commit TEXT,                   -- sentinel-config commit whose quarantine.yaml holds the record
-  quarantined_at TEXT, quarantined_by TEXT, quarantine_owner TEXT, quarantine_ticket_ref TEXT, quarantine_reason TEXT,
+  quarantined_at TEXT, quarantined_by TEXT, quarantine_owner TEXT, quarantine_ticket_ref TEXT,
+  quarantine_reason TEXT CHECK (quarantine_reason IS NULL OR quarantine_reason IN ('flake','aa_drift','aa_floor',
+                      'maintenance_budget','fire_drill','safety_canary','kill_switch','gateway_drops','fallback_rate')),   -- 10.5 (SD-96)
   updated_at       TEXT NOT NULL,
   CHECK (quarantined = 0 OR (quarantine_commit IS NOT NULL AND quarantine_owner IS NOT NULL
                              AND quarantine_ticket_ref IS NOT NULL))
 );
 
+CREATE TABLE synthetic_outcomes (           -- 10.3: what each canary mutant produced; outcomes holds real rows only (SD-91)
+  synthetic_id      INTEGER PRIMARY KEY,
+  run_id            TEXT NOT NULL REFERENCES runs(run_id),
+  mutant_id         TEXT NOT NULL,
+  checkpoint_id     TEXT NOT NULL REFERENCES checkpoints(checkpoint_id),
+  outcome           TEXT NOT NULL CHECK (outcome IN ('identical','noise','intended','collateral','needs_human',
+                                                     'invariant_violation','assertion_failed','not_settled',
+                                                     'not_comparable','landmark_missing','env_error','harness_error',
+                                                     'not_run','unregistered_surface','needs_baseline')),
+  reason            TEXT,
+  reason_detail     TEXT,
+  gate              TEXT,
+  mutant_sha256     TEXT,
+  recorded_at       TEXT NOT NULL,
+  UNIQUE (run_id, mutant_id, checkpoint_id),
+  FOREIGN KEY (outcome, reason) REFERENCES outcome_reasons(outcome, reason)
+);
+
+CREATE TABLE canary_manifests (             -- 10.3 determinism: the generated catalog of a run, re-generated and compared
+  run_id            TEXT PRIMARY KEY REFERENCES runs(run_id),
+  catalog_sha256    TEXT NOT NULL,
+  manifest_json     TEXT NOT NULL,          -- mutant id, checkpoint, seed and mutant hash per generated mutant
+  created_at        TEXT NOT NULL
+);
+
 CREATE TABLE canary_results (
   canary_id         INTEGER PRIMARY KEY,
   run_id            TEXT NOT NULL REFERENCES runs(run_id),
-  kind              TEXT NOT NULL DEFAULT 'mutant' CHECK (kind IN ('mutant','safety_canary','fire_drill','path_equivalence')),   -- 10.3 mutants; 6.3 to 6.10 safety canaries; 6.5 drill items; the nightly re-evaluated real pair of 10.3
-  mutant_id         TEXT NOT NULL,          -- M01 to M33 of sentinel-config/canaries/mutants.yaml (12.5); drill items are drill-1 to drill-5; safety canaries name their control (6.3 to 6.10)
+  kind              TEXT NOT NULL DEFAULT 'mutant' CHECK (kind IN ('mutant','safety_canary','fire_drill',
+                                                                   'path_equivalence')),   -- 10.3 mutants; 6.3 to 6.10 safety canaries; 6.5 drill items; the nightly re-evaluated real pair of 10.3
+  mutant_id         TEXT NOT NULL,          -- M01 to M33 and on of sentinel-config/canaries/mutants.yaml (12.5); drill items are drill-1 to drill-5; safety canaries name their control (6.3 to 6.10)
   catalog_version   TEXT NOT NULL,
   checkpoint_id     TEXT NOT NULL,
-  defect_class      TEXT NOT NULL,          -- the snake_case class names of 10.3 (erased_control, swapped_digit, swapped_label, color_swap,
-                                            -- shifted_panel, clipped_label, overlapped_panels, missing_row, header_change, placeholder,
-                                            -- font_height, scrollbar, redaction, sub_floor, global_shift, landmark_loss, study_removed,
-                                            -- aa_control, wrong_quantity, blank_field, gateway) plus the classes M29 to M33 of 12.5 add
-                                            -- (outside_parent, window_offscreen, misaligned_column, focus_order, error_dialog); 26 names, equal to the
-                                            -- class enum of 4.11; one list, kept in canaries/mutants.yaml
+  defect_class      TEXT NOT NULL,          -- kind mutant: one of the 26 snake_case class names of 10.3 and 12.5, equal to the class
+                                            -- enum of 4.11; every other kind: the kind itself, with mutant_id naming the item (SD-81)
   money_cell        INTEGER NOT NULL DEFAULT 0 CHECK (money_cell IN (0,1)),
   seed              INTEGER NOT NULL,
   base_sha256 TEXT, mutant_sha256 TEXT,
   expected_json     TEXT NOT NULL,          -- the mutant's expected outcome list
   produced_outcome  TEXT,
   produced_reason   TEXT,
-  state             TEXT NOT NULL CHECK (state IN ('detected','missed','detector_blind',
-                      'detector_degraded','generation_failed')),
+  state             TEXT NOT NULL CHECK (state IN ('detected','missed','detector_blind','detector_degraded',
+                                                   'generation_failed')),
   absorbed_by       TEXT,                   -- mask id, decision id, threshold or landmark that swallowed a miss
   class_rate REAL, class_floor REAL,        -- that night's class detection rate and rolling floor
   reviewer_verdict TEXT, reviewer_confidence REAL,
   mask_version TEXT, threshold_version TEXT, model_id TEXT, prompt_hash TEXT,
   created_at        TEXT NOT NULL,
+  synthetic_ref     INTEGER REFERENCES synthetic_outcomes(synthetic_id),   -- the mutant's produced outcome row (SD-91)
+  CHECK ((kind = 'mutant' AND defect_class IN ('erased_control','swapped_digit','swapped_label','color_swap',
+           'shifted_panel','clipped_label','overlapped_panels','missing_row','header_change','placeholder','font_height',
+           'scrollbar','redaction','sub_floor','global_shift','landmark_loss','study_removed','aa_control',
+           'wrong_quantity','blank_field','gateway','outside_parent','window_offscreen','misaligned_column',
+           'focus_order','error_dialog'))
+      OR (kind <> 'mutant' AND defect_class = kind)),   -- SD-81: a safety canary, drill item or path-equivalence pair names its kind
   CHECK (NOT (money_cell = 1 AND state = 'missed')),            -- a money-cell miss is always detector_blind
   CHECK (NOT (money_cell = 0 AND state = 'detector_blind')),
   CHECK (state <> 'detector_degraded' OR (class_rate IS NOT NULL AND class_floor IS NOT NULL)),
   CHECK (state NOT IN ('missed','detector_blind','detector_degraded') OR produced_outcome IS NOT NULL)
 );
 
-CREATE TABLE calibration_floors (
+CREATE TABLE calibration_floors (           -- 3.9 step 3 and 4: per calibration key, checkpoint and region (SD-19, SD-69)
   floor_id           INTEGER PRIMARY KEY,
   checkpoint_id      TEXT NOT NULL REFERENCES checkpoints(checkpoint_id),
   region_id          TEXT NOT NULL,         -- '*' for whole window
-  fingerprint_sha256 TEXT NOT NULL,         -- a floor is valid for one fingerprint only
+  rendering_key_sha256 TEXT NOT NULL,       -- the calibration key: the match fields that affect pixels (7.13)
+  fingerprint_sha256 TEXT,                  -- the fingerprint the floor was measured on (record)
   calibration_run_id TEXT NOT NULL REFERENCES runs(run_id),
   samples            INTEGER NOT NULL,      -- A/A pairs measured
   diff_pixels_p50 INTEGER, diff_pixels_p95 INTEGER, diff_pixels_max INTEGER,
   ssim_min           REAL,
   components_max INTEGER, largest_bbox_max TEXT,
-  phash_noise_spread INTEGER, fault_separation INTEGER,   -- inputs to the tolerance rule of 9.7
+  noise_spread       INTEGER,               -- largest pHash distance among the region's A/A pairs (9.7)
+  fault_separation   INTEGER,               -- smallest distance between the region's distinct mutants (9.7)
+  hamming_tolerance  INTEGER CHECK (hamming_tolerance BETWEEN 0 AND 8),   -- the effective tolerance the floors give (4.14, 9.7)
+  exact_fallback     INTEGER NOT NULL DEFAULT 0 CHECK (exact_fallback IN (0,1)),   -- tolerance at or below the noise spread (9.7)
   pairs_json         TEXT,                  -- the per-pair metrics of 3.9 step 3 (15 pairs per checkpoint and region)
-  threshold_pixels   INTEGER NOT NULL,      -- derived per 3.9
-  threshold_ssim     REAL NOT NULL,
+  settle_p50_ms      INTEGER,               -- time-to-settle p50, the settle_regression base (3.9)
+  threshold_component_area INTEGER NOT NULL,   -- the four thresholds of 3.9
+  threshold_changed_px INTEGER NOT NULL,
+  threshold_delta_e  REAL NOT NULL,
+  threshold_shift_px INTEGER NOT NULL,
+  threshold_ssim     REAL,                  -- SSIM ranks and has no threshold (3.9); NULL unless a ranking floor is kept
+  regions_file_sha256 TEXT, mask_versions_json TEXT, redaction_version TEXT,   -- what the floor was measured under (7.13)
+  workspace_sha256   TEXT, epoch_definition_sha256 TEXT,
   nonzero_on_frozen  INTEGER NOT NULL DEFAULT 0,   -- 1 marks a flow or environment bug to fix
-  exported_commit    TEXT,                  -- sentinel-config commit of calibration/<fingerprint_id>.yaml
+  exported_commit    TEXT,                  -- sentinel-config commit of calibration/<hex>.yaml (SD-36)
   valid_from         TEXT NOT NULL, superseded_at TEXT
 );
-CREATE UNIQUE INDEX ux_floor_current ON calibration_floors(checkpoint_id, region_id, fingerprint_sha256)
+CREATE UNIQUE INDEX ux_floor_current ON calibration_floors(checkpoint_id, region_id, rendering_key_sha256)
   WHERE superseded_at IS NULL;
 
-CREATE TABLE calibration_fixes (            -- the fix list of 3.9: one row per non-zero floor on a frozen checkpoint
+CREATE TABLE calibration_fixes (            -- the fix list of 3.9: one row per fix item, frozen and masked_live checkpoints
   fix_id         INTEGER PRIMARY KEY,
-  floor_id       INTEGER NOT NULL REFERENCES calibration_floors(floor_id),
+  floor_id       INTEGER REFERENCES calibration_floors(floor_id),   -- NULL for a failed-capture item (3.9 step 2)
+  calibration_run_id TEXT REFERENCES runs(run_id),
   checkpoint_id  TEXT NOT NULL REFERENCES checkpoints(checkpoint_id),
-  region_id      TEXT NOT NULL,
-  cause_class    TEXT NOT NULL CHECK (cause_class IN ('timing','state','animation','landmark','redaction','rendering','unknown')),
+  region_id      TEXT,                      -- NULL for a failed-capture item
+  cause_class    TEXT NOT NULL CHECK (cause_class IN ('caret','hover','tooltip','flash','scroll','sort','live_data',
+                   'settle','landmark_jitter','unknown')),   -- the ten classes of 3.9 step 5 (SD-20)
+  outcome        TEXT CHECK (outcome IS NULL OR outcome IN ('not_settled','landmark_missing','env_error',
+                                                            'harness_error')),   -- a failed capture's outcome (3.9 step 2)
+  reason         TEXT,
   owner          TEXT NOT NULL,
   ticket_ref     TEXT,
   opened_at      TEXT NOT NULL,             -- age = now minus opened_at; open 5 business days quarantines the checkpoint (10.5)
   closed_at TEXT, closed_by TEXT, floor_exception_ref TEXT,   -- closed by a fix, or by a human-approved floor_exception (3.9)
-  CHECK ((closed_at IS NULL) = (closed_by IS NULL))
+  CHECK ((closed_at IS NULL) = (closed_by IS NULL)),
+  CHECK (floor_id IS NOT NULL OR outcome IS NOT NULL)   -- a floor item names its floor, a failed-capture item its outcome
 );
 
 CREATE TABLE reviewer_evals (               -- one row per evaluation of a model and prompt version (3.14, 10.4)
@@ -815,7 +1052,8 @@ CREATE TABLE egress_log (                   -- 6.10: every outbound request
 CREATE TABLE outbox (                       -- 9.1: every outbound post is a job before it is a send
   job_id          INTEGER PRIMARY KEY,
   run_id          TEXT REFERENCES runs(run_id),
-  kind            TEXT NOT NULL CHECK (kind IN ('pr_comment','commit_status','jira_create','jira_comment','jira_transition',
+  kind            TEXT NOT NULL CHECK (kind IN ('pr_comment','commit_status','jira_create','jira_comment',
+                                                'jira_transition',
                     'slack','page','digest','manifest_pr','mask_pr')),
   destination     TEXT NOT NULL,
   payload_sha256  TEXT NOT NULL,            -- the payload is an artifact; the row carries its hash
@@ -824,7 +1062,11 @@ CREATE TABLE outbox (                       -- 9.1: every outbound post is a job
   last_error      TEXT,
   state           TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued','sent','failed','abandoned')),
   created_at      TEXT NOT NULL, sent_at TEXT,
-  CHECK ((state = 'sent') = (sent_at IS NOT NULL))
+  closed_by TEXT, closed_at TEXT,           -- a human closes an abandoned job (9.1)
+  CHECK ((state = 'sent') = (sent_at IS NOT NULL)),
+  CHECK ((closed_by IS NULL) = (closed_at IS NULL)),
+  CHECK (closed_by IS NULL OR (state = 'abandoned' AND closed_by NOT IN ('reviewer','system','orchestrator',
+                                                                         'reporter')))
 );
 
 CREATE TABLE coverage_cells (               -- merge, RC and nightly runs only; PR runs keep the matrix in runs.summary_json
@@ -834,10 +1076,13 @@ CREATE TABLE coverage_cells (               -- merge, RC and nightly runs only; 
   entitlement      TEXT NOT NULL,
   tier             INTEGER NOT NULL,
   state            TEXT NOT NULL CHECK (state IN ('covered','not_run','not_registered')),
-  not_run_reason   TEXT CHECK (not_run_reason IN ('entitlement','budget','scope','quarantine','base_step_failed','app_crash','model_unavailable')
-                     OR not_run_reason LIKE 'step_failed:%' OR not_run_reason LIKE 'blocked:%'),   -- 2.12; blocked:<outcome> names the outcome that blocked every checkpoint of the cell
+  not_run_reason   TEXT CHECK (not_run_reason IN ('entitlement','budget','scope','quarantine','base_step_failed',
+                                                  'app_crash',
+                                                  'model_unavailable') OR not_run_reason LIKE 'step_failed:%'
+                     OR not_run_reason LIKE 'blocked:%'),   -- 2.12; blocked:<outcome> names the outcome that blocked every checkpoint of the cell
   worst_outcome    TEXT,                    -- covered cells: the worst usable outcome
   checkpoint_count INTEGER NOT NULL DEFAULT 0,
+  profile_id       TEXT,                    -- the login entitlement profile the cell's column names (2.12)
   PRIMARY KEY (run_id, surface_id, persona, entitlement),
   CHECK ((state = 'not_run') = (not_run_reason IS NOT NULL)),
   CHECK ((state = 'covered') = (worst_outcome IS NOT NULL))
@@ -866,22 +1111,53 @@ CREATE TABLE artifacts (                    -- index of the artifact store; a ro
   deleted_at        TEXT
 );
 
-CREATE TABLE post_run_proofs (              -- 6.6: ORDER SAFETY PROOF, one per shard
-  shard_id          TEXT PRIMARY KEY REFERENCES shards(shard_id),
+CREATE TABLE artifact_sets (                -- one row per copy of an object in a set; retention, backup and audit act per set (SD-82)
+  sha256            TEXT NOT NULL REFERENCES artifacts(sha256),
+  set_path          TEXT NOT NULL,          -- runs/<run_id>, baselines/<lineage>/<build_id>, eval/<version>
+  created_at        TEXT NOT NULL,
+  deleted_at        TEXT,
+  quarantined_at    TEXT,                   -- a secret-scan hit quarantined the set (6.9)
+  PRIMARY KEY (sha256, set_path)
+) WITHOUT ROWID;
+
+CREATE TABLE post_run_proofs (              -- 6.6: ORDER SAFETY PROOF, one per shard; a run with no shard has one run-level row
+  proof_id          INTEGER PRIMARY KEY,
+  shard_id          TEXT UNIQUE REFERENCES shards(shard_id),   -- NULL: the run-level row of a run that started no session (SD-61)
   run_id            TEXT NOT NULL REFERENCES runs(run_id),
-  login_alias       TEXT NOT NULL REFERENCES logins(login_alias),
-  verdict           TEXT NOT NULL CHECK (verdict IN ('proven_no_sends','proven_declared_sends','proven_no_session','unproven','orders_sent')),   -- proven_no_session: no token issued, read from the gateway log; orders_sent: a clean read found an undeclared row (6.6)
+  login_alias       TEXT REFERENCES logins(login_alias),
+  verdict           TEXT NOT NULL CHECK (verdict IN ('proven_no_sends','proven_declared_sends','proven_no_session',
+                                                     'unproven','orders_sent')),   -- proven_no_session: no token issued, read from the gateway log; orders_sent: a clean read found an undeclared row (6.6)
   reason            TEXT,
   send_policy_ref   TEXT NOT NULL,          -- risk owner decision id from policy/send_policy.yaml
   counts_json       TEXT NOT NULL,          -- working, filled, canceled, position rows: start, end, new, expected; net liq start, end, drift
   cancel_all        TEXT NOT NULL CHECK (cancel_all IN ('not_needed','performed_verified','performed_unverified')),
   paper_mode_assertions INTEGER NOT NULL, paper_mode_mismatches INTEGER NOT NULL,
   gateway_events INTEGER NOT NULL, gateway_drops INTEGER NOT NULL,
+  unreadable_count  INTEGER NOT NULL DEFAULT 0,   -- unreadable identity or Monitor reads in the session (6.6)
+  refusals_count    INTEGER NOT NULL DEFAULT 0,   -- slow-half refusals (6.6 gateway line)
+  attestation_ref   TEXT,                   -- the attestation screenshots artifact (6.3)
   start_snapshot_sha256 TEXT, end_snapshot_sha256 TEXT,
   produced_at       TEXT NOT NULL,
-  verified_by TEXT, verified_at TEXT,       -- human clearance of an unproven verdict
-  CHECK (verdict <> 'unproven' OR reason IS NOT NULL)
+  verified_by TEXT, verified_at TEXT,       -- human clearance of an unproven verdict, set once
+  CHECK (verdict <> 'unproven' OR reason IS NOT NULL),
+  CHECK (shard_id IS NULL OR login_alias IS NOT NULL),
+  CHECK (verified_by IS NULL OR verified_by NOT IN ('reviewer','system','orchestrator','reporter'))
 );
+
+CREATE UNIQUE INDEX ux_proof_run_level ON post_run_proofs(run_id) WHERE shard_id IS NULL;
+
+CREATE TRIGGER trg_proof_clearance BEFORE UPDATE ON post_run_proofs
+WHEN OLD.verified_by IS NOT NULL OR OLD.verdict <> 'unproven'
+  OR NEW.proof_id IS NOT OLD.proof_id OR NEW.shard_id IS NOT OLD.shard_id OR NEW.run_id IS NOT OLD.run_id
+  OR NEW.login_alias IS NOT OLD.login_alias OR NEW.verdict IS NOT OLD.verdict OR NEW.reason IS NOT OLD.reason
+  OR NEW.send_policy_ref IS NOT OLD.send_policy_ref OR NEW.counts_json IS NOT OLD.counts_json
+  OR NEW.cancel_all IS NOT OLD.cancel_all OR NEW.paper_mode_assertions IS NOT OLD.paper_mode_assertions
+  OR NEW.paper_mode_mismatches IS NOT OLD.paper_mode_mismatches OR NEW.gateway_events IS NOT OLD.gateway_events
+  OR NEW.gateway_drops IS NOT OLD.gateway_drops OR NEW.unreadable_count IS NOT OLD.unreadable_count
+  OR NEW.refusals_count IS NOT OLD.refusals_count OR NEW.attestation_ref IS NOT OLD.attestation_ref
+  OR NEW.start_snapshot_sha256 IS NOT OLD.start_snapshot_sha256 OR NEW.end_snapshot_sha256 IS NOT OLD.end_snapshot_sha256
+  OR NEW.produced_at IS NOT OLD.produced_at
+BEGIN SELECT RAISE(ABORT, 'a proof is written once; only its clearance (verified_by, verified_at) is set, once (6.6)'); END;
 
 CREATE TABLE incidents (                    -- 6.12: S1 to S3 rows, linked from the report
   incident_id   INTEGER PRIMARY KEY,
@@ -891,13 +1167,113 @@ CREATE TABLE incidents (                    -- 6.12: S1 to S3 rows, linked from 
   trigger       TEXT NOT NULL,
   opened_at     TEXT NOT NULL,
   closed_at TEXT, closed_by TEXT, close_reason TEXT, ticket_ref TEXT, postmortem_ref TEXT,
+  postmortem_due_at TEXT,                   -- S1 and S2: five business days after opened_at (6.12)
   CHECK ((closed_at IS NULL) = (closed_by IS NULL)),
   CHECK (closed_by IS NULL OR closed_by NOT IN ('reviewer','system','orchestrator','reporter'))
 );
 
+CREATE TABLE safety_quarantines (           -- 6.5, 6.12, 10.5: a flow, rig, login or activity taken out of service
+  quarantine_id     INTEGER PRIMARY KEY,
+  target_kind       TEXT NOT NULL CHECK (target_kind IN ('flow','rig','login','activity')),
+  target            TEXT NOT NULL,
+  reason            TEXT NOT NULL CHECK (reason IN ('flake','aa_drift','aa_floor','maintenance_budget','fire_drill',
+                      'safety_canary','kill_switch','gateway_drops','fallback_rate')),   -- 10.5 (SD-96)
+  run_id            TEXT REFERENCES runs(run_id),
+  detail            TEXT,
+  ticket_ref        TEXT,
+  opened_at         TEXT NOT NULL,
+  reenabled_by TEXT, reenabled_at TEXT, reenable_reason TEXT,   -- human-only, with reason and ticket (6.12)
+  CHECK ((reenabled_by IS NULL) = (reenabled_at IS NULL)),
+  CHECK (reenabled_by IS NULL OR (reenable_reason IS NOT NULL AND ticket_ref IS NOT NULL
+                                  AND reenabled_by NOT IN ('reviewer','system','orchestrator','reporter')))
+);
+
+CREATE TABLE model_usage (                  -- 11.4: the usage block of every model response, per component
+  usage_id          INTEGER PRIMARY KEY,
+  run_id            TEXT REFERENCES runs(run_id),   -- NULL for the model check and digests
+  component         TEXT NOT NULL CHECK (component IN ('reviewer','agent_rescue','explorer')),
+  model_id          TEXT NOT NULL,
+  request_id        TEXT,
+  input_tokens      INTEGER NOT NULL DEFAULT 0,
+  output_tokens     INTEGER NOT NULL DEFAULT 0,
+  cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+  cost_usd          REAL NOT NULL DEFAULT 0 CHECK (cost_usd >= 0),
+  at                TEXT NOT NULL
+);
+
+CREATE TABLE escapes (                      -- 10.9 G+1, 9.11: a production bug and the checkpoint that should have shown it
+  escape_id         INTEGER PRIMARY KEY,
+  release           TEXT NOT NULL,          -- the released build
+  ticket_ref        TEXT NOT NULL,
+  escape_class      TEXT NOT NULL CHECK (escape_class IN ('covered_missed','not_run','not_registered',
+                                                          'not_detectable')),
+  checkpoint_id     TEXT REFERENCES checkpoints(checkpoint_id),
+  surface_id        TEXT,
+  tier              INTEGER CHECK (tier IN (1,2,3)),
+  entered_by        TEXT NOT NULL CHECK (entered_by NOT IN ('reviewer','system','orchestrator','reporter')),
+  entered_at        TEXT NOT NULL,
+  UNIQUE (release, ticket_ref),
+  CHECK ((escape_class = 'not_registered') = (checkpoint_id IS NULL))
+);
+
+CREATE TABLE maintenance_items (            -- 11.5: flow maintenance, its owner and the hours logged
+  item_id           INTEGER PRIMARY KEY,
+  kind              TEXT NOT NULL,          -- update_scripted_flow, maintenance_task, anchor_patch, ...
+  ref               TEXT NOT NULL,          -- flow, step or anchor template id
+  owner             TEXT NOT NULL,
+  run_id            TEXT REFERENCES runs(run_id),
+  ticket_ref        TEXT,
+  detail            TEXT,
+  hours             REAL NOT NULL DEFAULT 0 CHECK (hours >= 0),
+  opened_at         TEXT NOT NULL,
+  closed_at TEXT, closed_by TEXT,
+  CHECK ((closed_at IS NULL) = (closed_by IS NULL))
+);
+
+CREATE TABLE triage_assignments (           -- 9.12: who holds a finding and its SLA clock
+  assignment_id     INTEGER PRIMARY KEY,
+  finding_id        INTEGER NOT NULL REFERENCES findings(finding_id),
+  assignee          TEXT NOT NULL,
+  assigned_by       TEXT NOT NULL,          -- a person, or system for the escalation's assignment to the rotation
+  assigned_at       TEXT NOT NULL,
+  claimed_at        TEXT,
+  released_at       TEXT,
+  escalation_step   INTEGER NOT NULL DEFAULT 0 CHECK (escalation_step BETWEEN 0 AND 4),   -- the 9.12 steps reached
+  sla_due_at        TEXT
+);
+
+CREATE UNIQUE INDEX ux_assignment_current ON triage_assignments(finding_id) WHERE released_at IS NULL;
+
+CREATE TABLE proposals (                    -- 9.6 two-person rule: a committer's proposal waits for a second human
+  proposal_id       INTEGER PRIMARY KEY,
+  finding_id        INTEGER NOT NULL REFERENCES findings(finding_id),
+  run_id            TEXT NOT NULL REFERENCES runs(run_id),
+  action            TEXT NOT NULL CHECK (action IN ('confirm_bug','mark_intended','request_mask','noise_signature',
+                                                    'agent_mistake','expected_behavior','approve_baseline',
+                                                    'reject_baseline','fixed_in_build')),
+  proposed_by       TEXT NOT NULL CHECK (proposed_by NOT IN ('reviewer','system','orchestrator','reporter')),
+  proposed_at       TEXT NOT NULL,
+  ticket_ref        TEXT,
+  reason            TEXT NOT NULL,
+  state             TEXT NOT NULL DEFAULT 'proposed' CHECK (state IN ('proposed','confirmed','declined')),
+  decided_by        TEXT,
+  decided_at        TEXT,
+  decline_reason    TEXT,
+  decision_id       INTEGER REFERENCES decisions(decision_id),
+  CHECK ((state = 'proposed') = (decided_by IS NULL)),
+  CHECK ((decided_by IS NULL) = (decided_at IS NULL)),
+  CHECK (decided_by IS NULL OR (decided_by <> proposed_by AND decided_by NOT IN ('reviewer','system','orchestrator',
+                                                                                 'reporter'))),
+  CHECK (state <> 'declined' OR decline_reason IS NOT NULL),
+  CHECK (state <> 'confirmed' OR decision_id IS NOT NULL)
+);
+
+CREATE UNIQUE INDEX ux_proposal_open ON proposals(finding_id) WHERE state = 'proposed';
+
 CREATE TABLE system_state (                 -- keys: last_backup_at, last_backup_error, last_integrity_check_at,
   key TEXT PRIMARY KEY,                     --   last_restore_drill_at, last_artifact_audit_at, kill_switch_state,
-  value TEXT NOT NULL, updated_at TEXT NOT NULL   --   detector_state, schema_version, free_bytes_at_last_preflight
+  value TEXT NOT NULL,                      --   detector_state, canaries_pending, nightly_skipped_for, reviewer_disabled,
+  updated_at TEXT NOT NULL                  --   harness_freeze, schema_version, schema_sha256, free_bytes_at_last_preflight
 );
 ```
 
@@ -929,6 +1305,18 @@ CREATE INDEX ix_artifacts_sweep  ON artifacts(set_path, pinned, created_at) WHER
 CREATE INDEX ix_incidents_open   ON incidents(rig_id) WHERE closed_at IS NULL;
 CREATE INDEX ix_outbox_due       ON outbox(state, next_attempt_at) WHERE state IN ('queued','failed');
 CREATE INDEX ix_soak_run         ON soak_samples(run_id, metric, sampled_at);
+
+CREATE INDEX ix_extractions_cp   ON oracle_extractions(run_id, checkpoint_id, side);
+
+CREATE INDEX ix_synthetic_run    ON synthetic_outcomes(run_id, mutant_id);
+
+CREATE INDEX ix_artifact_sets    ON artifact_sets(set_path, created_at) WHERE deleted_at IS NULL;
+
+CREATE INDEX ix_usage_time       ON model_usage(component, at);
+
+CREATE INDEX ix_quarantine_open  ON safety_quarantines(target_kind, target) WHERE reenabled_at IS NULL;
+
+CREATE INDEX ix_maintenance_open ON maintenance_items(owner, opened_at) WHERE closed_at IS NULL;
 ```
 
 ### 8.4 Artifact layout on disk

@@ -923,9 +923,9 @@ CREATE UNIQUE INDEX ux_proposal_open ON proposals(finding_id) WHERE state = 'pro
 
 CREATE TABLE system_state (                 -- keys: last_backup_at, last_backup_error, last_integrity_check_at,
   key TEXT PRIMARY KEY,                     --   last_restore_drill_at, last_artifact_audit_at, kill_switch_state,
-  value TEXT NOT NULL, updated_at TEXT NOT NULL   --   detector_state, canaries_pending, nightly_skipped_for,
-);                                          --   reviewer_disabled, harness_freeze, schema_version, schema_sha256,
-                                            --   free_bytes_at_last_preflight
+  value TEXT NOT NULL,                      --   detector_state, canaries_pending, nightly_skipped_for, reviewer_disabled,
+  updated_at TEXT NOT NULL                  --   harness_freeze, schema_version, schema_sha256, free_bytes_at_last_preflight
+);
 
 CREATE INDEX ix_runs_type_time   ON runs(run_type, started_at);
 CREATE INDEX ix_runs_pair        ON runs(pair_id);
@@ -959,13 +959,9 @@ CREATE INDEX ix_usage_time       ON model_usage(component, at);
 CREATE INDEX ix_quarantine_open  ON safety_quarantines(target_kind, target) WHERE reenabled_at IS NULL;
 CREATE INDEX ix_maintenance_open ON maintenance_items(owner, opened_at) WHERE closed_at IS NULL;
 
--- ==========================================================================================================
--- Run scope, the written outcome record and the remaining immutability and completeness rules (8.1, 8.3, 4.13);
--- in 8.3 they sit in the "Checkpoints and outcomes" block.
-
--- The checkpoints a run is asked to visit, with the persona of the visit (4.13 checkpoint_outcome.persona has
--- no 8.3 column). runs.scope_count is the count of these rows. With trg_run_complete_scope a run is complete
--- only when every one of them, by id, has an outcome (8.1, 8.3), and the 8.2 import can fill the silent ones.
+-- The checkpoints a run is asked to visit, with the persona of the visit (4.13 checkpoint_outcome.persona).
+-- runs.scope_count is the count of these rows. With trg_run_complete_scope a run is complete only when every one
+-- of them, by id, has an outcome (8.1), and the import of 8.2 can fill the silent ones.
 CREATE TABLE run_scope (
   run_id        TEXT NOT NULL REFERENCES runs(run_id),
   checkpoint_id TEXT NOT NULL REFERENCES checkpoints(checkpoint_id),
@@ -974,7 +970,7 @@ CREATE TABLE run_scope (
 ) WITHOUT ROWID;
 
 -- The 4.13 outcome record as written, so the store hands back the whole record (persona, classification,
--- diff regions: fields 8.3 has no column for). The `outcomes` columns stay the truth for the later changes.
+-- diff regions: fields no column above holds). The `outcomes` columns stay the truth for the later changes.
 CREATE TABLE outcome_records (
   run_id        TEXT NOT NULL,
   checkpoint_id TEXT NOT NULL,
@@ -989,8 +985,8 @@ BEGIN SELECT RAISE(ABORT, 'outcome is immutable'); END;
 CREATE TRIGGER trg_outcome_record_keep BEFORE DELETE ON outcome_records
 BEGIN SELECT RAISE(ABORT, 'outcome is immutable'); END;
 
--- 4.13 and 8.3: "Nothing else is ever rewritten." The 8.3 triggers guard outcome, reason, reason_detail,
--- review_state and the evidence columns; these guard every other column, and deletion.
+-- 4.13: "Nothing else is ever rewritten." The triggers above guard outcome, reason, reason_detail, review_state
+-- and the evidence columns; these guard every other column, and deletion.
 CREATE TRIGGER trg_outcome_keep BEFORE DELETE ON outcomes
 BEGIN SELECT RAISE(ABORT, 'outcome is immutable'); END;
 

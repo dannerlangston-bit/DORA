@@ -488,6 +488,17 @@ def test_review_provenance_columns(store):
     assert row[:] == ("manifest_match", "reg-7", 100)
 
 
+def test_ladder_f_ascending_sweep_ids_register(store, monkeypatch):
+    """SD-04: `<w>x<h>-asc` sweep ids (the taxonomy grammar admits them once regenerated) keep their size."""
+    from sentinel.store import store as store_module
+    cid = "sweep/charts.flexible-grid.active-trader-cell/flexgrid/480x360-asc"
+    kind, surface, host, size = cid.split("/")
+    monkeypatch.setattr(store_module, "checkpoint_parts",
+                        lambda c: {"kind": kind, "surface": surface, "qualifier": f"{host}/{size}"})
+    row = store._checkpoint_row(ScopeEntry(cid, WS, "active_trader", 2, "frozen"), "c0ffee")
+    assert (row["host"], row["size_w"], row["size_h"]) == ("flexgrid", 480, 360)
+
+
 def test_seed_rows_read_reason_metadata():
     data = copy.deepcopy(load().data)
     data["reason_metadata"] = {"not_run": {"step_failed": {"owner_section": "5.2",

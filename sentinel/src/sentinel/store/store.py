@@ -1022,7 +1022,7 @@ class Store:
         if kind == "census" and q[0] != e.workspace_id:
             raise StoreRefused(f"{e.checkpoint_id}: a census id's qualifier is its workspace id (8.3)")
         if kind == "sweep":
-            w, h = q[1].split("x")
+            w, h = q[1].removesuffix("-asc").split("x")       # SD-04: Ladder F ascending ids end in -asc
             row.update(host=q[0], size_w=int(w), size_h=int(h))
         elif kind == "split":
             row.update(splitter_id=q[0], fraction=float(q[1]))

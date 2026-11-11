@@ -24,7 +24,16 @@ Choices where the spec is ambiguous (reported):
    the first checkpoint resolves against the first one, a teardown step against any checkpoint of
    the flow, and a `*_since_previous_step` kind also against its `since_step` checkpoint (the 4.7
    worked examples need all three). Rule operand lists: RULE_OPERANDS below, generated from the
-   2.8.3 operand table (SD-34).
+   2.8.3 operand table (SD-34), with each operand's type (RULE_OPERAND_TYPES: a literal number stands
+   only for a numeric operand, a whole one for an integer) and the all-or-none groups (R03).
+   Every assertion the lint accepts is one the Oracle builds (`oracle.assertions.Assertion`): a
+   refusal is L-FLW-11 on a rule and L-FLW-00 on any other kind (a field-shape problem), as are a
+   `pattern` that does not compile, a `value_ref` the flow's fixture does not resolve and an
+   `expected` that is not a value of its `format`. Assertion ids are unique among the assertions that
+   decide one checkpoint (its `expect`, the assert and verify steps it resolves against, and for the
+   last checkpoint the teardown asserts): 4.1 says "unique within their flow", but the 4.7 worked
+   example repeats `side`, `qty` and `price` across checkpoints, and an outcome names its assertion
+   per checkpoint.
 6. L-FLW-10 checks `max_duration_s` against 5 minutes unless a measured p50 is passed in; measured
    p50s live in the Run Store, not in the files.
 7. L-MUT-05 ("each appear at least once per tier-1 checkpoint") cannot hold for every tier-1
@@ -34,12 +43,15 @@ Choices where the spec is ambiguous (reported):
    `redaction` class (M19) expect `identical`: a working redaction stage leaves the capture identical,
    and 12.5 proves M19 by the redaction hit, not by a diff.
 8. L-RGN-07 recognises the allowed frozen masks by the region id's last segment: `clock`,
-   `connection-indicator`, `caret` or `parking`.
+   `connection-indicator`, `parking`, or `caret` on a flow checkpoint with `keep_focus: true` (SD-27).
 9. L-MSK-03 measures a panel class as the bounding box of the checkpoint's regions of that class on
-   one landmark; redaction anchors (`redaction/anchors.yaml`) on a landmark the checkpoint declares
-   count toward it unless `identity_field: true`. Every mask and every redaction box, identity or not,
-   is checked against the money cells (budget 0 percent). A rect with a non-positive w or h is an
-   L-RGN-00 (regions) or L-MSK-03 (redaction anchors) error and takes part in no geometry check.
+   one landmark, and counts every mask region and every redaction anchor (`redaction/anchors.yaml`)
+   on that landmark that is not `identity_field: true`, whatever its own `panel` label, as the union
+   of its intersections with the bounds (overlaps once), as the run time does (`panel_share`). The
+   budgets are the Diff Engine parameters file's `mask_budget` (one source). Every mask and every
+   redaction box, identity or not, is checked against the money cells (budget 0 percent). A rect with
+   a non-positive w or h is an L-RGN-00 (regions) or L-MSK-03 (redaction anchors) error and takes part
+   in no geometry check.
 10. L-XREF-06 reports a manifest that still names a surface or primitive absent from the registry
     or the map, and a disagreement between map and registry, once per file.
 11. L-XREF-07's credential pattern: `password`, `passwd`, `pwd` or `secret`, alone or inside a key such
@@ -60,14 +72,60 @@ Choices where the spec is ambiguous (reported):
 15. "The fixture the run uses" (L-WSP-07) is every fixture a flow on that workspace names, or any
     fixture when no flow uses the workspace. The masked_live rule of L-SRF-08 covers census, sweep
     and split checkpoints; flow checkpoints carry their own data mode (L-FLW-05).
+16. L-RGN-04: a money cell (`money_cell: true` or a `money_role`) is never a mask and carries no
+    floor exception anywhere; on a flow checkpoint it is diff or freeze and asserted; on a census
+    checkpoint a money cell of the closed list (a `money_role`, or `money_cell: true` on an
+    order_confirmation or order_ticket panel, SD-28) is a rule region (SD-29); on sweep and split
+    checkpoints the spec names no kind, so only "never a mask" applies.
+17. L-FLW-08 on class paper_send_ok (6.7) reads the order from the flow itself, since the 4.7 header
+    has no order block: the fields typed into the ticket (`type_fixture`, by the control id: `qty`,
+    `price`, `tif`, `order-type`, `symbol`) and the `equals` assertions on the ticket and dialog (by
+    the region id's last segment) before the one Send click (the Order Confirmation's Send by id,
+    OCR text or JAB name). The limit price is a `fixture.prices.<id>.value`, whose `rule` (`last_delayed
+    x <factor>` or `last_delayed - <points>`) gives the last price and so the distance: at least
+    `distance_pct_equity` percent (default 20) for an equity, `tick_distance_futures` ticks for a
+    future (no default: the policy must declare it), other assets refused. The expected Working row
+    text is an `equals`, `matches` or `present` assertion after the send whose text names `working`;
+    the cancel step is a click after the send on a cancel control other than Cancel All. With the
+    policy enabled and signed, that Send click and the cancel clicks after it may target `deny: true`
+    controls (the single-use token lifts the deny rectangle for one click, and the row's cancel is
+    "allowed only in this class"); nothing else is exempt from L-FLW-13. The library holds no more
+    paper_send_ok flows (one send each) than the per-run cap of `caps.per_run` (default 5), and
+    `caps.per_run` is at most `caps.per_day` (default 20).
+18. Expiry (L-MSK-02, L-RGN-05, L-SRF-11): in CI an `expires_at` in the past is that rule's error; a
+    run-start lint (`lint_repo(..., run_start=True)`, sentinel.lint.runstart) turns it into an
+    `ExpiredRecord` instead, never a violation. A missing owner or reason, or an unreadable date,
+    stays an error at run start.
+19. Rule ids of the smaller field checks: a precondition entry of another type, a regex that does not
+    compile (checkpoint `title_regex`, wait_for `window_title_regex`, assertion `pattern`) and a
+    wait_for landmark of none of the flow's surfaces and regions files are L-FLW-00; a secret's
+    `vault_ref` that is not `vault://<path>#<field>` is L-FLW-06; a region rule's uncompilable
+    `pattern`, `min` above `max` and `must_advance` off a time field, and a regions file's landmark
+    list (unique ids, PNG templates of 16x16 to 400x400, `confidence_min` in (0, 1]) are L-RGN-00
+    (L-MSK-03 for the redaction file's landmarks).
+20. L-POP-02 compares the key after folding its spelling (`_chord`: Control or Ctl as Ctrl, Return and
+    numpad or keypad Enter as Enter, Spacebar as Space, modifiers first). L-POP-04 requires `key` on
+    `dismiss_key` and `wait_timeout_ms` on `wait`, and refuses `key`, `target` and
+    `wait_timeout_ms` on the actions they do not belong to.
+21. L-FIX-03: an expired contract is one whose month code and year name a month before today's; a
+    `roll_date` after the contract month also fails (the roll comes before the contract expires).
+22. Checkpoint ids are enumerated by sentinel.checkpoints, the scope's enumeration too: census ids
+    repeat per dimension combination for tier-1 surfaces in tier A workspaces only, sweep ids exist on
+    the flexgrid, detached and dialog hosts only, with `-asc` for Ladder F's ascending pass, and
+    Ladder F's MAXW and MAXH are the work areas of configs/allowed.yaml.
 
 Rules checked only in part from files (the rest needs live state, history or a store; reported):
 L-DEP-07 (the 90 days after the first Phase 1 scan), L-FLW-03 (that a removed id was renamed needs
 the previous commit; the rename map itself is checked), L-FLW-13 (the 6.8 Explorer deny list has no
-file), L-RGN-02 (bounds from the last calibration), L-RGN-04 (the zero floor lives in calibration;
-on census checkpoints the 2.8 Oracle checks are code, not files), L-MSK-01 (the decision record is in
-the Central Store), L-POP-06 (counts the released builds present in builds/), L-XREF-04 and L-XREF-11
-(calibration files), L-XREF-15 (JAB fields are reported by L-SRF-09).
+file), L-RGN-02 (bounds from the last calibration), L-RGN-04 (the zero floor lives in calibration),
+L-RGN-08 (the `money_cell: true` without `money_role` half waits for the regions migration, see
+sentinel.lint.checks.money_roles), L-MSK-01 (the decision record is in the Central Store), L-POP-06
+(counts the released builds present in builds/), L-XREF-04 and L-XREF-11 (calibration files), L-XREF-15
+(JAB fields are reported by L-SRF-09).
+
+Public API beyond `lint`: `check_pair` (L-BLD-04 and L-BLD-05 at run creation, 4.2), `panel_share` and
+`money_cells_covered` (the mask budget of a regions file with an optional proposed mask, 4.8),
+`mask_budgets`, `ExpiredRecord`.
 """
 from __future__ import annotations
 
@@ -889,10 +947,10 @@ class _Linter:
     def _define_checkpoints(self) -> None:
         """The checkpoint ids the registry and the flows define, enumerated by sentinel.checkpoints (the scope's
         enumeration too, so lint and scope agree on which ids exist)."""
-        tiers = {wid: w.get("tier") for wid, (_rel, w) in self.workspaces.items()}
+        corpus = {wid: w for wid, (_rel, w) in self.workspaces.items()}
         for sid, s in self.surfaces.items():
             file, mode, tier = self.surface_file[sid], s.get("data_mode"), s.get("tier")
-            for cid, kind in cps.surface_checkpoints(s, tiers, self.sweep_steps + self.corpus_sizes.get(sid, [])):
+            for cid, kind in cps.surface_checkpoints(s, corpus, self.sweep_steps + self.corpus_sizes.get(sid, [])):
                 self.defined.setdefault(cid, CheckpointDef(cid, kind, sid, mode, tier, file))
         for fid, doc in self.flows.items():
             for st in self._seq(doc.data):

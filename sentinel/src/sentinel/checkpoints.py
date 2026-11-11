@@ -1,10 +1,14 @@
-"""The one enumeration of checkpoint ids (4.1 grammar; 2.4, 2.5.1, 2.5.2, 4.5 `census`, 4.7 checkpoint ids).
+"""The one enumeration of checkpoint ids (4.1 grammar; 2.4, 2.5.1, 2.5.2, 2.11, 4.5 `census`, 4.7 checkpoint ids).
 
 The lint (which checkpoint ids a regions file, mask, mutant or rename may name: L-RGN-01, L-XREF-04) and the
 scope computation (which checkpoints a run plans, 2.11) both build checkpoint ids here, so they never disagree
 on which ids exist. Every rule that decides whether an id exists is applied in this module only:
 
-- census (2.4, 4.5 `census.dimensions`): `census/<surface>/<workspace>`. A tier-1 surface that declares
+- census visits (2.11): a PR run visits a surface in the workspaces of its `census.workspaces`; the merge pass
+  visits the tier A workspaces and the RC pass the tier A and B workspaces that host the surface
+  (`gadgets_present`), list it in `census.workspaces`, or any of them for a global surface (kinds tab, subtab, menu,
+  settings_page and dialog, scope choice 3): `pass_visits`.
+- census ids (2.4, 4.5 `census.dimensions`): `census/<surface>/<workspace>`. A tier-1 surface that declares
   `census.dimensions` repeats over the cross product of the declared values, in tier A workspaces only, with the
   dimension segment `/<dim>=<value>[,<dim>=<value>]` (dimensions and values in declared order); in every other
   workspace, and for every other surface, the plain id.
@@ -15,8 +19,15 @@ on which ids exist. Every rule that decides whether an id exists is applied in t
   narrowed by the splitter's `fractions`, with 0.00 and 1.00 only when `collapsible`.
 - flow (4.7): `flow/<surface_id>/<flow_id>/<step id>`.
 
-Choice where the spec is ambiguous (reported): the cross product "is visited in tier-1 workspaces only" (2.2) is
-read as the tier A canonical workspaces of 2.3, as the scope computation already had it (scope choice 4).
+Choices where the spec is ambiguous (reported):
+
+- The cross product "is visited in tier-1 workspaces only" (2.2) is read as the tier A canonical workspaces of 2.3,
+  as the scope computation already had it (scope choice 4).
+- `surface_checkpoints`, the lint's definition (L-RGN-01: "a flow or census entry references the checkpoint"),
+  takes the census workspaces of the surface's own `census.workspaces`. The merge and RC passes also visit hosting
+  tier A and B workspaces the entry does not list (`pass_visits`); defining those ids too would require a regions
+  file with a rule or mask region for every such masked_live visit (L-SRF-08, L-XREF-03), which the example lacks
+  for the Position Statement in two tier A workspaces.
 """
 from __future__ import annotations
 
@@ -31,6 +42,8 @@ FULL_FRACTIONS: tuple[float, ...] = (0.00, 0.15, 0.30, 0.50, 0.70, 0.85, 1.00)  
 SHORT_FRACTIONS: tuple[float, ...] = (0.15, 0.50, 0.85)
 DIMENSION_TIER = 1                       # 2.4: the census repeats tier-1 surfaces over their dimensions
 DIMENSION_WORKSPACE_TIER = "A"           # 2.2: in the canonical (tier A) workspaces only
+PASS_TIERS: dict[str, tuple[str, ...]] = {"merge": ("A",), "rc": ("A", "B")}     # 2.11 merge and RC census passes
+GLOBAL_KINDS = frozenset({"tab", "subtab", "menu", "settings_page", "dialog"})    # 2.4 global surfaces (scope choice 3)
 
 
 def repeats_dimensions(surface_tier: object, workspace_tier: object, dimensions: Mapping[str, Sequence] | None) -> bool:
@@ -47,6 +60,13 @@ def census_ids(surface_id: str, workspace_id: str, *, surface_tier: object, work
     dims = [(str(k), [str(v) for v in vals]) for k, vals in (dimensions or {}).items()]
     combos = itertools.product(*[[f"{k}={v}" for v in vals] for k, vals in dims])
     return tuple(f"{base}/{','.join(combo)}" for combo in combos)
+
+
+def pass_visits(surface_id: str, kind: object, listed: Iterable[str], workspace_id: str,
+                gadgets_present: Iterable[str]) -> bool:
+    """A merge or RC census pass visits the surface in this workspace (2.11): the workspace hosts it, the surface
+    lists the workspace in `census.workspaces`, or the surface is global."""
+    return surface_id in set(gadgets_present) or workspace_id in set(listed) or kind in GLOBAL_KINDS
 
 
 def sweep_hosts(hosts: Iterable[object]) -> tuple[str, ...]:
@@ -97,23 +117,22 @@ def _list(x: object) -> list:
     return x if isinstance(x, list) else []
 
 
-def surface_checkpoints(surface: Mapping[str, object], workspace_tiers: Mapping[str, object],
+def surface_checkpoints(surface: Mapping[str, object], workspaces: Mapping[str, Mapping[str, object]],
                         steps: Iterable[SweepStep]) -> list[tuple[str, str]]:
     """Every census, sweep and split checkpoint id one registry entry (4.5) can produce in any run type, as
     (checkpoint id, kind), in definition order and without duplicates.
 
-    `workspace_tiers` maps a corpus workspace id to its tier (a census workspace absent from it is visited with
-    the plain id); `steps` is the union of the ladders' steps and the surface's corpus sizes (2.5.2)."""
+    `workspaces` maps a corpus workspace id to its entry (`tier`); a census workspace absent from it is visited with
+    the plain id. `steps` is the union of the ladders' steps and the surface's corpus sizes."""
     sid = str(surface.get("id"))
     out: dict[str, str] = {}
     census = _map(surface.get("census"))
     if census.get("enabled", True):
         dims = {str(k): _list(v) for k, v in _map(census.get("dimensions")).items()}
-        for ws in _list(census.get("workspaces")):
-            if isinstance(ws, str):
-                for cid in census_ids(sid, ws, surface_tier=surface.get("tier"), workspace_tier=workspace_tiers.get(ws),
-                                      dimensions=dims):
-                    out.setdefault(cid, CENSUS)
+        for ws in (w for w in _list(census.get("workspaces")) if isinstance(w, str)):
+            for cid in census_ids(sid, ws, surface_tier=surface.get("tier"),
+                                  workspace_tier=_map(workspaces.get(ws)).get("tier"), dimensions=dims):
+                out.setdefault(cid, CENSUS)
     if surface.get("resizable") is True:
         hosts = sweep_hosts(_list(surface.get("hosts")))
         for st in steps:

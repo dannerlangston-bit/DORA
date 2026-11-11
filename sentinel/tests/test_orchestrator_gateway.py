@@ -594,7 +594,14 @@ def test_three_per_flow_quarantine_and_ten_per_run_trip_the_kill_switch():
     for _ in range(2):
         assert not ledger.record(nonsend, unit="flow.a").has("quarantine_flow")
     third = ledger.record(nonsend, unit="flow.a")
-    assert third.step == "failed" and third.has("quarantine_flow") and third.has("end_flow")
+    # 5.4 Failure outcomes, 5.4.8 rule 3, SD-53: the threshold adds the quarantine; the scripted step stays blocked
+    assert third.step == "blocked_by_gateway" and third.has("quarantine_flow") and third.has("end_flow")
+    agent = DropLedger()
+    rescue = replace(nonsend, mode="agent")
+    for _ in range(2):
+        assert agent.record(rescue, unit="rescue").step == "failed"
+    third_rescue = agent.record(rescue, unit="rescue")                      # an agent rescue's step is failed (5.4.8)
+    assert third_rescue.step == "failed" and third_rescue.actions == ("end_session", "quarantine_flow")
     for i in range(6):
         assert ledger.record(nonsend, unit=f"flow.b{i}").run is None
     tenth = ledger.record(nonsend, unit="flow.c")
@@ -771,7 +778,7 @@ def test_a_non_send_refusal_ends_the_flow_and_its_later_checkpoints_are_not_run(
     for _ in range(2):
         ledger.record(GatewayDrop("deny_profile", "refused", "integrity"), unit="flow.q", step_id="s01")
     third = ledger.record(GatewayDrop("deny_profile", "refused", "integrity"), unit="flow.q", step_id="s02")
-    assert third.step == "failed" and rest(third) == [("not_run", "step_failed:s02")]
+    assert third.step == "blocked_by_gateway" and rest(third) == [("not_run", "step_failed:s02")]
 
 
 def test_an_own_token_drop_after_the_retry_marks_its_checkpoint_hook_lost_and_the_rest_not_run():

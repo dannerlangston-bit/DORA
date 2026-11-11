@@ -1029,9 +1029,12 @@ class DropLedger:
                 return ControlResult("gateway", False, "running", step="blocked_by_gateway", step_reason=drop.reason,
                                      actions=("end_session",), findings=findings, evidence=ev,
                                      detail=f"{self.unit_counts[unit]} denied attempts end the session (6.8)")
-            end = "end_session" if drop.mode == "agent" else "end_flow"
-            return ControlResult("gateway", False, "running", step="failed", step_reason=drop.reason,
-                                 actions=(end, "quarantine_flow"), alert=alert or alerts.flow_quarantined(),
+            # the threshold adds the quarantine; the step outcome stays rule 3's by mode (choice 15)
+            agent = drop.mode == "agent"
+            return ControlResult("gateway", False, "running", step="failed" if agent else "blocked_by_gateway",
+                                 step_reason=drop.reason, actions=("end_session" if agent else "end_flow",
+                                                                   "quarantine_flow"),
+                                 alert=alert or alerts.flow_quarantined(),
                                  findings=findings, incident="S3",
                                  detail=f"{self.unit_counts[unit]} drops or refusals in {unit}", evidence=ev)
         if drop.reason in INTEGRITY_FINDING:

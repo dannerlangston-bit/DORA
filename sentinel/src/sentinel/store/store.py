@@ -21,7 +21,9 @@ Enforced here and, where SQL can say it, again by the schema:
 - decisions are human-only (4.14, L-DEC-01) and never edited in place: supersede and revoke only (8.3). Also
   refused at write: approve_baseline from a PR run, a run not complete, a synthetic outcome or by the change's
   author on tier 1 (L-DEC-05); a waiver without an expiry at most 30 days out (L-DEC-07); a fixed_in_build build
-  not newer, by first_seen_at, than build_id or the superseded row's build_id (L-DEC-08).
+  not newer, by first_seen_at, than build_id or the superseded row's build_id (L-DEC-08); a supersession of a
+  decision on another signature (checkpoint, region, category, pHash within the old row's tolerance; 9.7), and a
+  fixed_in_build superseding anything but the signature's confirm_bug or its reopened fix (SD-79).
 - the lookup reads only actions that act through the signature (request_mask once its mask_ref is set); a
   signature with two supersessions within 30 days is frozen; a mark_intended decision applies (counts toward the
   verdict set and inheritance) only within its 9.7 scope: made on this run or its build pair, or the run's loaded
@@ -2156,10 +2158,24 @@ class Store:
                 return self._stored_decision(decision_ref(again[0]))
         old = None
         if supersedes is not None:
-            old = self._one("SELECT status, build_id, decided_by, source_finding_id FROM decisions "
-                            "WHERE decision_id = ?", (decision_int(supersedes),))
+            old = self._one("SELECT status, build_id, decided_by, source_finding_id, checkpoint_id, region_id, "
+                            "category, phash, hamming_tolerance, action FROM decisions WHERE decision_id = ?",
+                            (decision_int(supersedes),))
             if old is None or old["status"] not in ("active", "reopened"):
                 raise StoreRefused(f"{supersedes} is not an active decision to supersede (8.3)")
+            sig, dist = d.signature, hamming(old["phash"], d.signature.phash)
+            if ((old["checkpoint_id"], old["region_id"], old["category"]) != (sig.checkpoint_id, sig.region_id,
+                                                                            sig.category)
+                    or dist > old["hamming_tolerance"]):
+                # 9.7: a supersession replaces the active row of this signature, the one the lookup matches
+                raise StoreRefused(f"{supersedes} is a decision on another signature ({old['checkpoint_id']} / "
+                                   f"{old['region_id']} / {old['category']}, pHash at Hamming {dist} with tolerance "
+                                   f"{old['hamming_tolerance']}); supersede the active decision of this signature "
+                                   "(9.7)")
+            if d.action == "fixed_in_build" and not (old["action"] == "confirm_bug" or (
+                    old["action"] == "fixed_in_build" and old["status"] == "reopened")):
+                raise StoreRefused(f"fixed_in_build supersedes the confirm_bug decision on the signature (or its "
+                                   f"reopened fix), not {old['action']} {supersedes} (SD-79, 4.14)")
         if d.action == "approve_baseline":
             self._approvable(run_id, d, cp["tier"])
         if d.action == "fixed_in_build" and fixed_in_build_id is not None:

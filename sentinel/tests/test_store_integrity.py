@@ -327,6 +327,32 @@ def test_the_same_click_again_returns_the_same_decision(store):
     assert store.conn.execute("SELECT count(*) FROM decisions").fetchone()[0] == 1
 
 
+FAR = "fedcba9876543210"                    # 64 bits from PH: outside every tolerance
+
+
+def test_supersedes_names_a_decision_on_the_same_signature(store):
+    # store:2, 9.7: Supersede replaces the active row of THIS signature; SD-79: fixed_in_build supersedes its confirm_bug
+    finding(store, "F-1")
+    decide(store, "dec-000001", by="alice", finding_ref="F-1")
+    decide(store, "dec-000002", by="carol", region="rgn.unrelated")
+    decide(store, "dec-000003", by="carol", phash=FAR)
+    decide(store, "dec-000004", by="carol", category="invariant_violation")
+    for other in ("dec-000002", "dec-000003", "dec-000004"):
+        with pytest.raises(StoreRefused, match="another signature"):
+            decide(store, "dec-000005", "confirm_bug", by="bob", finding_ref="F-1", supersedes=other)
+        assert store.get_decision(other).status == "active"
+    assert store.get_decision("dec-000005") is None and not store.get_finding("F-1").contested
+    for b, at in (("b1", "2026-11-01T00:00:00+00:00"), ("b2", "2026-11-05T00:00:00+00:00")):
+        store.register_build(b, channel="branch", source_commit=b, pipeline_artifact_url="u", installer_sha256=b,
+                             first_seen_at=at)
+    with pytest.raises(StoreRefused, match="SD-79"):
+        decide(store, "dec-000005", "fixed_in_build", by="bob", supersedes="dec-000001",
+               call={"fixed_in_build_id": "b2", "build_id": "b1"})
+    assert store.get_decision("dec-000001").status == "active"
+    sup = decide(store, "dec-000005", "confirm_bug", by="bob", finding_ref="F-1", supersedes="dec-000001")
+    assert sup.supersedes == "dec-000001" and store.get_decision("dec-000001").status == "superseded"
+
+
 def test_superseding_your_own_decision_writes_a_new_row(store):
     # store:3, 9.6 Supersede decision, 9.7: the idempotent return is for the same click again, never a supersession
     finding(store, "F-1")

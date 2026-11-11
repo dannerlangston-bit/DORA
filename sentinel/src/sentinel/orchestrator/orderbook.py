@@ -163,8 +163,8 @@ def build_order_book(grid_rows_ocr: Mapping[str, Sequence[Cells] | None], copy_a
             problems.append(f"{g}: grid OCR and Copy All disagree (OCR only: {only_ocr or 'none'}; Copy All only: "
                             f"{only_copy or 'none'}; or a cell differs)")
             agrees = False
-        seen = list(copy or ()) + [r for r in (ocr or ()) if row_key(layout, r) not in
-                                   {row_key(layout, c) for c in (copy or ())}]
+        copy_keys = {row_key(layout, c) for c in copy or ()}
+        seen = list(copy or ()) + [r for r in ocr or () if row_key(layout, r) not in copy_keys]     # choice 3
         if g == POSITION_GRID:
             position_rows = len(seen)
             continue

@@ -238,6 +238,39 @@ def test_an_unused_armed_token_blocks_moves_only_until_it_expires():
     assert hook_decide(g, ev("button_down", 100, 100), T + 0.6).reason == "token_expired"   # matching unchanged
 
 
+def test_an_unexpired_match_wins_over_a_dead_token_left_armed():
+    """Choice 18: a dead token left armed after `token_mismatch_coords` or `no_token` no longer drops a fresh token's
+    down `token_expired`; when every match has expired, the first still drops it `token_expired`."""
+    g = armed()
+    dead_click = g.issue_click(100, 100, T)
+    assert hook_decide(g, ev("button_down", 110, 100), T).reason == "token_mismatch_coords"
+    dead_key = g.issue_key(ord("A"), T)
+    assert hook_decide(g, ev("key_down", vk=ord("B")), T).reason == "no_token"
+    g.stamp_watcher(Flag.CLEAR, T + 0.6)                                         # a fresh poll: the flag is clear
+    fresh_click = g.issue_click(101, 99, T + 0.6)
+    fresh_key = g.issue_key(ord("A"), T + 0.6)
+    d = hook_decide(g, ev("button_down", 100, 100), T + 0.7)
+    assert (d.allowed, d.token_id) == (True, fresh_click.id)
+    d = hook_decide(g, ev("key_down", vk=ord("A")), T + 0.7)
+    assert (d.allowed, d.token_id) == (True, fresh_key.id)
+    assert (dead_click.state, dead_key.state) == ("armed", "armed")
+    d = hook_decide(g, ev("button_down", 100, 100), T + 0.7)                     # only the dead one is armed now
+    assert (d.reason, d.token_id) == ("token_expired", dead_click.id)
+    d = hook_decide(g, ev("key_down", vk=ord("A")), T + 0.7)
+    assert (d.reason, d.token_id) == ("token_expired", dead_key.id)
+
+
+def test_of_two_unexpired_matches_the_first_issued_wins_and_a_drop_spends_the_preferred_token():
+    g = armed()
+    first, second = g.issue_click(100, 100, T), g.issue_click(100, 100, T + 0.1)
+    assert hook_decide(g, ev("button_down", 100, 100), T + 0.2).token_id == first.id
+    g = armed(Flag.SET)
+    old, fresh = g.issue_click(100, 100, T - 0.6, dialog_ok=True), g.issue_click(100, 100, T, dialog_ok=True)
+    d = hook_decide(g, ev("button_down", 100, 100, mods=frozenset({"shift"})), T)
+    assert (d.reason, d.token_id) == ("shift_click_dialog", fresh.id)
+    assert (old.state, fresh.state) == ("armed", "dropped")
+
+
 def test_a_half_consumed_token_keeps_blocking_moves_past_expiry_until_its_up():
     g = armed()
     g.issue_click(100, 100, T)

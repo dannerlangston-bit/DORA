@@ -474,6 +474,29 @@ def test_an_expired_armed_slot_blocks_no_move_without_any_republish():
     assert token_states(buf)[t.id] == ("armed", None)
 
 
+def test_the_segment_prefers_an_unexpired_match_in_any_slot_over_a_dead_token():
+    """Choice 6 (orchestrator.gateway choice 18), read from the bytes: the fresh token sits in an earlier slot than
+    the dead one, so neither slot order nor issue order decides; expiry does."""
+    g = armed()
+    used = g.issue_click(500, 500, T)
+    dead = g.issue_click(100, 100, T)
+    buf, w = published(g)
+    for kind in ("button_down", "button_up"):
+        assert decide_from_segment(buf, ev(kind, 500, 500), to_ns(T)).allowed
+    assert decide_from_segment(buf, ev("button_down", 110, 100), to_ns(T)).reason == "token_mismatch_coords"
+    apply_token_states(buf, g)
+    g.stamp_watcher(Flag.CLEAR, T + 0.6)
+    fresh = g.issue_click(101, 99, T + 0.6)                                        # takes the used token's slot
+    w.publish(g)
+    slots = {s.id: s.slot for s in read_tokens(buf)}
+    assert slots[fresh.id] < slots[dead.id] and used.id not in slots
+    d = decide_from_segment(buf, ev("button_down", 100, 100), to_ns(T + 0.7))
+    assert d == Decision(True, None, fresh.id) and token_states(buf)[dead.id] == ("armed", None)
+    d = decide_from_segment(buf, ev("button_down", 100, 100), to_ns(T + 0.7))
+    assert d == Decision(False, "token_expired", dead.id)                          # only expired matches left
+    assert token_states(buf)[dead.id] == ("expired", "token_expired")
+
+
 def test_the_segment_reuses_the_slots_of_expired_armed_tokens():
     g = armed()
     old = [g.issue_key(0x41, T) for _ in range(16)]
@@ -613,11 +636,20 @@ LIFE_POINTS = ((100, 100), (101, 99), (400, 300), (920, 610))
 
 
 def _issue_any(g: GatewayState, rng: random.Random, now: float) -> None:
-    """One token of a random kind at `now`, as the emitter writes them (stage 5); a full segment issues nothing."""
+    """One token of a random kind at `now`, as the emitter writes them (stage 5), or a new token for the target of
+    a click or key token that expired unconsumed, as the retry of 5.4.3 stage 7 re-tokenizes; a full segment issues
+    nothing."""
     x, y = rng.choice(LIFE_POINTS)
     k = rng.random()
+    retry = [t for t in g.tokens.values() if t.state == "armed" and t.kind in ("click", "key") and now > t.expires]
     try:
-        if k < 0.4:
+        if retry and rng.random() < 0.5:
+            t = rng.choice(retry)
+            if t.kind == "click":
+                g.issue_click(t.x, t.y, now, button=t.button or "left", dialog_ok=t.dialog_ok)
+            else:
+                g.issue_key(t.vk or 0, now)
+        elif k < 0.4:
             g.issue_click(x, y, now, button=rng.choice(("left", "right")), dialog_ok=rng.random() < 0.6,
                           hold_ms=rng.choice((None, None, None, 300)))
         elif k < 0.75:
@@ -630,8 +662,16 @@ def _issue_any(g: GatewayState, rng: random.Random, now: float) -> None:
         pass
 
 
-def _emitter_event(rng: random.Random) -> InputEvent:
-    """Mostly the emitter's own events at token points, so rule 1 and rule 2 drops meet real tokens."""
+def _emitter_event(rng: random.Random, g: GatewayState) -> InputEvent:
+    """Mostly the emitter's own events at token points, so rule 1 and rule 2 drops meet real tokens; often the down
+    of a click or key token `g` holds, as the emitter sends it."""
+    held = [t for t in g.tokens.values() if t.kind in ("click", "key")]
+    if held and rng.random() < 0.4:
+        t = rng.choice(held)
+        mods = rng.choice((frozenset(),) * 4 + (frozenset({"shift"}),))
+        if t.kind == "click":
+            return InputEvent("button_down", t.x, t.y, button=t.button, mods=mods)
+        return InputEvent("key_down", vk=t.vk, mods=mods)
     kind = rng.choice(("move", "button_down", "button_down", "button_up", "wheel", "key_down", "key_down", "key_up"))
     x, y = rng.choice(LIFE_POINTS + ((5, 5), (110, 100)))
     kw = {"origin": rng.choice(("emitter",) * 8 + ("foreign_process", "drill")),
@@ -645,15 +685,26 @@ def _emitter_event(rng: random.Random) -> InputEvent:
     return InputEvent(kind, x, y, **kw)
 
 
+def _downs_matching(g: GatewayState, e: InputEvent) -> list[gw.Token]:
+    """The armed tokens the emitter's button or key down matches, in issue order (5.4.4), whatever their expiry."""
+    if e.origin != "emitter" or e.type not in ("button_down", "key_down"):
+        return []
+    if e.type == "key_down":
+        return [t for t in g.tokens.values() if t.kind == "key" and t.vk == e.vk and t.state == "armed"]
+    return [t for t in g.tokens.values() if t.kind == "click" and t.button == e.button and t.state == "armed"
+            and abs(t.x - e.x) <= t.tol_px and abs(t.y - e.y) <= t.tol_px]
+
+
 def test_parity_on_a_seeded_random_corpus_with_expiry_and_spent_tokens():
     """Choice 6 and orchestrator.gateway choice 17 at random: tokens issued as time runs, the hook armed and disarmed,
     deny-all and the flag toggled, events dropped under rules 1 and 2 that spend their tokens, and time run past
-    expiry. Both halves decide alike throughout, and once every token has expired with none half consumed, the
-    emitter's move is allowed: a dead token never wedges input."""
+    expiry. Both halves decide alike throughout; once every token has expired with none half consumed, the
+    emitter's move is allowed (a dead token never wedges input); and a down that matches a dead token first and a
+    live one later is decided on the live one (choice 18)."""
     rng = random.Random(20261112)
     dual = Dual()
-    unwedged, spent = 0, set()
-    for _ in range(300):
+    unwedged, preferred, spent = 0, 0, set()
+    for _ in range(600):
         g = GatewayState(armed=True)
         now = T
         g.stamp_watcher(Flag.CLEAR, now)
@@ -668,14 +719,20 @@ def test_parity_on_a_seeded_random_corpus_with_expiry_and_spent_tokens():
             elif k < 0.55:
                 now += rng.choice((0.1, 0.3, 0.6, 2.5))
             else:
-                d = dual(g, _emitter_event(rng), now)
-                if d.token_id is not None and g.tokens[d.token_id].drop_reason == d.reason:
+                e = _emitter_event(rng, g)
+                matching = _downs_matching(g, e)
+                live = [t for t in matching if now <= t.expires]
+                d = dual(g, e, now)
+                if live and live[0] is not matching[0]:
+                    assert d.token_id == live[0].id, (e, now)
+                    preferred += 1
+                if not d.allowed and d.token_id is not None and g.tokens[d.token_id].drop_reason == d.reason:
                     spent.add(d.reason)
             dead = all(t.state != "half_consumed" and now > t.expires for t in g.tokens.values())
             if dead and g.armed and not g.deny_all:
                 assert dual(g, InputEvent("move", 5, 5), now).allowed
                 unwedged += 1
-    assert dual.calls > 3000 and unwedged > 600
+    assert dual.calls > 6000 and unwedged > 1200 and preferred > 30
     assert {"deny_all", "not_armed", "blocked_key_dialog", "blocked_chord_dialog", "shift_click_dialog"} <= spent
 
 

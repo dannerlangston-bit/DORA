@@ -63,6 +63,8 @@ Choices where the spec is silent or ambiguous (reported):
    wheel writes the token rule 3 would have used as `dropped` with the reason (`_spend`), so stage 7 reads the
    safety reason. Slots are reused as the slow half's picture says: `publish` frees every slot whose token
    `GatewayState` no longer holds, and `GatewayState._slot` lets an expired armed token go when its slot is needed.
+   Of several matching tokens, rule 3 takes the first unexpired one and the first expired one only when all have
+   expired (`orchestrator.gateway` choice 18), so a dead token cannot drop a fresh token's down `token_expired`.
 """
 from __future__ import annotations
 
@@ -661,16 +663,21 @@ def _pending(t: TokenSlot, now_ns: int) -> bool:
     return t.state == HALF_CONSUMED or (t.state == ARMED and now_ns <= t.expires_ns)
 
 
+def _unexpired_first(cands: list[TokenSlot], now_ns: int) -> TokenSlot:
+    """The first unexpired token in issue order, else the first (expired) one (choice 6)."""
+    return next((t for t in cands if now_ns <= t.expires_ns), cands[0])
+
+
 def _match(toks: list[TokenSlot], e: EventLike, now_ns: int) -> tuple[str | None, TokenSlot | None]:
-    """The token rule 3 acts on for the emitter's button down, key down or wheel event (5.4.4), the first in issue
-    order (choice 3), or the reason none matches (`no_token`, `token_mismatch_coords`). Moves, ups and every other
-    origin match none here."""
+    """The token rule 3 acts on for the emitter's button down, key down or wheel event (5.4.4): the first unexpired
+    match in issue order (choice 3), else the first expired one (choice 6), or the reason none matches
+    (`no_token`, `token_mismatch_coords`). Moves, ups and every other origin match none here."""
     if e.origin != "emitter" or e.type not in ("button_down", "key_down", "wheel"):
         return "no_token", None
     if e.type == "key_down":
         keys = [t for t in toks if t.kind == KIND_KEY and not t.release and t.button_or_vk == e.vk
                 and t.state == ARMED]
-        return (None, keys[0]) if keys else ("no_token", None)
+        return (None, _unexpired_first(keys, now_ns)) if keys else ("no_token", None)
     if e.type == "button_down":
         code = BUTTON_CODE.get(e.button or "", -1)
         cands = [t for t in toks if t.kind == KIND_BUTTON and not t.release and t.button_or_vk == code
@@ -682,7 +689,7 @@ def _match(toks: list[TokenSlot], e: EventLike, now_ns: int) -> tuple[str | None
     if not cands:
         return "no_token", None
     near = [t for t in cands if _near(t, e)]
-    return (None, near[0]) if near else ("token_mismatch_coords", None)
+    return (None, _unexpired_first(near, now_ns)) if near else ("token_mismatch_coords", None)
 
 
 def _spend(buf: Any, e: EventLike, now_ns: int, reason: str, toks: list[TokenSlot]) -> Decision:

@@ -120,8 +120,12 @@ Choices where the spec is ambiguous (reported):
    cannot tell which token another origin's event or an up belongs to, so those drops spend none. Every other
    unused token (after `no_token` or `token_mismatch_coords`, or when the event never came) ends at its expiry.
    Without this rule, one click dropped under deny-all left its token armed forever, and every later move was
-   dropped `move_outside_allow`. Token matching is unchanged: an expired token that matches a button down first
-   still drops it `token_expired`.
+   dropped `move_outside_allow`.
+18. Several matching tokens (5.4.4 Button down and Key down rows: allowed when "a token with the same button,
+   abs(dx) and abs(dy) <= tol_px, unexpired, state `armed`" exists). Rule 3 takes the first unexpired armed match in
+   issue order and falls back to the first expired one only when every match has expired, which keeps the
+   `token_expired` drop (5.4.5). So a dead token left armed after `token_mismatch_coords` or `no_token` cannot drop
+   a fresh token's down `token_expired`. A wheel match is unexpired already (choice 5).
 """
 from __future__ import annotations
 
@@ -485,15 +489,20 @@ def _near(t: Token, e: InputEvent) -> bool:
     return abs(t.x - e.x) <= t.tol_px and abs(t.y - e.y) <= t.tol_px
 
 
+def _unexpired_first(cands: list[Token], now: float) -> Token:
+    """The first unexpired token in issue order, else the first (expired) one (choice 18)."""
+    return next((t for t in cands if now <= t.expires), cands[0])
+
+
 def _match(state: GatewayState, e: InputEvent, now: float) -> tuple[str | None, Token | None]:
-    """The token rule 3 acts on for the emitter's button down, key down or wheel event (5.4.4), the first in issue
-    order, or the reason none matches (`no_token`, `token_mismatch_coords`). Moves, ups and every other origin
-    match none here."""
+    """The token rule 3 acts on for the emitter's button down, key down or wheel event (5.4.4): the first unexpired
+    match in issue order, else the first expired one (choice 18), or the reason none matches (`no_token`,
+    `token_mismatch_coords`). Moves, ups and every other origin match none here."""
     if e.origin != "emitter" or e.type not in ("button_down", "key_down", "wheel"):
         return "no_token", None
     if e.type == "key_down":
         keys = [t for t in state.tokens.values() if t.kind == "key" and t.vk == e.vk and t.state == "armed"]
-        return (None, keys[0]) if keys else ("no_token", None)
+        return (None, _unexpired_first(keys, now)) if keys else ("no_token", None)
     if e.type == "button_down":
         cands = [t for t in state.tokens.values()
                  if t.kind == "click" and t.button == e.button and t.state == "armed"]
@@ -504,7 +513,7 @@ def _match(state: GatewayState, e: InputEvent, now: float) -> tuple[str | None, 
     if not cands:
         return "no_token", None
     near = [t for t in cands if _near(t, e)]
-    return (None, near[0]) if near else ("token_mismatch_coords", None)
+    return (None, _unexpired_first(near, now)) if near else ("token_mismatch_coords", None)
 
 
 def _spend(state: GatewayState, e: InputEvent, now: float, reason: str) -> HookDecision:

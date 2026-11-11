@@ -1923,7 +1923,7 @@ def run_start(repo: Repo, candidate: str, today: date) -> RunStart:
 
 def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path, today: date = DEFAULT_TODAY,
                  reviewer: ReviewerAdapter | None = None, live: ReviewerJob | None = None,
-                 live_factory: Callable[[EgressGate | None], ReviewerJob] | None = None) -> RunResult:
+                 live_factory: Callable[[EgressGate], ReviewerJob] | None = None) -> RunResult:
     """One simulated PR run from webhook to PR comment (module docstring). The Reviewer is `reviewer`, else
     with `live` (a `reviewer.ReviewerJob`, `pipeline.live.live_job`; or `live_factory`, which builds it over the
     run's `egress.EgressGate`, 6.10) the real adapter `ModelReviewer`, else
@@ -2272,24 +2272,29 @@ def _summary(store: Store, cfg: SentinelConfig, plan: ScopePlan, run: _Run, scen
     return out
 
 
-def egress_gate(cfg_root: Path, store: Store, run_id: str) -> EgressGate | None:
-    """The run's egress gate over the signed allowlist (`policy/egress_allowlist.yaml`, 6.10); None without one."""
+def egress_allowlist(cfg_root: Path) -> EgressAllowlist:
+    """The signed allowlist `policy/egress_allowlist.yaml` (6.10); without the file the empty allowlist, under which
+    every host is refused (L-XREF-19 choice 1, `egress` choice 5): a missing allowlist never opens the gate."""
     path = cfg_root / "policy" / "egress_allowlist.yaml"
-    return EgressGate(EgressAllowlist.load(path), store, run_id=run_id) if path.is_file() else None
+    return EgressAllowlist.load(path) if path.is_file() else EgressAllowlist.empty()
 
 
-def nightly_reconcile(store: Store, cfg_root: Path, now: datetime) -> ControlResult | None:
-    """The Nightly egress reconciliation (6.10): the last day's `egress_log` rows against the signed allowlist and
-    the rigs' firewall logs; the simulated rig keeps no firewall log, so only rows to an unapproved host can trip it.
-    Each run the reconciliation names is re-marked `aborted_harness (egress_unlogged)` by its caller (none here)."""
-    path = cfg_root / "policy" / "egress_allowlist.yaml"
-    if not path.is_file():
-        return None
+def egress_gate(cfg_root: Path, store: Store, run_id: str) -> EgressGate:
+    """The run's egress gate over the signed allowlist (`egress_allowlist`, 6.10): every outbound call of the run,
+    the live Reviewer's included, goes through it."""
+    return EgressGate(egress_allowlist(cfg_root), store, run_id=run_id)
+
+
+def nightly_reconcile(store: Store, cfg_root: Path, now: datetime) -> ControlResult:
+    """The Nightly egress reconciliation (6.10): the last day's `egress_log` rows against the signed allowlist (the
+    empty one without the file) and the rigs' firewall logs; the simulated rig keeps no firewall log, so only rows to
+    an unapproved host can trip it. Each run the reconciliation names is re-marked `aborted_harness
+    (egress_unlogged)` by its caller (none here)."""
     since = (now - timedelta(days=1)).astimezone(timezone.utc).isoformat()
     names = {f.name for f in dataclasses.fields(EgressRow)}
     rows = [EgressRow(**{k: r[k] for k in r.keys() if k in names})
             for r in store.query("SELECT * FROM egress_log WHERE sent_at >= ?", (since,))]
-    return reconcile(rows, EgressAllowlist.load(path), ()).control()
+    return reconcile(rows, egress_allowlist(cfg_root), ()).control()
 
 
 @dataclass(frozen=True)
@@ -2690,9 +2695,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         if expired_findings:
             health["expired"] = [f.evidence["raw_values"]["run_health"] for f in expired_findings]
         egress = nightly_reconcile(store, cfg.root, now)          # 6.10: the day's egress rows against the allowlist
-        if egress is not None:
-            work._note(st, egress)
-            health["egress"] = {"verdict": "ok" if egress.passed else egress.incident, "detail": egress.detail}
+        work._note(st, egress)
+        health["egress"] = {"verdict": "ok" if egress.passed else egress.incident, "detail": egress.detail}
         runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", shard.verdict.status, "reported",
                                           reason=shard.verdict.reason, started_at=started,
                                           ended_at=_ts(today, scenario.clock, 2 * 3600)),

@@ -27,6 +27,9 @@ Choices where the spec is ambiguous (reported):
 4. Reconciliation matches a firewall-permitted harness connection to a `sent` or `failed` row of the same host
    (and run, when both name one) within `window_s` seconds (default 60; the rig clocks are within 2 s, R7). A
    firewall entry without a run id raises the S1 finding but re-marks no run.
+5. A config without `policy/egress_allowlist.yaml` (which L-XREF-19 accepts) has the empty allowlist
+   (`EgressAllowlist.empty`): the harness HTTP client refuses every host, as the lint's choice 1 assumes, and the
+   Nightly reconciliation compares the day's rows with it, so any `sent` row is to a host outside the allowlist.
 """
 from __future__ import annotations
 
@@ -141,6 +144,11 @@ class EgressAllowlist:
     def load(path: str | Path) -> "EgressAllowlist":
         return EgressAllowlist.from_dict(yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {})
 
+    @staticmethod
+    def empty() -> "EgressAllowlist":
+        """No host at all: the allowlist of a config without `policy/egress_allowlist.yaml` (choice 5)."""
+        return EgressAllowlist((), "", "", "")
+
     def entry(self, host: str, port: int = 443) -> AllowedHost | None:
         h = normalize_host(host)
         return next((e for e in self.hosts if e.host == h and e.port == port), None)
@@ -152,6 +160,8 @@ class EgressAllowlist:
 
     def refusal(self, host: str, purpose: str, port: int = 443) -> str | None:
         """Why a request would be refused, or None when the allowlist permits it (6.10)."""
+        if not self.hosts:
+            return f"destination not allowlisted: {normalize_host(host)} (no signed allowlist: every host is refused)"
         if not self.allows_host(host):
             return f"destination not allowlisted: {normalize_host(host)}"
         e = self.entry(host, port)

@@ -130,3 +130,54 @@ def test_secrets_1_a_live_transport_without_a_gate_refuses_every_request(monkeyp
         else:
             raise AssertionError("an ungated request was not refused")
     assert seen == [] and "refused to api.anthropic.com" in caplog.text
+
+
+# == secrets:2: the sweep looks for the test login's display name =============================================
+
+def _name_frame(name: str):
+    """A dark frame with the account holder's two-word name drawn where no anchored redaction box sits, and its
+    OCR."""
+    import numpy as np
+
+    from sentinel.capture import SyntheticOcr
+    from sentinel.diff.regions import Rect
+    img = np.full((120, 400, 3), 18, dtype=np.uint8)
+    first, last = name.split()
+    img[42:50, 30:70:3] = 230                                  # glyph-like strokes, not a filled box
+    img[42:50, 76:160:3] = 230
+    return img, SyntheticOcr([(first, Rect(30, 40, 40, 12)), (last, Rect(76, 40, 84, 12))], (400, 120))
+
+
+def test_secrets_2_the_runs_sweep_finds_the_test_logins_display_name(tmp_path, monkeypatch):
+    """3.6, 6.10 stage 2: the run's sweep matches the test login's display name (from the vault's login record; the
+    4.9 fixture has no name field), so a name outside the anchors is blacked out and is a `redaction_miss`."""
+    import sentinel.pipeline.run as pr
+    from sentinel.capture import RedactionList, redact_pair
+    sweeps = []
+    real = pr.redact_pair
+
+    def redact(base, cand, anchors, ocr, theme, *, sweep=None, context=None, params=None):
+        sweeps.append(sweep)
+        return real(base, cand, anchors, ocr, theme, sweep=sweep, context=context, params=params)
+    monkeypatch.setattr(pr, "redact_pair", redact)
+    r = run_pipeline(EXAMPLE, clean_scenario(TODAY), tmp_path, today=TODAY)
+    assert r.status == "complete" and sweeps
+    name = sweeps[0].display_name
+    assert name and len(name.split()) == 2                   # the vault stand-in's name reaches the sweep
+    img, ocr = _name_frame(name)
+    res = redact_pair(img, img.copy(), RedactionList(), ocr, (18, 18, 18), sweep=sweeps[0])
+    assert {h.kind for h in res.hits} == {"display_name"}
+    assert [f.kind for f in res.findings] == ["redaction_miss"]
+    assert (res.candidate[40:52, 30:160] == 18).all()
+
+
+def test_secrets_2_a_run_with_no_display_name_for_the_sweep_does_not_start(tmp_path, monkeypatch):
+    """6.10 "always": without a display name the sweep cannot be built, and the run ends `aborted_harness (reason:
+    config_invalid)` before any capture instead of sweeping without it."""
+    import sentinel.pipeline.run as pr
+    monkeypatch.setattr(pr, "login_display_name", lambda rig: None)
+    r = run_pipeline(EXAMPLE, clean_scenario(TODAY), tmp_path, today=TODAY)
+    assert (r.status, r.reason) == ("aborted_harness", "config_invalid")
+    assert not any(o.artifacts for o in r.outcomes)
+    with Store(tmp_path / "sentinel.db") as store:
+        assert "display name" in " ".join(store.run_summary(r.run_id)["lint_errors"])

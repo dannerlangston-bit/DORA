@@ -51,6 +51,10 @@ Choices where the spec is ambiguous (reported):
    the fill color, the re-OCR of the output has zero hits, and the result carries the redaction version that every
    upload header and egress row records (8.4, 8.3). No request is sent, so no `egress_log` row is written.
 8. Captures of different sizes are redacted with the same boxes, each clipped to its own image (3.3 pads later).
+9. Sources (6.10 "from the fixture and the vault"): the literal account ids come from the fixture's `accounts`
+   (4.9); the display name from the vault's record of the fixture's `login_ref`, since the closed 4.9 fixture
+   schema has no name field. A run's sweep is built with `Sweep.for_login`, which refuses a missing display name,
+   and the pipeline then ends the run `aborted_harness (reason: config_invalid)` before any capture.
 """
 from __future__ import annotations
 
@@ -202,6 +206,16 @@ class Sweep:
             if kind not in _KIND_ORDER:
                 raise RedactionError(f"sweep pattern kind {kind!r} is not one of {_KIND_ORDER}")
             re.compile(rx)
+
+    @staticmethod
+    def for_login(literals: Sequence[str], display_name: str | None,
+                  patterns: tuple[tuple[str, str], ...] = DEFAULT_PATTERNS) -> "Sweep":
+        """A run's sweep (choice 9): the fixture's literal account ids and the test login's display name, which 6.10
+        says is swept always; raises RedactionError without a display name, so the sweep never silently drops it."""
+        if not (display_name or "").strip():
+            raise RedactionError("6.10 stage 2 always sweeps the test login's display name, and none was found in the "
+                                 "fixture or the vault login record; the run cannot redact its captures")
+        return Sweep(tuple(literals), display_name=display_name, patterns=patterns)
 
     def matchers(self) -> list[tuple[str, re.Pattern[str]]]:
         """(kind, compiled pattern) in the order a hit's kind is chosen (choice 4)."""

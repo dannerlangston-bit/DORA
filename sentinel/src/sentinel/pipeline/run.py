@@ -128,8 +128,8 @@ from ..diff import load_params
 from ..diff.calibration import CalibrationFile, Capture as CalCapture, calibrate_checkpoint
 from ..diff.engine import (DiffContext, DiffResult, compare_fingerprints, diff_pair, fingerprint_id,
                            global_shift_prepass)
-from ..capture import (RedactionContext, RedactionList, RedactionResult, Sweep, SyntheticOcr, redact_pair,
-                       redaction_version)
+from ..capture import (RedactionContext, RedactionError, RedactionList, RedactionResult, Sweep, SyntheticOcr,
+                       redact_pair, redaction_version)
 from ..diff.phash import phash
 from ..egress import EgressAllowlist, EgressGate, reconcile
 from ..synth import THEME
@@ -401,11 +401,12 @@ class _Run:
         self.budget: RerunBudget | None = None
         self.entries = frozenset(e.entry_id for e in manifest.entries) if manifest else frozenset()
         self.tickets = frozenset(t for e in manifest.entries for t in e.tickets) if manifest else frozenset()
-        # 3.6, 6.10: the redaction list and the sweep's literal ids (the fixture's accounts); one version per run
+        # 3.6, 6.10: the redaction list and the sweep's literal ids (the fixture's accounts) and display name (the
+        # vault's login record); one version per run. Sweep.for_login raises RedactionError without the name.
         anchors = cfg.root / "redaction" / "anchors.yaml"
         self.anchors = RedactionList.load(anchors, cfg.root) if anchors.is_file() else RedactionList()
         ids = tuple(str(a["account_id"]) for a in cfg.fixture.get("accounts") or () if a.get("account_id"))
-        self.sweep = Sweep(ids, display_name=cfg.fixture.get("display_name"))
+        self.sweep = Sweep.for_login(ids, login_display_name(str(cfg.fixture.get("rig", "rig-01"))))
         self.red_header = Redaction(redaction_version(self.anchors, self.sweep))
         self.redaction_counts = {"base": 0, "candidate": 0}
         self.pair_id: str | None = None                  # 8.3 build_pairs.pair_id, set before begin_run
@@ -1970,7 +1971,11 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                                  expiring=start.expiring)
         planned = list(plan.planned)
         rig_of = {cp.checkpoint_id: it.rigs[0] for it in plan.items for cp in it.checkpoints}
-        run = _Run(cfg, scenario.run_id, "pr", scenario.base, scenario.candidate, now, manifest, plan, plan.x_input)
+        try:
+            run = _Run(cfg, scenario.run_id, "pr", scenario.base, scenario.candidate, now, manifest, plan,
+                       plan.x_input)
+        except RedactionError as exc:               # 6.10: no capture without the whole redaction stage
+            return _abort_config(store, scenario, cfg_root, [str(exc)], [], out, today, started)
         run.budget = RerunBudget(len(planned), run.params)
         # 3.3: fingerprint equality on every field but build id, before any capture
         mismatch = compare_fingerprints({"match": dict(run.fp_match, build_id=base_id)},
@@ -2351,6 +2356,16 @@ def safety_pass(cfg: SentinelConfig, orch: Orchestrator, rig: SimulatedRig, ctx:
 SIM_SECRET = "sim-paper-login-secret-4b7e19"     # the stand-in plaintext of every simulated login's password (6.9)
 
 
+SIM_DISPLAY_NAME = "Wren Halvorsen-Tate"     # the stand-in display name of every simulated test login (6.10)
+
+
+def login_display_name(rig: str) -> str | None:
+    """The display name of the rig's test login, from the vault's record of its `login_ref` (6.10 stage 2: the
+    sweep looks for it always; `capture.redaction` choice 9). Here one stand-in name that the synthetic screens
+    never draw, so a sweep hit on it can only come from a frame that shows the account holder's name."""
+    return SIM_DISPLAY_NAME
+
+
 def run_secrets(rigs: Iterable[str]) -> dict[str, str]:
     """The plaintext of each secret the run's logins used, by vault reference (6.9 Plaintext scan): on the rig the
     Orchestrator's locked buffer; here one stand-in value the simulated LOGIN flow never types (its keys are
@@ -2559,8 +2574,13 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         assert cfg.catalog is not None
         wanted = set(scenario.mutants or SIMULATED_MUTANTS)
         entries = [e for e in cfg.catalog.entries if e.mutant_id in wanted]
-        run = _Run(cfg, scenario.run_id, "nightly", scenario.build, scenario.build, now, None, None,
-                   lambda s: "undeclared")
+        try:
+            run = _Run(cfg, scenario.run_id, "nightly", scenario.build, scenario.build, now, None, None,
+                       lambda s: "undeclared")
+        except RedactionError as exc:               # 6.10: no capture without the whole redaction stage
+            sc = Scenario(scenario.name, scenario.run_id, scenario.build, scenario.build, run_type="nightly",
+                          clock=scenario.clock)
+            return _abort_config(store, sc, cfg_root, [str(exc)], [], out, today, started)
         bound = sorted({e.checkpoint_id for e in entries} | {str(e.params.get("donor_checkpoint")) for e in entries
                                                               if e.params.get("donor_checkpoint")})
         cps = {cid: planned_for(cfg, cid) for cid in bound}

@@ -89,7 +89,7 @@ def test_the_pipeline_writes_one_alert_for_an_order_found_at_teardown(tmp_path, 
     monkeypatch.setattr(pipeline_run, "SimulatedRig", LeakyRig)
     r = run_pipeline(EXAMPLE, clean_scenario(date(2026, 11, 10)), tmp_path)
     alerts = json.loads((tmp_path / "alerts.json").read_text())
-    (page,) = alerts
+    (page,) = [a for a in alerts if a["control"] != "fingerprint"]       # less 12.7 G5's on-call notice (10.7)
     assert page["detail"] == "ORDERS SENT: undeclared rows (sim-order-1); Cancel All verified" == r.proof
     assert page["rule"] == "safety:aborted_safety" and page["incident"] == "S1" and "login_owner" in page["paged"]
 

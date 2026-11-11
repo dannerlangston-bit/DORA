@@ -3,6 +3,7 @@ smoke flows the scope plans (sentinel.pipeline)."""
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import replace
 from datetime import date
 
@@ -153,6 +154,47 @@ def test_a_lint_error_aborts_the_run_config_invalid(tmp_path):
         (proof,) = store.post_run_proofs(sc.run_id)
         assert (proof.shard_id, proof.verdict) == (None, "proven_no_session")
         assert store.run_summary(sc.run_id)["abort"]["rule_ids"] == ["L-RGN-03"]
+
+
+def test_the_masks_decisions_are_checked_against_the_store_at_run_start(tmp_path):
+    """4.8 L-MSK-01 at run start (`diffmode.store_rules`): every mask's `decision_ref` must be a human's request_mask
+    decision in the Central Store. A store without dec-000812 aborts `config_invalid`; the simulated store seeded
+    with the config's decision export (`seed_decisions`, through `record_decision` and its L-DEC rules) runs."""
+    bare = replace(clean_scenario(TODAY), seed_decisions=False)
+    r = run_pipeline(EXAMPLE, bare, tmp_path / "bare", today=TODAY)
+    assert (r.status, r.reason) == ("aborted_harness", "config_invalid")
+    assert sorted(re.search(r"dec-\d{6}", e).group(0) for e in r.lint_errors if "L-MSK-01" in e) == \
+        [f"dec-{812 + i:06d}" for i in range(7)]                                        # the seven masks
+    seeded = run_pipeline(EXAMPLE, clean_scenario(TODAY), tmp_path / "seeded", today=TODAY)
+    assert seeded.status == "complete" and not seeded.lint_errors
+    with Store(tmp_path / "seeded" / "sentinel.db") as store:
+        d = store.get_decision("dec-000812")
+        assert (d.action, d.decided_by, d.run_id) == ("request_mask", "triage.lead", "run-2026-11-05-merge-0418")
+        assert store.run_outcome(d.run_id).status == "complete"                     # its run, as history
+        linked = store.query("SELECT d.decision_id, d.mask_ref FROM decisions d ORDER BY d.decision_id")
+        assert [tuple(x) for x in linked] == [(812 + i, f"msk.ps.last-update-{i + 1:02d}") for i in range(7)]
+    again = run_pipeline(EXAMPLE, replace(clean_scenario(TODAY), run_id="run-2026-11-10-pr-4823-02"),
+                         tmp_path / "seeded", today=TODAY)
+    assert again.status == "complete"                                               # a seeded store is seeded once
+
+
+def test_a_seeded_decision_keeps_the_store_write_rules(tmp_path):
+    """The seed is no back door: a decision by a service identity, or outside the triage roster, is refused by
+    `Store.record_decision` (L-DEC-01), so the run cannot start."""
+    import shutil
+    from sentinel.pipeline.config import SentinelConfig
+    from sentinel.pipeline.run import seed_decisions
+    from sentinel.store.store import Roster, StoreRefused
+    root = tmp_path / "cfg"
+    shutil.copytree(EXAMPLE, root)
+    path = root / "decisions" / "dec-000812.yaml"
+    path.write_text(path.read_text().replace("decided_by: triage.lead", "decided_by: mallory"))
+    cfg = SentinelConfig.load(root)
+    with Store(tmp_path / "s.db") as store:
+        store.set_roster(Roster.from_oncall(cfg.repo.one("oncall").data))
+        with pytest.raises(StoreRefused, match="L-DEC-01"):
+            seed_decisions(store, cfg)
+        assert store.get_decision("dec-000812") is None
 
 
 def test_an_expired_mask_stops_applying_and_the_run_completes(tmp_path):

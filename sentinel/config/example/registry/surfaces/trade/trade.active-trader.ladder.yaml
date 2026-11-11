@@ -7,7 +7,7 @@ owner: tos-trade-ui
 smoke: true
 path:
   - {id: p1, type: wait_for, anchor: {landmark: lm.ladder-header}, timeout_ms: 8000}
-primitives: [FlexibleGrid, OrderTicketCore, LadderModel, Theme]
+primitives: [LadderModel, FlexibleGrid, Docking, ColumnModel, OrderTicketCore, QuoteStream, SymbolLinking, Theme, FontMetrics]   # 12.4
 roots: ["com.tos.desktop.trade.activetrader"]
 personas: [active_trader, futures_trader]
 entitlements: [margin]

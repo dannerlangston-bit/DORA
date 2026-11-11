@@ -36,8 +36,9 @@ def test_a_fire_drill_that_placed_an_order_aborts_the_nightly_with_drill_order_p
     assert [(s["verdict"], s["reason"]) for s in n.shards] == [("aborted_safety", "drill_order_placed")]
     assert n.shards[0]["kill_switch"]             # the kill switch path ran for the drill's result
     with sqlite3.connect(tmp_path / "sentinel.db") as c:
-        assert c.execute("SELECT outcome, abort_reason FROM runs").fetchall() == [("aborted_safety",
-                                                                                  "drill_order_placed")]
+        # the Nightly's own row (the seeded store also holds its decisions' history run, pipeline.run.seed_decisions)
+        assert c.execute("SELECT outcome, abort_reason FROM runs WHERE run_id = ?", (n.run_id,)).fetchall() == [
+            ("aborted_safety", "drill_order_placed")]
         assert c.execute("SELECT blocked_reason FROM logins WHERE blocked_at IS NOT NULL").fetchall() == [
             ("drill_order_placed",)]
 

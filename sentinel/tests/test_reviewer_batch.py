@@ -4,12 +4,14 @@ front, the deadline fallback to the synchronous path and the 24-hour give-up. Fa
 from __future__ import annotations
 
 import re
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from test_reviewer import FakeTransport, answer, config, item_data, make_item, outcome, resp
+from test_reviewer import MODEL, S07, FakeTransport, answer, config, item_data, make_item, outcome, resp
 
-from sentinel.reviewer import BatchEntry, ReviewerJob, SpendLedger, custom_id
+from sentinel.egress import EgressAllowlist, EgressGate, EgressRefused, LogSink
+from sentinel.reviewer import BatchEntry, ReviewerJob, SpendLedger, TransportError, custom_id
 from sentinel.reviewer.schema import TASK_A, TASK_B
 
 T = 0.80
@@ -205,3 +207,58 @@ def test_a_batch_capable_run_needs_its_deadline_before_any_call():
     with pytest.raises(ValueError, match="deadline"):
         ReviewerJob(config(zero_data_retention=False), fake, "merge").review(items())
     assert fake.calls == [] and fake.batches == {}
+
+
+GATE_ALLOW = EgressAllowlist.from_dict({
+    "signed_by": "sec", "signed_at": "2026-11-01T00:00:00Z", "signature": "pgp:1",
+    "hosts": [{"host": "api.anthropic.com", "purposes": ["review", "batch_review"]}]})
+
+
+class GatedFake(FakeTransport):
+    """A `FakeTransport` whose requests go through an `EgressGate` as `AnthropicTransport`'s do (6.10): the transport
+    knows only its purpose and model, and a refusal reaches the job as a client `TransportError`."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.sink = LogSink()
+        self.gate = EgressGate(GATE_ALLOW, self.sink)
+
+    def _gated(self, purpose: str, send):
+        try:
+            with self.gate.default_context(purpose=purpose, model_id=MODEL):
+                return self.gate.request("api.anthropic.com", send)
+        except EgressRefused as e:
+            raise TransportError("client", f"egress refused: {e.reason}") from None
+
+    def create_message(self, params):
+        return self._gated("review", lambda: FakeTransport.create_message(self, params))
+
+    def create_batch(self, requests):
+        return self._gated("batch_review", lambda: FakeTransport.create_batch(self, requests))
+
+
+def test_batch_requests_carry_the_image_and_redaction_row_context_so_the_gate_checks_them():
+    """gateway-safety:2 (6.10 Egress, 8.9): a Message Batch of screenshot crops is logged with its redaction version
+    (and the checkpoint and artifact its items share), on the first submit and on a resubmit; a batch with an item
+    that has no redaction version is refused before connecting and the synchronous fallback refuses that item alone."""
+    fake = GatedFake()
+    j = bjob(fake)
+    j.review(items())
+    (row,) = fake.sink.rows
+    assert (row.purpose, row.status, row.redaction_version, row.checkpoint_id) == ("batch_review", "sent", "r1", S07)
+    one = GatedFake()
+    j1 = bjob(one)
+    j1.review([make_item(TASK_B, key="run-7|b3", artifact_sha256="a" * 64)])
+    deliver(one, "msgbatch_01", lambda cid, p: BatchEntry(cid, "expired"))
+    assert j1.poll(EARLY) == {} and "msgbatch_02" in one.batches                     # the resubmit
+    assert [(r.status, r.redaction_version, r.checkpoint_id, r.artifact_sha256) for r in one.sink.rows] == \
+        [("sent", "r1", S07, "a" * 64)] * 2
+    bare = GatedFake(respond=lambda p: resp(answer(TASK_B)))
+    result = bjob(bare).review([replace(make_item(TASK_B, key="run-7|b1"), redaction_version=""),
+                                make_item(TASK_B, key="run-7|b2", region="r2")])
+    assert bare.batches == {} and result.batch_ids == ()                             # no batch left the gate
+    assert [(r.purpose, r.status, r.refusal_reason) for r in bare.sink.rows] == [
+        ("batch_review", "refused", "redaction version missing"), ("review", "refused", "redaction version missing"),
+        ("review", "sent", None)]
+    v = result.verdicts
+    assert (v["run-7|b1"].state, v["run-7|b1"].path) == ("unavailable", "sync") and v["run-7|b2"].state == "answered"

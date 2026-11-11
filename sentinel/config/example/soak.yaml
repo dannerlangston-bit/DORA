@@ -1,0 +1,14 @@
+# Soak resource budgets (10.11, schema in 4.16): one per soak.<metric> assertion, evaluated at every cycle checkpoint
+# of the RC soak. These are the 10.11 defaults; the first lineage soak run recalibrates them (calibrated_from). No
+# budget may be looser than its default without the system owner's approval in the pull request (L-XREF-27).
+schema_version: 1
+budgets:
+  working_set: {growth_pct_max: 25, growth_mb_max: 1536}
+  growth_slope: {window_h: 3, mb_per_h_max: 60}
+  gdi_objects: {max: 9000}
+  handles: {within_pct: 20}
+  threads: {within_pct: 20}
+  heap: {pct_of_xmx_max: 80}
+  freezes: {max: 0}
+  relaunches: {max: 0}
+  render_latency: {tick_window_s: 2, windows_pct_min: 99}

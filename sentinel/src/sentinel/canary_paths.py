@@ -13,8 +13,11 @@ later night reproduces (`canary.persist` raises the detector state from the retu
 Choices where the spec is ambiguous (reported):
 
 1. Eligible pairs: the merge run's real (non-synthetic) outcome rows that carry a diff and both capture artifacts
-   (`base`, `candidate`), in checkpoint order; the pair is the one at `numpy.random.default_rng(seed)`'s first
-   integer below their count, so the choice is stable for a seed and a merge run. A merge run with no eligible pair
+   (`base`, `candidate`), in checkpoint order, less the rows a decision suppressed (a `decision_ref` or a
+   `decision:<id>` reason): the canary entry point never matches a decision (10.3, 4.14), so such a pair would
+   always diverge on its reason and prove nothing about the path; the pair is the one at
+   `numpy.random.default_rng(seed)`'s first integer below their count, so the choice is stable for a seed and a
+   merge run. A merge run with no eligible pair
    gives None: nothing could be re-evaluated, and the caller says so in run health.
 2. "Outcome, metrics and components exactly" (10.3; "per-region metrics and component list", 5.15): the outcome and
    its reason; the whole-window pixel fraction, SSIM and shift; per region, by id, the pixel fraction, SSIM and
@@ -63,10 +66,16 @@ class PathEquivalence:
 
 
 def eligible_pairs(store: Store, merge_run_id: str) -> list[CheckpointOutcome]:
-    """The merge run's real checkpoint pairs that can be re-evaluated: a diff and both captures (choice 1)."""
+    """The merge run's real checkpoint pairs that can be re-evaluated: a diff and both captures, and no decision
+    applied, since a synthetic re-run is never matched against a decision (choice 1)."""
     return [o for o in store.outcomes(merge_run_id)
             if not o.synthetic and o.diff is not None and (o.artifacts or {}).get("base")
-            and (o.artifacts or {}).get("candidate")]
+            and (o.artifacts or {}).get("candidate") and not _decided(o)]
+
+
+def _decided(o: CheckpointOutcome) -> bool:
+    """A decision suppressed or referenced the row (4.14): its outcome came from the store, not the engine."""
+    return o.decision_ref is not None or (o.reason or "").startswith("decision:")
 
 
 def choose_pair(pairs: list[CheckpointOutcome], seed: int) -> CheckpointOutcome:

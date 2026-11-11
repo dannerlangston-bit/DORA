@@ -152,7 +152,6 @@ class WorkspaceObservation:
     anchor_present: bool
     tabs: tuple[str, ...]
     window_count: int
-    probes_unlocated: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

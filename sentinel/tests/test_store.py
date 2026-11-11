@@ -13,7 +13,8 @@ from sentinel.records import (CheckpointOutcome, Component, Decision, DiffSummar
 from sentinel.store import (ImportConflict, Review, RunNotComplete, RunPlan, ScopeEntry, ShardPlan, Store, StoreError,
                             StoreRefused, StoreWriteFailed, WriterLockError, apply_inheritance, connect_reader, hamming,
                             render_schema, seed_rows)
-from sentinel.store.store import SCHEMA_VERSION
+from sentinel.store import ArtifactStore
+from sentinel.store.store import SCHEMA_VERSION, StoreIntegrityError
 from sentinel.taxonomy import Taxonomy, TaxonomyError, load
 
 RUN = "run-01"
@@ -99,7 +100,7 @@ def test_schema_refuses_a_taxonomy_missing_a_named_value():
         render_schema(Taxonomy(data))
 
 
-def test_reasons_are_retired_not_deleted_and_lists_need_migration(tmp_path):
+def test_reasons_are_retired_not_deleted_and_lists_are_migrated(tmp_path):
     db = tmp_path / "run.db"
     with Store(db) as s:
         s.begin_run(plan())
@@ -111,12 +112,15 @@ def test_reasons_are_retired_not_deleted_and_lists_need_migration(tmp_path):
         with pytest.raises(sqlite3.IntegrityError, match="retired reason"):
             s.conn.execute("INSERT INTO outcomes (run_id, checkpoint_id, outcome, reason, recorded_at) "
                            "VALUES (?, ?, 'needs_baseline', 'explorer_replay', 'now')", (RUN, CENSUS))
-    data["reasons"]["not_run"].remove("quarantine")         # a reason a generated CHECK lists
-    with pytest.raises(StoreError, match="migration"):
-        Store(db, taxonomy=Taxonomy(data))
-    with Store(db) as s:                                    # the refused open left no lock; the reason is back
+    data["reasons"]["not_run"].remove("quarantine")         # a reason a generated CHECK lists: a migration (8.2)
+    with Store(db, taxonomy=Taxonomy(data)) as s:
+        assert s.migration is not None and s.migration.snapshot.exists()
+        assert s.get_outcome(RUN, CENSUS) is None and s.conn.execute("SELECT count(*) FROM runs").fetchone()[0] == 1
+    with Store(db) as s:                                    # and back again; the reason is back
+        assert s.migration is not None and s.migration.from_version == s.migration.to_version == SCHEMA_VERSION
         row = s.conn.execute("SELECT active FROM outcome_reasons WHERE reason = 'explorer_replay'")
         assert row.fetchone()[0] == 1
+    assert len(list((tmp_path / "pre-migration").iterdir())) == 2
 
 
 def test_pragmas_reader_and_hamming(tmp_path):
@@ -645,3 +649,78 @@ def test_canary_results_hold_one_row_per_mutant(tmp_path):
     lines = [json.loads(x) for x in (tmp_path / "results.jsonl").read_text().splitlines()]
     assert [x["batch"] for x in lines] == ["run_begin", "canary_results", "checkpoint"]
     assert {r["table"] for r in lines[1]["rows"]} == {"canary_results"} and len(lines[1]["rows"]) == 4
+
+
+# -- integrity at service start (8.9, 12.7 H7) and the store-maintenance follow-ups (SD-82, SD-83) ---------------
+
+def test_a_corrupted_database_fails_quick_check_at_open(tmp_path):
+    db = tmp_path / "run.db"
+    with Store(db) as s:
+        s.begin_run(plan())
+        for n in range(40):
+            s.write_finding(Finding(f"F-{n}", RUN, "collateral", "x" * 400, RUN, checkpoint_id=SWEEP))
+    data = bytearray(db.read_bytes())
+    page = 4096
+    assert len(data) > 6 * page
+    for start in range(len(data) - 4 * page, len(data), page):     # the last pages: the findings just written
+        data[start + 100: start + page - 100] = (bytes(range(256)) * 16)[: page - 200]
+    db.write_bytes(bytes(data))
+    with pytest.raises(StoreIntegrityError, match="quick_check|not a readable|cannot be opened"):
+        Store(db)
+    assert not (tmp_path / "writer.lock").exists()                    # the refused open released its lock
+    junk = tmp_path / "junk" / "run.db"
+    junk.parent.mkdir()
+    junk.write_bytes(b"this is not a database" * 100)
+    with pytest.raises(StoreIntegrityError):
+        Store(junk)
+
+
+def test_every_copy_of_an_object_gets_its_set_row(tmp_path):
+    """SD-82: the artifact row once per hash, an artifact_sets row per (hash, set), also when the hash is indexed."""
+    data = b'{"ocr": "boxes"}'
+    with Store(tmp_path / "db" / "central.db") as s:
+        s.begin_run(plan())
+        a = ArtifactStore.at(tmp_path / "root", f"runs/{RUN}").put(data, name="a.json", kind="ocr_json",
+                                                                    media_type="application/json")
+        b = ArtifactStore.at(tmp_path / "root", "eval/v1").put(data, name="a.json", kind="ocr_json",
+                                                              media_type="application/json")
+        s.write_checkpoint(out(CENSUS), artifacts=[a])
+        s.write_checkpoint(out(SWEEP), artifacts=[b])
+        s.write_checkpoint(out(FLOW), artifacts=[a])                  # the same copy again: one row
+        assert s.query("SELECT count(*) FROM artifacts")[0][0] == 1
+        assert [tuple(r) for r in s.query("SELECT sha256, set_path FROM artifact_sets ORDER BY set_path")] == [
+            (a.sha256, "eval/v1"), (a.sha256, f"runs/{RUN}")]
+
+
+def test_closed_at_follows_the_findings_moves_out_of_and_into_the_pinning_states(store):
+    """SD-83, 8.6: closed_at is when a decision moved the finding out of the pinning states; moving back clears it."""
+    store.write_finding(Finding("F-1", RUN, "collateral", "moved", RUN, checkpoint_id=SWEEP, phash=ph(), tier=2,
+                                category="collateral"))
+    assert store.get_finding("F-1").closed_at is None                 # open pins
+    record(store, "dec-000001", "noise_signature", "noise", finding_id="F-1", decided_at="2026-11-10T10:00:00Z")
+    assert store.get_finding("F-1").closed_at == "2026-11-10T10:00:00+00:00"
+    record(store, "dec-000002", "noise_signature", "noise", finding_id="F-1", supersedes="dec-000001", by="bob",
+           decided_at="2026-11-11T10:00:00Z")
+    assert store.get_finding("F-1").closed_at == "2026-11-10T10:00:00+00:00"   # released since the first
+    record(store, "dec-000003", "confirm_bug", "confirmed_bug", finding_id="F-1", supersedes="dec-000002",
+           decided_at="2026-11-12T10:00:00Z")
+    assert store.get_finding("F-1").closed_at is None                 # back into a pinning state
+
+
+def test_a_batch_delete_is_journaled_and_replayed(tmp_path):
+    db = tmp_path / "a" / "run.db"
+    with Store(db) as s:
+        s.register_rig("rig-a1", login_alias="paper-01", owner="qa", snapshot_id="snap-1", allowlist_entry=1)
+        s.begin_run(plan(shards=(ShardPlan(f"{RUN}/1", "rig-a1"),)))
+        s.write_steps([StepOutcome(RUN, "flow.x", "s01", "passed")], shard_id=f"{RUN}/1", side="candidate")
+        with s.batch("retention_step_events") as b:
+            assert b.delete("step_events", {"run_id": RUN}) == 1
+            with pytest.raises(StoreRefused):
+                b.delete("step_events", {})
+        assert s.query("SELECT count(*) FROM step_events")[0][0] == 0
+    last = json.loads((tmp_path / "a" / "results.jsonl").read_text().splitlines()[-1])
+    assert last["rows"] == [{"op": "delete", "table": "step_events", "key": {"run_id": RUN}, "count": 1}]
+    with Store(tmp_path / "b" / "run.db") as s:
+        s.replay(tmp_path / "a" / "results.jsonl")
+        assert s.query("SELECT count(*) FROM step_events")[0][0] == 0
+        assert s.query("SELECT count(*) FROM runs")[0][0] == 1

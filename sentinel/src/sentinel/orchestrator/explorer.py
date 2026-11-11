@@ -22,6 +22,12 @@
   turn it into `DenyEntry` rows. `denied_action_plan` is the nightly denied-action test's list (6.8): one
   Explorer-profile action per detection of every entry, plus one per registry control with `deny: true`
   that no entry names; `safety_canaries.denied_action_test` drives it.
+- The stage around the session (2.9, 6.8, 1.9): under DR-07 Branch B the Explorer is not built and the RC report
+  prints "Explorer: not available under DR-07 B" (`not_available_dr07b`); the session starts when the last scripted
+  shard has reported and is cut at the capture deadline (`session_window`); `ExplorerMetrics` are the per-run
+  metrics (precision, agent-error ratio, deny-list hits, budget hit, dollars) and `pause_line` the pause rule:
+  precision under 30 percent on two consecutive RC runs pauses the Explorer until the steering list or toolset is
+  fixed, printed as a run-health line, never silence.
 
 Choices (reported): the label patterns of `DEFAULT_DENY_LIST` are this module's reading of the 6.8
 table and fail closed (for example every label containing "alert" is denied, not only alert creation);
@@ -39,6 +45,14 @@ Choices for the denied-action test (6.8, 4.16; reported):
   the window, named as the window: the Window Watcher's own close-by-Escape path is 5.4.6's.
 - An `order_path` entry adds a drag that starts on a splitter and ends on the entry's geometry (6.2: a drag
   that ends on order geometry is an order path).
+
+Choices for the stage (2.9; reported):
+- Precision is reproduced over emitted findings; a run whose session emitted no finding has no precision and
+  neither counts toward nor breaks the two consecutive runs of the pause rule. "Fixed" is a changed steering list
+  (`explorer_steering.steering_version`) or toolset (`agent.tools.TOOLSET_SCHEMA_VERSION`) since the latest of the
+  two runs.
+- A candidate whose lint failed was emitted and did not reproduce: it counts in the denominator of precision.
+- A session whose start comes at or after the capture deadline does not run; the health line says so.
 """
 from __future__ import annotations
 
@@ -46,6 +60,7 @@ import re
 import re._parser as _rx  # the stdlib regex parser (3.11+), read-only, for `regex_sample`
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -439,3 +454,95 @@ def explorer_teardown(ledger_items: Sequence[str], verified_deleted: Mapping[str
     return ControlResult("explorer_teardown", False, "teardown", outcomes=(SubsetOutcome("explorer_stage", o),),
                          alert=alerts.explorer_owner(), actions=("block_login",),
                          detail="Explorer login blocked until the owner cleans it by hand: " + ", ".join(left))
+
+
+# -- the stage around the session (2.9, 6.8, 1.9) ----------------------------------------------------------------
+NOT_AVAILABLE_DR07B = "Explorer: not available under DR-07 B"
+PAUSE_PRECISION = 0.30                     # 2.9: precision under 30 percent on two consecutive RC runs
+
+
+def not_available_dr07b() -> ControlResult:
+    """DR-07 Branch B: the Explorer is not built and RC runs end at the sweeps, with the line in the RC report (2.9)."""
+    return ControlResult("explorer", False, "running", detail=NOT_AVAILABLE_DR07B)
+
+
+@dataclass(frozen=True)
+class SessionWindow:
+    """When the session runs: from the last scripted shard's report until the full budget or the capture deadline,
+    whichever comes first (1.9, 6.8); `start` None when the deadline had passed."""
+
+    start: datetime | None
+    end: datetime | None
+    cut_by_deadline: bool
+    health: str
+
+
+def session_window(last_shard_reported: datetime, capture_deadline: datetime,
+                   budget: ExplorerBudget = ExplorerBudget()) -> SessionWindow:
+    """The session's window (1.9: a start later than T+6:20 is cut at the T+7:50 deadline, never the other way)."""
+    if last_shard_reported >= capture_deadline:
+        return SessionWindow(None, None, True, "Explorer: not run, the last scripted shard reported after the capture "
+                                               f"deadline {capture_deadline:%H:%M}")
+    full = last_shard_reported + timedelta(minutes=budget.max_minutes)
+    end = min(full, capture_deadline)
+    cut = full > capture_deadline
+    mins = (end - last_shard_reported).total_seconds() / 60
+    line = f"Explorer: {mins:.0f} of {budget.max_minutes:g} minutes" + (", cut at the capture deadline" if cut else "")
+    return SessionWindow(last_shard_reported, end, cut, line)
+
+
+@dataclass(frozen=True)
+class ExplorerMetrics:
+    """The per-RC-run Explorer metrics of 2.9."""
+
+    emitted: int
+    reproduced: int
+    actions: int
+    agent_errors: int
+    deny_hits: int
+    budget_hit: str | None
+    usd: float
+    steering_version: str | None = None
+    toolset_schema_version: str | None = None
+
+    @property
+    def precision(self) -> float | None:
+        """Reproduced over emitted findings; None when nothing was emitted (choice)."""
+        return self.reproduced / self.emitted if self.emitted else None
+
+    @property
+    def agent_error_ratio(self) -> float | None:
+        """Agent errors over actions."""
+        return self.agent_errors / self.actions if self.actions else None
+
+    def health_lines(self) -> list[str]:
+        """The run-health lines of the session: metrics, and the budget line when a budget ended it (6.8)."""
+        p = "n/a" if self.precision is None else f"{100 * self.precision:.0f}%"
+        r = "n/a" if self.agent_error_ratio is None else f"{100 * self.agent_error_ratio:.1f}%"
+        out = [f"Explorer: precision {p} ({self.reproduced} of {self.emitted}), agent errors {r} of {self.actions} "
+               f"actions, {self.deny_hits} deny-list hits, ${self.usd:.2f}"]
+        if self.budget_hit:
+            out.append(f"Explorer budget hit: {self.budget_hit}; the run continues")
+        return out
+
+    def to_summary(self) -> dict[str, Any]:
+        """The `rc.explorer` block of the run summary, which the next RC runs' pause rule reads."""
+        return {"emitted": self.emitted, "reproduced": self.reproduced, "precision": self.precision,
+                "actions": self.actions, "agent_errors": self.agent_errors, "agent_error_ratio": self.agent_error_ratio,
+                "deny_hits": self.deny_hits, "budget_hit": self.budget_hit, "usd": round(self.usd, 4),
+                "steering_version": self.steering_version, "toolset_schema_version": self.toolset_schema_version}
+
+
+def pause_line(history: Sequence[Mapping[str, Any]], *, steering_version: str | None,
+               toolset_schema_version: str | None) -> str | None:
+    """The pause run-health line when the Explorer is paused, else None (2.9, choices). `history` is the earlier RC
+    runs' `rc.explorer` summaries, newest first."""
+    scored = [h for h in history if isinstance(h.get("precision"), (int, float))][:2]
+    if len(scored) < 2 or any(h["precision"] >= PAUSE_PRECISION for h in scored):
+        return None
+    last = scored[0]
+    if last.get("steering_version") != steering_version or last.get("toolset_schema_version") != toolset_schema_version:
+        return None
+    vals = ", ".join(f"{100 * h['precision']:.0f}%" for h in scored)
+    return (f"Explorer: paused, precision under 30% on two consecutive RC runs ({vals}); it resumes when the steering "
+            "list or toolset is fixed")

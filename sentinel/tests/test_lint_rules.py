@@ -65,8 +65,8 @@ def step(flow: dict, sid: str) -> dict:
     return next(s for sec in ("normalize", "preconditions", "steps", "teardown") for s in flow.get(sec, []) if s["id"] == sid)
 
 
-def mutant(cat: list, mid: str) -> dict:
-    return next(m for m in cat if m["mutant_id"] == mid)
+def mutant(cat: list | dict, mid: str) -> dict:
+    return next(m for m in entries(cat) if m["mutant_id"] == mid)
 
 
 def popup(cat: list | dict, pid: str) -> dict:
@@ -116,7 +116,7 @@ MUTATIONS: list[tuple[str, str | None, Callable]] = [
     ("L-BLD-06", MAIN_BUILD, lambda d: d["build"].update(released_at="2026-11-09T00:00:00-05:00")),
     ("L-MAN-00", MANIFEST, lambda d: d.update(source="email")),
     ("L-MAN-01", MANIFEST, lambda d: d["entries"][0]["declared_surfaces"].append("charts.unknown")),
-    ("L-MAN-02", MANIFEST, lambda d: d["entries"][0]["touched_primitives"].append("Docking")),
+    ("L-MAN-02", MANIFEST, lambda d: d["entries"][0]["touched_primitives"].append("NoSuchPrimitive")),
     ("L-MAN-03", MANIFEST, lambda d: d["entries"][0].update(expected_visual=d["entries"][0]["summary"])),
     ("L-MAN-04", MANIFEST, lambda d: d["entries"][0].update(mock_image="manifests/mocks/missing.png")),
     ("L-MAN-05", MANIFEST, lambda d: d["entries"][0].update(tickets=["tos-48120"])),
@@ -128,7 +128,8 @@ MUTATIONS: list[tuple[str, str | None, Callable]] = [
     ("L-DEP-03", DEPMAP, lambda d: edge(d, "OrderTicketCore", "dialog.order-confirmation").update(confirmed_from_source=False)),
     ("L-DEP-04", DEPMAP, lambda d: d["edges"].append(copy.deepcopy(d["edges"][0]))),
     ("L-DEP-05", CHART, lambda d: d["primitives"].remove("FlexibleGrid")),
-    ("L-DEP-06", DEPMAP, lambda d: d["edges"].remove(edge(d, "Theme", "*"))),
+    ("L-DEP-06", DEPMAP, lambda d: d.update(edges=[e for e in d["edges"] if e["surface"] not in
+                                                    ("*", "monitor.activity.position-statement")])),
     ("L-DEP-07", DEPMAP, lambda d: d["edges"][0].update(last_verified="2026-01-01T00:00:00-05:00")),
     ("L-DEP-08", DEPMAP, lambda d: d["edges"].remove(edge(d, "FlexibleGrid", "trade.active-trader.ladder"))),
     ("L-SRF-00", STOCK, lambda d: d.update(tier=4)),
@@ -216,7 +217,7 @@ MUTATIONS: list[tuple[str, str | None, Callable]] = [
                                     popup(d, "POP-01").update(title_regex="(?i)(updat|download)ing|New"))),
     ("L-POP-06", None, lambda r: (add_released_builds(r),
                                   popup(r.docs[POPUPS].data, "POP-08").update(last_seen_build="released-1997.0.0-0000000"))),
-    ("L-MUT-00", MUTANTS, lambda d: d[0].update(mode="video")),
+    ("L-MUT-00", MUTANTS, lambda d: d["entries"][0].update(mode="video")),
     ("L-MUT-01", MUTANTS, lambda d: mutant(d, "M03").update(region_ref="rgn.confirm.nothing")),
     ("L-MUT-02", MUTANTS, lambda d: mutant(d, "M01")["expected"].update(outcomes=["needs_human"])),
     ("L-MUT-04", MUTANTS, lambda d: mutant(d, "M26").update(canary_flow="flow.trade.order-ticket.stock.limit")),
@@ -231,7 +232,7 @@ MUTATIONS: list[tuple[str, str | None, Callable]] = [
     ("L-XREF-06", MANIFEST, lambda d: d["entries"][0]["declared_surfaces"].append("charts.renamed-away")),
     ("L-XREF-11", QUARANTINE, lambda d: d["records"].append({"checkpoint": "flow/Bad Id", "owner": "o", "ticket": "TOS-1",
                                                             "entered": "2026-11-01", "reason": "flaky"})),
-    ("L-XREF-12", MUTANTS, lambda d: d.remove(mutant(d, "M33"))),
+    ("L-XREF-12", MUTANTS, lambda d: d["entries"].remove(mutant(d, "M33"))),
     ("L-XREF-14", EXPLORER, lambda d: d.update(max_actions=500)),
     ("L-XREF-15", BRANCHES, lambda d: d.update(data_fixture="B")),
 ]
@@ -555,7 +556,7 @@ def test_fingerprint_differences_is_the_one_pair_comparison():
     (DEPMAP, ("edges", 0, "surface"), ["x"], "L-DEP-00"),
     (FLOW, ("steps", 1, "target"), {"a": 1}, "L-FLW-00"),
     (FIXTURE, ("accounts", 0, "account_id"), [], "L-FIX-00"),
-    (MUTANTS, (0, "checkpoint_id"), [], "L-MUT-00"),
+    (MUTANTS, ("entries", 0, "checkpoint_id"), [], "L-MUT-00"),
     (POPUPS, ("entries", 0, "popup_id"), {}, "L-POP-00"),
     (WS_AT, ("gadgets_present",), "trade.active-trader.ladder", "L-WSP-00"),
     (S07, ("regions", 0, "landmark"), [], "L-RGN-00"),
@@ -716,11 +717,11 @@ def diff_params(tmp_path, monkeypatch):
         p = tmp_path / "diff_engine.yaml"
         p.write_text(yaml.safe_dump(data))
         monkeypatch.setenv("SENTINEL_DIFF_PARAMS", str(p))
-        diff.load_params.cache_clear()
+        diff.clear_cache()
 
     yield write
     monkeypatch.delenv("SENTINEL_DIFF_PARAMS", raising=False)
-    diff.load_params.cache_clear()
+    diff.clear_cache()
 
 
 def test_mask_budget_comes_from_the_diff_engine_parameters(base, diff_params):
@@ -730,6 +731,27 @@ def test_mask_budget_comes_from_the_diff_engine_parameters(base, diff_params):
     diff_params(position_statement=0.5)
     assert R.mask_budgets()["position_statement"] == 0.5
     assert "L-MSK-03" not in {v.rule for v in _violations(base, PS_CENSUS, big)}
+
+
+def test_the_diff_engine_parameters_come_from_the_config_checkout(base, tmp_path):
+    """04-layout-files-unread (4.1): `diff_engine.yaml` at the root of the run's sentinel-config is the Diff Engine's
+    parameters file; the harness default stands in only where the checkout has none."""
+    from sentinel import diff
+    data = yaml.safe_load(diff.DEFAULT_PARAMS_PATH.read_text())
+    data["mask_budget"]["position_statement"] = 0.5
+    (tmp_path / "diff_engine.yaml").write_text(yaml.safe_dump(data))
+    assert diff.params_path(config_root=tmp_path) == tmp_path / "diff_engine.yaml"
+    assert diff.params_path(config_root=EXAMPLE) == diff.DEFAULT_PARAMS_PATH
+    assert diff.load_params(config_root=tmp_path)["mask_budget"]["position_statement"] == 0.5
+    assert diff.params_sha256(diff.load_params(config_root=tmp_path)) != diff.params_sha256(diff.load_params())
+
+    def big(d: dict) -> None:
+        region(d, "rgn.ps.last-update").update(rect={"dx": 0, "dy": 166, "w": 600, "h": 60})
+    assert "L-MSK-03" in {v.rule for v in _violations(base, PS_CENSUS, big)}
+    root = tmp_path / "cfg"
+    shutil.copytree(EXAMPLE, root)
+    shutil.copy(tmp_path / "diff_engine.yaml", root / "diff_engine.yaml")
+    assert "L-MSK-03" not in {v.rule for v in _violations(Repo.load(root), PS_CENSUS, big)}
 
 
 # -- 04-regions-landmark-templates-unchecked --------------------------------------------------------------------------
@@ -1188,11 +1210,29 @@ def test_margin_rules_cover_what_r02_and_futures_reach(base, change, needle):
     assert any(v.rule == "L-FIX-00" and needle in v.message for v in found), [v.line() for v in found]
 
 
-def test_a_mutant_catalog_in_the_4_11_file_form_reads_its_entries(base):
-    """4.11: canaries/mutants.yaml is {schema_version, entries}; the lint reads the entries as it reads a bare list."""
-    found = _violations(base, None, lambda r: setattr(r.docs[MUTANTS], "data", {"schema_version": 1,
-                                                                                 "entries": r.docs[MUTANTS].data}))
-    assert not [v for v in found if v.rule.startswith("L-MUT") or v.file == MUTANTS], [v.line() for v in found]
+def test_a_bare_catalog_list_warns_in_phase_0_and_is_an_error_from_phase_1(base):
+    """SD-47, 4.10, 4.11: the example catalogs are {schema_version, entries}; a bare list is still read, warns in
+    Phase 0 and is an error from Phase 1, and the message names the migration (4.1, sentinel.config_migrations)."""
+    assert base.docs[MUTANTS].data["schema_version"] == 1 and base.docs[POPUPS].data["schema_version"] == 1
+
+    def bare(r: Repo) -> None:
+        r.docs[MUTANTS].data = r.docs[MUTANTS].data["entries"]
+        r.docs[POPUPS].data = r.docs[POPUPS].data["entries"]
+    for phase, severity in ((0, "warn"), (1, "error")):
+        found = _violations(base, None, bare, phase)
+        assert [(v.rule, v.severity) for v in found] == [("L-MUT-01", severity), ("L-POP-01", severity)], \
+            [v.line() for v in found]
+        assert all("sentinel schemas --migrate" in v.message for v in found)
+
+
+def test_a_catalog_or_file_at_an_unknown_version_is_refused_with_the_migration_hint(base):
+    """4.1: lint refuses a file whose version the harness does not know and says whether a migration ships."""
+    found = _violations(base, MUTANTS, lambda d: d.update(schema_version=2))
+    assert [(v.rule, v.path) for v in found] == [("L-MUT-01", "schema_version")]
+    assert "knows version 1" in found[0].message and "no migration from schema_version 2" in found[0].message
+    found = _violations(base, FLOW, lambda d: d.update(schema_version=1))
+    assert [(v.rule, v.path) for v in found] == [("L-FLW-00", "schema_version")]
+    assert "schema_version 1 is not known: this harness knows version 2" in found[0].message
 
 
 def test_an_aa_control_mutant_may_bind_every_checkpoint(base):
@@ -1257,3 +1297,85 @@ def test_renames_name_a_build_and_may_rename_a_surface(base):
     assert {v.message for v in stale if v.rule == "L-FLW-03"} >= {
         "renamed or retired surface trade.order-entry.stock is still registered",
         "rename target surface trade.order-entry.equity is not registered (or 'retired')"}
+
+
+# -- 12-popup-xref-depth, 07-popup-catalog-close-controls (12.8, L-XREF-12) -----------------------------------------
+
+def _xref12(base: Repo, pid: str, change: Callable) -> list[str]:
+    found = _violations(base, POPUPS, lambda d: change(popup(d, pid)))
+    return [v.message for v in found if v.rule == "L-XREF-12"]
+
+
+@pytest.mark.parametrize("pid,change,needle", [
+    ("POP-04", lambda p: p["on_abort"].update(reason="gate"), "on_abort.reason gate (12.8: session_kicked)"),
+    ("POP-14", lambda p: p.update({"class": "env"}), "class env (12.8: safety)"),
+    ("POP-07", lambda p: p.update(key="alt+f4"), "key alt+f4 (12.8: escape)"),
+    ("POP-12", lambda p: p.update(wait_timeout_ms=60000), "wait_timeout_ms 60000 (12.8: 90000)"),
+    ("POP-01", lambda p: p.update(action="wait", wait_timeout_ms=1000), "action wait (12.8: abort)"),
+    ("POP-10", lambda p: p["on_abort"].update(invariant_id="INV-05"), "on_abort.invariant_id INV-05 (12.8: INV-14)"),
+    ("POP-22", lambda p: p["on_abort"].update(run_outcome="aborted_harness"), "run_outcome aborted_harness"),
+    ("POP-05", lambda p: p.update(action="abort"), "action abort (12.8: relogin)"),
+    ("POP-02", lambda p: p.update(status="verified"), "action dismiss_key (12.8: click Close)"),
+])
+def test_a_starter_popup_must_equal_its_12_8_row(base, pid, change, needle):
+    msgs = _xref12(base, pid, change)
+    assert any(pid in m and needle in m for m in msgs), msgs
+
+
+def test_the_example_catalog_matches_12_8_with_escape_standing_in_while_unverified(base):
+    assert not [v for v in lint_repo(base, 1, TODAY).violations if v.rule == "L-XREF-12"]
+    stand_ins = [p["popup_id"] for p in entries(base.docs[POPUPS].data) if p["action"] == "dismiss_key"
+                 and R.POP_12_8[p["popup_id"]].action == "click"]
+    assert stand_ins == ["POP-02", "POP-06", "POP-11", "POP-13"]
+
+
+def test_a_click_entry_must_target_its_12_8_control(base):
+    def click(target: str) -> Callable:
+        return lambda p: p.update(action="click", key=None, target=target, status="verified",
+                                  template="registry/templates/dialog/title-close.png")
+    assert _xref12(base, "POP-02", click("dialog.order-confirmation.title-close")) == []   # JAB name Close
+    (msg,) = _xref12(base, "POP-02", click("dialog.order-confirmation.delete-button"))
+    assert "reads ['delete'] (12.8: Close)" in msg
+    (msg,) = _xref12(base, "POP-13", click("dialog.order-confirmation.title-close"))
+    assert "(12.8: Don't Save)" in msg
+
+
+def test_the_mutant_catalog_may_grow_from_m34_in_sequence(base):
+    """12.5, L-MUT-01, L-XREF-12: M01 to M33 exactly as 12.5 tables them, then M34 onward without a gap."""
+    def add(mid: str) -> Callable:
+        def fn(d: dict) -> None:
+            m = copy.deepcopy(mutant(d, "M20"))
+            m.update(mutant_id=mid, name=f"mut.extra.{mid.lower()}")
+            d["entries"].append(m)
+        return fn
+    assert not {v.rule for v in _violations(base, MUTANTS, add("M34"))} & {"L-MUT-01", "L-XREF-12"}
+    assert {"L-MUT-01", "L-XREF-12"} <= {v.rule for v in _violations(base, MUTANTS, add("M35"))}
+
+
+def test_a_retired_starter_row_is_not_compared(base):
+    assert _xref12(base, "POP-04", lambda p: p.update(retired=True, retired_reason="gone",
+                                                       on_abort={**p["on_abort"], "reason": "gate"})) == []
+
+
+@pytest.mark.skipif(not (EXAMPLE.parents[2] / "sentinel-spec").exists(), reason="spec checkout not present")
+def test_the_12_8_table_in_the_lint_equals_the_spec():
+    """POP_12_8 mirrors the class, action and first env_error outcome of every 12.8 row."""
+    import re as _re
+    import sys
+    sys.path.insert(0, str(EXAMPLE.parents[1] / "tools"))
+    import spec_tables as st
+    rows = st.table_after(st.subsection("12.8"), "| Id | Window |")
+    assert [r[0].strip() for r in rows] == list(R.POP_12_8)
+    for r in rows:
+        pid, cls_action, outcome = r[0].strip(), r[2], r[3]
+        row = R.POP_12_8[pid]
+        ticks = _re.findall(r"`([^`]+)`", cls_action)
+        assert row.klass == (ticks[0] if ticks else None), pid
+        action = ticks[1] if len(ticks) > 1 else ("no_input" if "no input" in cls_action else
+                                                  "relogin" if "recovery once" in cls_action else None)
+        assert row.action == action, pid
+        if row.action == "click":
+            assert cls_action.endswith(row.label), pid
+        m = _re.search(r"`(env_error) \(gate: (\w+), reason: (\w+)\)`", outcome)
+        if m and row.gate is not None:
+            assert (row.outcome, row.gate, row.reason) == m.groups(), pid

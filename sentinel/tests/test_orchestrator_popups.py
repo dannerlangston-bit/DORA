@@ -307,11 +307,17 @@ def test_low_memory_is_a_memory_warning_and_a_proactive_relaunch():
 
 
 def test_fixture_findings_unless_the_flow_expects_the_popup():
-    assert decide(entry("POP-07"), RUN).evidence["fixture_finding"] == "fixture_drift"
-    assert decide(entry("POP-15"), RUN).evidence["fixture_finding"] == "fixture_maintenance_needed"
+    """12.8 POP-07 and POP-15: a 4.13 `fixture_finding` with its reason in `detail` (choice 15)."""
+    alert = decide(entry("POP-07"), RUN, win("Alert triggered"))
+    (f,) = alert.findings
+    assert (f.kind, f.detail) == ("fixture_finding", "fixture_drift") and "POP-07 'Alert triggered'" in f.description
+    assert alert.passed and alert.evidence["input"] == {"kind": "key", "key": "escape"}
+    assert [(x.kind, x.detail) for x in decide(entry("POP-15"), RUN).findings] == [
+        ("fixture_finding", "fixture_maintenance_needed")]
     expects = PopupContext(flow_expects=frozenset({"POP-15"}))
-    assert "fixture_finding" not in decide(entry("POP-15"), expects).evidence
-    assert "fixture_finding" not in decide(entry("POP-06"), RUN).evidence
+    assert decide(entry("POP-15"), expects).findings == ()
+    assert decide(entry("POP-06"), RUN).findings == ()
+    assert "fixture_finding" not in alert.evidence
 
 
 def test_os_window_over_the_frame_is_occlusion_with_a_hardening_finding():

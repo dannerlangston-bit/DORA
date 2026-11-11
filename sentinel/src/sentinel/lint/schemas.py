@@ -867,7 +867,7 @@ quarantine_record:
   owner: str
   ticket: str
   entered: date
-  reason: enum[flake|aa_drift|aa_floor|maintenance_budget|fire_drill|safety_canary|kill_switch|gateway_drops|fallback_rate]
+  reason: enum[flake|aa_drift|aa_floor|maintenance_budget|fire_drill|safety_canary|kill_switch|gateway_drops|fallback_rate|unknown_popup]
   detail: str?
 """,
     "eval-report": """\

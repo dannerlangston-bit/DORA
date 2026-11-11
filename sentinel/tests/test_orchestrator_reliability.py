@@ -109,6 +109,22 @@ def test_first_launch_crash_is_an_app_failure_never_env_error_f62():
     assert spent.run_reason == "app_restart_budget" and spent.unreached.reason == "budget"
 
 
+def test_app_failure_carries_the_watchdog_evidence_manifest_for_the_app_crash_finding(tmp_path):
+    from sentinel.orchestrator.watchdog_loop import StatusWriter, WatchdogStatus, crash_signal_of, read_status
+    manifest = [{"kind": "screenshot", "ref": "sha256:ab"},
+                {"kind": "thread_dump", "note": "thread dump unavailable: attach disabled"},
+                {"kind": "client_log", "note": "client log: not located"}]
+    StatusWriter(tmp_path / "watchdog.json").write(WatchdogStatus(4500, 10.0, "t", last_trigger={
+        "trigger": "app_failure", "cause": "hang", "source": "screenshot_staleness", "evidence": manifest}))
+    status = read_status(tmp_path / "watchdog.json")
+    r = app_failure(crash_signal_of(status), ShardBudgets(), phase="running", artifacts=status.last_trigger["evidence"])
+    assert r.findings[0].kind == "app_crash" and r.evidence["artifacts"] == manifest
+    assert r.checkpoint.detail == "hang" and r.has("relaunch")
+    spent = app_failure(CRASH, ShardBudgets(app_relaunches=0), phase="running", artifacts=manifest[:1])
+    assert spent.run_reason == "app_restart_budget" and spent.evidence["artifacts"] == manifest[:1]
+    assert app_failure(CRASH, ShardBudgets(), phase="running").evidence == {}
+
+
 def test_launcher_update_is_version_changed_mid_run_and_consumes_no_relaunch():
     b = ShardBudgets()
     r = app_failure(CrashSignal("process_exit", "empty_tree", launcher_update=True), b, phase="running")
@@ -168,13 +184,43 @@ def test_dead_man_deadlines_and_finalize_only_after_running():
     cutoff = datetime(2026, 11, 10, 11, 0, tzinfo=timezone.utc)
     assert dead_man_deadline("nightly", d, nightly_cutoff=cutoff) == cutoff
     with pytest.raises(ValueError):
-        dead_man_deadline("nightly", d)
+        dead_man_deadline("soak", d)
     after = dead_man_finalize("running", True, run_type="merge")
     assert after.run_reason == "dead_man" and after.unreached == Outcome("harness_error", "dead_man")
     assert after.alert.priority == "P1" and dead_man_finalize("running", True, run_type="pr").alert.priority == "P2"
     before = dead_man_finalize("workspace_loaded", False, run_type="pr")
     assert before.run_status == "complete_with_env_errors"
     assert before.unreached == Outcome("env_error", "timeout", "workspace_loaded")
+
+
+def test_nightly_and_calibration_dead_man_is_the_first_0600_new_york_after_the_pass():
+    # SD-98, 10.2: the Nightly's 4 h budget from 22:00 ends 02:00, dead-man 06:00 the same morning
+    nightly_end = datetime(2026, 11, 10, 7, 0, tzinfo=timezone.utc)                 # 02:00 EST
+    assert dead_man_deadline("nightly", nightly_end) == datetime(2026, 11, 10, 11, 0, tzinfo=timezone.utc)
+    # a weekend Calibration's first night ends about 11:10 Saturday: the first 06:00 after it is Sunday's
+    first_night = datetime(2026, 11, 14, 16, 10, tzinfo=timezone.utc)               # Sat 11:10 EST
+    assert dead_man_deadline("calibration", first_night) == datetime(2026, 11, 15, 11, 0, tzinfo=timezone.utc)
+    # the Saturday-night sixth pass ends about 00:50 Sunday: 06:00 Sunday
+    sixth = datetime(2026, 11, 15, 5, 50, tzinfo=timezone.utc)
+    assert dead_man_deadline("calibration", sixth) == datetime(2026, 11, 15, 11, 0, tzinfo=timezone.utc)
+    # an emergency calibration scheduled to end at 06:00 has its dead-man at 06:00, not a day later
+    emergency_end = datetime(2026, 11, 10, 11, 0, tzinfo=timezone.utc)
+    assert dead_man_deadline("calibration", emergency_end) == emergency_end
+    # summer time: 06:00 EDT is 10:00 UTC
+    assert dead_man_deadline("calibration", datetime(2026, 7, 11, 5, 0, tzinfo=timezone.utc)) == \
+        datetime(2026, 7, 11, 10, 0, tzinfo=timezone.utc)
+
+
+def test_finalize_of_a_nightly_or_calibration_never_at_running_is_start_failed_not_env_error():
+    for run_type in ("nightly", "calibration"):
+        r = dead_man_finalize("provisioned", False, run_type=run_type)
+        assert r.run_status == "aborted_harness" and r.run_reason == "start_failed"
+        assert r.unreached == Outcome("harness_error", "start_failed")
+        assert r.alert == alerts.aborted_harness() and r.has("kill_tree")
+    assert dead_man_finalize("launched", False, run_type="calibration").has("queue_calibration")
+    assert not dead_man_finalize("launched", False, run_type="nightly").has("queue_calibration")
+    # a Nightly that reached running and went silent is still dead_man
+    assert dead_man_finalize("running", True, run_type="nightly").run_reason == "dead_man"
 
 
 # -- 7.7 re-login and run budgets -------------------------------------------------------------------------
@@ -271,6 +317,26 @@ def test_network_past_15_minutes_ends_the_shard():
     p = NetworkPause(0.0)
     r = p.poll(901.0, connected=False)
     assert r.run_status == "complete_with_env_errors" and r.unreached == Outcome("env_error", "gate", "connectivity")
+
+
+def test_network_sparse_poll_decides_on_elapsed_time_before_the_connection_state():
+    # 10.7: a reconnect first observed between 5 and 15 minutes still fails the flow, with the resume
+    p = NetworkPause(0.0)
+    r = p.poll(400.0, connected=True)
+    env = Outcome("env_error", "gate", "connectivity")
+    assert r.checkpoint == env and {s.selector: s.outcome for s in r.outcomes} == {"in_progress": env,
+                                                                                   "rest_of_flow": env}
+    assert r.has("resume_next_flow") and r.has("reassert_paper_mode") and not r.has("retry_step")
+    assert r.run is None and r.alert == alerts.env_error()
+    again = p.poll(410.0, connected=True)                    # the flow already failed: no second env_error
+    assert again.checkpoint is None and again.has("resume_next_flow")
+    # past 15 minutes the shard ends whenever the reconnect is observed
+    late = NetworkPause(0.0).poll(1000.0, connected=True)
+    assert late.run_status == "complete_with_env_errors" and late.unreached == env and not late.has("resume_next_flow")
+    # after a dense poll failed the flow, a reconnect past 15 minutes ends the shard too
+    dense = NetworkPause(0.0)
+    assert dense.poll(301.0, connected=False).checkpoint == env
+    assert dense.poll(1000.0, connected=True).run_status == "complete_with_env_errors"
 
 
 def test_rig_loss_requeues_once_then_env_error_or_aborted_harness():

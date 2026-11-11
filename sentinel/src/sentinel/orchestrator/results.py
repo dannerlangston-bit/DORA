@@ -140,10 +140,11 @@ class SubsetOutcome:
     """An outcome for a named part of the scope.
 
     `selector` names which checkpoints: `all`, `shard`, `account_state` (4.5, 7.6), `account_state:golden`,
-    `api_within` (N3), `frozen` (N4), `ocr_assertion` (5.10), `probe:<Pn>` (2.2.3), `in_progress` (the
-    checkpoint being captured), `rest_of_flow`, `first_unreached` (10.1), `explorer_stage` (6.3 A10, 6.8),
-    `drill` (6.5), `pending_review` (10.7), `uncaptured` (10.7), `workspace:<workspace id>` (the shard's
-    remaining census visits in that workspace, after three consecutive `env_error` visits there, 2.4).
+    `api_within` (N3), `frozen` (N4), `ocr_assertion` (5.10), `surface:<id>` (every checkpoint of one surface:
+    registry validation's `not_run (entitlement)` and `harness_error (registry_entry_not_found)`, 2.2.3),
+    `in_progress` (the checkpoint being captured), `rest_of_flow`, `first_unreached` (10.1), `explorer_stage`
+    (6.3 A10, 6.8), `drill` (6.5), `pending_review` (10.7), `uncaptured` (10.7), `workspace:<workspace id>` (the
+    shard's remaining census visits in that workspace, after three consecutive `env_error` visits there, 2.4).
     """
 
     selector: str

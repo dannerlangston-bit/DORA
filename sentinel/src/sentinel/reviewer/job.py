@@ -225,6 +225,20 @@ def custom_id(queue_key: str, copy: int, attempt: int) -> str:
     return f"rv-{hashlib.sha256(queue_key.encode()).hexdigest()[:40]}-{copy}-{attempt}"
 
 
+def _batch_row_context(items: Sequence[ReviewItem]) -> Any:
+    """The egress row fields of one Message Batch request (6.10, 8.9), as `_sync_item` sets them for one item: an
+    image payload, with the redaction version, checkpoint and stored capture its items share. A field the items do
+    not share is left unset, so the gate refuses an image batch without one redaction version and `_submit` falls
+    back to the synchronous path, which sends or refuses each item with its own row."""
+    def shared(values: Iterable[str | None]) -> str | None:
+        found = set(values)
+        return (found.pop() or None) if len(found) == 1 else None
+    return row_context(image=any(i.steps for i in items) or None,
+                       redaction_version=shared(i.redaction_version for i in items),
+                       checkpoint_id=shared(i.checkpoint_ids[0] for i in items),
+                       artifact_sha256=shared(i.artifact_sha256 for i in items))
+
+
 @dataclass
 class _Acc:
     """Calls made for one item: usage, cost, ids, latency, egress counts."""
@@ -567,7 +581,8 @@ class ReviewerJob:
         if not requests:
             return
         try:
-            bid = self.transport.create_batch(requests)
+            with _batch_row_context(fresh):
+                bid = self.transport.create_batch(requests)
         except TransportError:
             for item in fresh:                              # 3.15: the synchronous path is the fallback
                 del st.items[item.queue_key], st.copies[item.queue_key], st.acc[item.queue_key]
@@ -627,7 +642,8 @@ class ReviewerJob:
                 params_by_key[key] = self.prompt.params(st.items[key])    # byte-stable: rebuilt, not stored
             requests.append((cid, params_by_key[key]))
         try:
-            bid = self.transport.create_batch(requests)
+            with _batch_row_context([st.items[k] for k in params_by_key]):
+                bid = self.transport.create_batch(requests)
         except TransportError:
             for key, ci in retry:
                 st.copies[key][ci].attempt -= 1

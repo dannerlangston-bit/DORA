@@ -92,6 +92,7 @@ LAYOUT: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("soak", ("soak.yaml",)),
     ("calibration", ("calibration/*.yaml",)),
     ("eval_report", ("eval/reports/*.yaml",)),
+    ("decision", ("decisions/*.yaml",)),     # 4.14: the nightly export for review; SQLite is the source of truth
     ("taxonomy", ("taxonomy.yaml",)),
 )
 NOT_FIXTURES = frozenset({"fixtures/margin_rules.yaml"})

@@ -354,6 +354,21 @@ def test_ladder_is_a_locator_over_a_frame():
     assert lad.last is not None and lad.last.status == "passed"
 
 
+def test_a_single_attempt_ladder_misses_once_without_retry_rescue_or_finding():
+    """Choice 9: the emitter owns the step's retry and rung 4, so one locate is one scripted attempt."""
+    rescuer = Rescuer(RescueOutcome(True, point=(1, 1)))
+    c = ctx(retry_image=SCREEN.image, rescuer=rescuer)
+    lad = Ladder(None, None, A_ON, c, regions={}, single_attempt=True)
+    res = lad.locate(send_target(), Frame(BLANK, ORIGIN, 1.0))
+    assert res.point is None and res.rung == "none" and res.finding_kind is None
+    assert [r["result"] for r in res.rung_results] == ["locator_failed(image)"]
+    assert c.retry_calls == [] and rescuer.requests == [] and lad.last.attempts == 1 and lad.last.consequence is None
+    hit = lad.locate(send_target(), Frame(SCREEN.image, ORIGIN, 1.0))
+    assert hit.rung == "image" and lad.last.status == "passed"
+    two = Ladder(None, None, A_ON, c, regions={}).locate(send_target(), Frame(BLANK, ORIGIN, 1.0))
+    assert two.rung == "image" and c.retry_calls == [1]                             # the default mode retries itself
+
+
 def test_branches_come_from_the_phase0_file():
     doc = yaml.safe_load((Path(__file__).resolve().parents[1] / "config/example/phase0/branches.yaml").read_text())
     assert Branches.from_doc(doc) == Branches("A", "A")

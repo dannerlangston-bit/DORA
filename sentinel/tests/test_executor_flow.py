@@ -8,8 +8,8 @@ from test_executor_emitter import MISS, FakeLocator, FakePlanner, FakePorts, Fak
 
 from sentinel.executor.emitter import ExecContext, Rescue
 from sentinel.executor.failures import FailureLedger, FaultInjector
-from sentinel.executor.flow import (CENSUS_CHECKS, AssertVerdict, Captured, CheckRead, Unit, UnitHooks, WaitPoll,
-                                    WorkspaceStreak, census_unit, run_unit)
+from sentinel.executor.flow import (CENSUS_CHECKS, NO_DIALOG, AssertVerdict, Captured, CheckRead, Unit, UnitHooks,
+                                    WaitPoll, WorkspaceStreak, census_unit, run_unit)
 from sentinel.executor.heartbeat import AppLife, HeartbeatPolicy
 from sentinel.orchestrator.boundary import FlowTimer, flow_budget_cut
 from sentinel.orchestrator.budgets import ShardBudgets
@@ -65,12 +65,14 @@ def unit(checkpoints=(CP3, CP6, CP7), doc=DOC):
 def setup(clock=None, labels=None, **ctx_kw):
     clock = clock or ManualClock()
     ports = FakePorts(clock)
+    ports.track_dialog = True
     # attestation passed and a current paper-mode assertion: the slow half lets Confirm and Send open the dialog
     ports.safety = SafetyContext(dismiss_allowlist=frozenset({"Delete"}), attestation_passed=True,
                                  paper_assertion_current=True)
     names = {**LABELS, **(labels or {})}
     ctx = ExecContext(run_id="pr-1-1", shard_id="pr-1-1/1", clock=clock,
-                      resolve_target=lambda t: {"name": t, "label": names.get(t, "Field"), "window": "main"},
+                      resolve_target=lambda t: {"name": t, "label": names.get(t, "Field"),
+                                                "window": "^Order" if t.startswith("dialog.") else "main"},
                       **ctx_kw)
     return ports, FakeLocator(), FakePlanner(), ctx
 
@@ -147,6 +149,23 @@ def test_a_locator_miss_on_every_rung_is_landmark_missing_then_step_failed():
     assert r.outcomes == {CP6: Outcome("landmark_missing", "locator:s04"), CP7: step_failed("s04")}
     assert [f.kind for f in r.findings] == ["locator_failure"]
     assert [s.step_id for s in r.teardown] == ["t1", "t2", "t4", "t5"]              # teardown runs after a failure
+
+
+def test_close_dialog_with_no_dialog_open_is_a_teardown_no_op():
+    """Choice 7: the flow failed before its dialog opened; the close target is rightly absent, so t1 passes with no
+    input and files no locator_failure (the ladder would miss on every rung)."""
+    ports, loc, plan, ctx = setup(agent_available=False)
+    loc.script = {QTY: [MISS], "dialog.order-confirmation.title-close": [MISS]}
+    r = run(ports, loc, plan, ctx)
+    assert r.ended_by == "s04" and not ports.dialog_open
+    t1 = r.teardown[0]
+    assert (t1.step_id, t1.status, t1.detail, t1.events) == ("t1", "passed", NO_DIALOG, ())
+    assert all(s.passed for s in r.teardown) and [f.kind for f in r.findings] == ["locator_failure"]
+    assert not any(a.teardown_action == "close_dialog" for a in ports.sent)
+    ports, loc, plan, ctx = setup()                                                 # the dialog is open: it is closed
+    r = run(ports, loc, plan, ctx)
+    assert r.teardown[0].detail != NO_DIALOG and any(a.teardown_action == "close_dialog" for a in ports.sent)
+    assert not ports.dialog_open
 
 
 def test_an_agent_rescue_captures_the_next_checkpoint_after_normalize_flagged_rescued():

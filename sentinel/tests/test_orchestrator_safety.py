@@ -727,6 +727,31 @@ def test_orders_sent_with_cancel_all_failed_keeps_its_line_and_carries_the_hand_
     assert "instruction" not in verified.evidence and verified.evidence["blocked_reason"] == "incident"
 
 
+def test_cancel_all_not_located_after_an_unclean_fresh_read_hands_over_to_a_human():
+    """gateway-safety:0 (6.6 Cancel All failure): the fresh Working read shows a new row but Copy All disagrees, so
+    the proof cannot be ORDERS SENT and is UNPROVEN monitor_unreadable; Cancel All was needed and is not located, so
+    the safety page is re-sent with the login owner, the account, the Working Orders screenshot and the instruction
+    to cancel by hand, whatever the UNPROVEN reason."""
+    clock = ManualClock()
+    rig = SimulatedRig(SimScenario(copy_all_disagrees=True, cancel_all_located=False), clock=clock)
+    start = rig.read_orders()                                                           # the snapshot read is clean
+    rig._send()
+    rep = _ks(rig, clock, start)
+    assert (rep.proof.verdict, rep.proof.reason, rep.proof.cancel_all) == (UNPROVEN, "monitor_unreadable", "failed")
+    assert [r.key for r in rig.book.working] == ["sim-order-1"]                         # still live in the account
+    e = rep.proof_effect
+    assert e.run is None and e.alert == alerts.safety_abort().plus(paged=("login_owner",))
+    assert e.evidence["account"] == "account D-xxxxxxxx (allowlist entry 2) on rig rig-01"
+    assert e.evidence["working_orders_screenshot"] and e.evidence["instruction"] == CANCEL_BY_HAND
+    assert CANCEL_BY_HAND in e.detail and e.detail.startswith("UNPROVEN: monitor_unreadable; account D-xxxxxxxx")
+    assert e.has("block_login") and e.evidence["blocked_reason"] == "unproven_proof"
+    # not aborted yet: the UNPROVEN page with the login owner added
+    p = post_run_proof(ProofInputs(START, replace(START, copy_all_agrees=False), cancel_all="failed"))
+    r = proof_result(p, account=account_ref(ALLOW, EMPTY), screenshot_sha256="sha-wo")
+    assert r.alert == alerts.unproven_proof().plus(paged=("login_owner",))
+    assert r.evidence["working_orders_screenshot"] == "sha-wo" and r.evidence["instruction"] == CANCEL_BY_HAND
+
+
 def test_after_live_identity_no_recovery_login_is_made_and_the_proof_is_session_unavailable():
     clock = ManualClock()
     rig = SimulatedRig(clock=clock)

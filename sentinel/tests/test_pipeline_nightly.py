@@ -3,6 +3,7 @@ scoring and persistence, the A/A pass, flake and quarantine, the registry self-t
 end to end through `pipeline.run.run_nightly` on the example config."""
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import date
 from pathlib import Path
@@ -55,6 +56,38 @@ def test_the_oracle_and_the_declared_inputs_read_the_mutants_pixels(night):
     assert (m15.state, m15.produced_outcome) == ("detected", "invariant_violation")
     assert "INV-08" in n.canary["report"].fired[f"M15@{m15.checkpoint_id}"]
     assert not n.canary["report"].unproven                  # every expected signal fired (12.3)
+
+
+def test_the_gateway_mutant_runs_its_step_through_the_rigs_gateway(tmp_path, monkeypatch):
+    """M28 (10.3, SD-44): the canary flow's step on the swapped Send template goes through `SimulatedRig.send_input`
+    (slow half, then hook): the ambiguous name is refused, no click is emitted, and the mutant is detected; a gateway
+    that emitted the click would miss it."""
+    from sentinel.orchestrator import simrig
+    sent = []
+    real = simrig.SimulatedRig.send_input
+
+    def spy(self, action, **kw):
+        res = real(self, action, **kw)
+        if action.flow_class == "canary" and action.under_point_text == "dneS dna mrifnoC":
+            sent.append((action, res))
+        return res
+    monkeypatch.setattr(simrig.SimulatedRig, "send_input", spy)
+    n = nightly(tmp_path / "a", "M28")
+    (m28,) = by_id(n)["M28"]
+    assert m28.state == "detected"
+    ((action, res),) = sent
+    assert action.ambiguous and res.refused is not None and res.refused.reason == "deny_profile" and res.events == ()
+    from sentinel.orchestrator.gateway import HookDecision, InputEvent
+    from sentinel.orchestrator.rig import EmitResult
+
+    def broken(self, action, **kw):                       # a gateway that lets the click through
+        if action.under_point_text == "dneS dna mrifnoC":
+            return EmitResult(decisions=(HookDecision(True, token_id=1),),
+                              events=(InputEvent("button_down", *action.point, button="left"),))
+        return real(self, action, **kw)
+    monkeypatch.setattr(simrig.SimulatedRig, "send_input", broken)
+    n = nightly(tmp_path / "b", "M28", run_id="run-2026-11-10-nightly-02")
+    assert by_id(n)["M28"][0].state != "detected"           # the click was emitted: M28 is missed
 
 
 def test_the_global_shift_mutants_are_judged_over_their_batch(night):
@@ -113,8 +146,8 @@ def test_the_detector_state_carries_across_nights_and_a_green_night_clears_it(tm
                                           (n3.run_id,))[0][0])
     assert {"mutants", "popups"} <= set(versions)
     alerts = json.loads((tmp_path / "alerts.json").read_text())
-    assert [(a["run_id"], a["rule"], a["priority"]) for a in alerts] == \
-        [(n1.run_id, "canary_failure", "P1"), (n2.run_id, "canary_failure", "P1")]
+    assert [(a["run_id"], a["rule"], a["priority"]) for a in alerts if a["control"] != "fingerprint"] == \
+        [(n1.run_id, "canary_failure", "P1"), (n2.run_id, "canary_failure", "P1")]          # less G5's notices
 
 
 def test_a_catalog_that_fails_the_g3_hash_runs_no_canary_and_aborts_the_run(tmp_path):

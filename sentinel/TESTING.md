@@ -66,6 +66,7 @@ The scenarios, and what each one should show:
 | `base-reuse` | A merge run captures the new main build. Then a PR run uses that build as its base. | The PR run does not capture the base again for its frozen screens: each one names the merge run as its source, and Run health counts them. The results match `clean-pr`. |
 | `calibrated-floors` | A weekend calibration run measures the base build's noise and saves it. Then a PR run uses that base. | The PR run reads the saved floors instead of measuring its own. Run health asks for no new calibration. The results match `clean-pr`. |
 | `lockstep-slip` | The Position Statement runs on two rigs at once, one per build. The base rig falls more than a minute behind, twice. | It is tried once more at the end, then marked not run (budget). Run health counts one lockstep slip. No finding is written for it. |
+| `unregistered-tab` | The new build shows a new tab at the top, "Crypto". The list of known screens does not have it. | The PR comment lists a tier 1 "unregistered surface" for the tab. Its finding names the file a new registry entry would add. The check fails. |
 
 `out/index.html` repeats this list with links. Use the questions below for every scenario.
 

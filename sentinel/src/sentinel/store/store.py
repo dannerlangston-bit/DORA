@@ -9,7 +9,8 @@ frozen dataclasses below.
 Enforced here and, where SQL can say it, again by the schema:
 - one writer process: a `writer.lock` beside the database holds the writer's PID and a second writer refuses to
   start while that PID is alive (8.2); a stale lock (dead PID) is taken over. The connection is bound to the
-  thread that opened it, which is the "one writer thread" of 8.2.
+  thread that opened it; `store.writer.WriterService` is the "one writer thread" of 8.2 that producers on other
+  threads queue batches to.
 - the database and the artifact root must be on a local volume: UNC paths, and on POSIX the network file systems
   of /proc/mounts, are refused; on Windows the drive must be DRIVE_FIXED (8.2, H7, 8.9).
 - every outcome, reason, gate, finding kind, triage state and decision value is in the closed taxonomy: records
@@ -51,7 +52,13 @@ Enforced here and, where SQL can say it, again by the schema:
   10.2 late arrival: `replace_dead_man_run` replaces a dead-man run with its real rows and outcome, all of them in
   one batch (every placeholder covered; each row under its shard; the shards' events, steps, extractions,
   fingerprints and post-run proofs with them; a complete outcome only with every shard's proof).
-- every write batch is one `BEGIN IMMEDIATE` transaction, appended to `results.jsonl` before it commits (8.2).
+- every write batch is one `BEGIN IMMEDIATE` transaction, appended to `results.jsonl` before it commits (8.2), and
+  for a Central Store opened with `decisions_ledger` a decision batch also to `ledgers/decisions-<day>.jsonl` (8.7).
+  `replay` rebuilds a database from those ledgers (8.1, 8.9) and `main` is `sentinel store rebuild`.
+- the service start runs `PRAGMA quick_check` (12.7 H7; `StoreIntegrityError`, 8.9) and migrates an older schema,
+  or one generated from another taxonomy.yaml, forward after a VACUUM INTO snapshot (`store.migrations`, 8.6).
+- the shard import (`store.importer`) writes a shipped Run Store's rows in one batch (`import_shard_rows`); a lost
+  shard of a dead-man run reopens and re-evaluates it, an older attempt goes to `outcomes_superseded` (8.9, 10.7).
 
 Choices where the spec is ambiguous or silent (reported to the coordinator):
 - schema.sql rendered equals the 8.3 DDL blocks (tests/test_schema_mirror.py), including what once were store
@@ -69,7 +76,7 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   is plain (SD-78).
 - At service start the seed is synced (8.3: "seeded ... at service start"): new reasons are added, reasons no
   longer in the file are retired (active = 0), never deleted. A taxonomy change that alters a generated CHECK
-  (any list) is refused at open: that needs a migration, and none exists yet.
+  (any list) is migrated at open (`store.migrations`), after a pre-migration snapshot.
 - `reason_detail` holds the reason's parameter for a parametric reason and the record's `detail` otherwise; with
   both, `<param>\\n<detail>`. For invariant_violation without a detail it holds the fired invariant ids (8.3).
 - Decision ids are `dec-<zero-padded sequence>` (4.14) and map to the integer `decisions.decision_id`; finding ids
@@ -77,8 +84,10 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   records.Decision.hamming_tolerance takes the tier's default (8, or 6 on tier 1: "tier-1 checkpoint, so the
   override applies"), an explicit value above that default is refused (L-DEC-03: "at most 6 when the checkpoint's
   tier is 1", write refused; never clamped), and the region's calibrated tolerance at the run's config commit
-  lowers it. noise_signature and request_mask get `expires_at` = decided_at + 30 days when none is given (8.3,
-  4.14).
+  lowers it. A region on the exact fallback (`regions.exact_fallback`, or a calibrated tolerance of 0) stores
+  tolerance 0 and needs the decision's `bbox_q4` (L-DEC-03, write refused without it); the lookup matches a
+  tolerance-0 decision only on an equal pHash and an equal 4 px box (`lookup_decisions(bbox_q4=)`, 4.14, 9.7).
+  noise_signature and request_mask get `expires_at` = decided_at + 30 days when none is given (8.3, 4.14).
 - A decision's `finding_ref`, `manifest_entry_ref` and `build_pair_id` are read back from its source finding and
   its run's pair (8.3 has no decision columns for them); `bbox_q4` is stored as `x,y,w,h`.
 - 9.7 Two humans, one signature, and the 9.6 idempotency are the Reporter API's rules for a decision made on a
@@ -109,8 +118,8 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   is open, and come back through `post_run_proofs`. `counts_json` holds the 6.6 table lines and, beside the counts
   8.3 names, the undeclared and declared row keys, since an ORDERS SENT verdict lists every undeclared row (6.6)
   and no other column can hold them.
-- A finished run is not re-ended with a different outcome (the 10.7 re-evaluation of a returning rig belongs
-  to the import, which is not this module), except the 10.2 late arrival of a dead-man run. A RunOutcome's summary
+- A finished run is not re-ended with a different outcome, except the 10.2 late arrival of a dead-man run and the
+  re-evaluation when a lost shard of a dead-man run is imported (8.9, `import_shard_rows`). A RunOutcome's summary
   and 4.13 artifact refs go into `summary_json` (8.3 has no column for them) under `summary` and `refs`, beside
   `counts` and `last_gate`; those four keys are the store's, and the teardown summary and `update_summary` add any
   other top-level key (8.3: coverage matrix, run health, detector state; 8.7, 9.10: acknowledgements). Top-level
@@ -144,6 +153,17 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   that rig's login and role; one active rig per login is a partial unique index, and the rig role and login kind
   must agree (explorer with explorer, pool and nightly with scripted; 11.3).
 - Timestamps are normalised to UTC ISO 8601 seconds on write (8.3).
+- The ledger carries what replay needs to write the same rows (8.2): an insert the rowid SQLite gave its INTEGER
+  PRIMARY KEY, an upsert its conflict clause; a supersession, a link or a release is journaled as keyed updates,
+  the late arrival's placeholder move as one `supersede_outcomes` op. Updates keyed by a surrogate id (a finding's
+  `finding_id`, a review's `review_id`) therefore replay exactly. Entries other modules add that change no row
+  (a human action's note, an audit restore) are annotations replay skips.
+- The decisions ledger day is the America/New_York date of the batch (the control host's day, as 8.6's jobs keep
+  it); a decision batch is a `decision*`, `human:*`, `proposal` or `proposal_update` batch (the 8.7 UI writes).
+- SD-83: `record_decision` sets `findings.closed_at` to `decided_at` when it moves the finding from a pinning state
+  into closed, noise, agent_mistake or expected_behavior, keeps it between those, and clears it when a decision
+  moves the finding back into a pinning state (revoke already reopens and clears it).
+- `Store.reader(path)` reads a database without writing it (a shipped Run Store): no lock, `mode=ro`.
 
 The decision lifecycle (4.14, 8.3, 9.6, 9.7, 9.9; `store.lifecycle` and `store.mirror` hold the jobs that run
 over it). Choices where the spec is ambiguous (reported):
@@ -197,6 +217,8 @@ from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping, Sequence
 
+from zoneinfo import ZoneInfo
+
 from .. import required_fields
 from ..classify import DecisionMatch
 from ..canonical import canonical_json
@@ -205,7 +227,8 @@ from ..records import (ACTION_VERDICT, DATA_MODES, PERSONAS, RUN_TYPES, Checkpoi
                        MaintenanceItem, ModelUsage, OutboxJob, Proposal, RegionDiff, RunOutcome, Signature, StepEvent,
                        StepOutcome, SyntheticOutcome, now, to_jsonable)
 from ..taxonomy import Taxonomy, TaxonomyError, checkpoint_parts, load
-from .artifacts import ArtifactStore, StoredArtifact, is_visual
+from . import migrations
+from .artifacts import StoredArtifact, is_visual
 
 if TYPE_CHECKING:
     from ..canary import CanaryResult
@@ -256,7 +279,26 @@ SUMMARY_RESERVED = frozenset({"counts", "last_gate", "summary", "refs"})   # sum
 RUN_REFS = ("report_sha256", "comment_sha256", "coverage_matrix_ref", "egress_log_ref", "post_run_proof_ref")   # 4.13
 RECONFIRM_PREFIX = "re-confirmed: "            # 9.7: the reason of a re-confirmation row (`lifecycle.reconfirm`)
 TRIAGE_EVIDENCE_KEYS = frozenset({"proposal", "triage_note"})   # 9.6, 9.9: triage notes on a finding's evidence
+# SD-83, 8.6: the triage states that release a finding's evidence (180 days after closed_at); the others pin it
+RELEASING_TRIAGE = ("closed", "noise", "agent_mistake", "expected_behavior")
 DECIDING_ROLES = ("system_owner", "release_manager")             # 9.6: the role holders that decide (ops/oncall.yaml)
+# 8.7: batches that also go to the Central Store's day's decisions ledger (besides decision_* and human:* kinds)
+DECISION_BATCHES = frozenset({"decision", "proposal", "proposal_update"})
+NEW_YORK = ZoneInfo("America/New_York")
+# 8.2 shard import: the further Run Store tables imported row for row, with the key a replayed row is matched on
+# (None: every column but the surrogate id); canary_results.synthetic_ref is linked again on the Central Store
+IMPORT_TABLES: Mapping[str, tuple[str, ...] | None] = {
+    "egress_log": None, "model_usage": None, "flake_events": None, "soak_samples": ("run_id", "sampled_at", "pid",
+                                                                                   "metric"),
+    "synthetic_outcomes": ("run_id", "mutant_id", "checkpoint_id"),
+    "canary_results": ("run_id", "kind", "mutant_id", "checkpoint_id"), "canary_manifests": ("run_id",)}
+# 8.2: the run identity a Run Store must share with the Central Store's row
+RUN_IDENTITY = ("run_type", "config_commit", "config_tarball_sha256", "snapshot_set_sha256", "harness_sha",
+                "authorization_ref")
+SETTLED_SHARDS = ("imported", "import_failed")    # shards whose outcome the run outcome is computed from (8.2)
+LIVE_SHARD_STATES = ("queued", "running", "finished", "shipping")
+# replay identity of a table without a primary key (8.3 outcomes_superseded is CREATE TABLE AS)
+NATURAL_KEYS = {"outcomes_superseded": ("run_id", "checkpoint_id", "shard_id", "attempt")}
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -276,6 +318,11 @@ class StoreError(Exception):
 
 class WriterLockError(StoreError):
     """Another live process holds the writer lock (8.2)."""
+
+
+class StoreIntegrityError(StoreError):
+    """`PRAGMA quick_check` failed at service start, or the file is not a database (8.9, 12.7 H7): the service
+    stops; the operator restores the last good snapshot and replays the later ledgers (`Store.replay`)."""
 
 
 class StoreRefused(StoreError, ValueError):
@@ -370,6 +417,55 @@ class RunPlan:
     catalog_versions: Mapping[str, str] | None = None       # popup and mutant catalog versions (preflight G3, 8.3)
     data_window_start: str | None = None                    # 8.3 runs.data_window_start and _end
     data_window_end: str | None = None
+
+
+@dataclass(frozen=True)
+class ReplayResult:
+    """What one `Store.replay` did: the ledger lines read, the batches that changed something, the ops applied."""
+    batches: int
+    applied: int
+    ops: int
+
+
+@dataclass(frozen=True)
+class ExportResult:
+    """What one `Store.load_export` did with one table's export."""
+    table: str
+    inserted: int
+    same: int
+    kept: int
+
+
+@dataclass(frozen=True)
+class ShardRows:
+    """The rows of one shipped Run Store that the shard import writes (8.2), read by `Store.shard_rows` from a
+    read-only `Store.reader`. `outcomes` pairs each record with the shard it is stored under; a row the Run Store
+    wrote without a shard is the shard's (a Run Store holds one shard). `raw_outcomes` are the `outcomes` rows as
+    stored, for `outcomes_superseded`. `tables` holds the rows of `IMPORT_TABLES`, surrogate ids left out."""
+    shard_id: str
+    run_id: str
+    attempt: int
+    run: Mapping[str, Any]
+    shard_outcome: str | None
+    shard_reason: str | None
+    finished_at: str | None
+    scope: tuple[str, ...]
+    outcomes: tuple[tuple[CheckpointOutcome, str], ...]
+    raw_outcomes: tuple[Mapping[str, Any], ...]
+    findings: tuple[tuple[Finding, bool], ...]
+    events: tuple[StepEvent, ...]
+    extractions: tuple[Extraction, ...]
+    fingerprints: tuple[Fingerprint, ...]
+    proofs: tuple[PostRunProof, ...]
+    artifacts: tuple[StoredArtifact, ...]
+    tables: Mapping[str, tuple[Mapping[str, Any], ...]]
+
+
+class _NoLock:
+    """The writer lock of a read-only `Store.reader`: there is none to take or release."""
+
+    def release(self) -> None:
+        return None
 
 
 @dataclass(frozen=True)
@@ -539,14 +635,6 @@ class _Prepared:
     shard_id: str | None
 
 
-@dataclass(frozen=True)
-class SweepResult:
-    """What one retention sweep did (8.6)."""
-    deleted: tuple[str, ...] = ()
-    kept: tuple[str, ...] = ()
-    skipped: bool = False                         # "retention skipped: backup failed"
-
-
 # ---------------------------------------------------------------------------------------------------------------
 # small helpers
 
@@ -681,6 +769,17 @@ def seed_rows(t: Taxonomy) -> list[tuple[str, str, int, str | None, str]]:
             if o == parent:
                 rows.setdefault((child, code), (child, code, par, means, "1.10"))
     return list(rows.values())
+
+
+def _reason_forms(t: Taxonomy) -> dict[tuple[str, str], tuple[int, str]]:
+    """(outcome, reason code) -> (parametric, separator), with the reasons the run outcomes pass to the unreached
+    checkpoints (`reason_inheritance`, 1.10)."""
+    forms = {(o, c): (par, sep) for o, pats in t.data["reasons"].items() for c, par, _, sep in map(_pattern, pats)}
+    for child, parent in t.data.get("reason_inheritance", {}).items():
+        for (o, c), form in list(forms.items()):
+            if o == parent:
+                forms.setdefault((child, c), form)
+    return forms
 
 
 def _seed_sql(rows: Sequence[tuple]) -> str:
@@ -824,6 +923,7 @@ _DECISION_COLUMNS = """d.*, r.pair_id AS run_pair_id, f.manifest_entry AS findin
 _LOOKUP_FROM = f"SELECT {_DECISION_COLUMNS}, hamming(d.phash, :phash) AS distance\n{_DECISION_FROM}"
 LOOKUP_SQL = (_LOOKUP_FROM + _LOOKUP_WHERE + """
   AND hamming(d.phash, :phash) <= d.hamming_tolerance
+  AND (d.hamming_tolerance > 0 OR d.bbox_q4 = :bbox_q4)
 ORDER BY hamming(d.phash, :phash), d.decided_at DESC""")   # 8.3: no LIMIT, the verdict set is the answer (9.7)
 RELATED_SQL = (_LOOKUP_FROM + _LOOKUP_WHERE + """
   AND hamming(d.phash, :phash) > d.hamming_tolerance AND hamming(d.phash, :phash) <= :related
@@ -944,7 +1044,8 @@ def _in_ticket_scope(d: Decision, run_id: str | None, run_pair: str | None, entr
 def lookup_decisions(conn: sqlite3.Connection, signature: Signature, *, at: str | None = None,
                      rescued: bool = False, synthetic: bool = False, run_id: str | None = None,
                      manifest_entries: Iterable[str] = (), manifest_tickets: Iterable[str] = (),
-                     candidate_build: str | None = None) -> DecisionLookup:
+                     candidate_build: str | None = None,
+                     bbox_q4: Sequence[int] | None = None) -> DecisionLookup:
     """Every active decision within tolerance of `signature`, plus the related ones up to 12 bits (8.3, 4.14).
 
     A rescued checkpoint (5.5) and a synthetic outcome (10.3) never run the query: the answer is empty.
@@ -959,12 +1060,17 @@ def lookup_decisions(conn: sqlite3.Connection, signature: Signature, *, at: str 
     under test: a fixed_in_build match whose fix build it has reached is listed in `fixed_returned` and does not
     apply, since from that build on the signature must be absent (4.14, L-DEC-08); `lifecycle.verify_fixes` then
     reopens the decision after the run.
+
+    `bbox_q4` is the finding's largest component box on the 4 px grid (`diff.calibration.bbox_q4`): a decision
+    stored with tolerance 0 (the region's exact fallback) matches only an equal pHash with an equal box, and never
+    when the box is not given (4.14, 9.7, L-DEC-03).
     """
     if rescued or synthetic:
         return DecisionLookup()
     cps = json.dumps(list(rename_chain(conn, signature.checkpoint_id)))
     args = {"cps": cps, "region": signature.region_id, "cat": signature.category,
-            "phash": phash_bytes(signature.phash), "now": utc(at) or now(), "related": RELATED_LIMIT}
+            "phash": phash_bytes(signature.phash), "now": utc(at) or now(), "related": RELATED_LIMIT,
+            "bbox_q4": None if bbox_q4 is None else ",".join(str(int(v)) for v in bbox_q4)}
     rows = conn.execute(LOOKUP_SQL, args).fetchall()
     pair = None
     if run_id is not None:
@@ -1075,6 +1181,75 @@ def _ledger_default(v: Any) -> Any:
     raise TypeError(type(v).__name__)
 
 
+def _append_line(path: Path, line: str) -> None:
+    """Append one ledger line and fsync it before the batch commits (8.2)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def read_ledger(path: str | os.PathLike) -> list[tuple[dict, str]]:
+    """The batches of a ledger file with their lines, in order (8.2); a torn last line (the writer died
+    mid-append) is skipped, a torn line anywhere else raises StoreError. A missing file has none."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    text = p.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    out = []
+    for i, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            out.append((json.loads(line), line))
+        except json.JSONDecodeError as e:
+            if i == len(lines) - 1 and not text.endswith("\n"):
+                break
+            raise StoreError(f"{p}: line {i + 1} is not a ledger batch ({e})") from e
+    return out
+
+
+def is_decision_batch(kind: str) -> bool:
+    """A batch the 8.7 report UI writes or a decision moves: decisions and their links, proposals and the human
+    actions (clear a proof, close an incident, override a check, re-enable); these also go to the day's decisions
+    ledger of the Central Store (8.7, 8.9)."""
+    return kind in DECISION_BATCHES or kind.startswith(("decision_", "human:"))
+
+
+def decisions_ledger_path(directory: Path, at: str) -> Path:
+    """`ledgers/decisions-<YYYY-MM-DD>.jsonl` for the America/New_York day of `at` (8.7: the day's decisions
+    ledger; the control host's day, as the 8.6 jobs keep it)."""
+    day = datetime.fromisoformat(at).astimezone(NEW_YORK).date().isoformat()
+    return directory / f"decisions-{day}.jsonl"
+
+
+@dataclass(frozen=True)
+class _TableMeta:
+    """What the writer and `replay` need of one table: its columns, the key that identifies a row (the primary
+    key, or `NATURAL_KEYS` for a table without one), its INTEGER PRIMARY KEY column and its BLOB columns."""
+    columns: tuple[str, ...]
+    key: tuple[str, ...]
+    rowid_alias: str | None
+    blobs: frozenset[str]
+
+
+def _table_meta(conn: sqlite3.Connection, table: str) -> _TableMeta:
+    if not _IDENT.match(table):
+        raise StoreRefused(f"table name {table!r}")
+    info = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    if not info:
+        raise StoreRefused(f"unknown table {table!r} (8.3)")
+    pk = tuple(r[1] for r in sorted((r for r in info if r[5]), key=lambda r: r[5]))
+    sql = (conn.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone()
+           or ("",))[0] or ""
+    types = {r[1]: (r[2] or "").upper() for r in info}
+    alias = pk[0] if len(pk) == 1 and types[pk[0]] == "INTEGER" and "WITHOUT ROWID" not in sql.upper() else None
+    return _TableMeta(tuple(r[1] for r in info), NATURAL_KEYS.get(table, pk), alias,
+                      frozenset(c for c, t in types.items() if t == "BLOB"))
+
+
 # ---------------------------------------------------------------------------------------------------------------
 
 class Store:
@@ -1082,10 +1257,17 @@ class Store:
 
     def __init__(self, path: str | os.PathLike, *, taxonomy: Taxonomy | None = None, ledger: bool = True,
                  busy_timeout_ms: int = 5000, require_local: bool = True, strict_records: bool = False,
-                 system_owners: Iterable[str] = (), roster: Roster | None = None):
+                 system_owners: Iterable[str] = (), roster: Roster | None = None, decisions_ledger: bool = False):
         """`strict_records` refuses, at `write_checkpoint`, a record that fails the 4.13 required-fields table
         (L-OUT-02, `RecordIncomplete`); `system_owners` are the logins that may decide on a frozen signature (9.7);
-        `roster` (ops/oncall.yaml) turns on the L-DEC-01 and L-DEC-06 roster checks (`set_roster` later)."""
+        `roster` (ops/oncall.yaml) turns on the L-DEC-01 and L-DEC-06 roster checks (`set_roster` later);
+        `decisions_ledger` (the Central Store) also appends every decision batch to the day's decisions ledger,
+        `ledgers/decisions-<YYYY-MM-DD>.jsonl` beside the database (8.7, 8.9).
+
+        At open: the 8.2 pragmas, `PRAGMA quick_check` (12.7 H7; a failure or a file that is not a database is
+        `StoreIntegrityError`, 8.9), then the schema: created on an empty file, migrated forward after a VACUUM INTO
+        snapshot when it is older or was generated from another taxonomy.yaml (`migrations`, 8.2, 8.6), and the
+        reason seed synced (8.3)."""
         self.path = Path(path)
         self.taxonomy = taxonomy or load()
         self.strict_records = strict_records
@@ -1101,22 +1283,68 @@ class Store:
         try:
             self._conn = sqlite3.connect(str(self.path), isolation_level=None)
             _configure(self._conn)
-            for p in ("journal_mode = WAL", "synchronous = NORMAL", "foreign_keys = ON",
-                      f"busy_timeout = {int(busy_timeout_ms)}", "wal_autocheckpoint = 1000"):
-                self._conn.execute(f"PRAGMA {p}")
+            self._open_checked(busy_timeout_ms)
             self._ledger = self.path.parent / "results.jsonl" if ledger else None
-            self._forms = {(o, c): (par, sep) for o, pats in self.taxonomy.data["reasons"].items()
-                           for c, par, _, sep in map(_pattern, pats)}
-            for child, parent in self.taxonomy.data.get("reason_inheritance", {}).items():
-                for (o, c), form in list(self._forms.items()):
-                    if o == parent:
-                        self._forms.setdefault((child, c), form)
+            self._decisions = self.path.parent / "ledgers" if decisions_ledger else None
+            self._meta: dict[str, _TableMeta] = {}
+            self.migration: migrations.MigrationReport | None = None
+            self._forms = _reason_forms(self.taxonomy)
             self._open_schema()
         except BaseException:
             if hasattr(self, "_conn"):
                 self._conn.close()
             self._lock.release()
             raise
+
+    @classmethod
+    def reader(cls, path: str | os.PathLike, *, taxonomy: Taxonomy | None = None) -> "Store":
+        """A read-only Store over a database file this process does not write: a shipped Run Store in `incoming`
+        (8.2: the Rig Manager and the import read it; nobody writes it after the Orchestrator). No writer lock, no
+        ledger; the connection is `mode=ro` with `query_only`, so every write method fails. Its read methods
+        (`outcomes`, `findings`, `step_events`, `shard_rows`...) work as on the writer."""
+        self = cls.__new__(cls)
+        self.path = Path(path)
+        self.taxonomy = taxonomy or load()
+        self.strict_records = False
+        self.system_owners = frozenset()
+        self.roster = None
+        self._sessions = {}
+        self._flow_steps = {}
+        self._lock = _NoLock()
+        self._ledger = self._decisions = None
+        self._meta = {}
+        self.migration = None
+        self._forms = _reason_forms(self.taxonomy)
+        if not self.path.exists():
+            raise StoreError(f"{self.path} does not exist")
+        try:
+            self._conn = connect_reader(self.path)
+            version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        except sqlite3.DatabaseError as e:
+            raise StoreIntegrityError(f"{self.path} is not a readable database: {e}") from e
+        if version != SCHEMA_VERSION:
+            self._conn.close()
+            raise StoreError(f"{self.path} has schema version {version}; this store reads {SCHEMA_VERSION}")
+        return self
+
+    def _open_checked(self, busy_timeout_ms: int) -> None:
+        """The 8.2 pragmas and the 12.7 H7 `PRAGMA quick_check`; anything but `ok` stops the service (8.9)."""
+        try:
+            for p in ("journal_mode = WAL", "synchronous = NORMAL", "foreign_keys = ON",
+                      f"busy_timeout = {int(busy_timeout_ms)}", "wal_autocheckpoint = 1000"):
+                self._conn.execute(f"PRAGMA {p}")
+            found = [str(r[0]) for r in self._conn.execute("PRAGMA quick_check")]
+        except sqlite3.OperationalError as e:
+            if any(w in str(e) for w in ("locked", "busy")):
+                raise StoreWriteFailed(f"cannot open {self.path}: {e}") from e
+            raise StoreIntegrityError(f"{self.path} cannot be opened: {e} (8.9: stop, restore the last good "
+                                      "snapshot and replay the later ledgers)") from e
+        except sqlite3.DatabaseError as e:
+            raise StoreIntegrityError(f"{self.path} is not a readable database: {e} (8.9: stop, restore the last "
+                                      "good snapshot and replay the later ledgers)") from e
+        if found != ["ok"]:
+            raise StoreIntegrityError(f"{self.path} failed PRAGMA quick_check: {'; '.join(found[:5])} (12.7 H7, "
+                                      "8.9: stop, restore the last good snapshot and replay the later ledgers)")
 
     # -- lifecycle -----------------------------------------------------------------------------------------
     def close(self) -> None:
@@ -1155,14 +1383,29 @@ class Store:
                 + "".join(f"INSERT INTO system_state (key, value, updated_at) VALUES ({s});\n" for s in state)
                 + f"PRAGMA user_version = {SCHEMA_VERSION};\nCOMMIT;")
             return
-        if version != SCHEMA_VERSION:
-            raise StoreError(f"{self.path} has schema version {version}; this store reads {SCHEMA_VERSION} and has "
-                             "no migration for it (migrations are forward-only, after VACUUM INTO, 8.6)")
+        if version > SCHEMA_VERSION:
+            raise StoreError(f"{self.path} has schema version {version}; this store reads {SCHEMA_VERSION} and "
+                             "migrations are forward-only (8.2)")
         row = self._conn.execute("SELECT value FROM system_state WHERE key = 'schema_sha256'").fetchone()
-        if row is None or row[0] != digest:
-            raise StoreError(f"{self.path} was created from a different taxonomy.yaml (a generated CHECK changed); "
-                             "it needs a migration before this store can write it (8.3, 8.6)")
+        if version < SCHEMA_VERSION or row is None or row[0] != digest:
+            self._migrate(version, ddl, digest)
         self._sync_reasons()
+
+    def _migrate(self, version: int, ddl: str, digest: str) -> None:
+        """8.2, 8.6, 8.9: VACUUM INTO a pre-migration snapshot, then migrate forward in one transaction; a failure
+        stops the service with the file unchanged and the snapshot intact (`store.migrations`)."""
+        snap = migrations.snapshot_path(self.path, version)
+        try:
+            migrations.snapshot(self._conn, snap)
+        except (sqlite3.Error, OSError, migrations.MigrationError) as e:
+            raise StoreError(f"{self.path}: the pre-migration snapshot {snap} failed ({e}); no migration runs "
+                             "without it (8.6)") from e
+        try:
+            self.migration = migrations.migrate(self._conn, SCHEMA_VERSION, ddl=ddl, digest=digest, at=now(),
+                                                snapshot_file=snap)
+        except migrations.MigrationError as e:
+            raise StoreError(f"{self.path}: schema migration failed: {e}; the database is unchanged and the "
+                             f"pre-migration snapshot is {snap} (8.9)") from e
 
     def _sync_reasons(self) -> None:
         """8.3: the reason table is seeded from taxonomy.yaml at service start; reasons are retired, never deleted."""
@@ -1179,8 +1422,9 @@ class Store:
 
     # -- transactions and the ledger -----------------------------------------------------------------------
     @contextlib.contextmanager
-    def _batch(self, kind: str) -> Iterator[list[dict]]:
-        """One BEGIN IMMEDIATE transaction; its rows go to results.jsonl before COMMIT (8.2)."""
+    def _txn(self) -> Iterator[None]:
+        """One BEGIN IMMEDIATE transaction (8.2) with the 8.9 mapping of its failures: busy after the busy timeout
+        and 3 retries, an I/O error or a failed ledger append is StoreWriteFailed, a constraint StoreRefused."""
         if self._conn is None:
             raise StoreError("store is closed")
         for attempt in range(4):                       # 8.9: busy timeout and 3 retries
@@ -1190,16 +1434,8 @@ class Store:
             except sqlite3.OperationalError as e:
                 if attempt == 3 or not any(w in str(e) for w in ("locked", "busy")):
                     raise StoreWriteFailed(f"cannot begin a write: {e}") from e
-        rows: list[dict] = []
         try:
-            yield rows
-            if self._ledger is not None and rows:
-                line = json.dumps({"batch": kind, "at": now(), "rows": rows}, sort_keys=True,
-                                  default=_ledger_default)
-                with open(self._ledger, "a", encoding="utf-8") as f:
-                    f.write(line + "\n")
-                    f.flush()
-                    os.fsync(f.fileno())
+            yield
             self._conn.execute("COMMIT")
         except BaseException as e:
             if self._conn.in_transaction:
@@ -1212,13 +1448,48 @@ class Store:
                 raise StoreWriteFailed(f"ledger append failed: {e}") from e
             raise
 
+    @contextlib.contextmanager
+    def _batch(self, kind: str) -> Iterator[list[dict]]:
+        """One BEGIN IMMEDIATE transaction; its rows go to results.jsonl before COMMIT (8.2), and a decision batch
+        of the Central Store to the day's decisions ledger too (8.7)."""
+        with self._txn():
+            rows: list[dict] = []
+            yield rows
+            if rows:
+                at = now()
+                self._journal(json.dumps({"batch": kind, "at": at, "rows": rows}, sort_keys=True,
+                                         default=_ledger_default), kind, at)
+
+    def _journal(self, line: str, kind: str, at: str) -> None:
+        """Append one batch line to results.jsonl and, for a decision batch, to the day's decisions ledger."""
+        if self._ledger is not None:
+            _append_line(self._ledger, line)
+        if self._decisions is not None and is_decision_batch(kind):
+            _append_line(decisions_ledger_path(self._decisions, at), line)
+
+    def _table_meta(self, table: str) -> _TableMeta:
+        """The columns, key, INTEGER PRIMARY KEY and BLOB columns of a table (8.3), cached."""
+        meta = self._meta.get(table)
+        if meta is None:
+            meta = _table_meta(self._conn, table)
+            self._meta[table] = meta
+        return meta
+
     def _insert(self, rows: list[dict], table: str, values: dict, *, upsert: str | None = None) -> int:
+        """Insert one row and journal it. An insert journals the rowid of its INTEGER PRIMARY KEY when the values
+        leave it to SQLite, an upsert its conflict clause, so `replay` writes the same row (8.2)."""
         cols = list(values)
         sql = f"INSERT INTO {table} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})"
         if upsert:
             sql += f" ON CONFLICT {upsert}"
         cur = self._conn.execute(sql, [values[c] for c in cols])
-        rows.append({"op": "upsert" if upsert else "insert", "table": table, "row": values})
+        op: dict[str, Any] = {"op": "upsert" if upsert else "insert", "table": table, "row": values}
+        alias = self._table_meta(table).rowid_alias
+        if upsert:
+            op["upsert"] = upsert
+        elif alias is not None and values.get(alias) is None:
+            op["rowid"] = cur.lastrowid
+        rows.append(op)
         return cur.lastrowid
 
     def _update(self, rows: list[dict], table: str, key: dict, values: dict) -> int:
@@ -1226,6 +1497,12 @@ class Store:
         where = " AND ".join(f"{c} = ?" for c in key)
         cur = self._conn.execute(f"UPDATE {table} SET {sets} WHERE {where}", [*values.values(), *key.values()])
         rows.append({"op": "update", "table": table, "key": key, "set": values})
+        return cur.rowcount
+
+    def _delete(self, rows: list[dict], table: str, key: dict) -> int:
+        where = " AND ".join(f"{c} = ?" for c in key)
+        cur = self._conn.execute(f"DELETE FROM {table} WHERE {where}", list(key.values()))
+        rows.append({"op": "delete", "table": table, "key": key, "count": cur.rowcount})
         return cur.rowcount
 
     def _one(self, sql: str, args: Sequence = ()) -> sqlite3.Row | None:
@@ -1824,12 +2101,27 @@ class Store:
             raise StoreRefused(f"image {a.sha256} has no redaction version (8.4, 8.9 redaction_version_missing)")
 
     def _put_artifact(self, rows: list[dict], a: StoredArtifact, run_id: str) -> None:
-        if self._one("SELECT 1 FROM artifacts WHERE sha256 = ?", (a.sha256,)) is not None:
-            return                                   # 8.4: a hash already indexed; the first set keeps the row
-        self._insert(rows, "artifacts", {
-            "sha256": a.sha256, "kind": a.kind, "media_type": a.media_type, "bytes": a.bytes, "width": a.width,
-            "height": a.height, "redaction_passed": 1, "redaction_version": a.redaction_version,
-            "set_path": a.set_path, "first_run_id": run_id, "created_at": now()})
+        """The `artifacts` row when the hash is new (the first set keeps it) and the `artifact_sets` row of this
+        set's copy in every case, in the same batch (8.4, SD-82); a copy placed again is live again
+        (`_live_again`)."""
+        at = now()
+        if self._one("SELECT 1 FROM artifacts WHERE sha256 = ?", (a.sha256,)) is None:
+            self._insert(rows, "artifacts", {
+                "sha256": a.sha256, "kind": a.kind, "media_type": a.media_type, "bytes": a.bytes, "width": a.width,
+                "height": a.height, "redaction_passed": 1, "redaction_version": a.redaction_version,
+                "set_path": a.set_path, "first_run_id": run_id, "created_at": at})
+        if self._one("SELECT 1 FROM artifact_sets WHERE sha256 = ? AND set_path = ?", (a.sha256, a.set_path)) is None:
+            self._insert(rows, "artifact_sets", {"sha256": a.sha256, "set_path": a.set_path, "created_at": at})
+        self._live_again(rows, a)
+
+    def _live_again(self, rows: list[dict], a: StoredArtifact) -> None:
+        """Clear the retention marks a copy placed again makes wrong (8.6, 8.7, SD-82): this set's row deleted by an
+        earlier sweep, and the hash's `deleted_at`, which means every copy is gone ("retention removed it")."""
+        if self._one("SELECT 1 FROM artifact_sets WHERE sha256 = ? AND set_path = ? AND deleted_at IS NOT NULL",
+                     (a.sha256, a.set_path)) is not None:
+            self._update(rows, "artifact_sets", {"sha256": a.sha256, "set_path": a.set_path}, {"deleted_at": None})
+        if self._one("SELECT 1 FROM artifacts WHERE sha256 = ? AND deleted_at IS NOT NULL", (a.sha256,)) is not None:
+            self._update(rows, "artifacts", {"sha256": a.sha256}, {"deleted_at": None})
 
     def _ensure_checkpoint(self, rows: list[dict], o: CheckpointOutcome) -> None:
         if self._one("SELECT 1 FROM checkpoints WHERE checkpoint_id = ?", (o.checkpoint_id,)) is not None:
@@ -1972,16 +2264,10 @@ class Store:
         1.10: unreached checkpoints of an aborted run carry its abort reason (env_error with the aborting gate,
         or harness_error); 8.2 and 8.9 use the same for orchestrator_restart_budget, store_write_failed, disk_full.
         """
-        run = self._running(run_id)
+        self._running(run_id)
         filled = []
         for cid in self.missing_outcomes(run_id):
-            c = self._one("SELECT * FROM checkpoints WHERE checkpoint_id = ?", (cid,))
-            persona = self._one("SELECT persona FROM run_scope WHERE run_id = ? AND checkpoint_id = ?",
-                                (run_id, cid))[0]
-            self.write_checkpoint(CheckpointOutcome(
-                run_id=run["run_id"], checkpoint_id=cid, outcome=outcome, reason=reason, detail=detail, gate=gate,
-                workspace_id=c["workspace_id"], persona=persona, data_mode=c["data_mode"], tier=c["tier"],
-                flow_id=c["flow_id"], step_id=c["step_id"]))
+            self.write_checkpoint(self._unreached(run_id, cid, outcome, reason, gate, detail))
             filled.append(cid)
         return filled
 
@@ -2056,21 +2342,7 @@ class Store:
                                f"not covered, first {uncovered[0]} (10.2, 1.10)")
         placeholders = sorted(every & ids)
         with self._batch("late_arrival") as batch:
-            if placeholders:
-                pm = ",".join("?" * len(placeholders))
-                self._conn.execute(f"INSERT INTO outcomes_superseded SELECT o.*, 1 FROM outcomes o WHERE o.run_id = ? "
-                                   f"AND o.checkpoint_id IN ({pm})", (run_id, *placeholders))
-                keep = self._conn.execute(f"SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name IN "
-                                          f"({_sql_list(self._KEEP_TRIGGERS)})").fetchall()
-                for name, _ in keep:
-                    self._conn.execute(f"DROP TRIGGER {name}")
-                for table in ("outcome_records", "outcomes"):
-                    self._conn.execute(f"DELETE FROM {table} WHERE run_id = ? AND checkpoint_id IN ({pm})",
-                                       (run_id, *placeholders))
-                for _, sql in keep:                 # restored as they were, in the same transaction
-                    self._conn.execute(sql)
-                batch.append({"op": "supersede", "table": "outcomes", "key": {"run_id": run_id},
-                              "checkpoints": placeholders, "cause": "late arrival (10.2)"})
+            self._supersede_placeholders(batch, run_id, placeholders, attempt=1, cause="late arrival (10.2)")
             self._update(batch, "runs", {"run_id": run_id}, {"lifecycle": "running", "outcome": None,
                                                              "abort_reason": None, "abort_detail": None,
                                                              "finished_at": None})
@@ -2098,6 +2370,340 @@ class Store:
                                          f"{lacking[0] or 'the run'} arrived (1.10, 6.6)")
             reopened = self._one("SELECT * FROM runs WHERE run_id = ?", (run_id,))
             self._update(batch, "runs", {"run_id": run_id}, self._end_change(reopened, r, extra))
+        return self.run_outcome(run_id)
+
+    def _supersede_placeholders(self, rows: list[dict] | None, run_id: str, checkpoints: Sequence[str], *,
+                                attempt: int, cause: str) -> list[str]:
+        """Move the `harness_error (reason: dead_man)` placeholders of `checkpoints` to `outcomes_superseded` (kept
+        for diagnosis, never counted, 8.3) and delete them, inside the caller's transaction; the two keep triggers
+        are lifted for the deletion and restored with their exact SQL. Journaled as one `supersede_outcomes` op
+        (`rows` None: a replay of that op). Only placeholders move, so a replay of the op is a no-op. Returns the
+        checkpoints moved."""
+        moved = [c for (c,) in self._conn.execute(
+            "SELECT checkpoint_id FROM outcomes WHERE run_id = ? AND outcome = 'harness_error' AND reason = 'dead_man' "
+            "AND checkpoint_id IN (SELECT value FROM json_each(?)) ORDER BY checkpoint_id",
+            (run_id, json.dumps(list(checkpoints))))]
+        if not moved:
+            return moved
+        pm = ",".join("?" * len(moved))
+        self._conn.execute(f"INSERT INTO outcomes_superseded SELECT o.*, ? FROM outcomes o WHERE o.run_id = ? "
+                           f"AND o.checkpoint_id IN ({pm})", (attempt, run_id, *moved))
+        keep = self._conn.execute(f"SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND name IN "
+                                  f"({_sql_list(self._KEEP_TRIGGERS)})").fetchall()
+        for name, _ in keep:
+            self._conn.execute(f"DROP TRIGGER {name}")
+        for table in ("outcome_records", "outcomes"):
+            self._conn.execute(f"DELETE FROM {table} WHERE run_id = ? AND checkpoint_id IN ({pm})", (run_id, *moved))
+        for _, sql in keep:                         # restored as they were, in the same transaction
+            self._conn.execute(sql)
+        if rows is not None:
+            rows.append({"op": "supersede_outcomes", "run_id": run_id, "checkpoints": moved, "attempt": attempt,
+                         "cause": cause})
+        return moved
+
+    # -- shard import (8.2, 8.4, 8.9, 10.7; `store.importer` drives it) ---------------------------------------------
+    def shard_rows(self, shard_id: str, *, objects: Mapping[str, str | os.PathLike], set_path: str) -> ShardRows:
+        """The rows of `shard_id` in this (shipped, read-only) Run Store, for `import_shard_rows`. `objects` maps
+        every artifact hash to its file in the Central Store's tree and `set_path` is that set (`runs/<run_id>`); an
+        artifact row whose object is not in `objects` is an ImportConflict (the rig did not ship it, 8.2)."""
+        shard = self._one("SELECT * FROM shards WHERE shard_id = ?", (shard_id,))
+        if shard is None:
+            raise ImportConflict(f"the Run Store holds no shard {shard_id} (8.2)")
+        run_id = shard["run_id"]
+        run = self._one("SELECT * FROM runs WHERE run_id = ?", (run_id,))
+        outcomes, raw = [], []
+        for r in self._conn.execute("SELECT o.*, c.record_json FROM outcomes o JOIN outcome_records c USING (run_id, "
+                                    "checkpoint_id) WHERE o.run_id = ? ORDER BY o.checkpoint_id", (run_id,)):
+            outcomes.append((self._outcome(r, r["record_json"]), r["shard_id"] or shard_id))
+            raw.append({**{k: r[k] for k in r.keys() if k != "record_json"}, "shard_id": r["shard_id"] or shard_id})
+        arts = []
+        for r in self._conn.execute("SELECT * FROM artifacts ORDER BY sha256"):
+            if r["sha256"] not in objects:
+                raise ImportConflict(f"the Run Store names artifact {r['sha256']}, which the rig did not ship (8.2)")
+            arts.append(StoredArtifact(sha256=r["sha256"], name=r["sha256"], kind=r["kind"], media_type=r["media_type"],
+                                       bytes=r["bytes"], set_path=set_path, path=str(objects[r["sha256"]]),
+                                       redaction_version=r["redaction_version"], width=r["width"],
+                                       height=r["height"]))
+        tables = {}
+        for table in IMPORT_TABLES:
+            alias = self._table_meta(table).rowid_alias
+            drop = {alias, "synthetic_ref"} if table == "canary_results" else {alias}
+            order = ",".join(self._table_meta(table).key or self._table_meta(table).columns)
+            tables[table] = tuple({k: r[k] for k in r.keys() if k not in drop} for r in self._conn.execute(
+                f"SELECT * FROM {table} WHERE run_id = ? ORDER BY {order}", (run_id,)))
+        return ShardRows(
+            shard_id=shard_id, run_id=run_id, attempt=shard["attempt"], run=dict(run),
+            shard_outcome=shard["shard_outcome"],
+            shard_reason=None if shard["shard_outcome"] is None else self._join_reason(
+                shard["shard_outcome"], shard["abort_reason"], shard["abort_detail"]),
+            finished_at=shard["finished_at"],
+            scope=tuple(c for (c,) in self._conn.execute(
+                "SELECT checkpoint_id FROM run_scope WHERE run_id = ? ORDER BY checkpoint_id", (run_id,))),
+            outcomes=tuple(outcomes), raw_outcomes=tuple(raw),
+            findings=tuple((self._finding(r), bool(r["synthetic"])) for r in self._conn.execute(
+                "SELECT * FROM findings WHERE run_id = ? ORDER BY natural_key", (run_id,))),
+            events=tuple(e for e in self.step_events(run_id) if e.shard_id == shard_id),
+            extractions=tuple(self.extractions(run_id)),
+            fingerprints=tuple(f for f in (self.fingerprint(shard_id, side) for side in ("candidate", "base"))
+                               if f is not None),
+            proofs=tuple(p for p in self.post_run_proofs(run_id) if p.shard_id in (shard_id, None)),
+            artifacts=tuple(arts), tables=tables)
+
+    def import_shard_rows(self, rows: ShardRows, *, restart_budget_spent: bool = False,
+                          journal: Sequence[StepEvent] = (), keyed: Sequence[StepEvent] = (),
+                          hashes: Mapping[str, Any] | None = None, at: str | None = None) -> str:
+        """Write one verified shard's rows in one transaction (8.2: a partially imported shard is never visible);
+        returns how: `imported`, `lost_returned`, `superseded` or `replayed`.
+
+        - The Central Store's shard row decides. A Run Store of an older attempt than the row's (the shard was
+          re-queued, 10.7), or of a lost shard whose run has since ended other than by the dead-man, is kept as a
+          superseded attempt: its artifacts are indexed and its outcome rows go to `outcomes_superseded` with its
+          attempt, nothing else (never merged into the live attempt, never counted). A shard already imported with
+          the same hashes is a replay; with other hashes an ImportConflict.
+        - Otherwise every row goes through the writers' own checks and write-once paths (an ImportConflict for a
+          row that differs from one stored, 8.2): artifacts with their set rows, the shard's step events and the
+          journals' (`journal` by seq, `keyed` by event id, `store.journal`), outcomes, findings, extractions,
+          fingerprints, post-run proofs and `IMPORT_TABLES`. With `restart_budget_spent` every scoped checkpoint
+          of the shard (the Run Store's own scope) without an outcome gets `harness_error (reason:
+          orchestrator_restart_budget)` and the shard that outcome (8.2). The shard becomes `imported` with
+          `hashes` (run_store_sha256, ledger_sha256, ledger_rows) and the outcome its Run Store recorded.
+        - A lost shard of a run the dead-man ended (8.9) is imported into the reopened run: the dead-man
+          placeholders its rows cover move to `outcomes_superseded`, and the run is re-evaluated in the same
+          transaction (`lost_returned`): still `aborted_harness (reason: dead_man)` while a shard is lost or a
+          placeholder remains, else the worst of its shards' outcomes (8.2). This is the one later change of a
+          finished run's outcome besides the 10.2 late arrival; it is journaled like every batch, and run health
+          gets `lost_rig_returned`.
+        """
+        shard = self._one("SELECT * FROM shards WHERE shard_id = ?", (rows.shard_id,))
+        if shard is None or shard["run_id"] != rows.run_id:
+            raise StoreRefused(f"{rows.shard_id} is not a shard of run {rows.run_id} here (8.3)")
+        run = self._one("SELECT * FROM runs WHERE run_id = ?", (rows.run_id,))
+        differ = [k for k in RUN_IDENTITY if rows.run.get(k) != run[k]]
+        if differ:
+            raise ImportConflict(f"the Run Store's run {rows.run_id} differs in {', '.join(differ)} (8.2)")
+        hashes = dict(hashes or {})
+        when = utc(at) or now()
+        dead_man = (run["outcome"], run["abort_reason"]) == ("aborted_harness", "dead_man")
+        if rows.attempt > shard["attempt"]:
+            raise ImportConflict(f"{rows.shard_id} attempt {rows.attempt} is newer than attempt {shard['attempt']} "
+                                 "here (10.7)")
+        if rows.attempt < shard["attempt"] or (shard["state"] == "lost" and run["lifecycle"] == "finished"
+                                               and not dead_man):
+            with self._batch("shard_import_superseded") as b:
+                self._put_superseded(b, rows)
+            return "superseded"
+        if shard["state"] == "imported":
+            if all(shard[k] == v for k, v in hashes.items()):
+                return "replayed"
+            raise ImportConflict(f"{rows.shard_id} is already imported from another Run Store (8.2)")
+        late = shard["state"] == "lost" and run["lifecycle"] == "finished"
+        if run["lifecycle"] == "finished" and not late:
+            raise StoreRefused(f"run {rows.run_id} is finished; only a lost shard of a dead-man run is imported "
+                               "into it (8.9)")
+        with self._batch("shard_import_lost" if late else "shard_import") as b:
+            if late:
+                covered = {o.checkpoint_id for o, _ in rows.outcomes} | (set(rows.scope) if restart_budget_spent
+                                                                          else set())
+                self._supersede_placeholders(b, rows.run_id, sorted(covered), attempt=rows.attempt,
+                                             cause="lost rig returned (8.9, 10.7)")
+                self._update(b, "runs", {"run_id": rows.run_id}, {"lifecycle": "running", "outcome": None,
+                                                                  "abort_reason": None, "abort_detail": None,
+                                                                  "finished_at": None})
+            self._put_shard_rows(b, rows, journal, keyed)
+            status, reason = rows.shard_outcome, rows.shard_reason
+            if restart_budget_spent:
+                self._fill_scope(b, rows, "harness_error", "orchestrator_restart_budget")
+                status, reason = "aborted_harness", "orchestrator_restart_budget"
+            change: dict[str, Any] = {"state": "imported", "imported_at": when, **hashes}
+            if status is not None:
+                code, param = self._split_reason(status, reason)
+                mine = (shard["shard_outcome"], shard["abort_reason"], shard["abort_detail"])
+                if shard["shard_outcome"] is not None and mine != (status, code, param) and not restart_budget_spent:
+                    raise ImportConflict(f"{rows.shard_id} ended {status} on the rig and {shard['shard_outcome']} here "
+                                         "(8.2)")
+                change.update(shard_outcome=status, abort_reason=code, abort_detail=param,
+                              finished_at=shard["finished_at"] or utc(rows.finished_at) or when)
+            self._update(b, "shards", {"shard_id": rows.shard_id}, change)
+            if late:
+                self._reevaluate_lost(b, rows.run_id, rows.shard_id, when)
+        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        return "lost_returned" if late else "imported"
+
+    def _put_superseded(self, rows: list[dict], shard: ShardRows) -> None:
+        """A superseded attempt (10.7): its objects indexed in the run's set, its outcome rows in
+        `outcomes_superseded` under its attempt, write-once (run, checkpoint, shard, attempt)."""
+        for a in shard.artifacts:
+            self._verify_artifact(a)
+            self._put_artifact(rows, a, shard.run_id)
+        key_cols = NATURAL_KEYS["outcomes_superseded"]
+        for r in shard.raw_outcomes:
+            values = {**r, "attempt": shard.attempt}
+            self._write_once(rows, "outcomes_superseded", {k: values[k] for k in key_cols}, values)
+
+    def _put_shard_rows(self, rows: list[dict], shard: ShardRows, journal: Sequence[StepEvent],
+                        keyed: Sequence[StepEvent]) -> None:
+        """Every row of a live shard import, through the writers' own checks (`import_shard_rows`)."""
+        for a in shard.artifacts:
+            self._verify_artifact(a)
+            self._put_artifact(rows, a, shard.run_id)
+        self._put_events(rows, shard.events)
+        self._put_events(rows, journal)
+        self._put_keyed_events(rows, keyed)
+        for o, sid in shard.outcomes:
+            if sid != shard.shard_id:
+                raise ImportConflict(f"{o.checkpoint_id} is stored under {sid} in the Run Store of {shard.shard_id}")
+            p = self._prepare_checkpoint(o, (), (), (), sid, None)
+            if p is not None:
+                self._put_checkpoint(rows, p)
+        for f, synthetic in shard.findings:
+            self._put_finding(rows, _revalidate(f), synthetic)
+        self._put_extractions(rows, shard.extractions)
+        for fp in shard.fingerprints:
+            self._put_fingerprint(rows, fp)
+        for pr in shard.proofs:
+            self._put_proof(rows, dataclasses.replace(pr, shard_id=pr.shard_id or shard.shard_id))
+        for table, trows in shard.tables.items():
+            key = IMPORT_TABLES[table]
+            for r in trows:
+                self._write_once(rows, table, {k: r[k] for k in (key or r)}, dict(r))
+        if shard.tables.get("canary_results"):
+            self._link_synthetic(rows, shard.run_id)
+
+    def _fill_scope(self, rows: list[dict], shard: ShardRows, outcome: str, reason: str) -> list[str]:
+        """`outcome (reason)` for every scoped checkpoint of the shard without an outcome, under the shard (8.2)."""
+        filled = []
+        for cid in shard.scope:
+            if self._one("SELECT 1 FROM outcomes WHERE run_id = ? AND checkpoint_id = ? AND synthetic = 0",
+                         (shard.run_id, cid)) is not None:
+                continue
+            p = self._prepare_checkpoint(self._unreached(shard.run_id, cid, outcome, reason), (), (), (),
+                                         shard.shard_id, None)
+            if p is not None:
+                self._put_checkpoint(rows, p)
+                filled.append(cid)
+        return filled
+
+    def _unreached(self, run_id: str, cid: str, outcome: str, reason: str | None, gate: str | None = None,
+                   detail: str | None = None) -> CheckpointOutcome:
+        """The record of an unreached scoped checkpoint (1.10, L-OUT-07), as `fill_unreached` writes it."""
+        c = self._one("SELECT * FROM checkpoints WHERE checkpoint_id = ?", (cid,))
+        scoped = self._one("SELECT persona FROM run_scope WHERE run_id = ? AND checkpoint_id = ?", (run_id, cid))
+        if c is None or scoped is None:
+            raise StoreRefused(f"{cid} is not in the scope of run {run_id} here (8.3 run_scope)")
+        return CheckpointOutcome(run_id=run_id, checkpoint_id=cid, outcome=outcome, reason=reason, detail=detail,
+                                 gate=gate, workspace_id=c["workspace_id"], persona=scoped[0],
+                                 data_mode=c["data_mode"], tier=c["tier"], flow_id=c["flow_id"], step_id=c["step_id"])
+
+    def _worst_shards(self, run_id: str) -> tuple[str, str | None]:
+        """8.2: the worst of the settled shards' outcomes, in the order aborted_safety, aborted_harness,
+        aborted_budget, complete_with_env_errors, complete, with that shard's reason (the first such shard)."""
+        worst, reason = "complete", None
+        for r in self._conn.execute(f"SELECT * FROM shards WHERE run_id = ? AND state IN ({_sql_list(SETTLED_SHARDS)})"
+                                    " ORDER BY shard_id", (run_id,)):
+            status = r["shard_outcome"] or "complete"
+            if RUN_SEVERITY.index(status) > RUN_SEVERITY.index(worst):
+                worst, reason = status, self._join_reason(status, r["abort_reason"], r["abort_detail"])
+        if worst == "complete" and self.complete_blockers(run_id):
+            return "complete_with_env_errors", None
+        return worst, reason
+
+    def _reevaluate_lost(self, rows: list[dict], run_id: str, shard_id: str, at: str) -> None:
+        """End the reopened run again (see `import_shard_rows`), inside the import's batch."""
+        lost = self._one("SELECT count(*) FROM shards WHERE run_id = ? AND state = 'lost'", (run_id,))[0]
+        left = self._one("SELECT count(*) FROM outcomes WHERE run_id = ? AND outcome = 'harness_error' AND reason = "
+                         "'dead_man'", (run_id,))[0]
+        status, reason = ("aborted_harness", "dead_man") if lost or left else self._worst_shards(run_id)
+        run = self._one("SELECT * FROM runs WHERE run_id = ?", (run_id,))
+        old = json.loads(run["summary_json"] or "{}")
+        back = [*old.get("lost_rig_returned", []), {"shard_id": shard_id, "at": at, "outcome": status}]
+        extra = {"lost_rig_returned": back, "health": {**old.get("health", {}), "lost_rig_returned": back}}
+        r = RunOutcome(run_id=run_id, run_type=run["run_type"], status=status, last_gate="reported", reason=reason,
+                       ended_at=at)
+        self._update(rows, "runs", {"run_id": run_id}, self._end_change(run, r, extra))
+
+    def mark_shard_shipping(self, shard_id: str) -> None:
+        """The shard's directory is on its way into `incoming` (8.2); the import runs from this state, and a Central
+        Store that cannot commit leaves it here to retry (8.9). From queued, running, finished or shipping."""
+        self._shard_state(shard_id, LIVE_SHARD_STATES, {"state": "shipping"})
+
+    def mark_shard_lost(self, shard_id: str) -> None:
+        """Rig unreachable past the deadline (8.9, 10.7): the shard is `lost`; its data is intact on the rig and is
+        imported when the rig returns. From queued, running, finished or shipping."""
+        self._shard_state(shard_id, LIVE_SHARD_STATES, {"state": "lost"})
+
+    def mark_import_failed(self, shard_id: str, reason: str, detail: str) -> None:
+        """8.9: the import refused the shard; nothing of it is imported, the shard is `import_failed` and its
+        outcome here `aborted_harness` with `reason` (`import_conflict`, or `artifact_persist_failed` for an
+        upload hash mismatch), `detail` saying why. The run outcome follows (`settle_run`)."""
+        if reason not in ("import_conflict", "artifact_persist_failed"):
+            raise StoreRefused(f"an import fails with import_conflict or artifact_persist_failed, not {reason!r} (8.9)")
+        self._shard_state(shard_id, (*LIVE_SHARD_STATES, "lost"), {
+            "state": "import_failed", "shard_outcome": "aborted_harness", "abort_reason": reason,
+            "abort_detail": detail})
+
+    def _shard_state(self, shard_id: str, allowed: Sequence[str], change: Mapping[str, Any]) -> None:
+        r = self._one("SELECT state FROM shards WHERE shard_id = ?", (shard_id,))
+        if r is None:
+            raise StoreRefused(f"unknown shard {shard_id}")
+        if r["state"] not in allowed:
+            raise StoreRefused(f"{shard_id} is {r['state']}; this change needs {' or '.join(allowed)} (8.3)")
+        if r["state"] != change["state"] or len(change) > 1:
+            with self._batch("shard_state") as rows:
+                self._update(rows, "shards", {"shard_id": shard_id}, dict(change))
+
+    def requeue_shard(self, shard_id: str, *, rig_id: str, at: str | None = None) -> int:
+        """10.7: a lost shard is re-queued once, in full, to another rig: the shard row takes the next attempt, the
+        new rig and state `running`; the lost attempt is superseded and its rows, when its rig returns, land in
+        `outcomes_superseded` (`import_shard_rows`). Refused for a shard that is not lost, a second re-queue
+        (a second loss ends the run `aborted_harness (reason: rig_lost)`), a finished run, and a rig with an open
+        S1 or S2 incident or a blocked login (the 8.3 trg_shard_rig_gate rule). Returns the new attempt."""
+        shard = self._one("SELECT * FROM shards WHERE shard_id = ?", (shard_id,))
+        if shard is None:
+            raise StoreRefused(f"unknown shard {shard_id}")
+        if shard["state"] != "lost":
+            raise StoreRefused(f"{shard_id} is {shard['state']}; only a lost shard is re-queued (10.7)")
+        if shard["attempt"] > 1:
+            raise StoreRefused(f"{shard_id} was re-queued once already; a second loss ends the run aborted_harness "
+                               "(reason: rig_lost) (10.7)")
+        self._running(shard["run_id"])
+        if self._one("SELECT 1 FROM rigs WHERE rig_id = ?", (rig_id,)) is None:
+            raise StoreRefused(f"unknown rig {rig_id}")
+        if self._one("SELECT 1 FROM incidents i WHERE i.rig_id = :r AND i.closed_at IS NULL AND i.severity IN "
+                     "('S1','S2') UNION SELECT 1 FROM rigs g JOIN logins l ON l.login_alias = g.login_alias WHERE "
+                     "g.rig_id = :r AND l.blocked_at IS NOT NULL AND l.unblocked_at IS NULL", {"r": rig_id}):
+            raise StoreRefused(f"rig {rig_id} has an open incident or a blocked login (8.3)")
+        with self._batch("shard_requeue") as rows:
+            self._update(rows, "shards", {"shard_id": shard_id}, {
+                "attempt": shard["attempt"] + 1, "rig_id": rig_id, "state": "running", "started_at": utc(at) or now(),
+                "finished_at": None, "shard_outcome": None, "abort_reason": None, "abort_detail": None,
+                "run_store_sha256": None, "ledger_sha256": None, "ledger_rows": None})
+        return shard["attempt"] + 1
+
+    def settle_run(self, run_id: str, *, at: str | None = None) -> RunOutcome | None:
+        """8.2: the run outcome once every shard is settled (imported or import_failed): the worst of the shards'
+        outcomes with that shard's reason, `complete_with_env_errors` for a run of complete shards that cannot be
+        complete. An `aborted_harness` run's silent checkpoints get `harness_error` with its reason first (1.10).
+        None while a shard is queued, running, finished, shipping or lost; a finished run's outcome as it is."""
+        run = self._one("SELECT * FROM runs WHERE run_id = ?", (run_id,))
+        if run is None:
+            raise StoreRefused(f"unknown run {run_id}")
+        if run["lifecycle"] == "finished":
+            return self.run_outcome(run_id)
+        states = [r[0] for r in self._conn.execute("SELECT state FROM shards WHERE run_id = ?", (run_id,))]
+        if not states or any(st not in SETTLED_SHARDS for st in states):
+            return None
+        status, reason = self._worst_shards(run_id)
+        when = utc(at) or now()
+        with self._batch("run_settle") as rows:
+            if status == "aborted_harness":
+                for cid in self.missing_outcomes(run_id):
+                    p = self._prepare_checkpoint(self._unreached(run_id, cid, "harness_error", reason), (), (), (),
+                                                 None, None)
+                    if p is not None:
+                        self._put_checkpoint(rows, p)
+            r = RunOutcome(run_id=run_id, run_type=run["run_type"], status=status, last_gate="reported",
+                           reason=reason, ended_at=when)
+            self._update(rows, "runs", {"run_id": run_id}, self._end_change(run, r, None))
         return self.run_outcome(run_id)
 
     # -- canary results (8.3 canary_results, 10.3) ---------------------------------------------------------
@@ -2536,11 +3142,16 @@ class Store:
             raise StoreRefused(f"hamming_tolerance {d.hamming_tolerance} is above {default}, the most a tier-"
                                f"{cp['tier']} checkpoint allows (L-DEC-03)")
         tolerance = default if d.hamming_tolerance is None else d.hamming_tolerance
-        region = self._one("SELECT g.hamming_tolerance FROM regions g JOIN runs r ON r.config_commit = g.config_commit "
-                           "WHERE r.run_id = ? AND g.checkpoint_id = ? AND g.region_id = ?",
-                           (run_id, d.signature.checkpoint_id, d.signature.region_id))
+        region = self._one("SELECT g.hamming_tolerance, g.exact_fallback FROM regions g JOIN runs r "
+                           "ON r.config_commit = g.config_commit WHERE r.run_id = ? AND g.checkpoint_id = ? "
+                           "AND g.region_id = ?", (run_id, d.signature.checkpoint_id, d.signature.region_id))
         if region is not None and region[0] is not None:          # lowered by calibration, never raised (9.7)
             tolerance = min(tolerance, region[0])
+        if tolerance == 0 or (region is not None and region[1]):  # the exact fallback (4.14, 9.7)
+            if d.bbox_q4 is None:
+                raise StoreRefused(f"{d.signature.checkpoint_id} / {d.signature.region_id} uses the exact fallback: "
+                                   "the decision carries bbox_q4, the largest component's 4 px box (L-DEC-03)")
+            tolerance = 0
         decided_at = utc(d.decided_at)
         if expires_at is None and d.action in ("noise_signature", "request_mask"):
             expires_at = (datetime.fromisoformat(decided_at) + timedelta(days=EXPIRY_DAYS)).isoformat()
@@ -2617,7 +3228,8 @@ class Store:
             if supersedes is not None:
                 self._update(rows, "decisions", {"decision_id": decision_int(supersedes)}, {"status": "superseded"})
             if source_finding is not None:
-                change = {"decision_id": did, "triage_state": triage}
+                change = {"decision_id": did, "triage_state": triage, **self._closing(source_finding, triage,
+                                                                                       decided_at)}
                 if d.ticket:
                     change["ticket_ref"] = d.ticket
                 self._update(rows, "findings", {"finding_id": source_finding}, change)
@@ -2627,6 +3239,14 @@ class Store:
                 for fid in {old["source_finding_id"], source_finding} - {None}:
                     self._update(rows, "findings", {"finding_id": fid}, {"contested": 1})
         return self.get_decision(decision_ref(did))
+
+    def _closing(self, finding_id: int, triage: str, at: str) -> dict[str, str | None]:
+        """SD-83, 8.6: `closed_at` is the time a finding left the pinning states; set when a decision moves it out
+        (to closed, noise, agent_mistake or expected_behavior), cleared when one moves it back in, kept otherwise."""
+        old = self._one("SELECT triage_state, closed_at FROM findings WHERE finding_id = ?", (finding_id,))
+        if triage in RELEASING_TRIAGE:
+            return {} if old["triage_state"] in RELEASING_TRIAGE and old["closed_at"] else {"closed_at": at}
+        return {"closed_at": None} if old["closed_at"] is not None else {}
 
     def _check_signature_free(self, d: Decision, run_id: str, at: str, supersedes: str | None,
                               source_finding: int | None, manifest_entries: Iterable[str],
@@ -2686,54 +3306,16 @@ class Store:
 
     def lookup_decisions(self, signature: Signature, *, at: str | None = None, rescued: bool = False,
                          synthetic: bool = False, run_id: str | None = None, manifest_entries: Iterable[str] = (),
-                         manifest_tickets: Iterable[str] = (), candidate_build: str | None = None) -> DecisionLookup:
+                         manifest_tickets: Iterable[str] = (), candidate_build: str | None = None,
+                         bbox_q4: Sequence[int] | None = None) -> DecisionLookup:
         """The 8.3 signature lookup on this database (see the module-level `lookup_decisions`)."""
         return lookup_decisions(self._conn, signature, at=at, rescued=rescued, synthetic=synthetic, run_id=run_id,
                                 manifest_entries=manifest_entries, manifest_tickets=manifest_tickets,
-                                candidate_build=candidate_build)
-
-    # -- retention (8.6) -------------------------------------------------------------------------------------
-    def deletable(self, sha256: str) -> bool:
-        """8.6: never a pinned object, a quarantined one (8.4), one a baseline row names, or one a finding not closed
-        references."""
-        art = self._one("SELECT pinned, deleted_at FROM artifacts WHERE sha256 = ?", (sha256,))
-        if art is None or art["pinned"] or art["deleted_at"] is not None:
-            return False
-        if self._one("SELECT 1 FROM artifact_sets WHERE sha256 = ? AND quarantined_at IS NOT NULL", (sha256,)):
-            return False
-        if self._one("SELECT 1 FROM baselines WHERE image_sha256 = ?1 OR sidecar_sha256 = ?1", (sha256,)):
-            return False
-        return self._one("SELECT 1 FROM findings WHERE triage_state <> 'closed' AND instr(evidence_json, ?) > 0",
-                         (sha256,)) is None
-
-    def sweep(self, artifacts: ArtifactStore, candidates: Iterable[str], *, backup_ok: bool,
-              at: str | None = None) -> SweepResult:
-        """Remove the candidates 8.6 allows from `artifacts`: deleted_at is set before the file is unlinked.
-
-        Choosing candidates by class and age is the sweep job's; this enforces the safety rules. Nothing runs on
-        a night whose backup failed (8.6: "retention skipped: backup failed").
-        """
-        if not backup_ok:
-            return SweepResult(skipped=True)
-        deleted, kept = [], []
-        for sha in candidates:
-            if not self.deletable(sha):
-                kept.append(sha)
-                continue
-            with self._batch("retention") as rows:
-                self._update(rows, "artifacts", {"sha256": sha}, {"deleted_at": utc(at) or now()})
-            artifacts.unlink(sha)
-            deleted.append(sha)
-        return SweepResult(tuple(deleted), tuple(kept))
+                                candidate_build=candidate_build, bbox_q4=bbox_q4)
 
     # -- the public writer path (8.2): batches, inserts, updates and read queries for the store/* modules ------------
     def _table_columns(self, table: str) -> frozenset[str]:
-        if not _IDENT.match(table):
-            raise StoreRefused(f"table name {table!r}")
-        cols = frozenset(r[1] for r in self._conn.execute(f"PRAGMA table_info({table})"))
-        if not cols:
-            raise StoreRefused(f"unknown table {table!r} (8.3)")
-        return cols
+        return frozenset(self._table_meta(table).columns)
 
     def _checked(self, table: str, *parts: Mapping[str, Any]) -> None:
         cols = self._table_columns(table)
@@ -2781,6 +3363,177 @@ class Store:
             raise ImportConflict(f"{table} {dict(key)} is already recorded with other content (8.2)")
         return self._insert(rows, table, values)
 
+    # -- replay of the ledger (8.1, 8.2, 8.9) ------------------------------------------------------------------------
+    def replay(self, ledger: str | os.PathLike) -> ReplayResult:
+        """Re-apply a results.jsonl (or decisions) ledger to this database, batch by batch in order, each batch in
+        one transaction (8.1: a lost database is rebuilt by replay; 8.9: after a restore the later ledgers are
+        replayed). Replay is idempotent because every row carries its key (8.2):
+
+        - an insert writes the row (with the rowid its INTEGER PRIMARY KEY had) unless a row with its key exists;
+          a stored row equal to it is a no-op, and so is one whose differing columns later ops of this ledger
+          change (updates, upserts, deletes, superseded placeholders: the row has moved on since); any other
+          difference is an `ImportConflict` and nothing of that batch is written (8.9 import_conflict);
+        - an upsert runs its recorded conflict clause again; a delete deletes again;
+        - an update applies the values it sets that are not stored yet and that no later op of the ledger sets
+          again (so a store that is already further on never passes back through an earlier state its CHECKs
+          refuse); an update of a row the store lacks is an ImportConflict;
+        - `supersede_outcomes` moves the dead-man placeholders that are still there;
+        - any other entry (a human action's note, an audit restore) is an annotation and is skipped.
+
+        A batch that changed something is appended to this store's own ledger unless that ledger is the file being
+        replayed. A torn last line (the writer died mid-append) is skipped; a torn line elsewhere raises."""
+        path = Path(ledger)
+        lines = read_ledger(path)
+        later = self._later_index([b for b, _ in lines])
+        mine = self._ledger is not None and self._ledger.resolve() == path.resolve()
+        applied = ops = 0
+        for i, (batch, line) in enumerate(lines):
+            with self._txn():
+                n = sum(self._replay_op(op, (i, j), later) for j, op in enumerate(batch.get("rows") or ()))
+                if n and not mine:
+                    self._journal(line, batch.get("batch", ""), batch.get("at") or now())
+            applied += bool(n)
+            ops += n
+        return ReplayResult(len(lines), applied, ops)
+
+    def _decode(self, meta: _TableMeta, values: Mapping[str, Any]) -> dict[str, Any]:
+        """A ledger row's values as SQLite takes them: BLOB columns come back from hex (`_ledger_default`)."""
+        return {k: bytes.fromhex(v) if k in meta.blobs and isinstance(v, str) else v for k, v in values.items()}
+
+    def _later_index(self, batches: Sequence[Mapping[str, Any]]) -> dict[str, list[tuple[tuple[int, int], dict,
+                                                                                         frozenset[str] | None]]]:
+        """Per table, every op that changes existing rows: (position, key, columns it sets; None for every column:
+        a delete, a superseded placeholder)."""
+        out: dict[str, list] = {}
+        for i, b in enumerate(batches):
+            for j, op in enumerate(b.get("rows") or ()):
+                kind, table = op.get("op"), op.get("table")
+                if kind == "update":
+                    meta = self._table_meta(table)
+                    out.setdefault(table, []).append(((i, j), self._decode(meta, op["key"]), frozenset(op["set"])))
+                elif kind == "upsert":
+                    meta = self._table_meta(table)
+                    row = self._decode(meta, op["row"])
+                    out.setdefault(table, []).append(((i, j), {k: row.get(k) for k in meta.key}, frozenset(row)))
+                elif kind == "delete":
+                    meta = self._table_meta(table)
+                    out.setdefault(table, []).append(((i, j), self._decode(meta, op["key"]), None))
+                elif kind == "supersede_outcomes":
+                    for t in ("outcomes", "outcome_records"):
+                        out.setdefault(t, []).extend(((i, j), {"run_id": op["run_id"], "checkpoint_id": c}, None)
+                                                     for c in op["checkpoints"])
+        return out
+
+    @staticmethod
+    def _later_cols(later: Sequence[tuple[tuple[int, int], dict, frozenset[str] | None]], pos: tuple[int, int],
+                    row: Mapping[str, Any], stored: sqlite3.Row) -> frozenset[str] | None:
+        """The columns later ops change on this row (None: every column)."""
+        out: set[str] = set()
+        names = set(stored.keys())
+        for p, key, cols in later:
+            if p <= pos or not all(row.get(k) == v or (k in names and stored[k] == v) for k, v in key.items()):
+                continue
+            if cols is None:
+                return None
+            out |= cols
+        return frozenset(out)
+
+    @staticmethod
+    def _where(key: Mapping[str, Any]) -> tuple[str, list[Any]]:
+        return " AND ".join(f"{c} IS ?" for c in key), list(key.values())
+
+    def _replay_op(self, op: Mapping[str, Any], pos: tuple[int, int], later: Mapping[str, list]) -> int:
+        """One ledger op (see `replay`); returns 1 when it changed the database, else 0."""
+        kind = op.get("op")
+        if kind not in ("insert", "upsert", "update", "delete", "supersede_outcomes"):
+            return 0
+        if kind == "supersede_outcomes":
+            return int(bool(self._supersede_placeholders(None, op["run_id"], op["checkpoints"],
+                                                         attempt=op.get("attempt", 1), cause=op.get("cause", ""))))
+        table = op["table"]
+        meta = self._table_meta(table)
+        if kind == "delete":
+            where, args = self._where(self._decode(meta, op["key"]))
+            return int(self._conn.execute(f"DELETE FROM {table} WHERE {where}", args).rowcount > 0)
+        if kind == "update":
+            key, values = self._decode(meta, op["key"]), self._decode(meta, op["set"])
+            where, args = self._where(key)
+            stored = self._conn.execute(f"SELECT * FROM {table} WHERE {where}", args).fetchall()
+            if not stored:
+                raise ImportConflict(f"the ledger updates {table} {key}, which the store lacks (8.2, 8.9)")
+            moved_on: set[str] = set()                    # columns a later op sets again: its value is not final
+            for r in stored:
+                touched = self._later_cols(later.get(table, ()), pos, key, r)
+                if touched is None:
+                    return 0
+                moved_on |= touched
+            values = {c: v for c, v in values.items()
+                      if c not in moved_on and any(r[c] != v for r in stored)}
+            if not values:
+                return 0
+            sets = ",".join(f"{c} = ?" for c in values)
+            self._conn.execute(f"UPDATE {table} SET {sets} WHERE {where}", [*values.values(), *args])
+            return 1
+        row = self._decode(meta, op["row"])
+        cols = list(row)
+        sql = f"INSERT INTO {table} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})"
+        if kind == "upsert":
+            where, args = self._where({k: row.get(k) for k in meta.key})
+            before = [tuple(r) for r in self._conn.execute(f"SELECT * FROM {table} WHERE {where}", args)]
+            self._conn.execute(sql + f" ON CONFLICT {op['upsert']}", [row[c] for c in cols])
+            return int(before != [tuple(r) for r in self._conn.execute(f"SELECT * FROM {table} WHERE {where}", args)])
+        if meta.rowid_alias is not None and row.get(meta.rowid_alias) is None and op.get("rowid") is not None:
+            row[meta.rowid_alias] = op["rowid"]
+            cols = list(row)
+            sql = f"INSERT INTO {table} ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})"
+        key = {c: row[c] for c in meta.key} if meta.key and all(c in row for c in meta.key) else dict(row)
+        where, args = self._where(key)
+        stored = self._conn.execute(f"SELECT * FROM {table} WHERE {where}", args).fetchone()
+        if stored is not None:
+            diff = sorted(c for c in row if stored[c] != row[c])
+            if not diff:
+                return 0
+            touched = self._later_cols(later.get(table, ()), pos, row, stored)
+            if touched is None or set(diff) <= touched:
+                return 0
+            raise ImportConflict(f"replayed {table} row {key} differs from the stored row in {', '.join(diff)} "
+                                 "(8.2: never a silent overwrite; 8.9 import_conflict)")
+        try:
+            self._conn.execute(sql, [row[c] for c in cols])
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE" in str(e):
+                raise ImportConflict(f"replayed {table} row {key}: another row holds its natural key ({e}; 8.2, "
+                                     "8.9 import_conflict)") from e
+            raise StoreRefused(f"replayed {table} row {key} refused by the schema: {e}") from e
+        return 1
+
+    def load_export(self, path: str | os.PathLike) -> ExportResult:
+        """Load one nightly JSONL export (`<table>.jsonl`, 8.1, 8.6: decisions, baselines, masks, flake statistics,
+        incidents, quarantine records; BLOBs in hex) after the ledgers: a row the store lacks is inserted, an equal
+        row is counted, and a row the ledgers already moved on is kept as the ledgers left it and counted (the
+        export is a nightly picture; the ledger is every change). One batch."""
+        p = Path(path)
+        table = p.stem
+        meta = self._table_meta(table)
+        inserted = same = kept = 0
+        with self._batch(f"export:{table}") as rows:
+            for _, data in ((n, json.loads(t)) for n, t in enumerate(p.read_text(encoding="utf-8").splitlines())
+                            if t.strip()):
+                row = self._decode(meta, data)
+                if not meta.key or any(c not in row for c in meta.key):
+                    raise StoreRefused(f"{p}: an export row of {table} carries its key {meta.key}")
+                where, args = self._where({c: row[c] for c in meta.key})
+                stored = self._one(f"SELECT * FROM {table} WHERE {where}", args)
+                if stored is None:
+                    self._checked(table, row)
+                    self._insert(rows, table, row)
+                    inserted += 1
+                elif all(stored[c] == v for c, v in row.items()):
+                    same += 1
+                else:
+                    kept += 1
+        return ExportResult(table, inserted, same, kept)
+
     # -- system state (8.3, 8.6) -------------------------------------------------------------------------------------
     def set_system_state(self, key: str, value: str, *, at: str | None = None) -> None:
         """Set one documented `system_state` key; schema_version and schema_sha256 are the store's own."""
@@ -2819,6 +3572,38 @@ class Store:
             self._check_shard(e.shard_id, e.run_id)
         for e in evs:
             self._write_once(rows, "step_events", {"shard_id": e.shard_id, "seq": e.seq}, self._event_row(e))
+
+    def write_keyed_events(self, events: Sequence[StepEvent]) -> int:
+        """Write journal events that carry no shard seq (the Watchdog's, 10.2: it never opens the database), keyed
+        by the journal's own event id, which is the part of `reason` before `": "` (8.3 step_events.reason: "Watchdog
+        event id"). Each new event takes the shard's next seq; an event already stored under its key with the same
+        content is a no-op, with other content an ImportConflict (8.2). Returns how many were written."""
+        with self._batch("journal_events") as rows:
+            return self._put_keyed_events(rows, events)
+
+    def _put_keyed_events(self, rows: list[dict], events: Sequence[StepEvent]) -> int:
+        """`write_keyed_events` inside a batch (the shard import's too)."""
+        evs = [_revalidate(e) for e in events]
+        written = 0
+        for e in evs:
+            self._running(e.run_id)
+            self._check_shard(e.shard_id, e.run_id)
+            if not e.reason:
+                raise StoreRefused(f"a {e.source} journal event names its event id in reason (8.3)")
+            key = e.reason.split(": ", 1)[0]
+            new = {k: v for k, v in self._event_row(e).items() if k != "seq"}
+            same = [r for r in self._conn.execute("SELECT * FROM step_events WHERE shard_id = ? AND source = ? AND "
+                                                  "reason IS NOT NULL", (e.shard_id, e.source))
+                    if r["reason"].split(": ", 1)[0] == key]
+            if same:
+                if all(same[0][k] == v for k, v in new.items()):
+                    continue
+                raise ImportConflict(f"{e.source} event {key} of {e.shard_id} is already recorded with other content "
+                                     "(8.2)")
+            seq = self._one("SELECT COALESCE(MAX(seq), 0) + 1 FROM step_events WHERE shard_id = ?", (e.shard_id,))[0]
+            self._insert(rows, "step_events", {**new, "seq": seq})
+            written += 1
+        return written
 
     def step_events(self, run_id: str) -> list[StepEvent]:
         """The run's step events in shard and seq order (8.3)."""
@@ -3021,12 +3806,11 @@ class Store:
                 f = dict(f)
                 f["valid_from"] = utc(f.get("valid_from")) or now()
                 self._checked("calibration_floors", f)
-                self._conn.execute(
-                    "UPDATE calibration_floors SET superseded_at = ? WHERE checkpoint_id = ? AND region_id = ? "
-                    "AND rendering_key_sha256 = ? AND superseded_at IS NULL",
-                    (f["valid_from"], f["checkpoint_id"], f["region_id"], f["rendering_key_sha256"]))
-                rows.append({"op": "supersede", "table": "calibration_floors",
-                             "key": {k: f[k] for k in ("checkpoint_id", "region_id", "rendering_key_sha256")}})
+                for (old,) in self._conn.execute(
+                        "SELECT floor_id FROM calibration_floors WHERE checkpoint_id = ? AND region_id = ? "
+                        "AND rendering_key_sha256 = ? AND superseded_at IS NULL",
+                        (f["checkpoint_id"], f["region_id"], f["rendering_key_sha256"])).fetchall():
+                    self._update(rows, "calibration_floors", {"floor_id": old}, {"superseded_at": f["valid_from"]})
                 fid = self._insert(rows, "calibration_floors", f)
                 ids.append(fid)
                 by_region[(f["checkpoint_id"], f["region_id"])] = fid
@@ -3093,16 +3877,17 @@ class Store:
     def link_synthetic_refs(self, run_id: str) -> int:
         """Point every mutant `canary_results` row of the run at its synthetic outcome (SD-91); returns how many."""
         with self._batch("synthetic_link") as rows:
-            cur = self._conn.execute(
-                "UPDATE canary_results SET synthetic_ref = (SELECT s.synthetic_id FROM synthetic_outcomes s "
-                "WHERE s.run_id = canary_results.run_id AND s.mutant_id = canary_results.mutant_id "
-                "AND s.checkpoint_id = canary_results.checkpoint_id) WHERE run_id = ? AND kind = 'mutant' "
-                "AND synthetic_ref IS NULL AND EXISTS (SELECT 1 FROM synthetic_outcomes s "
-                "WHERE s.run_id = canary_results.run_id AND s.mutant_id = canary_results.mutant_id "
-                "AND s.checkpoint_id = canary_results.checkpoint_id)", (run_id,))
-            if cur.rowcount:
-                rows.append({"op": "link", "table": "canary_results", "key": {"run_id": run_id}})
-            return cur.rowcount
+            return self._link_synthetic(rows, run_id)
+
+    def _link_synthetic(self, rows: list[dict], run_id: str) -> int:
+        """`link_synthetic_refs` inside a batch: one journaled update per linked `canary_results` row."""
+        links = self._conn.execute(
+            "SELECT c.canary_id, s.synthetic_id FROM canary_results c JOIN synthetic_outcomes s ON s.run_id = c.run_id "
+            "AND s.mutant_id = c.mutant_id AND s.checkpoint_id = c.checkpoint_id WHERE c.run_id = ? AND c.kind = "
+            "'mutant' AND c.synthetic_ref IS NULL ORDER BY c.canary_id", (run_id,)).fetchall()
+        for cid, sid in links:
+            self._update(rows, "canary_results", {"canary_id": cid}, {"synthetic_ref": sid})
+        return len(links)
 
     def write_canary_manifest(self, run_id: str, *, catalog_sha256: str, manifest: Any,
                               created_at: str | None = None) -> None:
@@ -3185,9 +3970,9 @@ class Store:
         fid = self._finding_int(finding_id)
         when = utc(at) or now()
         with self._batch("triage_assignment") as rows:
-            self._conn.execute("UPDATE triage_assignments SET released_at = ? WHERE finding_id = ? "
-                               "AND released_at IS NULL", (when, fid))
-            rows.append({"op": "release", "table": "triage_assignments", "key": {"finding_id": fid}})
+            for (aid,) in self._conn.execute("SELECT assignment_id FROM triage_assignments WHERE finding_id = ? AND "
+                                             "released_at IS NULL", (fid,)).fetchall():
+                self._update(rows, "triage_assignments", {"assignment_id": aid}, {"released_at": when})
             return self._insert(rows, "triage_assignments", {
                 "finding_id": fid, "assignee": assignee, "assigned_by": assigned_by, "assigned_at": when,
                 "escalation_step": escalation_step, "sla_due_at": utc(sla_due_at)})
@@ -3243,3 +4028,54 @@ class WriteBatch:
             raise StoreRefused("an update names its key and its values")
         self._store._checked(table, key, values)
         return self._store._update(self.rows, table, dict(key), dict(values))
+
+    def delete(self, table: str, key: Mapping[str, Any]) -> int:
+        """Delete the rows matching `key` (8.6 retention of step events); returns how many went. The delete is
+        journaled with the batch, so a replay deletes them again (8.2)."""
+        if not key:
+            raise StoreRefused("a delete names its key")
+        self._store._checked(table, key)
+        return self._store._delete(self.rows, table, dict(key))
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """`sentinel store rebuild <db> --ledger PATH [--ledger PATH ...] [--exports DIR]` (8.1, 8.9).
+
+    Opens (or creates) the database, replays each ledger in the order given (the store's results.jsonl, then later
+    ledgers and the decisions ledgers) and loads every `<table>.jsonl` of the exports directory. Exit codes: 0
+    rebuilt, 1 refused (an import conflict, an integrity or schema failure), 2 usage."""
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="sentinel store", description="Central Store and Run Store maintenance")
+    sub = ap.add_subparsers(dest="command", required=True)
+    rb = sub.add_parser("rebuild", help="rebuild a database from its ledgers and the nightly exports (8.1, 8.9)")
+    rb.add_argument("db")
+    rb.add_argument("--ledger", action="append", required=True, help="a results.jsonl or decisions ledger, in order")
+    rb.add_argument("--exports", help="a directory of <table>.jsonl nightly exports")
+    try:
+        a = ap.parse_args(list(argv) if argv is not None else None)
+    except SystemExit as e:
+        return 0 if e.code == 0 else 2
+    try:
+        with Store(a.db) as store:
+            for ledger in a.ledger:
+                r = store.replay(ledger)
+                print(f"{ledger}: {r.batches} batches, {r.applied} applied, {r.ops} ops")
+            if a.exports:
+                for export in sorted(Path(a.exports).glob("*.jsonl")):
+                    e = store.load_export(export)
+                    print(f"{export}: {e.inserted} inserted, {e.same} already stored, {e.kept} kept as the ledgers "
+                          "left them")
+    except (StoreError, OSError) as e:
+        print(f"sentinel store rebuild: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def __getattr__(name: str) -> Any:
+    """`SweepResult` is the retention sweep's result, `store.retention.RetentionResult`: the sweep moved there with
+    the per-set rules of SD-82 and SD-83 (PEP 562, so the package export keeps working)."""
+    if name == "SweepResult":
+        from .retention import RetentionResult
+        return RetentionResult
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

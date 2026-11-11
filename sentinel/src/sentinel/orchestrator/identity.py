@@ -5,6 +5,9 @@ pattern or case folding (L-FIX-01). The allowlist's sha256 is the `allowlist_sha
 fingerprint's `harness` field (7.4).
 
 - A readable text that is an entry: pass.
+- The OnDemand virtual account (frozen Branch B, 7.9; `ondemand_virtual_account` of 4.9) is an entry only while the
+  OnDemand toolbar is visible by template (`ondemand_toolbar`, matched with the file's `valid_while_template`); the
+  same id shown without the toolbar is not an entry and takes the abort below (`aborted_safety`).
 - A readable text that is not an entry: deny-all, the tree killed, run `aborted_safety` and every
   unreached checkpoint `env_error (gate: paper_mode_asserted, reason: <the abort reason>)`; the reason
   is `live_identity` when the text matches the live id pattern and not the paper prefix (the login is
@@ -53,15 +56,25 @@ TIMER_S = 120.0                                 # the two-minute timer
 DEFERRAL_MAX_S = 300.0                          # a deferral past five minutes takes the unreadable path
 SEND_FRAME_MAX_S = 0.5                          # a frame no older than 500 ms before a paper_send_ok send
 PAPER_MODE = "paperMoney"                       # the stamp's mode (4.13 worked example)
+ONDEMAND_ENTRY = "ondemand_virtual_account"     # the proof's allowlist entry for the OnDemand account (7.9)
 
 
 @dataclass(frozen=True)
 class Allowlist:
-    """The exact account ids of one rig from `gateway/allowlist.yaml`, and the file's sha256 (6.4, 7.4)."""
+    """The exact account ids of one rig from `gateway/allowlist.yaml`, and the file's sha256 (6.4, 7.4); with frozen
+    Branch B, the OnDemand virtual account id and the toolbar template that makes it an entry (7.9)."""
 
     rig: str
     entries: tuple[str, ...]
     sha256: str
+    ondemand_account: str | None = None
+    ondemand_template: str | None = None
+
+    def admits(self, text: object, *, ondemand_toolbar: bool = False) -> bool:
+        """True when `text` is an entry: one of the rig's ids, or the OnDemand virtual account while the toolbar is
+        visible (7.9)."""
+        return text in self or (ondemand_toolbar and self.ondemand_account is not None
+                                and text == self.ondemand_account)
 
     def __contains__(self, text: object) -> bool:
         return isinstance(text, str) and text in self.entries
@@ -75,12 +88,15 @@ def load_allowlist(path: str | Path, rig: str) -> Allowlist:
     """Read `gateway/allowlist.yaml` (4.9 allowlist schema) and return the entries of `rig`."""
     raw = Path(path).read_bytes()
     data = yaml.safe_load(raw) or {}
+    od = data.get("ondemand_virtual_account") or {}
     for r in data.get("rigs", []):
         if r.get("rig") == rig:
             ids = tuple(str(a) for a in r.get("account_ids", []))
             if not ids:
                 raise ValueError(f"rig {rig} has no account ids in {path}")
-            return Allowlist(rig, ids, hashlib.sha256(raw).hexdigest())
+            account, template = od.get("account_id"), od.get("valid_while_template")
+            return Allowlist(rig, ids, hashlib.sha256(raw).hexdigest(),
+                             None if account is None else str(account), None if template is None else str(template))
     raise ValueError(f"rig {rig} is not in {path}")
 
 
@@ -89,9 +105,11 @@ def readable(r: SelectorRead, floor: float = OCR_FLOOR) -> bool:
     return r.landmark_found and r.confidence >= floor and bool(r.text)
 
 
-def classify(text: str, allowlist: Allowlist, live_re: re.Pattern[str] = LIVE_ID_RE) -> str:
-    """`allowlisted`, `live_identity` or `paper_mode_mismatch` for a readable selector text (6.4)."""
-    if text in allowlist:
+def classify(text: str, allowlist: Allowlist, live_re: re.Pattern[str] = LIVE_ID_RE, *,
+             ondemand_toolbar: bool = False) -> str:
+    """`allowlisted`, `live_identity` or `paper_mode_mismatch` for a readable selector text (6.4); the OnDemand virtual
+    account is allowlisted only with the toolbar visible (7.9)."""
+    if allowlist.admits(text, ondemand_toolbar=ondemand_toolbar):
         return "allowlisted"
     if live_re.match(text) and not text.startswith(PAPER_PREFIX):
         return "live_identity"
@@ -99,21 +117,23 @@ def classify(text: str, allowlist: Allowlist, live_re: re.Pattern[str] = LIVE_ID
 
 
 def judge_identity(reads: Sequence[SelectorRead], allowlist: Allowlist, *, floor: float = OCR_FLOOR,
-                   unreadable_streak: int = 0, live_re: re.Pattern[str] = LIVE_ID_RE) -> ControlResult:
+                   unreadable_streak: int = 0, live_re: re.Pattern[str] = LIVE_ID_RE,
+                   ondemand_toolbar: bool = False) -> ControlResult:
     """The paper-mode assertion over one read, or two reads 1 s apart when the first was unreadable (6.4).
 
-    `unreadable_streak` is the number of consecutive unreadable results on this login before this one.
+    `unreadable_streak` is the number of consecutive unreadable results on this login before this one;
+    `ondemand_toolbar` is the OnDemand toolbar seen by template in the same frame (7.9).
     """
     if not reads:
         raise ValueError("at least one selector read")
     first = reads[0]
     if readable(first, floor):
-        return _judge(first, allowlist, live_re, rearm=False)
+        return _judge(first, allowlist, live_re, rearm=False, ondemand_toolbar=ondemand_toolbar)
     if len(reads) < 2:
         raise ValueError("the first read is unreadable: deny-all and read again 1 s later (6.4)")
     second = reads[1]
     if readable(second, floor):
-        return _judge(second, allowlist, live_re, rearm=True)
+        return _judge(second, allowlist, live_re, rearm=True, ondemand_toolbar=ondemand_toolbar)
     return _unreadable("selector unreadable on two reads 1 s apart", [r.crop_sha256 for r in reads[:2]],
                        unreadable_streak)
 
@@ -135,14 +155,16 @@ def _unreadable(detail: str, crops: list[str | None], unreadable_streak: int) ->
         detail=detail + ("; login blocked" if blocked else ""), evidence={"crops": crops})
 
 
-def _judge(r: SelectorRead, allowlist: Allowlist, live_re: re.Pattern[str], *, rearm: bool) -> ControlResult:
+def _judge(r: SelectorRead, allowlist: Allowlist, live_re: re.Pattern[str], *, rearm: bool,
+           ondemand_toolbar: bool = False) -> ControlResult:
     text = r.text or ""
-    verdict = classify(text, allowlist, live_re)
+    ondemand = text not in allowlist and allowlist.admits(text, ondemand_toolbar=ondemand_toolbar)
+    verdict = "allowlisted" if ondemand else classify(text, allowlist, live_re)
     sha = hashlib.sha256(text.encode()).hexdigest()
     if verdict == "allowlisted":
+        entry = ONDEMAND_ENTRY if ondemand else allowlist.index(text)
         return ControlResult("paper_mode", True, GATE, actions=("rearm",) if rearm else (),
-                             evidence={"account_id_sha256": sha, "allowlist_entry": allowlist.index(text),
-                                       "crop": r.crop_sha256})
+                             evidence={"account_id_sha256": sha, "allowlist_entry": entry, "crop": r.crop_sha256})
     run, un = safety_abort_outcome(GATE, verdict)
     live = verdict == "live_identity"
     return ControlResult("paper_mode", False, GATE, run=run, unreached=un, alert=alerts.safety_abort(),

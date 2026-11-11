@@ -7,14 +7,14 @@ owner: tos-trade-ui
 smoke: true
 path:
   - {id: p1, type: wait_for, anchor: {landmark: lm.order-entry-header}, timeout_ms: 8000}
-primitives: [OrderTicketCore, Theme]
+primitives: [OrderTicketCore, QuoteStream, SymbolLinking, Theme, FontMetrics]   # 12.4
 roots: ["com.tos.desktop.trade.orderentry"]
 personas: [active_trader, options_trader, swing_trader, beginner]
 entitlements: [margin]
 enumerable_by: P6
-resizable: false
+resizable: false                       # deviation: 12.4 sweeps it (S yes); the example's sweep harness does not host the ticket
 target_window: {kind: main}
-data_mode: frozen
+data_mode: frozen                      # deviation: 12.4 says masked_live; its census regions here carry no rule or mask region
 account_state: false
 landmarks:
   - {id: lm.order-entry-header, template: registry/templates/trade/order-entry-header.png, confidence_min: 0.92, must_see: true}

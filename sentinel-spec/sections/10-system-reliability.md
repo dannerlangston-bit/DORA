@@ -192,6 +192,7 @@ Quarantine. A checkpoint enters quarantine on any of: flake score above 0.10 ove
 | `kill_switch` | a kill-switch trip or safety incident: the flows of the rig involved | 6.6 |
 | `gateway_drops` | one safety-reason gateway drop, or 3 integrity-reason drops in one flow: the whole flow | 5.4.8, 6.2 |
 | `fallback_rate` | a flow whose 30-day agent-fallback rate exceeds 5 percent: the whole flow | 11.5 |
+| `unknown_popup` | an unmatched top-level window appeared during a flow (the `unknown_popup` finding, closed by the dismiss-only toolset or WM_CLOSE): the whole flow, until the proposed catalog entry is merged | 4.10, 7.8 |
 
 At run start the Orchestrator mirrors the file at the pinned commit into `flake_stats.quarantined`, so git is the record and SQLite the mirror. While quarantined, the checkpoint is `not_run (reason: quarantine)` on every run, shown in the coverage matrix in its own color, never as covered. Exit requires a fix plus 5 consecutive clean captures in a Calibration run with a zero floor, cited in the PR that removes the record; nothing un-quarantines automatically. Above 2 percent of tier-1 checkpoints quarantined, run health is red and the RC gate blocks.
 

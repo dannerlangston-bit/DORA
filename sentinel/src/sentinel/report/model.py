@@ -55,6 +55,11 @@ Inputs beyond the records, and where each comes from:
     host (`capture.sweep.minimums_summary`, 2.5.1), one "Sweep minimums" line each (`MinSize.report_line`).
   - `health_rows` [[label, text]]: further run-health rows the run adds as they are (the popup rate, the
     fingerprint notes, the Phase 0 branches, the decision lifecycle lines), each printed only when present.
+  - `calibration` {build_id, checkpoints, calibrated, keys, sessions, fix_list, fix_routes, overdue, files}: a
+    Calibration run's own summary (`calibration_run.run_calibration`, 3.9, 11.2): the "Calibration" row (checkpoints
+    calibrated, keys, exported files), one "Calibration sessions" row (rig, night, status and the gate a session
+    stopped at), the "Fix list" row (`fix_list_lines`, 3.9 step 6), "Fix list by owner" (`fix_routes`) and "Fix items
+    overdue" (past 5 business days, the `aa_floor` quarantine candidates of 10.5), each printed only when present.
   - `post_run_check` {failures [str], report_withheld bool}: what `store.checks.end_taxonomy_check_failed` writes.
     `report_withheld` makes the comment and the page the abort block alone, with each failure (1.4 G2, L-OUT-07).
   - `safety` {banner, nightly_run_id}: `orchestrator.safety_canaries.banner(results)` of the last Nightly (null when
@@ -1488,6 +1493,32 @@ def _integrations_row(b: _Builder, items: list[Item]) -> Line:
     return tuple(out)
 
 
+def _calibration_rows(cal: Mapping[str, Any] | None) -> list[tuple[str, Line]]:
+    """A Calibration run's own summary as run-health rows (module docstring `calibration`; 3.9, 11.2)."""
+    if not cal:
+        return []
+    keys = ", ".join(cal.get("keys") or ()) or "none recorded"
+    head = (f"{cal.get('calibrated', 0)} of {plural(int(cal.get('checkpoints', 0)), 'checkpoint')} calibrated on "
+            f"{cal.get('build_id', 'unknown')}; keys {keys}")
+    if cal.get("files"):
+        head += "; exported " + ", ".join(cal["files"])
+    rows: list[tuple[str, Line]] = [("Calibration", (T(head),))]
+    sessions = [f"{x.get('rig')} night {x.get('night')} {x.get('status')}"
+                + (f" at {x['last_gate']} ({x['reason']})" if x.get("reason") else "")
+                for x in cal.get("sessions") or ()]
+    if sessions:
+        rows.append(("Calibration sessions", (T("; ".join(sessions)),)))
+    if cal.get("fix_list"):
+        rows.append(("Fix list", (T("; ".join(cal["fix_list"])),)))
+    routes = cal.get("fix_routes") or {}
+    if routes:
+        rows.append(("Fix list by owner", (T("; ".join(f"{owner}: {plural(len(items), 'item')}"
+                                                       for owner, items in sorted(routes.items()))),)))
+    if cal.get("overdue"):
+        rows.append(("Fix items overdue", (T("; ".join(cal["overdue"])),)))
+    return rows
+
+
 def health_rows(b: _Builder, items: list[Item], intended_clusters: list[Cluster]) -> list[tuple[str, Line]]:
     h, os_ = b.health, b.outcomes
     shards = plural(int(h.get("shards", 1)), "shard")
@@ -1544,6 +1575,7 @@ def health_rows(b: _Builder, items: list[Item], intended_clusters: list[Cluster]
         rows.append(("Sweep minimums", (T("; ".join(lines)),)))
     for label, text in b.summary.get("health_rows") or ():
         rows.append((str(label), (T(str(text)),)))
+    rows += _calibration_rows(b.summary.get("calibration"))
     if "canary" in h:
         rows.append(("Canary (last Nightly)", _canary_row(h["canary"])))
     if "safety" in h:

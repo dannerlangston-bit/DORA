@@ -140,3 +140,32 @@ def test_the_re_evaluation_must_use_the_canary_entry_point(store):
     with pytest.raises(ValueError, match="canary entry point"):
         P.path_equivalence(store, MERGE, C.SEED, lambda o: dataclasses.replace(o, run_id=NIGHTLY), run_id=NIGHTLY,
                            catalog_version="v")
+
+
+class _Rows:
+    """The two store reads path equivalence makes, over rows a decision lookup already shaped."""
+    def __init__(self, rows: list[CheckpointOutcome]):
+        self.rows = rows
+
+    def outcomes(self, run_id: str) -> list[CheckpointOutcome]:
+        return [o for o in self.rows if o.run_id == run_id]
+
+    def query(self, sql: str, args: tuple) -> list[dict]:
+        return []
+
+
+def test_decision_suppressed_rows_are_not_eligible():
+    """A synthetic re-run never matches a decision, so a decided pair would always diverge: it is skipped."""
+    arts = {"base": "b" * 64, "candidate": "c" * 64}
+    kw = dict(run_id=MERGE, workspace_id=WS, persona="active_trader", data_mode="frozen", tier=1, artifacts=arts)
+    rows = [CheckpointOutcome(checkpoint_id=PAIRS[0], outcome="noise", reason="decision:dec-000901",
+                              decision_ref="dec-000901", diff=diff(1), **kw),
+            CheckpointOutcome(checkpoint_id=PAIRS[1], outcome="needs_human", reason="reviewer_uncertain",
+                              decision_ref="dec-000902", diff=diff(2), **kw),
+            CheckpointOutcome(checkpoint_id=PAIRS[2], outcome="collateral", diff=diff(3), **kw)]
+    store = _Rows(rows)
+    assert [o.checkpoint_id for o in P.eligible_pairs(store, MERGE)] == [PAIRS[2]]
+    for seed in range(6):
+        got = P.path_equivalence(store, MERGE, seed, same, run_id=NIGHTLY, catalog_version="v")
+        assert got is not None and got.stored.checkpoint_id == PAIRS[2] and not got.diverged
+    assert P.path_equivalence(_Rows(rows[:2]), MERGE, 1, same, run_id=NIGHTLY, catalog_version="v") is None

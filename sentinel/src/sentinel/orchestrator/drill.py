@@ -53,7 +53,12 @@ Choices for `run_drill` (reported):
   reverted when `revert_snapshot` returned without an exception. The final Oracle read is item 5's recovery
   read (taken before the revert), and the clean read that made `Cancel All` click counts too (the larger
   new-row count wins), so re-reads that go unreadable after the click never hide a sent order: with no usable
-  read the new-row count is 0 and item 5 fails, so the drill is never PROVEN without it.
+  read the new-row count is 0 and item 5 fails, so the drill is never PROVEN without it. When item 5 cannot run
+  (a human stop pending, or the drill's flag did not arrive), the final Oracle read is the one read taken at once
+  after the drill ticket is cleared, as for a failed precondition (6.5 "an item that cannot run: the Oracle reads
+  Working Orders at once"), so an order sent in items 1 to 4 is still the S1 case. An item of 1 to 4 that cannot
+  run takes no read of its own: item 5 follows at once, the flag written while the ticket is up, and its read sees
+  every row an earlier read would, since a new row stays in one of the three grids.
 - Item 5's `deny_all` is measured when it is seen in effect, not when it is written: right after the deny-all write
   one drill-tagged raw key down of an inert key (`DENY_ALL_PROBE_VK`) goes to the hook, which must drop it
   `deny_all`; any other decision leaves `deny_all_s` None, so item 5 fails "hook not in deny-all" (6.5 Failure
@@ -409,7 +414,8 @@ def _item5(d: _Drive, *, clock: Clock, kill_channel: KillChannel, rig_id: str, s
     Returns item 5's measurements and its Monitor reads: the last one, and the clean read that made `Cancel All`
     click (killswitch choice 4), so a row either showed counts. A human stop request pending on the channel is never
     overwritten, consumed or acknowledged: item 5 does not run and the request stays for the Orchestrator (killflag
-    choice 5)."""
+    choice 5). When item 5 cannot run (that stop pending, or its flag did not arrive) the Oracle reads the Monitor at
+    once after the ticket is cleared, and that read is item 5's one read (6.5 Failure handling)."""
     t0 = clock.monotonic()
     human = killflag.poll(kill_channel)
     mine = killflag.drill_request(rig_id, clock.now().isoformat())
@@ -427,7 +433,7 @@ def _item5(d: _Drive, *, clock: Clock, kill_channel: KillChannel, rig_id: str, s
                               f"a stop request is pending ({human.requested_by} via {human.channel}: {human.reason}); "
                               "it is left for the kill switch")
         d.port.clear_drill_ticket()
-        return Item5(None, None, False, False, None, False), ()
+        return Item5(None, None, False, False, None, False), (d.rig.read_orders(),)     # the Oracle reads at once
     d.rig.set_hook_phase("kill_switch")
     deny_all_s = clock.monotonic() - t0 if d.deny_all_holds() else None      # seen in effect, not just written
     tree_gone_s = clock.monotonic() - t0 if d.rig.kill_process_tree() else None

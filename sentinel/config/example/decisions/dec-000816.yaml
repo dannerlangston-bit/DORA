@@ -1,0 +1,21 @@
+# The request_mask decision behind mask msk.ps.last-update-05 (4.8 L-MSK-01), in the 4.14 shape of the nightly export
+# (store.lifecycle.export_decisions). The simulated pipeline seeds a fresh store with it
+# (pipeline.run.seed_decisions); its merge run's finding and build are not in this checkout, so the record
+# names neither (the store's import path, 4.14).
+decision_id: dec-000816
+signature:
+  checkpoint_id: census/monitor.activity.position-statement/ws.tier-b.dense-charts
+  region_id: rgn.ps.last-update
+  phash: 5a3d96e1f00f3c5a
+  category: collateral
+action: request_mask
+verdict: noise
+decided_by: triage.lead
+role: triage_rotation
+source: report_ui
+decided_at: '2026-11-05T20:20:00+00:00'
+run_id: run-2026-11-05-merge-0418
+ticket: TOS-48133
+reason: The section header shows the last quote update time to the second; it moves on every capture. Mask it.
+expires_at: '2026-12-05T20:20:00+00:00'
+status: active

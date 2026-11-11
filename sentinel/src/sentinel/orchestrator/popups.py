@@ -37,7 +37,7 @@ over those observations is here, and every decision is a `ControlResult` in the 
 `refused_labels`, 7.8 policy 5). Some carry
 `wait_timeout_ms` (a `wait`, or the 30 s of an unowned Order Confirmation), `capture_first` (INV-14: capture the
 checkpoint with the dialog on screen before WM_CLOSE), `handoff: login_recovery` (POP-21 inside the LOGIN flow),
-`proactive_relaunch` (POP-11), `fixture_finding` (POP-07, POP-15), `ondemand_timeouts` (POP-12) or `proposed_entry`.
+`proactive_relaunch` (POP-11), `ondemand_timeouts` (POP-12) or `proposed_entry`.
 
 Choices where the spec is ambiguous or silent (reported):
 
@@ -74,8 +74,9 @@ Choices where the spec is ambiguous or silent (reported):
    is the challenge prompt (POP-21: the LOGIN flow's Branch B recovery once, inside phase `login`; anywhere else or a
    second time its `on_abort`). Rows whose extra effect the data cannot say are keyed by their fixed starter id
    (L-XREF-12 keeps them): POP-11 adds a `memory_warning` finding with the Watchdog's heap and GDI counts and asks for
-   the proactive relaunch at the next flow boundary (`proactive_relaunch`); POP-07 and POP-15 add a fixture finding
-   (`fixture_finding`: `fixture_drift`, 7.6, and `fixture_maintenance_needed`, 7.9) unless the flow expects the popup.
+   the proactive relaunch at the next flow boundary (`proactive_relaunch`); POP-07 and POP-15 add a `fixture_finding`
+   finding (4.13) whose `detail` is its reason, `fixture_drift` (7.6) and `fixture_maintenance_needed` (7.9), unless
+   the flow expects the popup.
    Every other `relogin` entry (POP-05) draws on the run's re-login budget K (SD-66, `budgets.ReloginBudget`).
 6. App error dialogs (`app_failure`, 7.8 policy 4, 5.9): never dismissed; the checkpoint in progress is `invariant_
    violation` with `on_abort.invariant_id` (INV-14) and the decision asks the driver to capture it with the dialog on
@@ -107,9 +108,9 @@ Choices where the spec is ambiguous or silent (reported):
     ticket flag or keep a window from being closed, so a draft or disabled regex can only make the guard stricter.
 14. A `dismiss_key` is one named key of `gateway.NAMED_VK`; a chord is refused at load, so no catalog entry can send
     Alt+F4 or Ctrl+Enter to the app.
-15. The 12.8 "fixture finding" has no finding kind in 4.13 and the closed vocabulary cannot be extended here, so it is
-    carried as `evidence["fixture_finding"]` with its reason (reported). The unknown popup's flow quarantine is the
-    `quarantine_flow` action; 10.5 has no quarantine reason for it (reported).
+15. The 12.8 "fixture finding" is the 4.13 finding kind `fixture_finding`, its reason in `detail`; the unknown popup's
+    flow quarantine is the `quarantine_flow` action, persisted with the 10.5 reason `unknown_popup`
+    (`store.safety.quarantine_reason_for`).
 16. A dismiss or WM_CLOSE found at the slow half's modal check (5.4.3 stage 2) goes through the same sweep; failing that
     step is the emitter's rule. A rising `focus_correction` count is a reason to sweep (5.4.3 stage 1); the driver runs
     `sweep` after a correction.
@@ -557,7 +558,9 @@ def decide(entry: PopupEntry, ctx: PopupContext, window: Any = None) -> ControlR
             extra["proactive_relaunch"] = True
         fixture = FIXTURE_FINDINGS.get(entry.popup_id)
         if fixture and entry.popup_id not in ctx.flow_expects:
-            extra["fixture_finding"] = fixture
+            findings += (FindingSpec("fixture_finding", f"{entry.popup_id} {getattr(window, 'title', '')!r} appeared "
+                                     "and the flow does not expect it: the fixture should rule it out (12.8)",
+                                     detail=fixture),)
         return ControlResult(CONTROL, True, ctx.gate, findings=findings, evidence=_evidence(entry, window, **extra),
                              detail=f"{entry.popup_id}: dismissed and counted")
     if entry.action == "wait":

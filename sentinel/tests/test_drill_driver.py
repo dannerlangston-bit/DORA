@@ -181,6 +181,29 @@ def test_a_kill_flag_that_never_arrives_fails_item5():
     assert "kill_process_tree" not in rig.calls and not rig.ticket_visible
 
 
+@pytest.mark.parametrize("stop", ["flag_lost", "human_pending"])
+def test_item5_that_cannot_run_reads_the_monitor_at_once_and_a_new_row_is_the_s1_case(monkeypatch, stop):
+    """gateway-safety:1 (6.5 Failure handling): an item that cannot run makes the Oracle read Working Orders at once,
+    and a new row is the S1 case. A guard lets an order through in items 1 to 4 and item 5 does not run (its flag is
+    lost, or a human stop is pending): the drill is `aborted_safety (drill_order_placed)`, not harness_error S2."""
+    from sentinel.orchestrator.killflag import MemoryKillChannel
+    real = simrig_module.slow_half
+    monkeypatch.setattr(simrig_module, "slow_half", lambda a, ctx: SlowDecision(False) if a.keys else real(a, ctx))
+    rig = ready(SimulatedRig())
+    rig.gw.blocked_vk = frozenset()                     # a broken blocked-key map
+    if stop == "flag_lost":
+        ch = MemoryChannel(deliver=False)
+    else:
+        ch = MemoryKillChannel()
+        ch.post(HUMAN)
+    r = drill(rig, channel=ch)
+    assert 5 in r.observation.could_not_run and rig.sent_orders >= 1
+    assert r.observation.new_order_rows >= 1 and "kill_process_tree" not in rig.calls
+    res = r.result
+    assert (res.run_status, res.run_reason, res.incident) == ("aborted_safety", "drill_order_placed", "S1")
+    assert res.has("block_login") and res.has("kill_switch") and res.has("cancel_all") and res.checkpoint is None
+
+
 class SlowKillRig(SimulatedRig):
     """The process tree takes 6 s to die."""
 

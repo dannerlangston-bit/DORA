@@ -46,10 +46,19 @@ Choices where the spec is silent or ambiguous (reported):
    handling covers the OS.
 7. `step_events.seq` orders a whole shard, so it comes from the caller's shard-wide allocator (`next_seq`),
    shared with every other writer of the shard's step events.
+8. `ctx.secret_step` covers the whole secret step on the `drain_ring` path too (6.9, the gateway:0 backstop). The
+   drainer thread reads the ring a poll interval behind the emitter, so the next step's
+   `set_context(secret_step=False)` can come before the secret step's last records are drained. The clear is then
+   deferred until the ring has been drained past the step: every secret token noted while the flag was set has
+   been drained up to its key up (or its drop), or a record of a token noted after the clear request arrives
+   (the hook writes the ring in event order, so the step's events are all behind it). Until then every key event
+   drained is redacted, the tokenless ones included. On the synchronous path (`drain` right after each
+   emission) the tokens are drained before the next step starts, so the clear takes effect at once.
 """
 from __future__ import annotations
 
 import json
+import threading
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -121,21 +130,62 @@ class Drainer:
         self.reader = RingReader()
         self.notes: dict[int, TokenNote] = {}
         self._secret_down: set[int] = set()   # vks of secret key downs whose up is not drained yet (choice 3)
+        self._secret_open: set[int] = set()   # secret-step tokens whose key up (or drop) is not drained (choice 8)
+        self._closing = False                 # a clear of `secret_step` waits for the ring (choice 8)
+        self._later: set[int] = set()         # tokens noted after the clear request (choice 8)
+        self._lock = threading.RLock()        # the emitter and the drainer thread share the context
 
     @property
     def lost(self) -> int:
         """Ring records the hook overwrote before they were drained."""
         return self.reader.lost
 
+    @property
+    def secret_pending(self) -> bool:
+        """A clear of `secret_step` is waiting for the ring to be drained past the secret step (choice 8)."""
+        return self._closing
+
     def set_context(self, **changes: Any) -> None:
-        """Change the context (step, mode, latest capture, drill phase, secret step)."""
-        self.ctx = replace(self.ctx, **changes)
+        """Change the context (step, mode, latest capture, drill phase, secret step). A clear of `secret_step`
+        takes effect once the ring is drained past the secret step (choice 8)."""
+        with self._lock:
+            if "secret_step" in changes:
+                on = bool(changes["secret_step"])
+                if on:
+                    self._closing = False
+                    self._later.clear()
+                elif self.ctx.secret_step and self._secret_open:
+                    changes = {**changes, "secret_step": True}
+                    self._closing = True
+                else:
+                    self._end_secret()
+            self.ctx = replace(self.ctx, **changes)
 
     def note_token(self, note: TokenNote) -> None:
         """Register a token the emitter wrote (stage 5), so its records carry the step that asked for it."""
-        self.notes[note.token_id] = note
-        while len(self.notes) > MAX_NOTES:
-            del self.notes[next(iter(self.notes))]
+        with self._lock:
+            self.notes[note.token_id] = note
+            while len(self.notes) > MAX_NOTES:
+                del self.notes[next(iter(self.notes))]
+            if self._closing:
+                self._later.add(note.token_id)
+            elif self.ctx.secret_step:
+                self._secret_open.add(note.token_id)
+
+    def _end_secret(self) -> None:
+        self._closing = False
+        self._secret_open.clear()
+        self._later.clear()
+        if self.ctx.secret_step:
+            self.ctx = replace(self.ctx, secret_step=False)
+
+    def _drained(self, r: RingRecord) -> None:
+        """Account a drained record against the secret step being cleared (choice 8)."""
+        if r.token_id is not None and r.token_id in self._secret_open and (
+                r.event_type == "key_up" or r.decision == "dropped"):
+            self._secret_open.discard(r.token_id)
+        if self._closing and not self._secret_open:
+            self._end_secret()
 
     def drain_ring(self, buf: Any) -> list[StepEvent]:
         """Read the ring records written since the last call and drain them."""
@@ -143,7 +193,13 @@ class Drainer:
 
     def drain(self, records: Iterable[RingRecord]) -> list[StepEvent]:
         """One `step_events` row per ring record, in ring order; the dropped rows are journaled first."""
-        rows = [self._row(r) for r in records]
+        rows = []
+        with self._lock:
+            for r in records:
+                if self._closing and r.token_id is not None and r.token_id in self._later:
+                    self._end_secret()                      # a later step's record: the ring is past (choice 8)
+                rows.append(self._row(r))
+                self._drained(r)
         self._journal([r for r in rows if r.gate_decision == "dropped"])
         return rows
 

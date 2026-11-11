@@ -44,6 +44,12 @@ def assert_legal(outcomes: list[CheckpointOutcome]) -> None:
         records.from_dict(CheckpointOutcome, o.to_dict())
 
 
+def product(outs: list) -> list:
+    """The product checkpoints' outcomes, less registry validation's probe rows (2.2.3: each PR run adds the eight
+    probes of its first tier A workspace)."""
+    return [o for o in outs if not o.surface_id.startswith("registry.validation-")]
+
+
 def assert_outputs(out: Path) -> str:
     for f in FILES:
         assert (out / f).exists(), f
@@ -180,8 +186,12 @@ def test_nightly_canary_goes_blind_on_a_money_cell(runs):
     assert n1.shards[0]["gates"][3]["control"] == "paper_mode"
     # 9.10 Canary failure: night 2's blind state pages the harness on-call at P1; night 1 pages nobody
     alerts = json.loads((out / "alerts.json").read_text())
-    assert [(a["run_id"], a["rule"], a["priority"], a["paged"]) for a in alerts] == \
+    assert [(a["run_id"], a["rule"], a["priority"], a["paged"]) for a in alerts if a["control"] != "fingerprint"] == \
         [(n2.run_id, "canary_failure", "P1", ["harness_on_call"])]
+    # 12.7 G5 with the store's calibrated keys: no Calibration run wrote floors, so each run queues one and tells the
+    # on-call channel once (10.7), without paging anyone
+    assert [(a["run_id"], a["rule"], a["priority"], a["paged"]) for a in alerts if a["control"] == "fingerprint"] == \
+        [(r, "env_error", "P2", []) for r in (n1.run_id, n2.run_id, pr.run_id)]
     assert [b["priority"] for b in n2.canary["sent_bugs"]] == ["Highest"] and n1.canary["sent_bugs"] == []
 
 
@@ -191,7 +201,8 @@ def test_decision_inheritance_suppresses_and_inherits(runs):
     outs, finds, counts = stored(out, r2.run_id)
     assert_legal(outs)
     with Store(out / "sentinel.db") as store:
-        rows = store.conn.execute("SELECT action, count(*) FROM decisions GROUP BY action").fetchall()
+        rows = store.conn.execute("SELECT action, count(*) FROM decisions WHERE action <> 'request_mask' "
+                                  "GROUP BY action").fetchall()       # less the masks' seeded decisions
     assert dict(rows) == {"confirm_bug": 8, "mark_intended": 18}
     for o in by(outs, outcome="invariant_violation"):
         assert o.decision_ref and o.reason == "INV-01"            # the outcome never changes; the finding is suppressed
@@ -300,8 +311,10 @@ def test_base_reuse_reads_the_merge_runs_frozen_captures(runs):
     captured, run health counts base_reused and the report says where the captures came from."""
     out, (m, r) = runs("base-reuse")
     assert m.run_type == "merge" and r.status == "complete"
+    assert m.status == "complete"                      # every sweep of the merge run reaches its sizes (2.5.1)
     outs, _, _ = stored(out, r.run_id)
     assert_legal(outs)
+    outs = product(outs)
     frozen = [o for o in outs if o.data_mode == "frozen"]
     assert frozen and {o.base_source_run_id for o in frozen} == {m.run_id}
     assert {o.base_source_run_id for o in outs if o.data_mode == "masked_live"} == {None}
@@ -325,7 +338,7 @@ def test_a_reused_base_whose_stored_capture_is_gone_is_needs_baseline_reuse_miss
     run_pipeline(EXAMPLE, merge, tmp_path)
     shutil.rmtree(tmp_path / "artifacts" / "runs" / merge.run_id / "objects")
     r = run_pipeline(EXAMPLE, pr, tmp_path)
-    frozen = [o for o in r.outcomes if o.data_mode == "frozen"]
+    frozen = [o for o in product(r.outcomes) if o.data_mode == "frozen"]
     assert frozen and {(o.outcome, o.reason) for o in frozen} == {("needs_baseline", "reuse_missing")}
     rows = dict(map(tuple, _summary(tmp_path, r.run_id)["health_rows"]))
     assert rows["Base reuse"].endswith(f"reuse_missing {len(frozen)}")
@@ -373,15 +386,44 @@ def test_a_pr_run_reads_the_floors_a_calibration_run_wrote_to_the_store(runs):
     clean-pr's."""
     out, (r,) = runs("calibrated-floors")
     outs, _, _ = stored(out, r.run_id)
-    assert sorted(o.outcome for o in outs) == ["identical"] * 4 + ["intended"] * 4
+    assert sorted(o.outcome for o in product(outs)) == ["identical"] * 4 + ["intended"] * 4
     with Store(out / "sentinel.db") as store:
         assert [tuple(x) for x in store.query("SELECT run_type, outcome FROM runs ORDER BY started_at")] == [
-            ("calibration", "complete"), ("pr", "complete")]
+            ("merge", "complete"), ("calibration", "complete"), ("pr", "complete")]    # the seed's history run first
         sources = {x[0] for x in store.query("SELECT json_extract(record_json, '$.threshold_source') FROM "
-                                             "outcome_records WHERE run_id = ?", (r.run_id,))}
+                                             "outcome_records WHERE run_id = ? AND json_extract(record_json, "
+                                             "'$.surface_id') NOT LIKE 'registry.validation-%'", (r.run_id,))}
         summary = store.run_summary(r.run_id)
     assert sources == {"calibrated"} and "calibration_queued" not in summary
     assert not [row for row in summary.get("health_rows", []) if row[0] == "Calibration"]
+    assert not [a for a in r.alerts if a["control"] == "fingerprint"]          # G5 found the key's floors
+
+
+def test_a_tab_the_registry_does_not_list_is_a_tier_1_unregistered_surface_with_a_stub_pr(runs):
+    """2.2.3, SD-15: registry validation at entry to running, in the shard's first tier A workspace, on both builds.
+    The candidate gains a top-level tab: P1 records `unregistered_surface (probe:P1)` on its synthetic surface, tier
+    1, with the registry stub PR; the PR comment lists it and the check fails; the other probes are identical."""
+    out, (r,) = runs("unregistered-tab")
+    text = assert_outputs(out)
+    outs, finds, _ = stored(out, r.run_id)
+    by = {o.checkpoint_id: o for o in outs}
+    ws = "ws.tier-a.active-trader"
+    u = by[f"census/unregistered.p1.crypto/{ws}"]
+    assert (u.outcome, u.reason, u.tier, u.surface_id) == ("unregistered_surface", "probe:P1", 1,
+                                                           "unregistered.p1.crypto")
+    assert u.artifacts["base"] != u.artifacts["candidate"]                          # the two probe screenshots
+    probes = {p: by[f"census/registry.validation-p{p}/{ws}"].outcome for p in range(1, 9)}
+    assert probes == {1: "collateral", **{p: "identical" for p in range(2, 9)}}
+    (f,) = [f for f in finds if f.kind == "unregistered_surface"]
+    stub = "registry/surfaces/unregistered/unregistered.p1.crypto.yaml"
+    assert f.tier == 1 and stub in f.description and f.evidence["raw_values"]["registry_pr_path"] == stub
+    assert "unregistered_surface (reason: probe:P1) on `unregistered.p1.crypto`" in text and stub in text
+    assert r.commit_status["state"] == "failure"
+    (prop,) = _summary(out, r.run_id)["registry_proposals"]
+    assert (prop["kind"], prop["path"], prop["document"]["tier"], prop["document"]["title"]) == (
+        "stub", stub, 1, "Crypto")
+    assert sorted(o.outcome for o in outs if o.surface_id.startswith("charts.flexible-grid.chart-cell")) == \
+        ["intended"] * 4                                                           # the rest is clean-pr's
 
 
 def test_a_pr_run_without_floors_in_the_store_requests_the_calibration(runs):
@@ -395,3 +437,5 @@ def test_a_pr_run_without_floors_in_the_store_requests_the_calibration(runs):
     assert q["requested_by"] == r.run_id and len(q["checkpoints"]) == 8
     rows = dict(map(tuple, summary["health_rows"]))
     assert rows["Calibration"].startswith("Calibration run requested for key sha256:")
+    (g5,) = [a for a in r.alerts if a["control"] == "fingerprint"]             # 12.7 G5 with calibrated_keys: once
+    assert (g5["rule"], g5["priority"]) == ("env_error", "P2") and "no calibration" in g5["detail"]

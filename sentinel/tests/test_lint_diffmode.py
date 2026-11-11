@@ -187,7 +187,7 @@ def test_l_msk_01_against_the_central_store(base, decisions, needle):
 def test_a_request_mask_by_a_rostered_human_is_clean(base):
     r = copy.deepcopy(base)
     r.docs["ops/oncall.yaml"] = Doc("ops/oncall.yaml", "oncall", ONCALL)
-    assert D.store_rules(r, _Store({"dec-000812": _Dec("request_mask", "jdoe")})) == []
+    assert D.store_rules(r, _Store({f"dec-{812 + i:06d}": _Dec("request_mask", "jdoe") for i in range(7)})) == []
     assert D.store_rules(r, None) == []
 
 

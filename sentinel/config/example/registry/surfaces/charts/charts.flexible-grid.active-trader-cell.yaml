@@ -9,7 +9,7 @@ owner: tos-trade-ui
 smoke: true
 path:
   - {id: p1, type: wait_for, anchor: {landmark: lm.atcell-header}, timeout_ms: 10000}
-primitives: [FlexibleGrid, OrderTicketCore, LadderModel, Theme]
+primitives: [LadderModel, FlexibleGrid, Docking, ColumnModel, OrderTicketCore, QuoteStream, SymbolLinking, Theme, FontMetrics]   # 12.4
 roots: ["com.tos.desktop.charts.grid.cell"]
 personas: [active_trader]
 entitlements: [margin]

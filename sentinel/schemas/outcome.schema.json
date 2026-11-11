@@ -197,7 +197,8 @@
             "flow_maintenance_needed",
             "harness_error",
             "memory_warning",
-            "hardening"
+            "hardening",
+            "fixture_finding"
           ]
         },
         "manifest_entry_ref": {

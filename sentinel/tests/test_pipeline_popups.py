@@ -84,3 +84,15 @@ def test_l_pop_01_accepts_ids_past_12_8_in_sequence(tmp_path):
     path.write_text(path.read_text().replace("POP-23", "POP-30"))
     report = lint_repo(root, phase=0, today=TODAY)
     assert any("POP-30" in v.line() for v in report.violations if v.rule == "L-POP-01")
+
+
+def test_a_price_alert_is_a_fixture_finding_and_an_unknown_window_quarantines_its_flow(tmp_path):
+    """12.8 POP-07 is a 4.13 `fixture_finding` (reason `fixture_drift` in `detail`); the unknown window's flow
+    quarantine is persisted with the 10.5 reason `unknown_popup`, not as a kill-switch quarantine."""
+    r, events, findings = _run(tmp_path, popups=(("s04", "Alert triggered: AAPL"), ("s05", "Strange Window")))
+    fixture = [f for f in findings if f.kind == "fixture_finding"]
+    assert [(f.detail, f.run_id) for f in fixture] == [("fixture_drift", r.run_id)]
+    assert "POP-07" in fixture[0].description
+    with Store(tmp_path / "sentinel.db") as store:
+        rows = store.query("SELECT target_kind, target, reason FROM safety_quarantines")
+    assert [tuple(x) for x in rows] == [("flow", STOCK_FLOW, "unknown_popup")]

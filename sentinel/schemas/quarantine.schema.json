@@ -31,7 +31,8 @@
             "safety_canary",
             "kill_switch",
             "gateway_drops",
-            "fallback_rate"
+            "fallback_rate",
+            "unknown_popup"
           ]
         },
         "ticket": {

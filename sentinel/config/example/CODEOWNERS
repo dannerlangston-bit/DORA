@@ -1,0 +1,27 @@
+# Pull request routing for sentinel-config (11.5, L-XREF-26): flows/ and registry/ go to the tier's flow owner, and
+# every file of 4.16 to the owner its 4.1 row names, as ops/oncall.yaml names them. The last matching line wins.
+*                                       @asmith
+/flows/tier-1/                          @tos-trade-ui
+/flows/tier-2/                          @tos-trade-ui
+/flows/tier-3/                          @tos-shell-ui
+/registry/                              @tos-trade-ui @tos-shell-ui @hnovak
+/gateway/default_order_hotkeys.yaml     @asmith
+/gateway/dismiss_allowlist.yaml         @asmith
+/policy/explorer_deny_list.yaml         @asmith @fgupta
+/policy/egress_allowlist.yaml           @asmith @security-contact
+/policy/computer_use_ruling.yaml        @asmith @security-contact
+/authorization/                         @cliu @security-contact
+/policy/budgets.yaml                    @asmith
+/policy/release_gate.yaml               @glee
+/policy/reporting.yaml                  @asmith
+/schedule/windows.yaml                  @asmith
+/ops/oncall.yaml                        @asmith
+/ops/credential_rotation.yaml           @asmith @fgupta
+/rig/                                   @asmith
+/corpus/measured_sizes.yaml             @hnovak
+/palettes/                              @hnovak
+/soak.yaml                              @asmith
+/calibration/                           @asmith
+/quarantine.yaml                        @asmith
+/eval/reports/                          @asmith
+/phase0/branches.yaml                   @asmith

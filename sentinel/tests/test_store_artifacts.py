@@ -10,7 +10,8 @@ from sentinel.records import CheckpointOutcome, Finding
 from sentinel.store import (ArtifactCorrupt, ArtifactError, ArtifactHashMismatch, ArtifactPersistError, ArtifactStore,
                             ManifestHeader, Redaction, RedactionRefused, RunPlan, ScopeEntry, Store)
 from sentinel.store import artifacts as artifacts_mod
-from sentinel.store.artifacts import ArtifactQuarantined, SecretLeaked, sha256_hex
+from sentinel.store.artifacts import ArtifactQuarantined, ArtifactRootRefused, SecretLeaked, sha256_hex
+from sentinel.store.retention import Candidate, sweep
 from sentinel.store.secret_scan import SecretScanner
 
 CID = "census/trade.active-trader.ladder/ws.tier-a.active-trader"
@@ -97,7 +98,8 @@ def test_read_back_retried_once_then_persist_error(arts, monkeypatch):
 
 
 def test_store_indexes_artifacts_and_sweeps_safely(tmp_path):
-    arts = ArtifactStore(tmp_path / "objects-set", "runs/run-01")
+    """The store indexes each object and its set copy (8.4, SD-82); the sweep is `store.retention.sweep` (SD-83)."""
+    arts = ArtifactStore.at(tmp_path / "root", "runs/run-01")
     with Store(tmp_path / "db" / "run.db") as s:
         s.begin_run(RunPlan("run-01", "merge", "c0ffee", "a" * 64, "b" * 64, "d00d", "auth/v1.md", 2700,
                             scope=(ScopeEntry(CID, "ws.tier-a.active-trader", "active_trader", 1, "frozen"),)))
@@ -106,15 +108,18 @@ def test_store_indexes_artifacts_and_sweeps_safely(tmp_path):
         o = CheckpointOutcome(run_id="run-01", checkpoint_id=CID, outcome="collateral", workspace_id="ws.tier-a."
                               "active-trader", persona="active_trader", data_mode="frozen",
                               artifacts={"candidate": cand.sha256, "base": base.sha256})
-        f = Finding("F-1", "run-01", "collateral", "overlap", "run-01", checkpoint_id=CID,
-                    evidence={"artifacts": [kept.sha256]})
+        f = Finding("F-1", "run-01", "collateral", "overlap", "run-01",          # a run-level finding: its
+                    evidence={"artifacts": [kept.sha256]})                         # evidence list pins only kept
         s.write_checkpoint(o, artifacts=[cand, base, kept], findings=[f])
         row = s.conn.execute("SELECT kind, redaction_passed, redaction_version, width FROM artifacts WHERE sha256 = ?",
                              (cand.sha256,)).fetchone()
         assert tuple(row) == ("capture", 1, "redact-v3", 8)
-        assert s.sweep(arts, [cand.sha256], backup_ok=False).skipped               # 8.6: backup failed
-        res = s.sweep(arts, [cand.sha256, kept.sha256], backup_ok=True)
-        assert res.deleted == (cand.sha256,) and res.kept == (kept.sha256,)       # open finding pins evidence
+        sets = s.conn.execute("SELECT sha256, set_path FROM artifact_sets ORDER BY sha256").fetchall()
+        assert sorted(tuple(r) for r in sets) == sorted((a.sha256, "runs/run-01") for a in (cand, base, kept))
+        now = "2026-12-31T00:00:00+00:00"
+        assert sweep(s, tmp_path / "root", [cand_of(cand)], backup_ok=False, now=now).skipped   # 8.6
+        res = sweep(s, tmp_path / "root", [cand_of(cand), cand_of(kept)], backup_ok=True, now=now)
+        assert res.deleted == (cand_of(cand),) and [k.candidate for k in res.kept] == [cand_of(kept)]   # pinned
         assert arts.path_of(cand.sha256) is None
         deleted_at = s.conn.execute("SELECT deleted_at FROM artifacts WHERE sha256 = ?", (cand.sha256,)).fetchone()
         assert deleted_at[0] is not None
@@ -123,9 +128,13 @@ def test_store_indexes_artifacts_and_sweeps_safely(tmp_path):
 
 
 
+def cand_of(a, set_path="runs/run-01"):
+    return Candidate(a.sha256, set_path, "capture", "test", "2026-12-01T00:00:00+00:00")
+
+
 def test_sweep_never_deletes_a_quarantined_object(tmp_path):
     """8.4 / 8.6: an object whose set was quarantined after a secret leak is evidence; the sweep skips it."""
-    arts = ArtifactStore(tmp_path / "objects-set", "runs/run-01")
+    arts = ArtifactStore.at(tmp_path / "root", "runs/run-01")
     with Store(tmp_path / "db" / "run.db") as s:
         s.begin_run(RunPlan("run-01", "merge", "c0ffee", "a" * 64, "b" * 64, "d00d", "auth/v1.md", 2700,
                             scope=(ScopeEntry(CID, "ws.tier-a.active-trader", "active_trader", 1, "frozen"),)))
@@ -134,11 +143,9 @@ def test_sweep_never_deletes_a_quarantined_object(tmp_path):
                               "active-trader", persona="active_trader", data_mode="frozen",
                               artifacts={"candidate": cap.sha256})
         s.write_checkpoint(o, artifacts=[cap])
-        assert s.deletable(cap.sha256)
-        s.write_artifact_set(cap.sha256, "runs/run-01")
         s.conn.execute("UPDATE artifact_sets SET quarantined_at = '2026-11-10T15:00:00Z' WHERE sha256 = ?", (cap.sha256,))
-        assert not s.deletable(cap.sha256)
-        assert s.sweep(arts, [cap.sha256], backup_ok=True).deleted == ()
+        res = sweep(s, tmp_path / "root", [cand_of(cap)], backup_ok=True, now="2026-12-31T00:00:00+00:00")
+        assert res.deleted == () and res.kept[0].reason.startswith("quarantined")
 
 # -- the plaintext put hook (6.9) and quarantine (8.4, 8.9) ---------------------------------------------------------
 
@@ -194,3 +201,13 @@ def test_quarantine_moves_the_set_marks_its_rows_and_refuses_reads_and_writes(tm
     with pytest.raises(ArtifactQuarantined):                             # a reopened set is still quarantined
         ArtifactStore(arts.root, "runs/run-01").get(cand.sha256)
     assert arts.path_of(cand.sha256) is None and not arts.unlink(cand.sha256)
+
+
+def test_an_artifact_root_on_a_share_is_refused_before_anything_is_created(tmp_path):
+    """8.2, H7, 8.9: the artifact root, like the database path, must be on a fixed local volume."""
+    with pytest.raises(ArtifactRootRefused, match="UNC"):
+        ArtifactStore("//fileserver/sentinel/runs/run-01", "runs/run-01")
+    with pytest.raises(ArtifactRootRefused):
+        ArtifactStore.at("\\\\fileserver\\sentinel", "runs/run-01")
+    assert ArtifactStore(tmp_path / "local", "runs/run-01").objects.is_dir()
+    assert ArtifactStore(tmp_path / "unchecked", "runs/run-01", require_local=False).objects.is_dir()

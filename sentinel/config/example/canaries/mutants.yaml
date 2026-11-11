@@ -1,339 +1,347 @@
-# The one mutant catalog (4.11): ids M01 to M33, classes and money_cell flags of 12.5, seed 20260101.
-# 12.5 is authoritative for ids, seed and money_cell; the bound checkpoints and regions are this example's own,
-# since the example registry holds eight surfaces. M26 to M28 and M30 drive flow.canary.ticket-stock.
-# The simulated app renders and scores every entry (pipeline.sim mutant_capture). M25 binds s07 until the lint
-# accepts checkpoint_id "*" for aa_control (SD-43; schema notation, L-MUT-01, L-XREF-04, L-XREF-11).
-- mutant_id: M01
-  name: mut.ticket.confirm-erased
-  checkpoint_id: flow/trade.order-entry.stock/flow.trade.order-ticket.stock.limit/s06
-  class: erased_control
-  mode: image
-  money_cell: true
-  generator: {op: erase, params: {fill: background_sample}, seed: 20260101}
-  region_ref: rgn.order-entry.confirm-button
-  expected: {outcomes: [invariant_violation], invariant_id: INV-10}
-  owner: sentinel-canaries
-- mutant_id: M02
-  name: mut.confirm.send-erased
-  checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
-  class: erased_control
-  mode: image
-  money_cell: true
-  generator: {op: erase, params: {fill: background_sample}, seed: 20260101}
-  region_ref: rgn.confirm.send-button
-  expected: {outcomes: [invariant_violation], invariant_id: INV-10}
-  owner: sentinel-canaries
-- mutant_id: M03
-  name: mut.confirm.qty-digit
-  checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
-  class: swapped_digit
-  mode: image
-  money_cell: true
-  generator: {op: replace_glyph, params: {from: "0", to: "8", position: last}, seed: 20260101}
-  region_ref: rgn.confirm.qty
-  expected: {outcomes: [assertion_failed], assertion_id: qty}   # quantity 100 -> 108
-  owner: sentinel-canaries
-- mutant_id: M04
-  name: mut.confirm.bp-effect-digit
-  checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
-  class: swapped_digit
-  mode: image
-  money_cell: true
-  generator: {op: replace_glyph, params: {}, seed: 20260101}
-  region_ref: rgn.confirm.bp-effect
-  expected: {outcomes: [assertion_failed], assertion_id: R02}
-  owner: sentinel-canaries
-- mutant_id: M05
-  name: mut.confirm.price-digit
-  checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
-  class: swapped_digit
-  mode: image
-  money_cell: true
-  generator: {op: replace_glyph, params: {from: "150.25", to: "150.52"}, seed: 20260101}
-  region_ref: rgn.confirm.price
-  expected: {outcomes: [assertion_failed], assertion_id: price}   # R01 fires on the cost as well
-  owner: sentinel-canaries
-- mutant_id: M06
-  name: mut.confirm.side-label
-  checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
-  class: swapped_label
-  mode: image
-  money_cell: false
-  generator: {op: overlay, params: {source: rgn.confirm.side-reverse}, seed: 20260101}   # SELL from the side toggle
-  region_ref: rgn.confirm.side
-  expected: {outcomes: [assertion_failed], assertion_id: side}
-  owner: sentinel-canaries
-- mutant_id: M07
-  name: mut.positions.pl-color-swap
-  checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
-  class: color_swap
-  mode: image
-  money_cell: false
-  generator: {op: channel_swap, params: {}, seed: 20260101}
-  region_ref: rgn.ps.pl-open
-  expected: {outcomes: [invariant_violation], invariant_id: INV-15}
-  owner: sentinel-canaries
-- mutant_id: M08
-  name: mut.ladder.shift-right
-  checkpoint_id: sweep/trade.active-trader.ladder/flexgrid/480x360
-  class: shifted_panel
-  mode: image
-  money_cell: false
-  generator: {op: translate, params: {dx: 12, fill: background_sample}, seed: 20260101}
-  region_ref: rgn.ladder.buy-mkt   # BUY MKT 12 px right into its neighbour, SELL MKT
-  expected: {outcomes: [invariant_violation], invariant_id: INV-01}
-  owner: sentinel-canaries
-- mutant_id: M09
-  name: mut.positions.grid-down
-  checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
-  class: shifted_panel
-  mode: image
-  money_cell: false
-  generator: {op: translate, params: {dy: 8}, seed: 20260101}
-  region_ref: rgn.ps.trade-price
-  expected: {outcomes: [collateral]}   # a layout_shift finding as well
-  owner: sentinel-canaries
-- mutant_id: M10
-  name: mut.positions.header-clipped
-  checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
-  class: clipped_label
-  mode: image
-  money_cell: false
-  generator: {op: crop_right, params: {style: crop}, seed: 20260101}
-  region_ref: rgn.ps.header-mark   # "Mark" cut to a prefix in its header cell
-  expected: {outcomes: [invariant_violation], invariant_id: INV-03}
-  owner: sentinel-canaries
-- mutant_id: M11
-  name: mut.ladder.header-ellipsis
-  checkpoint_id: flow/trade.active-trader.ladder/flow.trade.active-trader.read-back/cp-ladder
-  class: clipped_label
-  mode: image
-  money_cell: false
-  generator: {op: crop_right, params: {style: ellipsis}, seed: 20260101}
-  region_ref: rgn.ladder.header-ask   # "Ask Size" ends in an ellipsis
-  expected: {outcomes: [invariant_violation], invariant_id: INV-04}
-  owner: sentinel-canaries
-- mutant_id: M12
-  name: mut.ladder.overlap-grid
-  checkpoint_id: sweep/charts.flexible-grid.active-trader-cell/flexgrid/480x360
-  class: overlapped_panels
-  mode: image
-  money_cell: false
-  generator: {op: translate, params: {dy: -14, layer: rgn.ladder.viewport, fill: background_sample}, seed: 20260101}
-  region_ref: rgn.ladder.order-strip
-  expected: {outcomes: [invariant_violation, collateral], invariant_id: INV-01}   # the acceptance mutant of 10.10; INV-03 and INV-11 fire as well
-  owner: sentinel-canaries
-- mutant_id: M13
-  name: mut.positions.row-removed
-  checkpoint_id: flow/monitor.activity.position-statement/flow.trade.active-trader.read-back/cp-positions   # R08 is asserted here
-  class: missing_row
-  mode: image
-  money_cell: false
-  generator: {op: remove_row, params: {}, seed: 20260101}
-  region_ref: rgn.ps.trade-price
-  expected: {outcomes: [assertion_failed], assertion_id: pl_math}   # the R08 assertion of cp-positions
-  owner: sentinel-canaries
-- mutant_id: M14
-  name: mut.chart.header-date
-  checkpoint_id: census/charts.flexible-grid.chart-cell/ws.tier-a.swing-trader
-  class: header_change
-  mode: image
-  money_cell: false
-  generator: {op: replace_glyph, params: {}, seed: 20260101}
-  region_ref: rgn.chart.header
-  expected: {outcomes: [collateral]}
-  owner: sentinel-canaries
-- mutant_id: M15
-  name: mut.positions.placeholder
-  checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
-  class: placeholder
-  mode: image
-  money_cell: false
-  generator: {op: overlay, params: {text: "Loading..."}, seed: 20260101}
-  region_ref: rgn.ps.mark
-  expected: {outcomes: [invariant_violation], invariant_id: INV-08}
-  owner: sentinel-canaries
-- mutant_id: M16
-  name: mut.positions.font-height
-  checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
-  class: font_height
-  mode: image
-  money_cell: false
-  generator: {op: overlay, params: {cap_height: 5}, seed: 20260101}
-  region_ref: rgn.ps.header   # a declared one-row text region (SD-90)
-  expected: {outcomes: [invariant_violation], invariant_id: INV-07}
-  owner: sentinel-canaries
-- mutant_id: M17
-  name: mut.ladder.scrollbar
-  checkpoint_id: flow/trade.active-trader.ladder/flow.trade.active-trader.read-back/cp-ladder
-  class: scrollbar
-  mode: image
-  money_cell: false
-  generator: {op: overlay, params: {width: 12}, seed: 20260101}
-  region_ref: rgn.ladder.viewport
-  expected: {outcomes: [invariant_violation], invariant_id: INV-06}
-  owner: sentinel-canaries
-- mutant_id: M18
-  name: mut.positions.label-erased
-  checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
-  class: erased_control
-  mode: image
-  money_cell: false
-  generator: {op: erase, params: {}, seed: 20260101}
-  region_ref: rgn.ps.header
-  expected: {outcomes: [invariant_violation], invariant_id: INV-05}
-  owner: sentinel-canaries
-- mutant_id: M19
-  name: mut.confirm.account-unredacted
-  checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
-  class: redaction
-  mode: image
-  money_cell: false
-  generator: {op: overlay, params: {}, seed: 20260101}
-  region_ref: rgn.confirm.title
-  expected: {outcomes: [identical]}   # proven by the redaction hit and the egress log (6.10); a miss is harness_error safety_canary_blind:redaction
-  owner: sentinel-canaries
-- mutant_id: M20
-  name: mut.ticket.divider-subfloor
-  checkpoint_id: flow/trade.order-entry.stock/flow.trade.order-ticket.stock.limit/s06
-  class: sub_floor
-  mode: image
-  money_cell: false
-  generator: {op: translate, params: {dx: 1}, seed: 20260101}
-  region_ref: rgn.order-entry.divider
-  expected: {outcomes: [identical, noise]}   # control: absorbed below threshold; any finding is the miss
-  owner: sentinel-canaries
-- mutant_id: M21
-  name: mut.chart.global-shift
-  checkpoint_id: census/charts.flexible-grid.chart-cell/ws.tier-a.swing-trader
-  class: global_shift
-  mode: image
-  money_cell: false
-  generator: {op: translate, params: {dx: 1}, seed: 20260101}
-  region_ref: rgn.chart.plot
-  expected: {outcomes: [needs_human]}   # one global_shift cluster under the run-level global_rendering_shift finding
-  owner: sentinel-canaries
-- mutant_id: M22
-  name: mut.confirm.title-erased
-  checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
-  class: landmark_loss
-  mode: image
-  money_cell: false
-  generator: {op: erase, params: {}, seed: 20260101}
-  region_ref: rgn.confirm.title
-  expected: {outcomes: [landmark_missing]}   # never a blind diff
-  owner: sentinel-canaries
-- mutant_id: M23
-  name: mut.positions.red-plus-six
-  checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
-  class: global_shift
-  mode: image
-  money_cell: false
-  generator: {op: channel_swap, params: {channel: red, delta: 6}, seed: 20260101}
-  region_ref: rgn.ps.mark
-  expected: {outcomes: [needs_human]}   # color_shift findings; zero component findings
-  owner: sentinel-canaries
-- mutant_id: M24
-  name: mut.chart.study-removed
-  checkpoint_id: census/charts.flexible-grid.chart-cell/ws.tier-a.swing-trader
-  class: study_removed
-  mode: image
-  money_cell: false
-  generator: {op: erase, params: {color: [255, 200, 0]}, seed: 20260101}
-  region_ref: rgn.chart.plot
-  expected: {outcomes: [collateral]}
-  owner: sentinel-canaries
-- mutant_id: M25
-  name: mut.confirm.aa-control
-  checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
-  class: aa_control
-  mode: image
-  money_cell: false
-  generator: {op: translate, params: {}, seed: 20260101}
-  region_ref: rgn.confirm.symbol
-  expected: {outcomes: [identical]}   # control: the approved capture injected unchanged
-  owner: sentinel-canaries
-- mutant_id: M26
-  name: mut.canary.wrong-quantity
-  checkpoint_id: flow/trade.order-entry.stock/flow.canary.ticket-stock/cp-ready
-  class: wrong_quantity
-  mode: behavioral
-  money_cell: true
-  generator: {op: type_value, params: {value: "10"}, seed: 20260101}
-  region_ref: rgn.order-entry.qty
-  canary_flow: flow.canary.ticket-stock
-  expected: {outcomes: [assertion_failed], assertion_id: qty}
-  owner: sentinel-canaries
-- mutant_id: M27
-  name: mut.canary.blank-price
-  checkpoint_id: flow/trade.order-entry.stock/flow.canary.ticket-stock/cp-ready
-  class: blank_field
-  mode: behavioral
-  money_cell: false
-  generator: {op: type_value, params: {}, seed: 20260101}
-  region_ref: rgn.order-entry.price
-  canary_flow: flow.canary.ticket-stock
-  expected: {outcomes: [assertion_failed], assertion_id: price}
-  owner: sentinel-canaries
-- mutant_id: M28
-  name: mut.canary.gateway-template
-  checkpoint_id: flow/trade.order-entry.stock/flow.canary.ticket-stock/cp-ready
-  class: gateway
-  mode: behavioral
-  money_cell: true
-  generator: {op: overlay, params: {}, seed: 20260101}
-  region_ref: rgn.order-entry.confirm-button
-  canary_flow: flow.canary.ticket-stock
-  expected: {outcomes: [landmark_missing]}   # the step ends blocked_by_gateway and no click is emitted
-  owner: sentinel-canaries
-- mutant_id: M29
-  name: mut.ladder.outside-parent
-  checkpoint_id: sweep/trade.active-trader.ladder/flexgrid/480x360
-  class: outside_parent
-  mode: image
-  money_cell: false
-  generator: {op: translate, params: {parent: rgn.ladder.order-strip, distance: 6}, seed: 20260101}
-  region_ref: rgn.ladder.buy-mkt   # BUY MKT 6 px toward the strip's nearest border, across it
-  expected: {outcomes: [invariant_violation], invariant_id: INV-02}
-  owner: sentinel-canaries
-- mutant_id: M30
-  name: mut.canary.window-offscreen
-  checkpoint_id: flow/trade.order-entry.stock/flow.canary.ticket-stock/cp-ready
-  class: window_offscreen
-  mode: behavioral
-  money_cell: false
-  generator: {op: translate, params: {x: -200}, seed: 20260101}
-  region_ref: rgn.order-entry.header-symbol
-  canary_flow: flow.canary.ticket-stock
-  expected: {outcomes: [invariant_violation], invariant_id: INV-09}
-  owner: sentinel-canaries
-- mutant_id: M31
-  name: mut.positions.misaligned-cell
-  checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
-  class: misaligned_column
-  mode: image
-  money_cell: false
-  generator: {op: translate, params: {dx: 3}, seed: 20260101}
-  region_ref: rgn.ps.trade-price-r3   # one numeric cell of the Trade Price column
-  expected: {outcomes: [invariant_violation], invariant_id: INV-12}
-  owner: sentinel-canaries
-- mutant_id: M32
-  name: mut.ticket.focus-order
-  checkpoint_id: flow/trade.order-entry.stock/flow.trade.order-ticket.stock.limit/s06
-  class: focus_order
-  mode: image
-  money_cell: false
-  generator: {op: overlay, params: {donor_checkpoint: flow/trade.order-entry.stock/flow.trade.order-ticket.stock.limit/s03}, seed: 20260101}
-  region_ref: rgn.order-entry.tif
-  expected: {outcomes: [invariant_violation], invariant_id: INV-13}
-  owner: sentinel-canaries
-- mutant_id: M33
-  name: mut.positions.error-dialog
-  checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
-  class: error_dialog
-  mode: image
-  money_cell: false
-  generator: {op: overlay, params: {}, seed: 20260101}
-  region_ref: rgn.ps.mark
-  expected: {outcomes: [invariant_violation], invariant_id: INV-14}
-  owner: sentinel-canaries
+# The one mutant catalog (4.11), in the {schema_version, entries} form of SD-47: ids M01 to M33, classes and
+# money_cell flags of 12.5, seed 20260101. 12.5 is authoritative for ids, classes, seed and money_cell. Deviations of
+# this example from the 12.5 rows, because the example registry holds eight of the 12.4 surfaces (the starter tree
+# config/starter/canaries/mutants.yaml binds every row to its 12.5 checkpoint):
+# - M10, M11, M13 to M19, M21, M24, M28, M30, M32 and M33 are bound to checkpoints of this example's own;
+# - M13 and M14 assert R04 on the option chain census in 12.5 (strike count, expiration list); the example has no
+#   option chain, so M13 asserts the R08 P/L math on the position statement read-back and M14 expects collateral on
+#   the chart cell;
+# - M25 binds s07 instead of checkpoint_id "*" (SD-43), since the simulated Nightly plans bound checkpoints only.
+# M26 to M28 and M30 drive flow.canary.ticket-stock. The simulated app renders and scores every entry (pipeline.sim
+# mutant_capture).
+schema_version: 1
+entries:
+  - mutant_id: M01
+    name: mut.ticket.confirm-erased
+    checkpoint_id: flow/trade.order-entry.stock/flow.trade.order-ticket.stock.limit/s06
+    class: erased_control
+    mode: image
+    money_cell: true
+    generator: {op: erase, params: {fill: background_sample}, seed: 20260101}
+    region_ref: rgn.order-entry.confirm-button
+    expected: {outcomes: [invariant_violation], invariant_id: INV-10}
+    owner: sentinel-canaries
+  - mutant_id: M02
+    name: mut.confirm.send-erased
+    checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
+    class: erased_control
+    mode: image
+    money_cell: true
+    generator: {op: erase, params: {fill: background_sample}, seed: 20260101}
+    region_ref: rgn.confirm.send-button
+    expected: {outcomes: [invariant_violation], invariant_id: INV-10}
+    owner: sentinel-canaries
+  - mutant_id: M03
+    name: mut.confirm.qty-digit
+    checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
+    class: swapped_digit
+    mode: image
+    money_cell: true
+    generator: {op: replace_glyph, params: {from: "0", to: "8", position: last}, seed: 20260101}
+    region_ref: rgn.confirm.qty
+    expected: {outcomes: [assertion_failed], assertion_id: qty}   # quantity 100 -> 108
+    owner: sentinel-canaries
+  - mutant_id: M04
+    name: mut.confirm.bp-effect-digit
+    checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
+    class: swapped_digit
+    mode: image
+    money_cell: true
+    generator: {op: replace_glyph, params: {}, seed: 20260101}
+    region_ref: rgn.confirm.bp-effect
+    expected: {outcomes: [assertion_failed], assertion_id: R02}
+    owner: sentinel-canaries
+  - mutant_id: M05
+    name: mut.confirm.price-digit
+    checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
+    class: swapped_digit
+    mode: image
+    money_cell: true
+    generator: {op: replace_glyph, params: {from: "150.25", to: "150.52"}, seed: 20260101}
+    region_ref: rgn.confirm.price
+    expected: {outcomes: [assertion_failed], assertion_id: price}   # R01 fires on the cost as well
+    owner: sentinel-canaries
+  - mutant_id: M06
+    name: mut.confirm.side-label
+    checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
+    class: swapped_label
+    mode: image
+    money_cell: false
+    generator: {op: overlay, params: {source: rgn.confirm.side-reverse}, seed: 20260101}   # SELL from the side toggle
+    region_ref: rgn.confirm.side
+    expected: {outcomes: [assertion_failed], assertion_id: side}
+    owner: sentinel-canaries
+  - mutant_id: M07
+    name: mut.positions.pl-color-swap
+    checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
+    class: color_swap
+    mode: image
+    money_cell: false
+    generator: {op: channel_swap, params: {}, seed: 20260101}
+    region_ref: rgn.ps.pl-open
+    expected: {outcomes: [invariant_violation], invariant_id: INV-15}
+    owner: sentinel-canaries
+  - mutant_id: M08
+    name: mut.ladder.shift-right
+    checkpoint_id: sweep/trade.active-trader.ladder/flexgrid/480x360
+    class: shifted_panel
+    mode: image
+    money_cell: false
+    generator: {op: translate, params: {dx: 12, fill: background_sample}, seed: 20260101}
+    region_ref: rgn.ladder.buy-mkt   # BUY MKT 12 px right into its neighbour, SELL MKT
+    expected: {outcomes: [invariant_violation], invariant_id: INV-01}
+    owner: sentinel-canaries
+  - mutant_id: M09
+    name: mut.positions.grid-down
+    checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
+    class: shifted_panel
+    mode: image
+    money_cell: false
+    generator: {op: translate, params: {dy: 8}, seed: 20260101}
+    region_ref: rgn.ps.trade-price
+    expected: {outcomes: [collateral]}   # a layout_shift finding as well
+    owner: sentinel-canaries
+  - mutant_id: M10
+    name: mut.positions.header-clipped
+    checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
+    class: clipped_label
+    mode: image
+    money_cell: false
+    generator: {op: crop_right, params: {style: crop}, seed: 20260101}
+    region_ref: rgn.ps.header-mark   # "Mark" cut to a prefix in its header cell
+    expected: {outcomes: [invariant_violation], invariant_id: INV-03}
+    owner: sentinel-canaries
+  - mutant_id: M11
+    name: mut.ladder.header-ellipsis
+    checkpoint_id: flow/trade.active-trader.ladder/flow.trade.active-trader.read-back/cp-ladder
+    class: clipped_label
+    mode: image
+    money_cell: false
+    generator: {op: crop_right, params: {style: ellipsis}, seed: 20260101}
+    region_ref: rgn.ladder.header-ask   # "Ask Size" ends in an ellipsis
+    expected: {outcomes: [invariant_violation], invariant_id: INV-04}
+    owner: sentinel-canaries
+  - mutant_id: M12
+    name: mut.ladder.overlap-grid
+    checkpoint_id: sweep/charts.flexible-grid.active-trader-cell/flexgrid/480x360
+    class: overlapped_panels
+    mode: image
+    money_cell: false
+    generator: {op: translate, params: {dy: -14, layer: rgn.ladder.viewport, fill: background_sample}, seed: 20260101}
+    region_ref: rgn.ladder.order-strip
+    expected: {outcomes: [invariant_violation, collateral], invariant_id: INV-01}   # the acceptance mutant of 10.10; INV-03 and INV-11 fire as well
+    owner: sentinel-canaries
+  - mutant_id: M13
+    name: mut.positions.row-removed
+    checkpoint_id: flow/monitor.activity.position-statement/flow.trade.active-trader.read-back/cp-positions   # R08 is asserted here
+    class: missing_row
+    mode: image
+    money_cell: false
+    generator: {op: remove_row, params: {}, seed: 20260101}
+    region_ref: rgn.ps.trade-price
+    expected: {outcomes: [assertion_failed], assertion_id: pl_math}   # the R08 assertion of cp-positions
+    owner: sentinel-canaries
+  - mutant_id: M14
+    name: mut.chart.header-date
+    checkpoint_id: census/charts.flexible-grid.chart-cell/ws.tier-a.swing-trader
+    class: header_change
+    mode: image
+    money_cell: false
+    generator: {op: replace_glyph, params: {}, seed: 20260101}
+    region_ref: rgn.chart.header
+    expected: {outcomes: [collateral]}
+    owner: sentinel-canaries
+  - mutant_id: M15
+    name: mut.positions.placeholder
+    checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
+    class: placeholder
+    mode: image
+    money_cell: false
+    generator: {op: overlay, params: {text: "Loading..."}, seed: 20260101}
+    region_ref: rgn.ps.mark
+    expected: {outcomes: [invariant_violation], invariant_id: INV-08}
+    owner: sentinel-canaries
+  - mutant_id: M16
+    name: mut.positions.font-height
+    checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
+    class: font_height
+    mode: image
+    money_cell: false
+    generator: {op: overlay, params: {cap_height: 5}, seed: 20260101}
+    region_ref: rgn.ps.header   # a declared one-row text region (SD-90)
+    expected: {outcomes: [invariant_violation], invariant_id: INV-07}
+    owner: sentinel-canaries
+  - mutant_id: M17
+    name: mut.ladder.scrollbar
+    checkpoint_id: flow/trade.active-trader.ladder/flow.trade.active-trader.read-back/cp-ladder
+    class: scrollbar
+    mode: image
+    money_cell: false
+    generator: {op: overlay, params: {width: 12}, seed: 20260101}
+    region_ref: rgn.ladder.viewport
+    expected: {outcomes: [invariant_violation], invariant_id: INV-06}
+    owner: sentinel-canaries
+  - mutant_id: M18
+    name: mut.positions.label-erased
+    checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
+    class: erased_control
+    mode: image
+    money_cell: false
+    generator: {op: erase, params: {}, seed: 20260101}
+    region_ref: rgn.ps.header
+    expected: {outcomes: [invariant_violation], invariant_id: INV-05}
+    owner: sentinel-canaries
+  - mutant_id: M19
+    name: mut.confirm.account-unredacted
+    checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
+    class: redaction
+    mode: image
+    money_cell: false
+    generator: {op: overlay, params: {}, seed: 20260101}
+    region_ref: rgn.confirm.title
+    expected: {outcomes: [identical]}   # proven by the redaction hit and the egress log (6.10); a miss is harness_error safety_canary_blind:redaction
+    owner: sentinel-canaries
+  - mutant_id: M20
+    name: mut.ticket.divider-subfloor
+    checkpoint_id: flow/trade.order-entry.stock/flow.trade.order-ticket.stock.limit/s06
+    class: sub_floor
+    mode: image
+    money_cell: false
+    generator: {op: translate, params: {dx: 1}, seed: 20260101}
+    region_ref: rgn.order-entry.divider
+    expected: {outcomes: [identical, noise]}   # control: absorbed below threshold; any finding is the miss
+    owner: sentinel-canaries
+  - mutant_id: M21
+    name: mut.chart.global-shift
+    checkpoint_id: census/charts.flexible-grid.chart-cell/ws.tier-a.swing-trader
+    class: global_shift
+    mode: image
+    money_cell: false
+    generator: {op: translate, params: {dx: 1}, seed: 20260101}
+    region_ref: rgn.chart.plot
+    expected: {outcomes: [needs_human]}   # one global_shift cluster under the run-level global_rendering_shift finding
+    owner: sentinel-canaries
+  - mutant_id: M22
+    name: mut.confirm.title-erased
+    checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
+    class: landmark_loss
+    mode: image
+    money_cell: false
+    generator: {op: erase, params: {}, seed: 20260101}
+    region_ref: rgn.confirm.title
+    expected: {outcomes: [landmark_missing]}   # never a blind diff
+    owner: sentinel-canaries
+  - mutant_id: M23
+    name: mut.positions.red-plus-six
+    checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
+    class: global_shift
+    mode: image
+    money_cell: false
+    generator: {op: channel_swap, params: {channel: red, delta: 6}, seed: 20260101}
+    region_ref: rgn.ps.mark
+    expected: {outcomes: [needs_human]}   # color_shift findings; zero component findings
+    owner: sentinel-canaries
+  - mutant_id: M24
+    name: mut.chart.study-removed
+    checkpoint_id: census/charts.flexible-grid.chart-cell/ws.tier-a.swing-trader
+    class: study_removed
+    mode: image
+    money_cell: false
+    generator: {op: erase, params: {color: [255, 200, 0]}, seed: 20260101}
+    region_ref: rgn.chart.plot
+    expected: {outcomes: [collateral]}
+    owner: sentinel-canaries
+  - mutant_id: M25
+    name: mut.confirm.aa-control
+    checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
+    class: aa_control
+    mode: image
+    money_cell: false
+    generator: {op: translate, params: {}, seed: 20260101}
+    region_ref: rgn.confirm.symbol
+    expected: {outcomes: [identical]}   # control: the approved capture injected unchanged
+    owner: sentinel-canaries
+  - mutant_id: M26
+    name: mut.canary.wrong-quantity
+    checkpoint_id: flow/trade.order-entry.stock/flow.canary.ticket-stock/cp-ready
+    class: wrong_quantity
+    mode: behavioral
+    money_cell: true
+    generator: {op: type_value, params: {value: "10"}, seed: 20260101}
+    region_ref: rgn.order-entry.qty
+    canary_flow: flow.canary.ticket-stock
+    expected: {outcomes: [assertion_failed], assertion_id: qty}
+    owner: sentinel-canaries
+  - mutant_id: M27
+    name: mut.canary.blank-price
+    checkpoint_id: flow/trade.order-entry.stock/flow.canary.ticket-stock/cp-ready
+    class: blank_field
+    mode: behavioral
+    money_cell: false
+    generator: {op: type_value, params: {}, seed: 20260101}
+    region_ref: rgn.order-entry.price
+    canary_flow: flow.canary.ticket-stock
+    expected: {outcomes: [assertion_failed], assertion_id: price}
+    owner: sentinel-canaries
+  - mutant_id: M28
+    name: mut.canary.gateway-template
+    checkpoint_id: flow/trade.order-entry.stock/flow.canary.ticket-stock/cp-ready
+    class: gateway
+    mode: behavioral
+    money_cell: true
+    generator: {op: overlay, params: {}, seed: 20260101}
+    region_ref: rgn.order-entry.confirm-button
+    canary_flow: flow.canary.ticket-stock
+    expected: {outcomes: [landmark_missing]}   # the step ends blocked_by_gateway and no click is emitted
+    owner: sentinel-canaries
+  - mutant_id: M29
+    name: mut.ladder.outside-parent
+    checkpoint_id: sweep/trade.active-trader.ladder/flexgrid/480x360
+    class: outside_parent
+    mode: image
+    money_cell: false
+    generator: {op: translate, params: {parent: rgn.ladder.order-strip, distance: 6}, seed: 20260101}
+    region_ref: rgn.ladder.buy-mkt   # BUY MKT 6 px toward the strip's nearest border, across it
+    expected: {outcomes: [invariant_violation], invariant_id: INV-02}
+    owner: sentinel-canaries
+  - mutant_id: M30
+    name: mut.canary.window-offscreen
+    checkpoint_id: flow/trade.order-entry.stock/flow.canary.ticket-stock/cp-ready
+    class: window_offscreen
+    mode: behavioral
+    money_cell: false
+    generator: {op: translate, params: {x: -200}, seed: 20260101}
+    region_ref: rgn.order-entry.header-symbol
+    canary_flow: flow.canary.ticket-stock
+    expected: {outcomes: [invariant_violation], invariant_id: INV-09}
+    owner: sentinel-canaries
+  - mutant_id: M31
+    name: mut.positions.misaligned-cell
+    checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
+    class: misaligned_column
+    mode: image
+    money_cell: false
+    generator: {op: translate, params: {dx: 3}, seed: 20260101}
+    region_ref: rgn.ps.trade-price-r3   # one numeric cell of the Trade Price column
+    expected: {outcomes: [invariant_violation], invariant_id: INV-12}
+    owner: sentinel-canaries
+  - mutant_id: M32
+    name: mut.ticket.focus-order
+    checkpoint_id: flow/trade.order-entry.stock/flow.trade.order-ticket.stock.limit/s06
+    class: focus_order
+    mode: image
+    money_cell: false
+    generator: {op: overlay, params: {donor_checkpoint: flow/trade.order-entry.stock/flow.trade.order-ticket.stock.limit/s03}, seed: 20260101}
+    region_ref: rgn.order-entry.tif
+    expected: {outcomes: [invariant_violation], invariant_id: INV-13}
+    owner: sentinel-canaries
+  - mutant_id: M33
+    name: mut.positions.error-dialog
+    checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
+    class: error_dialog
+    mode: image
+    money_cell: false
+    generator: {op: overlay, params: {}, seed: 20260101}
+    region_ref: rgn.ps.mark
+    expected: {outcomes: [invariant_violation], invariant_id: INV-14}
+    owner: sentinel-canaries

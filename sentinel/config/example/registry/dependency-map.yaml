@@ -1,5 +1,7 @@
 # Which surfaces consume which hosting primitive (4.4). Source packages are filled from the Phase 0
-# jar listing (11.8); the 12.9 starter wrote them as TBD.<area>.** placeholders.
+# jar listing (11.8); the 12.9 starter wrote them as TBD.<area>.** placeholders. The edges of the 12.4 surfaces this
+# example holds are the 12.9 edges (FontMetrics and Theme global); the Flexible Grid cells charts.flexible-grid.*-cell
+# are tier-2 surfaces with edges of this example's own. ChartEngine has no edge here and is left out.
 schema_version: 1
 primitives:
   - id: FlexibleGrid
@@ -19,6 +21,27 @@ primitives:
     source_packages: ["com.tos.desktop.ui.laf.**"]
     owner: ui-platform
     global: true
+  - id: FontMetrics
+    description: Font set, sizes and text measurement for every text-bearing surface
+    source_packages: ["com.tos.desktop.ui.text.**"]
+    owner: ui-platform
+    global: true
+  - id: Docking
+    description: Detach, dock and tab-host behavior for every movable panel
+    source_packages: ["com.tos.desktop.ui.docking.**"]
+    owner: ui-platform
+  - id: ColumnModel
+    description: Shared column layout, sorting and sizing for data grids
+    source_packages: ["com.tos.desktop.ui.table.**"]
+    owner: data-ui
+  - id: SymbolLinking
+    description: Link groups and symbol propagation between gadgets
+    source_packages: ["com.tos.desktop.ui.linking.**"]
+    owner: ui-platform
+  - id: QuoteStream
+    description: Quote subscription, flashing and value formatting for live cells
+    source_packages: ["com.tos.desktop.data.quotes.**"]
+    owner: data-ui
 edges:
   - {primitive: FlexibleGrid, surface: trade.active-trader.ladder, source: declared, confidence: 1.0,
      confirmed_from_source: true, confirmed_build: main-1998.2.0-4f1c9a2,
@@ -49,3 +72,34 @@ edges:
   - {primitive: Theme, surface: "*", source: declared, confidence: 1.0,
      reason: properties-driven theming is invisible to the scan,
      first_seen: 2026-10-01T09:00:00-04:00, last_verified: 2026-11-02T03:10:00-05:00}
+  - {primitive: Docking, surface: trade.active-trader.ladder, source: declared, confidence: 1.0,
+     first_seen: 2026-11-09T09:00:00-05:00, last_verified: 2026-11-09T09:00:00-05:00}
+  - {primitive: Docking, surface: charts.flexible-grid.active-trader-cell, source: declared, confidence: 1.0,
+     first_seen: 2026-11-09T09:00:00-05:00, last_verified: 2026-11-09T09:00:00-05:00}
+  - {primitive: Docking, surface: monitor.activity.position-statement, source: declared, confidence: 1.0,
+     first_seen: 2026-11-09T09:00:00-05:00, last_verified: 2026-11-09T09:00:00-05:00}
+  - {primitive: ColumnModel, surface: monitor.activity.position-statement, source: declared, confidence: 1.0,
+     first_seen: 2026-11-09T09:00:00-05:00, last_verified: 2026-11-09T09:00:00-05:00}
+  - {primitive: ColumnModel, surface: trade.active-trader.ladder, source: declared, confidence: 1.0,
+     first_seen: 2026-11-09T09:00:00-05:00, last_verified: 2026-11-09T09:00:00-05:00}
+  - {primitive: ColumnModel, surface: charts.flexible-grid.active-trader-cell, source: declared, confidence: 1.0,
+     first_seen: 2026-11-09T09:00:00-05:00, last_verified: 2026-11-09T09:00:00-05:00}
+  - {primitive: SymbolLinking, surface: trade.active-trader.ladder, source: declared, confidence: 1.0,
+     first_seen: 2026-11-09T09:00:00-05:00, last_verified: 2026-11-09T09:00:00-05:00}
+  - {primitive: SymbolLinking, surface: charts.flexible-grid.active-trader-cell, source: declared, confidence: 1.0,
+     first_seen: 2026-11-09T09:00:00-05:00, last_verified: 2026-11-09T09:00:00-05:00}
+  - {primitive: SymbolLinking, surface: trade.order-entry.stock, source: declared, confidence: 1.0,
+     first_seen: 2026-11-09T09:00:00-05:00, last_verified: 2026-11-09T09:00:00-05:00}
+  - {primitive: QuoteStream, surface: trade.active-trader.ladder, source: declared, confidence: 1.0,
+     first_seen: 2026-11-09T09:00:00-05:00, last_verified: 2026-11-09T09:00:00-05:00}
+  - {primitive: QuoteStream, surface: charts.flexible-grid.active-trader-cell, source: declared, confidence: 1.0,
+     first_seen: 2026-11-09T09:00:00-05:00, last_verified: 2026-11-09T09:00:00-05:00}
+  - {primitive: QuoteStream, surface: monitor.activity.position-statement, source: declared, confidence: 1.0,
+     first_seen: 2026-11-09T09:00:00-05:00, last_verified: 2026-11-09T09:00:00-05:00}
+  - {primitive: QuoteStream, surface: trade.order-entry.stock, source: declared, confidence: 1.0,
+     first_seen: 2026-11-09T09:00:00-05:00, last_verified: 2026-11-09T09:00:00-05:00}
+  - {primitive: QuoteStream, surface: dialog.order-confirmation, source: declared, confidence: 1.0,
+     first_seen: 2026-11-09T09:00:00-05:00, last_verified: 2026-11-09T09:00:00-05:00}
+  - {primitive: FontMetrics, surface: "*", source: declared, confidence: 1.0,
+     reason: every text-bearing surface measures text through it,
+     first_seen: 2026-11-09T09:00:00-05:00, last_verified: 2026-11-09T09:00:00-05:00}

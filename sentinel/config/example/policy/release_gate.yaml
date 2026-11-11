@@ -1,5 +1,9 @@
-# Business days of sign-off lead before GA per release train (11.2, 10.9).
+# Business days of sign-off lead before GA per release train, with GA and RC cut dates (4.16, 11.1 PA-14, 11.2, 10.9).
+# The RC report is signed at 17:00 America/New_York on G-N (N XNYS business days before GA); the RC start deadline is
+# that time minus 8 hours. Without this file N = 3 and an RC cut at G-7 are assumed and printed in the RC report header.
 schema_version: 1
 default_business_days: 3
-trains: []
+trains:
+  - {train: "2026.12", ga_date: 2026-12-10, rc_cut_date: 2026-12-01}
+  - {train: "2027.01", ga_date: 2027-01-14, rc_cut_date: 2027-01-05, business_days: 4}
 owner: release.manager            # the release manager (9.12)

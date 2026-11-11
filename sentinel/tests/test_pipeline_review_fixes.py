@@ -64,3 +64,60 @@ def test_a_stop_during_a_sweep_ladder_trips_at_the_next_ladder_step(tmp_path):
     assert {(o.outcome, o.reason, o.gate) for o in ladder.values()} == {("env_error", "kill_switch", "running")}
     assert not [o for o in ladder.values() if o.artifacts]
 
+
+STOCK_FLOW = "flow.trade.order-ticket.stock.limit"
+
+
+def _drop_first_tab(monkeypatch, reason: str, times: int = 1) -> list:
+    """The hook drops the decisions of the first `times` Tab actions (the stock flow's step s04) for `reason`."""
+    from sentinel.orchestrator import simrig
+    from sentinel.orchestrator.gateway import VK_TAB, HookDecision
+    real = simrig.SimulatedRig._send_input
+    fired: list = []
+
+    def send_input(self, action, *, events=()):
+        res = real(self, action, events=events)
+        if len(fired) < times and action.keys == (VK_TAB,) and res.decisions:
+            fired.append(action)
+            res = dataclasses.replace(res, decisions=tuple(HookDecision(False, reason, d.token_id)
+                                                           for d in res.decisions))
+        return res
+
+    monkeypatch.setattr(simrig.SimulatedRig, "_send_input", send_input)
+    return fired
+
+
+def _stock_run(tmp_path):
+    from sentinel.demo import operator_stop_scenario
+    from sentinel.pipeline.orchestration import RigScript
+    from sentinel.store import Store
+    sc = dataclasses.replace(operator_stop_scenario(TODAY), rig=RigScript(), name="gateway-drop")
+    r = pipeline_run.run_pipeline(EXAMPLE, sc, tmp_path, TODAY)
+    with Store(tmp_path / "sentinel.db") as store:
+        summary = store.run_summary(sc.run_id)
+    stock = {o.checkpoint_id.rsplit("/", 1)[1]: (o.outcome, o.reason) for o in r.outcomes
+             if STOCK_FLOW in o.checkpoint_id}
+    return r, summary, stock
+
+
+def test_an_own_token_integrity_drop_is_retried_once_and_the_flow_goes_on(tmp_path, monkeypatch):
+    """pipeline:3 (1.10 blocked_by_gateway, 5.4.3 stage 7; closed by the wave-2 Executor): one `token_expired` drop
+    of the step's own token gets the single retry; the step passes after it with a `gateway_integrity` finding, the
+    flow's later checkpoints are captured and the post-run check passes."""
+    fired = _drop_first_tab(monkeypatch, "token_expired")
+    r, summary, stock = _stock_run(tmp_path)
+    assert len(fired) == 1
+    assert (r.status, r.reason) == ("complete", None) and "post_run_check" not in summary
+    assert stock == {"s03": ("identical", None), "s06": ("identical", None), "s07": ("identical", None)}
+    assert any(f.kind == "gateway_integrity" and "retried once" in f.description for f in r.findings)
+
+
+def test_an_uncounted_gateway_drop_ends_the_flow_with_an_outcome_for_every_later_checkpoint(tmp_path, monkeypatch):
+    """pipeline:3 (2.6, 1.10, L-OUT-07; closed by the wave-2 Executor): a `deny_all` drop blocks the step without
+    stopping the shard; the flow's later checkpoints are `not_run (step_failed:s04)`, so every scoped checkpoint has its
+    record and the run is not `aborted_harness (taxonomy_check_failed)`."""
+    _drop_first_tab(monkeypatch, "deny_all")
+    r, summary, stock = _stock_run(tmp_path)
+    assert (r.status, r.reason) == ("complete", None) and "post_run_check" not in summary
+    assert stock == {"s03": ("identical", None), "s06": ("not_run", "step_failed:s04"),
+                     "s07": ("not_run", "step_failed:s04")}

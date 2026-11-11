@@ -152,6 +152,37 @@ def test_order_stage_steps_inside_a_flow_stop_at_the_cap_and_the_last_event_ends
     assert report.verdict.reason == "rate_cap" and "system_owner" in cap.alert.notified
 
 
+def test_a2_rides_on_every_boundary_assertion_and_selects_the_roles_account_once():
+    """session:4: a flow left the GOLDEN account selected while the run's role is EMPTY. The next boundary's assertion
+    runs A2 too: it selects EMPTY once and re-reads; when the selection does not take, the run is env_error
+    (gate: fixture_verified) before any order-stage step runs on the wrong account."""
+    from sentinel.orchestrator.simrig import GOLDEN
+
+    def work(orch: Orchestrator) -> None:
+        assert orch.flow_boundary(flow_id="flow.a") is None
+        orch.rig.selected = GOLDEN
+        assert orch.flow_boundary(flow_id="flow.b") is None and orch.rig.selected == EMPTY
+        assert orch.safety.account_id_sha256 == paper_stamp(EMPTY, orch.clock.now())["account_id_sha256"]
+        orch.rig.selected = GOLDEN
+        assert orch.step_boundary(order_stage_step=True) is None and orch.rig.selected == EMPTY
+        assert orch.flow_boundary(flow_id="flow.c", account=GOLDEN) is None and orch.rig.selected == GOLDEN
+        record(orch, *SCOPE)
+    report, _, _, _ = run(work)
+    assert report.verdict.status == "complete" and len(results(report, "fixture_account")) == 3   # one per selection
+
+    def stuck(orch: Orchestrator) -> None:
+        assert orch.flow_boundary(flow_id="flow.a") is None
+        orch.rig.selected = GOLDEN
+        staged = len(orch.counters.orders_staged)
+        r = orch.step_boundary(order_stage_step=True)
+        assert r is orch.stop and (r.control, r.gate, r.unreached.reason) == ("fixture_account", "fixture_verified",
+                                                                             "gate")
+        assert len(orch.counters.orders_staged) == staged
+    report, _, sink, _ = run(stuck, SimScenario(select_works=False))
+    assert report.verdict.status == "complete_with_env_errors"
+    assert rest(sink, 0) == {("env_error", "gate", "fixture_verified")}
+
+
 def test_rate_caps_from_the_authorization_document_replace_the_defaults():
     caps = {**RATE_CAPS, "symbol_changes_per_hour": 2}
 

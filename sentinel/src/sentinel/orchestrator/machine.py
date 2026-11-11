@@ -8,9 +8,11 @@ scoped checkpoint through the `OutcomeSink` (1.10, L-OUT-07).
 
 Inside `running` the Executor calls, in this order (boundary.py has the check sequences):
 
-- `flow_boundary(obs, now=..., flow_id=..., p50_s=...)` before every flow, census visit or sweep ladder: the
-  trip-wires, the Watchdog's reverse heartbeat, free space, the run budgets, the spend ceiling, the model re-check,
-  the paper-mode assertion and the proactive relaunch; it returns the result that stopped the run, or None;
+- `flow_boundary(obs, now=..., flow_id=..., p50_s=..., account=...)` before every flow, census visit or sweep
+  ladder: the trip-wires, the Watchdog's reverse heartbeat, free space, the run budgets, the spend ceiling, the model
+  re-check, the paper-mode assertion with A2 against `account` (the pinned account of the unit's role, the run's
+  fixture account until the Executor passes one; 6.3 A2 "Same read") and the proactive relaunch; it returns the
+  result that stopped the run, or None;
 - `step_boundary(obs, now=..., order_stage_step=..., session_dialog=...)` before every step of a flow: the
   trip-wires, the flow's own budget (a returned result with `end_flow` ends the flow, the run continues) and the
   paper-mode assertion when due;
@@ -503,11 +505,13 @@ class Orchestrator:
 
     # -- boundaries inside `running` (boundary.py) -----------------------------------------------------
     def flow_boundary(self, obs: BoundaryObservations | None = None, *, now: float | None = None,
-                      flow_id: str | None = None, p50_s: float | None = None) -> ControlResult | None:
+                      flow_id: str | None = None, p50_s: float | None = None,
+                      account: str | None = None) -> ControlResult | None:
         """The checks before every flow, census visit or sweep ladder, in boundary.py's order; returns the result
         that stopped the run (already applied), or None, in which case the unit may start. `now` is the
         Orchestrator clock's monotonic reading (the default); `flow_id` names a flow, whose budget `p50_s` sets
-        (3 x p50, 5 minutes until measured) and which counts toward the proactive relaunch."""
+        (3 x p50, 5 minutes until measured) and which counts toward the proactive relaunch; `account` is the pinned
+        account of the unit's role for A2 (`assert_paper_mode`)."""
         if self.stop is not None:
             return self.stop
         now = self.clock.monotonic() if now is None else now
@@ -526,10 +530,10 @@ class Orchestrator:
                 self._contain(self.apply(r))
                 if self.stop is not None:
                     return self.stop
-        self.assert_paper_mode()                           # before every flow (6.4 Schedule)
+        self.assert_paper_mode(account=account)            # before every flow (6.4 Schedule), with A2 (6.3)
         if self.stop is not None:
             return self.stop
-        uptime = now - self.launched_mono if self.launched_mono is not None else 0.0
+        uptime =now - self.launched_mono if self.launched_mono is not None else 0.0
         if proactive_relaunch_due(self.flows_since_launch, uptime, inside_flow=False):
             if not self.relaunch("proactive") or self._rate_cap():     # its login and A9 ticket count too (6.4)
                 return self.stop
@@ -541,11 +545,13 @@ class Orchestrator:
         return None
 
     def step_boundary(self, obs: BoundaryObservations | None = None, *, now: float | None = None,
-                      order_stage_step: bool = False, session_dialog: bool = False) -> ControlResult | None:
+                      order_stage_step: bool = False, session_dialog: bool = False,
+                      account: str | None = None) -> ControlResult | None:
         """The checks before every step of a flow: the trip-wires, the flow's own budget and the paper-mode assertion
-        when 6.4 makes it due (`order_stage_step`: the next step is an order-stage step; `session_dialog`: a re-login
-        or session dialog was just handled). Returns the result that stopped the run, or the flow-budget result
-        (`end_flow`: the flow ends, its remaining checkpoints `not_run (reason: budget)`), else None."""
+        with A2 when 6.4 makes it due (`order_stage_step`: the next step is an order-stage step; `session_dialog`: a
+        re-login or session dialog was just handled; `account`: as for `flow_boundary`). Returns the result that
+        stopped the run, or the flow-budget result (`end_flow`: the flow ends, its remaining checkpoints `not_run
+        (reason: budget)`), else None."""
         if self.stop is not None:
             return self.stop
         now = self.clock.monotonic() if now is None else now
@@ -562,7 +568,7 @@ class Orchestrator:
         due = "now" if last is None else assertion_due(now, last, boundary=order_stage_step or session_dialog,
                                                          main_foreground=obs.main_foreground, modal_up=obs.modal_up)
         if due == "now":
-            self.assert_paper_mode()
+            self.assert_paper_mode(account=account)
         elif due == "unreadable" and last is not None:
             self.rig.set_hook_state(armed=True, deny_all=True)
             self.apply(deferral_unreadable(deferred_s=now - last - TIMER_S,
@@ -571,14 +577,24 @@ class Orchestrator:
             self.counters.order_staged(self.clock.now())  # the step about to run stages an order (6.4 rate caps)
         return self.stop
 
-    def assert_paper_mode(self) -> ControlResult:
+    def assert_paper_mode(self, *, account: str | None = None) -> ControlResult:
         """The paper-mode assertion outside the gate (6.4 Schedule): before every flow, after a re-login or session
         dialog, on the two-minute timer, before every order-stage step. A mismatch is `aborted_safety` with the
-        kill switch; two unreadable reads 1 s apart are the identity-unreadable path."""
+        kill switch; two unreadable reads 1 s apart are the identity-unreadable path. A2 rides on the same read
+        (6.3): an allowlisted account other than `account` (the pinned account of the work item's role; the run's
+        fixture account by default) is selected once and re-read, as at the gate, and still different is `env_error
+        (gate: fixture_verified)`."""
         if self.stop is not None:
             return self.stop
-        r, _ = self._read_identity()
+        r, read = self._read_identity()
         self._contain(r)
+        expected = account if account is not None else self.ctx.fixture_account
+        if r.passed and read.text != expected:
+            self.rig.select_account(expected)
+            r, after = self._read_identity()                # A1 holds for the selected account too (6.4)
+            self._contain(r)
+            if r.passed:
+                r = self.apply(judge_fixture_account(read.text or "", expected, after_select=after.text))
         return r
 
     def _tripwires(self, now: float, obs: BoundaryObservations, *, read_book: bool) -> ControlResult | None:

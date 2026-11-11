@@ -279,3 +279,35 @@ def test_secrets_4_quarantine_refuses_a_quarantine_root_inside_the_set(tmp_path)
     with pytest.raises(ArtifactError, match="outside every set"):
         arts.quarantine("r1", tmp_path / "artifacts" / "quarantine")
     assert arts.quarantined is None and arts.verify(a.sha256)
+
+
+# == secrets:8: a flagged results batch stops uploads at once ===================================================
+
+def test_secrets_8_the_flagged_batch_and_every_later_one_are_not_uploaded(tmp_path, monkeypatch):
+    """6.9: the Orchestrator scans each results batch before upload, "so a leak mid-run stops uploads at once": the
+    flagged checkpoint and every checkpoint after it are written only as `harness_error (secret_leaked)`, with no
+    findings, artifacts or steps, and the shards are not marked imported."""
+    import sentinel.pipeline.run as pr
+    from sentinel.store.secret_scan import SecretHit, leak_result
+    seen = []
+    real = pr.check_upload
+
+    def check(scanner, data, *, location):
+        seen.append(location)
+        if len(seen) == 3:                                    # the third batch holds a plaintext
+            return leak_result([SecretHit("vault://x#password", location, "utf-8")])
+        return real(scanner, data, location=location)
+    monkeypatch.setattr(pr, "check_upload", check)
+    sc = clean_scenario(TODAY)
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    assert (r.status, r.reason) == ("aborted_harness", "secret_leaked") and len(seen) == 3
+    uploaded = {loc.removeprefix("results batch ") for loc in seen[:2]}
+    with Store(tmp_path / "sentinel.db") as store:
+        outs = store.outcomes(sc.run_id)
+        withheld = [o for o in outs if o.checkpoint_id not in uploaded]
+        assert withheld and all((o.outcome, o.reason, o.artifacts) == ("harness_error", "secret_leaked", None)
+                                for o in withheld)
+        assert {o.checkpoint_id for o in outs if o.artifacts} == uploaded
+        cps = {o.checkpoint_id for o in withheld}
+        assert not [f for f in store.findings(sc.run_id) if f.checkpoint_id in cps]
+        assert not store.query("SELECT 1 FROM shards WHERE run_id = ? AND state = 'imported'", (sc.run_id,))

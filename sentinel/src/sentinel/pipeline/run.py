@@ -2037,39 +2037,58 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         for f in _expired_findings(scenario.run_id, start.expired, run.expiry_notices, run.expired_exceptions,
                                    started):
             store.write_finding(f)
+        def uploads(payload: Any, where: str, cp: PlannedCheckpoint | None = None, shard: str | None = None) -> bool:
+            """6.9: each results batch is scanned before it is uploaded, and from the first hit on no batch is (a leak
+            mid-run stops uploads at once): False when this one is withheld, and then the checkpoint `cp` it was for
+            is written only as the leak's unreached outcome, `harness_error (secret_leaked)`, with no findings,
+            artifacts or steps; the batch stays with the run for the human scan."""
+            nonlocal leak
+            if leak is None:
+                leak = check_upload(scanner, json.dumps(payload, sort_keys=True, default=str).encode(),
+                                    location=f"results batch {where}")
+            if leak is None:
+                return True
+            if cp is not None:
+                assert leak.unreached is not None                # check_upload's leak result names its outcome
+                work.write_record(work.bare_outcome(cp, leak.unreached), shard_id=shard)
+            return False
+
         for ev in evals:
             o, fs, stored = writer.records(ev)
-            if leak is None:                             # 6.9: each results batch is scanned before it is uploaded
-                batch = json.dumps([o.to_dict(), [f.to_dict() for f in fs]], sort_keys=True, default=str).encode()
-                leak = check_upload(scanner, batch, location=f"results batch {ev.cp.checkpoint_id}")
+            shard = shard_of[rig_of[ev.cp.checkpoint_id]]
             work.session_context(ev)                     # L-OUT-06: the stamp is one of its session's assertions
             steps = []
             if ev.cp.test_kind == "flow":
                 steps = [StepOutcome(scenario.run_id, ev.cp.flow_id or "", ev.cp.step_id or "", "passed",
                                      locator_rung="image", duration_ms=ev.settle_ms or 750, action="capture",
                                      recorded_at=_ts(today, scenario.clock, 600))]
-            work.write_record(o, findings=fs, artifacts=stored, shard_id=shard_of[rig_of[ev.cp.checkpoint_id]],
-                              steps=steps)
-            for side, chk in (("candidate", ev.oracle), ("base", ev.oracle_base)):   # SD-09: every extraction
-                if chk is not None:
-                    store.write_extractions(to_rows(chk.verdict.results, run_id=scenario.run_id,
-                                                    checkpoint_id=ev.cp.checkpoint_id, side=side, read_at=run.now))
+            reads = [to_rows(chk.verdict.results, run_id=scenario.run_id, checkpoint_id=ev.cp.checkpoint_id, side=side,
+                             read_at=run.now) for side, chk in (("candidate", ev.oracle), ("base", ev.oracle_base))
+                     if chk is not None]                                            # SD-09: every extraction
+            if not uploads([o.to_dict(), [f.to_dict() for f in fs], steps, reads], ev.cp.checkpoint_id, ev.cp, shard):
+                continue
+            work.write_record(o, findings=fs, artifacts=stored, shard_id=shard, steps=steps)
+            for rows in reads:
+                store.write_extractions(rows)
         by_cp = {}
         for f in work.findings:
             by_cp.setdefault(f.checkpoint_id, []).append(f)
         for cid, (cp, oc) in sorted(work.bare.items()):
-            work.write_record(work.bare_outcome(cp, oc), findings=by_cp.pop(cid, []),
-                              shard_id=shard_of[rig_of[cid]])
-        for fs in by_cp.values():
-            for f in fs:
+            rec, fs = work.bare_outcome(cp, oc), by_cp.pop(cid, [])
+            if uploads([rec.to_dict(), [f.to_dict() for f in fs]], cid, cp, shard_of[rig_of[cid]]):
+                work.write_record(rec, findings=fs, shard_id=shard_of[rig_of[cid]])
+        for f in [f for fs in by_cp.values() for f in fs]:
+            if uploads(f.to_dict(), f"finding {f.finding_id}"):
                 store.write_finding(f)
         for s, sid in work.steps:                         # each with its gateway_event (8.3 gate_* columns)
-            store.write_steps([s], shard_id=sid, side="candidate")
+            if uploads(s.to_dict(), f"step {s.flow_id}/{s.step_id}"):
+                store.write_steps([s], shard_id=sid, side="candidate")
         for c in plan.cuts:
             if c.checkpoint is not None:
-                work.write_record(dataclasses.replace(c.outcome(scenario.run_id), recorded_at=started,
-                                                      outcome_id=run.next_outcome_id(), pair_id=run.pair_id,
-                                                      profile_id=PROFILE))
+                rec = dataclasses.replace(c.outcome(scenario.run_id), recorded_at=started,
+                                          outcome_id=run.next_outcome_id(), pair_id=run.pair_id, profile_id=PROFILE)
+                if uploads(rec.to_dict(), c.checkpoint.checkpoint_id, c.checkpoint):
+                    work.write_record(rec)
         verdict = work.verdict()
         stop = work.stop()
         reported = {st.shard_id: rep for st, rep in work.reports}
@@ -2077,7 +2096,8 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         for sp in shards:
             v = reported[sp.shard_id].verdict
             store.end_shard(sp.shard_id, v.status, v.reason)
-            store.mark_shard_imported(sp.shard_id)
+            if leak is None:                              # 6.9: a shard whose uploads stopped is not imported
+                store.mark_shard_imported(sp.shard_id)
         arts.write_manifest(ManifestHeader(config_commit=tree_sha256(cfg.root)[:12], harness_commit="sentinel-core-0.1.0",
                                            run_id=scenario.run_id, created_at=started))
         wall = GATES_S + max(sum(it.rig_cost_s for it in plan.items if r in it.rigs) for r in used) + \

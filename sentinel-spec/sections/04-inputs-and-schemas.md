@@ -1283,7 +1283,7 @@ Worked example, three entries of the file's `entries` list (M02, M03 and M12 of 
 
 ### 4.12 Environment fingerprint
 
-The fingerprint is computed from live reads at gate `provisioned` (OS fields) and gate `launched` (app fields), never from a snapshot name. The fields, how each is read and its class are the table of 7.4 Environment fingerprint: 22 fields, 7.4's 21 plus `render_probe_hash` from 3.3; the schema below carries exactly those names and nothing else (L-FPR-01). Fields of class `match` must be identical between candidate and base or every checkpoint of the run is `not_comparable`; class `record` fields serve diagnosis and redaction. Thresholds are valid only for the fingerprint they were calibrated on. Both sides of a masked_live pair are captured on two identically fingerprinted rigs in lockstep, and the equality is asserted before capture (11.2).
+The fingerprint is computed from live reads at gate `provisioned` (OS fields) and gate `launched` (app fields), never from a snapshot name; the cheap fields are re-read at every flow boundary and after every relaunch (7.4). The fields, how each is read and its class are the table of 7.4 Environment fingerprint: 22 fields, `render_probe_hash` of 3.3 among them; the schema below carries exactly those names and nothing else (L-FPR-01). Fields of class `match` must be identical between candidate and base or every checkpoint of the run is `not_comparable`; class `record` fields serve diagnosis and redaction. Thresholds are valid only for the fingerprint they were calibrated on. Both sides of a masked_live pair are captured on two identically fingerprinted rigs in lockstep, and the equality is asserted before capture (11.2).
 
 ```yaml
 # schemas/fingerprint.schema.json
@@ -1304,16 +1304,17 @@ fingerprint:
     cleartype: {smoothing: bool, type: str, gamma: int, contrast: int, orientation: str}
     gpu: {name: str, driver_version: str}
     os_theme: {apps_light: bool, system_light: bool, transparency: bool, animations: bool}
-    app_theme: enum[dark|light]         # from the attestation OCR of Application Settings
+    app_theme: {scheme: enum[dark|light], font_size: enum[small|medium|large]}   # color scheme and font size from the attestation OCR of Application Settings
     workspace_hash: map[id, sha256]     # per corpus id, of the file as copied into usergui
-    settings_profile_hash: sha256       # the checked-in Application Settings profile 7.6 re-applies
+    settings_profile_hash: sha256       # the checked-in Application Settings and Order Defaults profiles 7.6 re-applies
     time_zone: {os: str, app_display: str, chart: str}     # all America/New_York
-    keyboard: {layout: str, layout_count: int, toggle_keys: {caps: bool, num: bool, scroll: bool}}
-    data_epoch: ref:fixture.epoch.epoch_id   # the fixture epoch of 4.9
+    keyboard: {layout: str, layout_count: int, toggle_keys: {caps: bool, num: bool, scroll: bool}, locale: str}
+    data_epoch: {epoch_id: ref:fixture.epoch.epoch_id, data_mode: enum[backend_fixture|ondemand|none]}   # the fixture epoch of 4.9 and the frozen data provider in force (4.9 data_mode.frozen.provider, 7.9)
     input_desktop: str                  # OpenInputDesktop name; must be Default
-    harness: {version: str, ocr_engine: str, ocr_model: str, capture_lib: str, settle_params_sha256: sha256, diff_engine_params_sha256: sha256, redaction_version: str, config_commit: str, allowlist_sha256: sha256}
+    harness: {version: str, ocr_engine: str, ocr_model: str, capture_lib: str, settle_params_sha256: sha256, diff_engine_params_sha256: sha256, redaction_version: str, region_registry_version: str, config_commit: str, config_tarball_sha256: sha256, allowlist_sha256: sha256}
     render_probe_hash: str              # 64-bit pHash of the Help > About text region after authenticated (3.3); Hamming 0 required
   record:                               # 7.4 class record
+    trading_24h_list_sha256: sha256?    # hash of the 24-hour trading list read this run (7.4, 7.10); not part of epoch_id
     jar_listing_hash: sha256            # sorted names and sizes under the install folder
     account: {account_id_sha256: sha256, login_sha256: sha256, role: enum[golden|empty]}   # redacted
     rig: {hostname: str, hypervisor: str, hypervisor_version: str, snapshot_ids: list[str], vm_image_id: str}
@@ -1341,16 +1342,17 @@ match:
   cleartype: {smoothing: true, type: FE_FONTSMOOTHINGCLEARTYPE, gamma: 1800, contrast: 1400, orientation: RGB}
   gpu: {name: "Hyper-V Video", driver_version: "10.0.26100.1"}
   os_theme: {apps_light: false, system_light: false, transparency: false, animations: false}
-  app_theme: dark
+  app_theme: {scheme: dark, font_size: medium}
   workspace_hash: {ws.tier-a.futures-trader: "sha256:5b7d...91c0"}
   settings_profile_hash: "sha256:19ab...c0de"
   time_zone: {os: "Eastern Standard Time", app_display: America/New_York, chart: America/New_York}
-  keyboard: {layout: "0x0409", layout_count: 1, toggle_keys: {caps: false, num: true, scroll: false}}
-  data_epoch: sha256:3d1a...b7c4
+  keyboard: {layout: "0x0409", layout_count: 1, toggle_keys: {caps: false, num: true, scroll: false}, locale: en-US}
+  data_epoch: {epoch_id: "sha256:3d1a...b7c4", data_mode: none}
   input_desktop: Default
-  harness: {version: 1.4.2, ocr_engine: tesseract-5.3.4, ocr_model: eng-best-4.1, capture_lib: mss-9.0.1, settle_params_sha256: "sha256:4e4e...1a1a", diff_engine_params_sha256: "sha256:7c7c...2b2b", redaction_version: r3, config_commit: c41a0f2, allowlist_sha256: "sha256:9d9d...3c3c"}
+  harness: {version: 1.4.2, ocr_engine: tesseract-5.3.4, ocr_model: eng-best-4.1, capture_lib: mss-9.0.1, settle_params_sha256: "sha256:4e4e...1a1a", diff_engine_params_sha256: "sha256:7c7c...2b2b", redaction_version: r3, region_registry_version: c41a0f2, config_commit: c41a0f2, config_tarball_sha256: "sha256:6a6a...4d4d", allowlist_sha256: "sha256:9d9d...3c3c"}
   render_probe_hash: "e3b0c44298fc1c14"
 record:
+  trading_24h_list_sha256: "sha256:0f0f...5e5e"
   jar_listing_hash: "sha256:ab12...ef90"
   account: {account_id_sha256: "sha256:51f2...0a0a", login_sha256: "sha256:77aa...bb88", role: empty}
   rig: {hostname: tos-rig-01, hypervisor: hyperv, hypervisor_version: "10.0.26100", snapshot_ids: [snap-2026-10-28-base], vm_image_id: tos-rig-win11-2026-10-28}
@@ -1359,22 +1361,24 @@ record:
 
 The JRE version is read from the bundled runtime's release file; the exact JRE current Windows builds bundle is unverified, so the field is whatever that file says. Whether `jcmd` can attach to the launcher's JVM is a Phase 0 check (7.4); when it cannot, `java2d_pipeline.confirmed` is `unknown` on both sides and the Help > About render comparison carries the check alone.
 
+**Calibration key.** Floors depend on how pixels are rendered, not on the data or the corpus files, so calibration is keyed on a rendering subset of the `match` fields rather than on `fingerprint_id`. `calibration_key` is the sha256 over the canonical JSON of `windows_build`, `display`, `cleartype`, `gpu`, `os_theme`, `app_theme`, `jre_release`, `vmoptions_hash`, `java2d_pipeline`, `render_probe_hash` and the `harness` subfields `capture_lib`, `settle_params_sha256` and `diff_engine_params_sha256`. It leaves out `build_id`, `data_epoch`, `workspace_hash` and every other field, so a new data epoch or a corpus change never discards a whole calibration; the rows of 7.13 What invalidates calibration say which changes invalidate the floors of one checkpoint or one region. A key that differs from a calibrated key only in `jre_release` or `render_probe_hash` takes over that key's floors once a Nightly A/A pass on the new key passes (10.6); until then its regions are `uncalibrated`. The calibration lives in `calibration_floors` (8.3) and in `calibration/<hex>.yaml`, `<hex>` being `calibration_key` without its `sha256:` prefix (4.16).
+
 | Rule | Check | Outcome on failure |
 |---|---|---|
 | L-FPR-01 | every `match` field non-null; `fingerprint_id` recomputes; the field set equals 7.4's table plus `render_probe_hash` (a CI test compares the schema with the table) | `error` in CI; a schema that disagrees with 7.4 at run start is `aborted_harness (reason: config_invalid)`; a `match` field that cannot be read on the rig is `env_error (gate: provisioned, reason: fingerprint_unreadable:<field>)` on every scoped checkpoint (7.4) |
 | L-FPR-02 | `match` equals the rig specification of 7.1 for the declared config (1920x1080, 100 percent, 96 dpi, en-US, America/New_York, Caps Lock and Scroll Lock off and Num Lock on (12.7 R4), `input_desktop: Default`, pinned pipeline, allowlist hash equal to the config commit's) | `env_error (gate: provisioned, reason: rig_spec_mismatch)` on every scoped checkpoint, run `complete_with_env_errors`, on-call channel |
 | L-FPR-03 | candidate and base `match` identical apart from `build_id`, which must equal each side's requested build | every checkpoint of the shard `not_comparable (reason: fingerprint_mismatch)` with the differing field names in `detail`, nothing captured, run `complete_with_env_errors`, on-call channel; a `build_id` that is not the requested build is `env_error (gate: launched, reason: version_mismatch)` instead |
-| L-FPR-04 | a calibration file exists for `fingerprint_id` | none exists: every region is `threshold_source: uncalibrated`, every diff with a changed pixel is `needs_human (reason: uncalibrated)` at threshold 0, a Calibration run is queued and the Reporter prints the count (3.9 step 6); never `not_comparable`. A file that lacks one region's floor is the same `uncalibrated` case for that region alone (4.8) |
+| L-FPR-04 | a calibration exists for the fingerprint's `calibration_key` (above), or for a key it may take over after a passing Nightly A/A | none exists: every region is `threshold_source: uncalibrated`, every diff with a changed pixel is `needs_human (reason: uncalibrated)` at threshold 0, a Calibration run is queued and the Reporter prints the count (3.9 step 6); never `not_comparable`. A calibration that lacks one region's floor, or whose floors for a checkpoint or region a 7.13 row invalidated, is the same `uncalibrated` case for that checkpoint or region alone (4.8) |
 | L-FPR-05 | `render_probe_hash` equal at Hamming 0 between sides | `not_comparable (reason: fingerprint_mismatch)` with `detail: render_probe_hash`; the morning report says a rasterization change happened inside the same Windows build |
 
 ### 4.13 Outcome record
 
-Four record shapes: one per level of brief 1.5, plus the finding record that carries what a human sees about a checkpoint or a run without being an outcome. Enums are imported from `taxonomy.yaml`. The Orchestrator writes each outcome record once (single-writer rule, 8.2); the only later changes are three. First, `decision_ref`, set when a decision suppresses the finding. Second, the `review_state: pending` case of 8.3: when an asynchronous Reviewer verdict lands, the outcome becomes what 3.11's table gives (`intended`, `collateral`, `noise` only through A/A, or `needs_human` with reason `reviewer_no_match` or `reviewer_uncertain`; a declared removed surface the Reviewer does not confirm is `needs_human (reason: reviewer_no_match)`, 3.11 row 25a) and `review_state` goes from `pending` to `done`; if a human decision already exists on the item, the verdict is attached as an annotation only and changes neither the outcome nor the decision (3.11, 10.7). Third, the end of review for a pending item that never got a verdict: when the per-run spend ceiling ends the run, its reason becomes `reviewer_cap` with `cause: dollar_cap` in `detail`, and when the Reviewer job gives up on it, it stays `reviewer_unavailable`; in both cases the outcome stays `needs_human` and `review_state` goes from `pending` to `done` (8.3 trigger, 10.7, 11.4).
+Four record shapes: one per level of brief 1.5, plus the finding record that carries what a human sees about a checkpoint or a run without being an outcome. Enums are imported from `taxonomy.yaml`. The Orchestrator writes each outcome record once (single-writer rule, 8.2); the only later changes are three. First, `decision_ref`, set when a decision suppresses the finding. Second, the `review_state: pending` case of 8.3: when an asynchronous Reviewer verdict lands, the outcome becomes what 3.11's table gives, which for a pending item is only `intended` or `needs_human` with reason `reviewer_no_match` or `reviewer_uncertain` (a late verdict never produces `collateral` or `noise`, and the write is refused if it tries; a declared removed surface the Reviewer does not confirm is `needs_human (reason: reviewer_no_match)`, 3.11 row 25a), and `review_state` goes from `pending` to `done`; if a human decision already exists on the item, the verdict is attached as an annotation only and changes neither the outcome nor the decision (3.11, 10.7). Third, the end of review for a pending item that never got a verdict: when the per-run spend ceiling ends the run, its reason becomes `reviewer_cap` with `cause: dollar_cap` in `detail`, and when the Reviewer job gives up on it, it stays `reviewer_unavailable`; in both cases the outcome stays `needs_human` and `review_state` goes from `pending` to `done` (8.3 trigger, 10.7, 11.4).
 
 ```yaml
 # schemas/outcome.schema.json
 checkpoint_outcome:
-  outcome_id: id
+  outcome_id: id                        # oc-<run_id>-<zero-padded sequence>
   run_id: id
   pair_id: ref:build_pair.pair_id
   checkpoint_id: id                     # grammar of 4.1; the kind segment is the test kind
@@ -1385,10 +1389,14 @@ checkpoint_outcome:
   step_id: id?
   workspace_id: ref:workspace.id
   persona: enum[active_trader|options_trader|futures_trader|swing_trader|beginner]
+  profile_id: id                        # the entitlement profile of the login: the matrix column of 2.12
   size_step: {host: str, w: int, h: int}?           # sweep; split carries {splitter: id, fraction: num}
   data_mode: enum[frozen|masked_live]
-  fingerprint_id: sha256
-  data_epoch_id: sha256
+  fingerprint_id: sha256?               # required unless the record references no capture artifact (below)
+  data_epoch_id: sha256?                # as fingerprint_id
+  cand_rig_id: id?                      # the rig that captured each side
+  base_rig_id: id?
+  settle_ms: int?                       # candidate time to settle (3.5)
   outcome: enum[identical|noise|intended|collateral|needs_human|invariant_violation|assertion_failed|not_settled|not_comparable|landmark_missing|env_error|harness_error|not_run|unregistered_surface|needs_baseline]
   reason: str?                          # <code>[:<param>] with code from taxonomy.yaml reasons.<outcome>; see the vocabulary table
   detail: str?                          # free text the reason points at: field names, step id, expected and extracted values
@@ -1396,12 +1404,15 @@ checkpoint_outcome:
   gate: str?                            # env_error: the gate from taxonomy.yaml gates, including preflight.<item>
   review_state: enum[none|pending|done] = none      # pending only with needs_human awaiting the Reviewer (8.3)
   rescued: bool = false                 # captured after a passed_via_agent_fallback step (5.5)
-  paper_assertion: {account_id_sha256: sha256, asserted_at: ts}   # the stamp of 6.4; no record is written without it
+  paper_assertion: {account_id_sha256: sha256, mode: str, asserted_at: ts}?   # the stamp of 6.4 with the mode read; required unless the record references no capture artifact (L-OUT-06)
   app_uptime_s: int?
   app_restart_count: int?
   diff: {whole: {pixel_fraction: num, ssim: num, shift: {dx: int, dy: int}}, regions: list[{region_id: id, pixel_fraction: num, ssim: num, above_threshold: bool}], components: list[{area: int, bbox: {x,y,w,h}}]}?
+  diff_pixels: int?                     # changed pixels over the whole window
+  masked_pct: num?                      # masked plus non-identity redacted share of the critical panel (4.8 mask budget)
   threshold_source: enum[calibrated|uncalibrated]?
   classification: {category: enum[intended|collateral|noise|needs_human], by: enum[rule|reviewer], confidence: num?, model_id: str?, prompt_hash: sha256?, description: str?, region_pointer: id?}?
+  lower_results: list[{outcome: checkpoint outcome enum, reason: str?}]?   # the outcomes the 1.10 precedence ranked below this one, kept as evidence ("also applied")
   manifest_entry_ref: ref:entry.entry_id?
   primitive: ref:primitive.id?
   invariant_ids: list[id]?
@@ -1413,6 +1424,7 @@ checkpoint_outcome:
   base_source_run_id: id?               # frozen base capture reused from this run (3.1)
   decision_ref: ref:decision.decision_id?
   synthetic: bool = false
+  mutant_id: str?                       # synthetic records: the mutant of 4.11 (synthetic mutant outcomes are stored apart, 8.3)
   captured_at: ts?
   recorded_at: ts
 
@@ -1422,10 +1434,16 @@ step_outcome:
   step_id: id
   attempt: int
   status: enum[passed|passed_after_retry|passed_via_agent_fallback|failed|blocked_by_gateway]
+  reason: str?                          # export steps only: export_timeout or export_unavailable (4.7 export)
+  mode: enum[scripted|agent|explorer]   # the gateway profile the step ran under (5.4)
   locator_rung: enum[jab|image|ocr|agent|none]?
   rung_results: list[{rung: enum[jab|image|ocr|agent], result: str, score: num?}]?   # every rung tried
   duration_ms: int
+  app_uptime_s: int?
+  app_restart_count: int?
   pre_screenshot: sha256?
+  post_screenshot: sha256?
+  click_crop: sha256?                   # the crop around the click point (6.2 audit trail)
   gateway_event: {decision: enum[emitted|dropped|refused|late_up|none], reason: str?, class: enum[allowed|safety|integrity|none]?}   # decision: dropped by the hook, refused by the slow half; reason is the hook or slow-half code of 5.4.3 and 5.4.4 (no_token, token_mismatch_coords, token_expired, deny_rect, shift_click_dialog, dialog_not_ok, blocked_key_dialog, blocked_chord_dialog, move_outside_allow, deny_all, not_armed, foreign_input, untokened_injected, never_tokenize, dialog_allowlist, deny_profile, guarded_key_refused, hook_host_dead, hook_reinstalled), stored as the code, never a coarse class; class is the safety or integrity split of 5.4.4 (F17). 8.3 stores these as step_events.gate_decision, gate_reason and gate_class
   finding_ref: id?                      # failed or passed_via_agent_fallback: the locator_failure finding
   recorded_at: ts
@@ -1438,9 +1456,14 @@ run_outcome:
   reason: str?                          # required for aborted_*; from taxonomy.yaml reasons.<status>
   last_gate: str                        # the Orchestrator state reached
   counts: map[checkpoint outcome enum, int]
+  summary: str                          # the report's one-line summary (9.2)
   coverage_matrix_ref: sha256
   egress_log_ref: sha256
+  report_sha256: sha256?                # the published report
+  comment_sha256: sha256?               # PR runs: the posted comment body
   post_run_proof_ref: sha256?           # the Working and Filled diff of 6.6; UNPROVEN makes status complete_with_env_errors
+  base_commit_distance: int?            # PR runs: commits between the merge base and the base build used, 0 to 20 (4.2)
+  authorization_sha256: sha256          # the authorization version in force (6.12, L-XREF-16)
   started_at: ts
   ended_at: ts
 
@@ -1455,14 +1478,19 @@ finding:
   manifest_entry_ref: ref:entry.entry_id?
   phash: str?                           # 16 hex, the anchored crop
   category: enum[intended|collateral|noise|needs_human|invariant_violation|assertion_failed]?
+  pre_existing: bool = false            # an invariant violation present on both builds, one severity lower (2.7)
+  cluster_id: id?                       # the signature cluster of 9.7
   description: str
   evidence: {artifacts: list[sha256], step_events: {first_seq: int, last_seq: int}?, raw_values: map[str, str]?}
-  explorer: {signature: {surface_id: id, observation: str, crop_sha256: sha256}, severity: enum[low|medium|high], confidence: num, trace_ref: sha256, replayed: enum[reproduced|not_reproduced|lint_failed], candidate_flow: ref:flow.flow_id?}?   # explorer_candidate only (2.9)
+  explorer: {session_id: id, signature: {surface_id: id, observation: str, crop_sha256: sha256}, severity: enum[low|medium|high], confidence: num, trace_ref: sha256, replayed: enum[not_replayed|reproduced|not_reproduced|lint_failed], candidate_flow: ref:flow.flow_id?}?   # explorer_candidate only (2.9)
   triage_state: enum[open|confirmed_bug|intended|noise|agent_mistake|expected_behavior|fixed_pending_verify|closed] = open
+  contested: bool = false               # a supersession of its decision is contested (9.7)
+  held: bool = false                    # an Explorer finding held, not reported, under an agent_mistake or expected_behavior decision (9.6)
   decision_ref: ref:decision.decision_id?
   ticket: str?
   first_seen_run_id: id
   created_at: ts
+  closed_at: ts?                        # when triage_state became closed; starts the 180-day release of its evidence (8.6)
 ```
 
 **Reason vocabulary.** `taxonomy.yaml` lists these codes under `reasons.<outcome>`; a record whose reason code is not in the list for its outcome is refused at write (L-OUT-01). Codes with a parameter take it after a colon.
@@ -1485,8 +1513,10 @@ finding:
 | `needs_baseline` | `new_surface`, `base_not_settled`, `base_env_error`, `base_harness_error`, `lineage_missing` (RC), `reuse_missing`, `explorer_replay` (input B of 3.11) | 1.10, 2.9, 3.1, 3.11 |
 | run `aborted_safety` | `paper_mode_mismatch`, `attestation_mismatch`, `unexpected_working_order`, `kill_switch`, `attempted_send`, `undeclared_order_row` (an undeclared Working, Filled or Canceled row found at teardown or by the post-run proof, 5.2, 6.6), `live_identity` (a live-format account id read at the paper-mode assertion: not on the allowlist and not matching the paper prefix, 6.4), `drill_order_placed` (a fire drill that produced a new order row, 6.5), `unknown_dialog_in_order_stage` (an unmatched window while `order_stage` is set, 4.10); any other readable selector text that is not an allowlist entry is `paper_mode_mismatch` (6.4) | 1.10, 6.2 to 6.7 |
 | run `aborted_budget` | `wall_clock` (the run's wall budget less the report margin reached, 5.2, 11.2), `app_restart_budget` (a fourth app failure in a shard, a crash or hang in the gate sequence of the shard's first launch or of a relaunch included, 5.2, 10.2), `dollar_cap` (the run's model spend, Reviewer, agent rescue and Explorer together, reached the 50-dollar per-run ceiling of 11.4: no further model call, the run ends at the next flow boundary, uncaptured checkpoints `not_run (reason: budget)`, items still awaiting a verdict `needs_human (reason: reviewer_cap)` with `cause: dollar_cap`; the 25-dollar Explorer session cap and the weekly cap never end a run, 10.7), `pool_saturated` (a PR run still queued at its start deadline; a queued merge run is coalesced into the next merge run and an RC run goes to the release manager instead, 11.2), `rate_cap` (a 6.4 rate cap on logins, symbol changes or staged orders reached), `superseded` (a newer RC build arrived while the RC run was in flight: the run stops at the next flow boundary, its unreached checkpoints `not_run (reason: budget)`, and the new RC run starts at once, 11.2) | 5.2, 6.4, 10.2, 10.7, 11.2, 11.4 |
-| run `aborted_harness` | `config_invalid`, `preflight.<item>` (a failed H item of 12.7, written as 12.7 writes it, for example `preflight.H8` when the Watchdog is absent at run start), `dead_man`, `start_failed` (a Nightly or Calibration run that did not reach `running` by its start deadline, 11.2), `secret_leaked`, `secret_scan_unavailable`, `egress_unlogged`, `base_build_missing`, `taxonomy_check_failed` (the post-run taxonomy query, including L-OUT-07, failed), `orchestrator_restart_budget`, `hook_lost` (second hook host restart in one shard, 5.4.2), `watchdog_dead` (the Watchdog's reverse heartbeat stale mid-run, 5.14), `heartbeat_unwritable` (5.14), `disk_full` (only the Watchdog's mid-run free-space check ends a run this way, including the immediate check an `ENOSPC` requests, 10.2; a single artifact write that fails, `ENOSPC` included, is checkpoint `harness_error (reason: artifact_persist_failed)`, 8.4, 8.9), `rig_lost` (a second loss of the same shard, 10.7), `dpi_awareness`, `store_write_failed` (8.9), `artifact_persist_failed` (8.4, 8.9), `import_conflict` (8.9), `canary_generation_failed` (a Nightly run on which no canary could run at all). A blind identity canary is not a run abort: its row is `harness_error (reason: safety_canary_blind:identity)` and the dependent flows are `not_run (reason: quarantine)` while the run stays `complete` (6.4) | 1.4, 1.10, 3.4, 4.1, 4.2, 5.2, 5.4, 5.12, 5.14, 6.9, 6.10, 8.9, 10.2, 10.3, 10.8, 11.2 |
+| run `aborted_harness` | `config_invalid`, `preflight.<item>` (a failed H item of 12.7, written as 12.7 writes it, for example `preflight.H8` when the Watchdog is absent at run start), `dead_man`, `start_failed` (a Nightly or Calibration run that did not reach `running` by its start deadline, 11.2), `secret_leaked`, `secret_scan_unavailable`, `egress_unlogged`, `base_build_missing`, `taxonomy_check_failed` (the post-run taxonomy query, including L-OUT-07, failed), `orchestrator_restart_budget`, `hook_lost` (second hook host restart in one shard, 5.4.2), `bounds_source_unavailable` (the bounds bridge still down after one relaunch, 2.7), `watchdog_dead` (the Watchdog's reverse heartbeat stale mid-run, 5.14), `heartbeat_unwritable` (5.14), `disk_full` (only the Watchdog's mid-run free-space check ends a run this way, including the immediate check an `ENOSPC` requests, 10.2; a single artifact write that fails, `ENOSPC` included, is checkpoint `harness_error (reason: artifact_persist_failed)`, 8.4, 8.9), `rig_lost` (a second loss of the same shard, 10.7), `dpi_awareness`, `store_write_failed` (8.9), `artifact_persist_failed` (8.4, 8.9), `import_conflict` (8.9), `canary_generation_failed` (a Nightly run on which no canary could run at all). A blind identity canary is not a run abort: its row is `harness_error (reason: safety_canary_blind:identity)` and the dependent flows are `not_run (reason: quarantine)` while the run stays `complete` (6.4) | 1.4, 1.10, 2.7, 3.4, 4.1, 4.2, 5.2, 5.4, 5.12, 5.14, 6.9, 6.10, 8.9, 10.2, 10.3, 10.8, 11.2 |
 | run `complete_with_env_errors` | the cause, when it is not an `env_error` checkpoint: `unproven_proof` (6.6), `teardown_fault` (5.2), `relogin_budget` (7.7) | 5.2, 6.6, 7.7 |
+
+A step record carries a reason only for an export step: `export_timeout` or `export_unavailable` (4.7 `export`).
 
 **Finding vocabulary.** `taxonomy.yaml` lists these under `finding_kinds`; 8.3's `findings.kind` CHECK is generated from it. Findings never change an outcome.
 
@@ -1534,7 +1564,7 @@ Required fields per outcome:
 | `assertion_failed` | `assertion_ids`, `reason: assertion:<id>`, expected and extracted values in `detail` |
 | `not_settled`, `landmark_missing` | `reason`, `side`, `detail` naming the anchor or landmark and the wait used |
 | `not_comparable` | `reason` from the vocabulary, differing field names in `detail` |
-| `env_error` | `gate`, `reason`, `artifacts.candidate` (last screenshot) |
+| `env_error` | `gate`, `reason`, `artifacts.candidate` (last screenshot) when a screen was captured before the failure |
 | `harness_error` | `reason` and a Watchdog event id in `detail` |
 | `not_run` | `reason` from the vocabulary; `step_failed:<step>` names an existing step of `flow_id` |
 | `unregistered_surface` | `reason: probe:<Pn>`, `detail` with the enumerated label and where it was seen |
@@ -1551,15 +1581,19 @@ surface_id: trade.active-trader.ladder
 test_kind: sweep
 workspace_id: ws.tier-c.sweep-harness
 persona: active_trader
+profile_id: paper-margin
 size_step: {host: flexgrid, w: 640, h: 720}
 data_mode: masked_live
 fingerprint_id: sha256:9a3f...c1e2
 data_epoch_id: sha256:3d1a...b7c4
+cand_rig_id: rig-01
+base_rig_id: rig-02
+settle_ms: 1840
 outcome: invariant_violation
 reason: INV-01
 detail: "ladder body (rgn.ladder.bid-column) intersects the order-type row by 18 px at 640x720"
 review_state: none
-paper_assertion: {account_id_sha256: "sha256:51f2...0a0a", asserted_at: 2026-11-09T14:21:02-05:00}
+paper_assertion: {account_id_sha256: "sha256:51f2...0a0a", mode: paperMoney, asserted_at: 2026-11-09T14:21:02-05:00}
 app_uptime_s: 1912
 app_restart_count: 0
 diff:
@@ -1568,12 +1602,14 @@ diff:
     - {region_id: rgn.ladder.bid-column, pixel_fraction: 0.188, ssim: 0.71, above_threshold: true}
     - {region_id: rgn.ladder.header, pixel_fraction: 0.0, ssim: 1.0, above_threshold: false}
   components: [{area: 4120, bbox: {x: 12, y: 388, w: 206, h: 20}}]
+diff_pixels: 4120
 threshold_source: calibrated
 classification:
   category: collateral
   by: rule                              # row 16 of 3.11: undeclared surface, no model call needed
   description: Surface trade.active-trader.ladder is not declared by any manifest entry; FlexibleGrid is touched by tos-48213-1.
   region_pointer: rgn.ladder.bid-column
+lower_results: [{outcome: collateral}]
 manifest_entry_ref: tos-48213-1
 primitive: FlexibleGrid
 invariant_ids: [INV-01]
@@ -1585,7 +1621,7 @@ captured_at: 2026-11-09T14:21:40-05:00
 recorded_at: 2026-11-09T14:21:44-05:00
 ```
 
-Under the precedence rule of 1.10 the outcome is `invariant_violation`, not `collateral`: INV-01 fired on the candidate capture, and `invariant_violation` outranks `collateral`. The `collateral` classification stays on the record and on its finding as evidence, by rule (row 16 of 3.11, undeclared surface) and without a model call, which is how the PR comment names both the overlap and the primitive and manifest entry that caused it. The Reviewer's description of the diff, when one is requested, lands on the finding (`description`), never in a `classification.by = reviewer` block on an invariant violation (L-OUT-03).
+Under the precedence rule of 1.10 the outcome is `invariant_violation`, not `collateral`: INV-01 fired on the candidate capture, and `invariant_violation` outranks `collateral`. The `collateral` classification stays on the record (`classification`, `lower_results`) and on its finding as evidence, by rule (row 16 of 3.11, undeclared surface) and without a model call, which is how the PR comment names both the overlap and the primitive and manifest entry that caused it. The Reviewer's description of the diff, when one is requested, lands on the finding (`description`), never in a `classification.by = reviewer` block on an invariant violation (L-OUT-03).
 
 | Rule | Check | Severity |
 |---|---|---|
@@ -1594,8 +1630,8 @@ Under the precedence rule of 1.10 the outcome is `invariant_violation`, not `col
 | L-OUT-03 | `classification.by = reviewer` never appears with `invariant_violation` or `assertion_failed`; a `decision_ref` never changes those two outcomes | write refused |
 | L-OUT-04 | `synthetic = true` records are excluded from every metric query and from baseline promotion (query-level test in CI) | error |
 | L-OUT-05 | exactly one `checkpoint_outcome` per `(run_id, checkpoint_id)` (the id already embeds the size step); one `run_outcome` per run; `checkpoint_id` matches the grammar of 4.1 and its kind segment equals `test_kind` | write refused |
-| L-OUT-06 | a record without `paper_assertion` from the current session, or whose `account_id_sha256` is not an allowlisted account's, is refused and the run is `aborted_safety (reason: paper_mode_mismatch)` | write refused, run aborted |
-| L-OUT-07 | every scoped checkpoint of a finished run has exactly one record (the Orchestrator writes `not_run`; for what a dead Orchestrator left, the resumed Orchestrator or the control-host import of the Watchdog's JSONL journal writes `harness_error` with the run's abort reason; the Watchdog itself never writes the store, 10.2) | post-run query; a miss is `aborted_harness (reason: taxonomy_check_failed)` and the report is withheld |
+| L-OUT-06 | a record without `paper_assertion` from the current session, or whose `account_id_sha256` is not an allowlisted account's, is refused and the run is `aborted_safety (reason: paper_mode_mismatch)`. Exempt: a record that references no capture artifact (an `env_error` or `harness_error` written before any screen was captured, or `not_run` for a checkpoint never captured), which may also omit `fingerprint_id` and `data_epoch_id` | write refused, run aborted |
+| L-OUT-07 | every scoped checkpoint of a finished run has exactly one record (the Orchestrator writes `not_run`; for what a dead Orchestrator left, the resumed Orchestrator or the control-host import of the Watchdog's JSONL journal writes `harness_error` with the run's abort reason; the Watchdog itself never writes the store, 10.2); such records reference no capture artifact and are exempt from L-OUT-06 | post-run query; a miss is `aborted_harness (reason: taxonomy_check_failed)` and the report is withheld |
 
 ### 4.14 Decision record
 
@@ -1611,7 +1647,7 @@ A decision is a human action on a finding, keyed by a diff signature so later ru
 | `expected_behavior` | `noise` | as `agent_mistake`, for behavior that is by design | `expected_behavior` | none |
 | `approve_baseline` | `intended` | the capture becomes the approved baseline for the checkpoint or cluster (9.8); not a signature match | `closed` | optional |
 | `reject_baseline` | `confirmed_bug` with a ticket when the candidate shows a defect, else `noise` (the capture is not representative) | the candidate `baselines` row becomes `retired` (8.3, 9.6), `needs_baseline` persists until a new candidate is approved, and the finding returns to Unexpected | `confirmed_bug`, or `open` | required for `confirmed_bug` |
-| `fixed_in_build` | `confirmed_bug` (updates the existing decision) | from that build on the run asserts the signature is gone; a return sets `status: reopened` | `fixed_pending_verify`, then `closed` after one clean run | required |
+| `fixed_in_build` | `confirmed_bug` (a new row that supersedes the active `confirm_bug` decision on the same signature) | from that build on the run asserts the signature is gone; a return sets `status: reopened` | `fixed_pending_verify`, then `closed` after one clean run | required |
 
 ```yaml
 # schemas/decision.schema.json
@@ -1621,11 +1657,13 @@ decision:
     checkpoint_id: id
     region_id: id | grid_cell           # region id, or g-<row>-<col> on the 8x8 grid of 9.7 for a diff outside any region
     phash: str                          # 64-bit perceptual hash of the anchored crop, hex
-    hamming_tolerance: int = 8          # 8 for matching by default; 6 for tier-1 checkpoints; 6 is also the cross-checkpoint clustering radius (3.7, 9.7)
+    hamming_tolerance: int?             # unset: the default applies, 8, or 6 for tier-1 checkpoints; set when written out or lowered by calibration (9.7, L-DEC-03); 6 is also the cross-checkpoint clustering radius (3.7, 9.7)
+    bbox_q4: {x: int, y: int, w: int, h: int}?   # the largest component's bounding box quantized to 4 px: the exact-match key when the region falls back to pHash equality (below)
     category: enum[intended|collateral|noise|needs_human|invariant_violation|assertion_failed]
   action: enum[confirm_bug|mark_intended|request_mask|noise_signature|agent_mistake|expected_behavior|approve_baseline|reject_baseline|fixed_in_build]
   verdict: enum[confirmed_bug|intended|noise]
   decided_by: str                       # corporate login; never a service account
+  role: enum[triage_rotation|flow_owner|system_owner|release_manager|pr_author|ticket_resolver]   # the role under which decided_by acted (9.12, L-DEC-01)
   source: enum[report_ui|pr_comment|jira_sync|explorer_triage] = report_ui   # where the action was taken (8.3 decisions.source); jira_sync: a fixed_in_build row the Jira poller wrote with the ticket resolver's login (9.9)
   confirmed_by: str?                    # second human; required by the two-person rule of 9.6
   decided_at: ts
@@ -1640,11 +1678,12 @@ decision:
   expires_at: ts?                       # noise_signature, request_mask and waived mark_intended: default 30 days
   cluster_id: id?                       # when written per member of a cluster decision (9.7)
   status: enum[active|expired|superseded|reopened|revoked]
+  reopen_count: int = 0                 # times the signature returned after fixed_in_build; two make the decision suspect (9.5)
   supersedes: ref:decision.decision_id?
   revoked: {by: str, at: ts, reason: str}?
 ```
 
-A region's tolerance may be lowered by calibration, never raised (9.7): with noise spread the largest pHash distance among the region's A/A pairs and fault separation the smallest distance between its distinct mutants, the region uses the smaller of its default (8, or 6 for tier 1) and fault separation minus 1, and falls back to pHash equality plus the largest component's bounding box quantized to 4 px when that is at or below the noise spread. The effective tolerance is stored on the row so a later change in calibration never silently widens an old decision.
+A region's tolerance may be lowered by calibration, never raised (9.7): with noise spread the largest pHash distance among the region's A/A pairs and fault separation the smallest distance between its distinct mutants, the region uses the smaller of its default (8, or 6 for tier 1) and fault separation minus 1, and falls back to pHash equality plus the largest component's bounding box quantized to 4 px (`bbox_q4`) when that is at or below the noise spread. A tolerance that calibration lowered is stored on the row so a later change in calibration never silently widens an old decision; an unset `hamming_tolerance` means the default.
 
 Worked example:
 
@@ -1659,6 +1698,7 @@ signature:
 action: confirm_bug
 verdict: confirmed_bug
 decided_by: rkim
+role: triage_rotation
 decided_at: 2026-11-09T15:05:32-05:00
 run_id: run-2026-11-09-pr-0931
 build_id: branch-1998.3.0-7be42d0
@@ -1674,7 +1714,7 @@ Inheritance rules: the lookup returns every active decision whose signature matc
 |---|---|---|
 | L-DEC-01 | `decided_by` is a human login: in the triage roster of 9.12, or the PR author for `confirm_bug` and for tier-3 `mark_intended`, or the Jira ticket's resolver for a `fixed_in_build` row with `source: jira_sync` (9.9); writes from the Reviewer, Orchestrator or any service identity are refused | write refused |
 | L-DEC-02 | `ticket` present at write time for `mark_intended`, `fixed_in_build` and a `reject_baseline` whose verdict is `confirmed_bug`; for `confirm_bug` the ticket may land later through the outbox (9.1), and a row still without one when the outbox window closes is listed "without ticket" in the daily digest; `verdict` equals the mapping table's value for `action` (for `reject_baseline`, `confirmed_bug` or `noise`) | write refused |
-| L-DEC-03 | `category` is from `taxonomy.yaml`; `signature.phash` is 16 hex characters; `hamming_tolerance` is at most 8, and at most 6 when the checkpoint's tier is 1 | write refused |
+| L-DEC-03 | `category` is from `taxonomy.yaml`; `signature.phash` is 16 hex characters; `hamming_tolerance`, when set, is at most 8, and at most 6 when the checkpoint's tier is 1; `bbox_q4` is present when the region uses the exact fallback | write refused |
 | L-DEC-04 | `noise_signature`, `request_mask` or a `floor_exception` on a `money_cell` region; or a `request_mask` whose prefilled mask would raise the panel's masked plus non-identity redacted share over its budget (4.8), computed on the finding's capture: the report UI refuses to submit it and says why (the current share, the budget and the mask's share), no row and no mask PR are written, and the finding stays open in Unexpected until it is decided by `confirm_bug` or `mark_intended`; raising a budget is a system-owner pull request to `sentinel-config` | write refused |
 | L-DEC-05 | `approve_baseline` from a PR run (`run_type = pr`; promotion happens at merge-run triage, 9.8), from a run with `synthetic = true` outcomes or with `status != complete`, or by the author of the change for a tier-1 checkpoint | write refused |
 | L-DEC-06 | two-person rule (9.6): `mark_intended` on a tier-1 or tier-2 finding whose run is a PR run authored by `decided_by` requires `confirmed_by`, a different human from the triage rotation or the tier's flow owner; until then the row is not written and the finding stays open with "proposed intended by <login>" | write refused |

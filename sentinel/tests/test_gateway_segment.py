@@ -368,6 +368,17 @@ def test_drops_and_consumed_tokens_write_records_and_allowed_moves_do_not():
     assert recs[3].secret and recs[3].token_id == k.id and recs[4].aux == 240
 
 
+def test_another_processs_injected_move_is_dropped_and_written_to_the_ring():
+    """6.2 rule 4: the move a foreign process (or the drill injector) sends is dropped `no_token` and leaves a ring
+    record, so the drainer logs it `untokened_injected` (or tags it `drill`); the emitter's untokened move writes none."""
+    buf, _ = published(armed())
+    for origin in ("foreign_process", "drill"):
+        assert decide_from_segment(buf, ev("move", 300, 300, origin=origin), to_ns(T)) == Decision(False, "no_token")
+    assert decide_from_segment(buf, ev("move", 300, 300), to_ns(T)).allowed
+    assert [(r.event_type, r.origin, r.reason, r.injected) for r in RingReader().read(buf)] == [
+        ("move", "foreign_process", "no_token", True), ("move", "drill", "no_token", True)]
+
+
 def test_record_for_is_the_hooks_record_rule_without_a_segment():
     gd = gw.HookDecision(True, token_id=7, late_up=True)
     rec = record_for(InputEvent("button_up", 3, 4, button="right", mods=frozenset({"shift", "capslock"})), gd, 99,

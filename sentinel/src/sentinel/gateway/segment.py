@@ -52,7 +52,8 @@ Choices where the spec is silent or ambiguous (reported):
    `deny_all`: there is no consistent picture to act on, and 5.4.2 fails closed. A writer whose transaction
    raises leaves `seq` odd for the same reason.
 5. The ring keeps a record for every drop and for every event that matched a token (5.4.4: "every consumed
-   token writes a compact record"), the probe included; allowed moves with no token write nothing. A record's
+   token writes a compact record"), the probe included; the emitter's allowed moves with no token write nothing,
+   while another process's move is a drop (rule 4, `orchestrator.gateway` choice 19) and writes one. A record's
    `origin` is what the hook can tell from the injected flag and the emitter's tag (`emitter`,
    `foreign_process`, `drill`, `console`), so the drainer can name `untokened_injected` and the drill tag. A
    control record (event type `control`: the hook host's own `hook_reinstalled` log, aux 1 when the reinstall
@@ -749,6 +750,8 @@ def decide_from_segment(buf: Any, e: EventLike, now_ns: int, *, deny_all: bool =
                 return _spend(buf, e, now_ns, "blocked_key_dialog", toks)
         if e.type == "button_down" and "shift" in e.mods:
             return _spend(buf, e, now_ns, "shift_click_dialog", toks)
+    if e.origin != "emitter":                                                # rule 4: another process, moves too
+        return _commit(buf, e, now_ns, Decision(False, "no_token"), None, None, secret=secret)
     if e.type == "move":                                                     # rule 3
         active, until, bx, by, bw, bh = _MOVE_ALLOW.unpack_from(snap, OFF_MOVE_ALLOW)
         pid = probe.id if probe else None
@@ -760,12 +763,11 @@ def decide_from_segment(buf: Any, e: EventLike, now_ns: int, *, deny_all: bool =
     if e.type in ("button_up", "key_up"):
         kind = KIND_BUTTON if e.type == "button_up" else KIND_KEY
         val = BUTTON_CODE.get(e.button or "", -1) if e.type == "button_up" else e.vk
-        mine = toks if e.origin == "emitter" else []
-        for t in mine:
+        for t in toks:
             if t.kind == kind and not t.release and t.state == HALF_CONSUMED and t.button_or_vk == val:
                 return _commit(buf, e, now_ns, Decision(True, token_id=t.id, late_up=now_ns > t.expires_ns), t,
                                CONSUMED, secret=secret)
-        for t in mine:
+        for t in toks:
             if t.kind == kind and t.release and t.state == ARMED and t.button_or_vk == val:
                 return _commit(buf, e, now_ns, Decision(True, token_id=t.id), t, CONSUMED, secret=secret)
         return _commit(buf, e, now_ns, Decision(False, "no_token"), None, None, secret=secret)

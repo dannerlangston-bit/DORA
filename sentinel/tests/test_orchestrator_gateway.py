@@ -53,6 +53,28 @@ def test_rule4_console_input_is_foreign_and_untokened_injection_is_logged():
     assert (drop.reason, drop.gate_class) == ("untokened_injected", "safety")
 
 
+def test_rule4_another_processs_injected_moves_are_dropped_and_logged_like_its_clicks():
+    """6.2 rule 4, 5.4.1 layer 2: a move injected by any process other than the emitter is dropped `no_token` (logged
+    `untokened_injected`, or tagged `drill` inside the drill's raw phase), with no token pending and inside a drag's
+    `move_allow` box alike; the emitter's own moves still pass. Rule 2 keeps its codes for another origin's keys."""
+    g = armed()
+    for origin in ("foreign_process", "drill"):
+        e = ev("move", 300, 300, origin=origin)
+        d = hook_decide(g, e, T)
+        assert (d.allowed, d.reason) == (False, "no_token")
+        assert drain(d, e).reason == ("untokened_injected" if origin == "foreign_process" else "no_token")
+    assert drain(hook_decide(g, ev("move", 3, 3, origin="drill"), T), ev("move", 3, 3, origin="drill"),
+                 drill_phase=True).tag == "drill"
+    assert hook_decide(g, ev("move", 300, 300), T).allowed
+    g.issue_click(100, 100, T, hold_ms=300)
+    g.open_move_allow(Rect(90, 90, 200, 50), T, 300)
+    assert hook_decide(g, ev("button_down", 100, 100), T).allowed
+    assert hook_decide(g, ev("move", 150, 110, origin="foreign_process"), T).reason == "no_token"   # steers no drag
+    assert hook_decide(g, ev("move", 150, 110), T).allowed
+    g = armed(Flag.SET)
+    assert hook_decide(g, ev("key_down", vk=VK_RETURN, origin="foreign_process"), T).reason == "blocked_key_dialog"
+
+
 def test_click_token_is_one_shot_with_2px_tolerance():
     g = armed()
     t = g.issue_click(100, 100, T)

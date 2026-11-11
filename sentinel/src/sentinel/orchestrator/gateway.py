@@ -126,6 +126,11 @@ Choices where the spec is ambiguous (reported):
    issue order and falls back to the first expired one only when every match has expired, which keeps the
    `token_expired` drop (5.4.5). So a dead token left armed after `token_mismatch_coords` or `no_token` cannot drop
    a fresh token's down `token_expired`. A wheel match is unexpired already (choice 5).
+19. Rule 4 covers moves (6.2 rule 4, 5.4.1 layer 2: "an injected event from any process other than the emitter is
+   dropped and logged `untokened_injected`"). It runs after rules 1 and 2, whose codes another origin's events keep
+   (the drill's raw Enter under the flag is `blocked_key_dialog`, 6.5), and drops every remaining event that is not
+   the emitter's `no_token`, moves included, so `drain` logs it `untokened_injected` (or tags it `drill` inside the
+   drill's raw phase). A foreign move never passes while no token is pending, nor steers a drag inside `move_allow`.
 """
 from __future__ import annotations
 
@@ -540,8 +545,9 @@ def hook_decide(state: GatewayState, e: InputEvent, now: float) -> HookDecision:
                 return _spend(state, e, now, "blocked_key_dialog")
         if e.type == "button_down" and "shift" in e.mods:
             return _spend(state, e, now, "shift_click_dialog")
-    tokened = e.origin == "emitter"                                          # rule 3
-    if e.type == "move":
+    if e.origin != "emitter":                                                # rule 4: another process injected it
+        return _drop("no_token")                                             # (moves included; choice 19)
+    if e.type == "move":                                                     # rule 3
         ma = state.move_allow
         if ma is not None and now <= ma.until and ma.bbox.contains(e.x, e.y):
             return HookDecision(True)
@@ -553,11 +559,11 @@ def hook_decide(state: GatewayState, e: InputEvent, now: float) -> HookDecision:
         val = e.button if e.type == "button_up" else e.vk
         kind = "click" if e.type == "button_up" else "key"
         for t in state.tokens.values():
-            if tokened and t.kind == kind and t.state == "half_consumed" and getattr(t, key) == val:
+            if t.kind == kind and t.state == "half_consumed" and getattr(t, key) == val:
                 t.state = "consumed"
                 return HookDecision(True, token_id=t.id, late_up=now > t.expires)
         for t in state.tokens.values():
-            if tokened and t.kind == "release" and t.state == "armed" and getattr(t, key) == val:
+            if t.kind == "release" and t.state == "armed" and getattr(t, key) == val:
                 t.state = "consumed"                                         # a release alone activates nothing
                 return HookDecision(True, token_id=t.id)
         return _drop("no_token")

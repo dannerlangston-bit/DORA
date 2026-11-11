@@ -1,0 +1,506 @@
+{
+  "$id": "sentinel:schemas/fingerprint.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "fingerprint_id": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "match": {
+      "additionalProperties": false,
+      "properties": {
+        "app_theme": {
+          "additionalProperties": false,
+          "properties": {
+            "font_size": {
+              "enum": [
+                "small",
+                "medium",
+                "large"
+              ]
+            },
+            "scheme": {
+              "enum": [
+                "dark",
+                "light"
+              ]
+            }
+          },
+          "required": [
+            "scheme",
+            "font_size"
+          ],
+          "type": "object"
+        },
+        "build_id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "cleartype": {
+          "additionalProperties": false,
+          "properties": {
+            "contrast": {
+              "type": "integer"
+            },
+            "gamma": {
+              "type": "integer"
+            },
+            "orientation": {
+              "type": "string"
+            },
+            "smoothing": {
+              "type": "boolean"
+            },
+            "type": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "smoothing",
+            "type",
+            "gamma",
+            "contrast",
+            "orientation"
+          ],
+          "type": "object"
+        },
+        "data_epoch": {
+          "additionalProperties": false,
+          "properties": {
+            "data_mode": {
+              "enum": [
+                "backend_fixture",
+                "ondemand",
+                "none"
+              ]
+            },
+            "epoch_id": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "epoch_id",
+            "data_mode"
+          ],
+          "type": "object"
+        },
+        "display": {
+          "additionalProperties": false,
+          "properties": {
+            "awareness": {
+              "type": "string"
+            },
+            "bits": {
+              "type": "integer"
+            },
+            "dpi": {
+              "type": "integer"
+            },
+            "frequency": {
+              "type": "integer"
+            },
+            "height": {
+              "type": "integer"
+            },
+            "monitors": {
+              "type": "integer"
+            },
+            "scale_percent": {
+              "type": "integer"
+            },
+            "width": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "width",
+            "height",
+            "bits",
+            "frequency",
+            "scale_percent",
+            "dpi",
+            "awareness",
+            "monitors"
+          ],
+          "type": "object"
+        },
+        "gpu": {
+          "additionalProperties": false,
+          "properties": {
+            "driver_version": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "driver_version"
+          ],
+          "type": "object"
+        },
+        "harness": {
+          "additionalProperties": false,
+          "properties": {
+            "allowlist_sha256": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "capture_lib": {
+              "type": "string"
+            },
+            "config_commit": {
+              "type": "string"
+            },
+            "config_tarball_sha256": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "diff_engine_params_sha256": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "ocr_engine": {
+              "type": "string"
+            },
+            "ocr_model": {
+              "type": "string"
+            },
+            "redaction_version": {
+              "type": "string"
+            },
+            "region_registry_version": {
+              "type": "string"
+            },
+            "settle_params_sha256": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "version",
+            "ocr_engine",
+            "ocr_model",
+            "capture_lib",
+            "settle_params_sha256",
+            "diff_engine_params_sha256",
+            "redaction_version",
+            "region_registry_version",
+            "config_commit",
+            "config_tarball_sha256",
+            "allowlist_sha256"
+          ],
+          "type": "object"
+        },
+        "input_desktop": {
+          "type": "string"
+        },
+        "java2d_pipeline": {
+          "additionalProperties": false,
+          "properties": {
+            "confirmed": {
+              "enum": [
+                "d3d",
+                "opengl",
+                "software",
+                "unknown"
+              ]
+            },
+            "pinned": {
+              "enum": [
+                "d3d",
+                "opengl",
+                "software"
+              ]
+            }
+          },
+          "required": [
+            "pinned",
+            "confirmed"
+          ],
+          "type": "object"
+        },
+        "jre_release": {
+          "additionalProperties": false,
+          "properties": {
+            "java_version": {
+              "type": "string"
+            },
+            "sha256": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sha256",
+            "java_version"
+          ],
+          "type": "object"
+        },
+        "keyboard": {
+          "additionalProperties": false,
+          "properties": {
+            "layout": {
+              "type": "string"
+            },
+            "layout_count": {
+              "type": "integer"
+            },
+            "locale": {
+              "type": "string"
+            },
+            "toggle_keys": {
+              "additionalProperties": false,
+              "properties": {
+                "caps": {
+                  "type": "boolean"
+                },
+                "num": {
+                  "type": "boolean"
+                },
+                "scroll": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "caps",
+                "num",
+                "scroll"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "layout",
+            "layout_count",
+            "toggle_keys",
+            "locale"
+          ],
+          "type": "object"
+        },
+        "os_theme": {
+          "additionalProperties": false,
+          "properties": {
+            "animations": {
+              "type": "boolean"
+            },
+            "apps_light": {
+              "type": "boolean"
+            },
+            "system_light": {
+              "type": "boolean"
+            },
+            "transparency": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "apps_light",
+            "system_light",
+            "transparency",
+            "animations"
+          ],
+          "type": "object"
+        },
+        "render_probe_hash": {
+          "type": "string"
+        },
+        "settings_profile_hash": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "time_zone": {
+          "additionalProperties": false,
+          "properties": {
+            "app_display": {
+              "type": "string"
+            },
+            "chart": {
+              "type": "string"
+            },
+            "os": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "os",
+            "app_display",
+            "chart"
+          ],
+          "type": "object"
+        },
+        "vmoptions_hash": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "windows_build": {
+          "additionalProperties": false,
+          "properties": {
+            "current_build": {
+              "type": "string"
+            },
+            "ubr": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "current_build",
+            "ubr"
+          ],
+          "type": "object"
+        },
+        "workspace_hash": {
+          "additionalProperties": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "propertyNames": {
+            "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "build_id",
+        "jre_release",
+        "vmoptions_hash",
+        "java2d_pipeline",
+        "windows_build",
+        "display",
+        "cleartype",
+        "gpu",
+        "os_theme",
+        "app_theme",
+        "workspace_hash",
+        "settings_profile_hash",
+        "time_zone",
+        "keyboard",
+        "data_epoch",
+        "input_desktop",
+        "harness",
+        "render_probe_hash"
+      ],
+      "type": "object"
+    },
+    "read_at": {
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+      "type": "string"
+    },
+    "record": {
+      "additionalProperties": false,
+      "properties": {
+        "account": {
+          "additionalProperties": false,
+          "properties": {
+            "account_id_sha256": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "login_sha256": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "role": {
+              "enum": [
+                "golden",
+                "empty"
+              ]
+            }
+          },
+          "required": [
+            "account_id_sha256",
+            "login_sha256",
+            "role"
+          ],
+          "type": "object"
+        },
+        "jar_listing_hash": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "rig": {
+          "additionalProperties": false,
+          "properties": {
+            "hostname": {
+              "type": "string"
+            },
+            "hypervisor": {
+              "type": "string"
+            },
+            "hypervisor_version": {
+              "type": "string"
+            },
+            "snapshot_ids": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "vm_image_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "hostname",
+            "hypervisor",
+            "hypervisor_version",
+            "snapshot_ids",
+            "vm_image_id"
+          ],
+          "type": "object"
+        },
+        "run_date": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "type": "string"
+        },
+        "trading_24h_list_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "jar_listing_hash",
+        "account",
+        "rig",
+        "run_date"
+      ],
+      "type": "object"
+    },
+    "rig_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "run_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 2,
+      "type": "integer"
+    },
+    "side": {
+      "enum": [
+        "candidate",
+        "base"
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "fingerprint_id",
+    "run_id",
+    "side",
+    "rig_id",
+    "read_at",
+    "match",
+    "record"
+  ],
+  "title": "fingerprint (fingerprint)",
+  "type": "object"
+}

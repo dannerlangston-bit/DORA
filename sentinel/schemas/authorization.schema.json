@@ -1,0 +1,125 @@
+{
+  "$id": "sentinel:schemas/authorization.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "account_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "automation": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "data_classes": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "document_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "model_endpoint": {
+      "type": "string"
+    },
+    "model_terms": {
+      "type": "string"
+    },
+    "rate_caps": {
+      "additionalProperties": false,
+      "properties": {
+        "logins_per_day": {
+          "type": "integer"
+        },
+        "staged_orders_per_day": {
+          "type": "integer"
+        },
+        "staged_orders_per_hour": {
+          "type": "integer"
+        },
+        "symbol_changes_per_hour": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "logins_per_day",
+        "symbol_changes_per_hour",
+        "staged_orders_per_hour",
+        "staged_orders_per_day"
+      ],
+      "type": "object"
+    },
+    "rig_hostnames": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "send_policy_branch": {
+      "enum": [
+        "default",
+        "gated"
+      ]
+    },
+    "signatures": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "platform_owner",
+              "security_contact",
+              "compliance_contact"
+            ]
+          },
+          "signed_at": {
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+            "type": "string"
+          }
+        },
+        "required": [
+          "role",
+          "name",
+          "signed_at"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "supersedes": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "version",
+    "document_sha256",
+    "signatures",
+    "account_ids",
+    "rig_hostnames",
+    "automation",
+    "model_endpoint",
+    "model_terms",
+    "data_classes",
+    "rate_caps",
+    "send_policy_branch"
+  ],
+  "title": "authorization (authorization)",
+  "type": "object"
+}

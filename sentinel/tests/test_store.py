@@ -12,6 +12,7 @@ from sentinel.records import CheckpointOutcome, Decision, DiffSummary, Finding, 
 from sentinel.store import (ImportConflict, Review, RunNotComplete, RunPlan, ScopeEntry, ShardPlan, Store, StoreError,
                             StoreRefused, StoreWriteFailed, WriterLockError, apply_inheritance, connect_reader, hamming,
                             render_schema, seed_rows)
+from sentinel.store.store import SCHEMA_VERSION
 from sentinel.taxonomy import Taxonomy, TaxonomyError, load
 
 RUN = "run-01"
@@ -65,6 +66,7 @@ def finish_all(store, outcome="identical"):
 
 def test_schema_lists_come_from_taxonomy(tmp_path):
     data = copy.deepcopy(load().data)
+    data.pop("reason_metadata")                     # the fallback when taxonomy.yaml carries no 8.3 seed metadata
     data["finding_kinds"].append("test_only_kind")
     data["reasons"]["not_run"].append("test_only_reason")
     t = Taxonomy(data)
@@ -121,7 +123,7 @@ def test_pragmas_reader_and_hamming(tmp_path):
     with Store(db) as s:
         assert s.conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
         assert s.conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
-        assert s.conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert s.conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 2
         r = connect_reader(db)
         pair = (bytes.fromhex(ph()), bytes.fromhex(ph((0, 9, 63))))
         assert r.execute("SELECT hamming(?, ?)", pair).fetchone()[0] == 3

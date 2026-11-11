@@ -1,0 +1,131 @@
+{
+  "$defs": {
+    "ladder": {
+      "additionalProperties": false,
+      "properties": {
+        "corpus_sizes": {
+          "default": false,
+          "type": "boolean"
+        },
+        "id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "name": {
+          "enum": [
+            "S",
+            "F"
+          ]
+        },
+        "run_types": {
+          "items": {
+            "enum": [
+              "pr",
+              "merge",
+              "rc",
+              "nightly",
+              "calibration"
+            ]
+          },
+          "type": "array"
+        },
+        "steps": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "h": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "enum": [
+                      "MAXH"
+                    ]
+                  }
+                ]
+              },
+              "part": {
+                "default": "grid",
+                "enum": [
+                  "grid",
+                  "corner",
+                  "ascending"
+                ]
+              },
+              "w": {
+                "anyOf": [
+                  {
+                    "type": "integer"
+                  },
+                  {
+                    "enum": [
+                      "MAXW"
+                    ]
+                  }
+                ]
+              }
+            },
+            "required": [
+              "w",
+              "h"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "run_types",
+        "steps"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "sentinel:schemas/ladders.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "ladders": {
+      "items": {
+        "$ref": "#/$defs/ladder"
+      },
+      "type": "array"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "splitter_sets": {
+      "additionalProperties": false,
+      "properties": {
+        "full": {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        },
+        "short": {
+          "items": {
+            "type": "number"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "full",
+        "short"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "ladders",
+    "splitter_sets"
+  ],
+  "title": "ladders (ladders_file)",
+  "type": "object"
+}

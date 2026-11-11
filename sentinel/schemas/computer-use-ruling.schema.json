@@ -1,0 +1,65 @@
+{
+  "$id": "sentinel:schemas/computer-use-ruling.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approved_model_tiers": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "computer_use_covered": {
+      "default": false,
+      "type": "boolean"
+    },
+    "endpoint": {
+      "type": "string"
+    },
+    "model_ids": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "retention": {
+      "enum": [
+        "zero_data_retention",
+        "standard"
+      ]
+    },
+    "reviewer_covered": {
+      "default": false,
+      "type": "boolean"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "signed_at": {
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+      "type": "string"
+    },
+    "signed_by": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "open",
+        "ruled"
+      ]
+    },
+    "ticket": {
+      "type": "string"
+    },
+    "toolset_schema_version": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "status"
+  ],
+  "title": "computer-use-ruling (computer_use_ruling)",
+  "type": "object"
+}

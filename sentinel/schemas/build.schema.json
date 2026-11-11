@@ -1,0 +1,169 @@
+{
+  "$defs": {
+    "build": {
+      "additionalProperties": false,
+      "properties": {
+        "artifact": {
+          "additionalProperties": false,
+          "properties": {
+            "sha256": {
+              "pattern": "^sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "uri": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "uri",
+            "sha256"
+          ],
+          "type": "object"
+        },
+        "branch": {
+          "type": "string"
+        },
+        "build_id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "built_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        "channel": {
+          "enum": [
+            "branch",
+            "main",
+            "rc",
+            "released"
+          ]
+        },
+        "commit_sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "install_method": {
+          "enum": [
+            "artifact",
+            "snapshot"
+          ]
+        },
+        "jre_release_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "merge_base_sha": {
+          "pattern": "^[0-9a-f]{40}$",
+          "type": "string"
+        },
+        "pipeline_run_id": {
+          "type": "string"
+        },
+        "released_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        "snapshot_id": {
+          "type": "string"
+        },
+        "version_string": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "build_id",
+        "channel",
+        "version_string",
+        "commit_sha",
+        "pipeline_run_id",
+        "artifact",
+        "install_method",
+        "built_at"
+      ],
+      "type": "object"
+    },
+    "build_pair": {
+      "additionalProperties": false,
+      "properties": {
+        "base": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "base_rule": {
+          "enum": [
+            "merge_base_main",
+            "previous_main",
+            "last_released",
+            "same_build"
+          ]
+        },
+        "candidate": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "created_at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        "lineage_baseline_set": {
+          "type": "string"
+        },
+        "pair_id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "run_type": {
+          "enum": [
+            "pr",
+            "merge",
+            "rc",
+            "nightly",
+            "calibration"
+          ]
+        }
+      },
+      "required": [
+        "pair_id",
+        "run_type",
+        "candidate",
+        "base",
+        "base_rule",
+        "created_at"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "sentinel:schemas/build.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "anyOf": [
+    {
+      "required": [
+        "build"
+      ]
+    },
+    {
+      "required": [
+        "build_pair"
+      ]
+    }
+  ],
+  "properties": {
+    "build": {
+      "$ref": "#/$defs/build"
+    },
+    "build_pair": {
+      "$ref": "#/$defs/build_pair"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version"
+  ],
+  "title": "build (build_file)",
+  "type": "object"
+}

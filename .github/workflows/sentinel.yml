@@ -1,0 +1,47 @@
+# Sentinel harness checks (sentinel-spec 4.15 "Pull request to sentinel"): the test suite, the example config lint,
+# taxonomy.yaml against the spec (L-XREF-08), the committed JSON Schemas against the notation (L-XREF-09) and the
+# spec's cross-references.
+name: sentinel
+
+on:
+  push:
+    paths:
+      - "sentinel/**"
+      - "sentinel-spec/**"
+      - ".github/workflows/sentinel.yml"
+  pull_request:
+    paths:
+      - "sentinel/**"
+      - "sentinel-spec/**"
+      - ".github/workflows/sentinel.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  sentinel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the harness
+        run: pip install -e 'sentinel[test]'
+      - name: Test suite
+        working-directory: sentinel
+        run: python -m pytest -q
+      - name: Lint the example sentinel-config
+        working-directory: sentinel
+        run: sentinel lint config/example --today 2026-11-10
+      - name: taxonomy.yaml matches the spec
+        working-directory: sentinel
+        run: python tools/gen_taxonomy.py --check
+      - name: JSON Schemas regenerate identically
+        working-directory: sentinel
+        run: sentinel schemas --check
+      - name: Spec cross-references resolve
+        working-directory: sentinel-spec
+        run: |
+          python -I tools/xcheck.py | tee xcheck.log
+          grep -qx 'TOTAL issues: 0' xcheck.log

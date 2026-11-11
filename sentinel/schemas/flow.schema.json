@@ -1,0 +1,1049 @@
+{
+  "$defs": {
+    "assertion": {
+      "additionalProperties": false,
+      "properties": {
+        "api_field": {
+          "type": "string"
+        },
+        "expected": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "number"
+            }
+          ]
+        },
+        "export_column": {
+          "type": "string"
+        },
+        "format": {
+          "enum": [
+            "money",
+            "price",
+            "int",
+            "percent",
+            "time",
+            "text"
+          ]
+        },
+        "id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "type": "string"
+        },
+        "inputs": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                "type": "string"
+              },
+              {
+                "type": "number"
+              }
+            ]
+          },
+          "type": "object"
+        },
+        "kind": {
+          "enum": [
+            "equals",
+            "matches",
+            "within_tol",
+            "present",
+            "absent",
+            "changed_since_previous_step",
+            "unchanged_since_previous_step",
+            "count",
+            "export_equals",
+            "api_within",
+            "rule",
+            "sign_color_agrees"
+          ]
+        },
+        "pattern": {
+          "type": "string"
+        },
+        "range": {
+          "additionalProperties": false,
+          "properties": {
+            "max": {
+              "type": "number"
+            },
+            "min": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "min",
+            "max"
+          ],
+          "type": "object"
+        },
+        "region": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "rule_id": {
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+          "type": "string"
+        },
+        "since_step": {
+          "pattern": "^[a-z][a-z0-9_-]*$",
+          "type": "string"
+        },
+        "source": {
+          "default": "ocr",
+          "enum": [
+            "ocr",
+            "export",
+            "jab",
+            "api"
+          ]
+        },
+        "tol": {
+          "type": "number"
+        },
+        "value_ref": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "step": {
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "click_named"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "button": {
+                "default": "left",
+                "enum": [
+                  "left",
+                  "right",
+                  "middle"
+                ]
+              },
+              "target": {
+                "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "target"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "type_fixture"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "oneOf": [
+              {
+                "required": [
+                  "value_ref"
+                ]
+              },
+              {
+                "required": [
+                  "value"
+                ]
+              }
+            ],
+            "properties": {
+              "commit": {
+                "enum": [
+                  "enter",
+                  "tab",
+                  "none"
+                ]
+              },
+              "target": {
+                "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              },
+              "value_ref": {
+                "type": "string"
+              },
+              "verify": {
+                "$ref": "#/$defs/assertion"
+              }
+            },
+            "required": [
+              "target",
+              "commit"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "press"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "key": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "key"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "drag"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "from": {
+                "anyOf": [
+                  {
+                    "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                    "type": "string"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "x": {
+                        "type": "integer"
+                      },
+                      "y": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "x",
+                      "y"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              "hold_ms": {
+                "type": "integer"
+              },
+              "steps": {
+                "type": "integer"
+              },
+              "to": {
+                "anyOf": [
+                  {
+                    "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                    "type": "string"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "x": {
+                        "type": "integer"
+                      },
+                      "y": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "x",
+                      "y"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "from",
+              "to",
+              "steps",
+              "hold_ms"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "wheel"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "at": {
+                "anyOf": [
+                  {
+                    "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                    "type": "string"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "x": {
+                        "type": "integer"
+                      },
+                      "y": {
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "x",
+                      "y"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              "notches": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "at",
+              "notches"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "rclick"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "target": {
+                "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "target"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "dblclick"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "target": {
+                "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "target"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "key_chord"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "keys": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "keys"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "reset_input_state"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {}
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "secret"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "commit": {
+                "enum": [
+                  "enter",
+                  "tab",
+                  "none"
+                ]
+              },
+              "target": {
+                "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                "type": "string"
+              },
+              "vault_ref": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "target",
+              "vault_ref",
+              "commit"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "wait_for"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "anchor": {
+                "additionalProperties": false,
+                "properties": {
+                  "landmark": {
+                    "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                    "type": "string"
+                  },
+                  "window_title_regex": {
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "anti_anchors": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "timeout_ms": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "anchor",
+              "timeout_ms"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "park_mouse"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {}
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "focus_neutral"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "target": {
+                "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "export"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "headers": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "enum": [
+                  "file",
+                  "copy_all"
+                ]
+              },
+              "path": {
+                "pattern": "^(?![/\\\\])(?!.*\\.\\.)[^\\\\]+$",
+                "type": "string"
+              },
+              "target": {
+                "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "target",
+              "kind",
+              "headers"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "checkpoint"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "account_state": {
+                "type": "boolean"
+              },
+              "checkpoint_id": {
+                "pattern": "^(?:census/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+)*(?:/[a-z]+=[A-Za-z0-9.-]+(?:,[a-z]+=[A-Za-z0-9.-]+)*)?|sweep/[a-z0-9]+(?:[.-][a-z0-9]+)*/(?:flexgrid|detached|dialog)/[0-9]+x[0-9]+(?:-asc)?|split/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+)*/(?:0|1)\\.[0-9]{2}|flow/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z][a-z0-9-]*)$",
+                "type": "string"
+              },
+              "data_mode": {
+                "enum": [
+                  "frozen",
+                  "masked_live"
+                ]
+              },
+              "expect": {
+                "items": {
+                  "$ref": "#/$defs/assertion"
+                },
+                "type": "array"
+              },
+              "keep_focus": {
+                "default": false,
+                "type": "boolean"
+              },
+              "max_settle_ms": {
+                "type": "integer"
+              },
+              "recapturable": {
+                "default": true,
+                "type": "boolean"
+              },
+              "regions": {
+                "anyOf": [
+                  {
+                    "pattern": "^(?![/\\\\])(?!.*\\.\\.)[^\\\\]+$",
+                    "type": "string"
+                  },
+                  {
+                    "const": "default"
+                  }
+                ]
+              },
+              "required_labels": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "requires_window": {
+                "enum": [
+                  "none",
+                  "all_quiet",
+                  "equities_quiet",
+                  "futures_break"
+                ]
+              },
+              "surface_id": {
+                "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                "type": "string"
+              },
+              "target_window": {
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "enum": [
+                      "main",
+                      "dialog",
+                      "detached",
+                      "popup"
+                    ]
+                  },
+                  "title_regex": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "kind"
+                ],
+                "type": "object"
+              },
+              "tier": {
+                "enum": [
+                  1,
+                  2,
+                  3
+                ]
+              }
+            },
+            "required": [
+              "checkpoint_id",
+              "surface_id",
+              "target_window",
+              "data_mode",
+              "regions"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "assert"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "assertions": {
+                "items": {
+                  "$ref": "#/$defs/assertion"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "assertions"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "precondition"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "check": {
+                "enum": [
+                  "paper_mode",
+                  "workspace_loaded",
+                  "no_modal",
+                  "single_main_frame",
+                  "main_window_rect",
+                  "fixture_symbol_linked",
+                  "working_orders",
+                  "settings_attested",
+                  "app_alive"
+                ]
+              },
+              "expect": {}
+            },
+            "required": [
+              "check"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "teardown"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          },
+          "then": {
+            "properties": {
+              "action": {
+                "enum": [
+                  "close_dialog",
+                  "clear_ticket",
+                  "close_non_main_windows",
+                  "reset_ui",
+                  "reload_workspace",
+                  "reset_profile",
+                  "cancel_all",
+                  "working_orders_check",
+                  "positions_flat_check"
+                ]
+              },
+              "expect": {},
+              "target": {
+                "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "action"
+            ]
+          }
+        }
+      ],
+      "properties": {
+        "id": {
+          "pattern": "^[a-z][a-z0-9_-]*$",
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        },
+        "on_fail": {
+          "default": "fail",
+          "enum": [
+            "fail",
+            "retry_once",
+            "teardown"
+          ]
+        },
+        "order_stage": {
+          "default": false,
+          "type": "boolean"
+        },
+        "timeout_ms": {
+          "default": 5000,
+          "type": "integer"
+        },
+        "type": {
+          "enum": [
+            "click_named",
+            "type_fixture",
+            "press",
+            "drag",
+            "wheel",
+            "rclick",
+            "dblclick",
+            "key_chord",
+            "reset_input_state",
+            "secret",
+            "wait_for",
+            "park_mouse",
+            "focus_neutral",
+            "export",
+            "checkpoint",
+            "assert",
+            "precondition",
+            "teardown"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "type"
+      ],
+      "type": "object",
+      "unevaluatedProperties": false
+    }
+  },
+  "$id": "sentinel:schemas/flow.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "account_role": {
+      "default": "empty",
+      "enum": [
+        "golden",
+        "empty"
+      ]
+    },
+    "agent_fallback": {
+      "enum": [
+        "allowed",
+        "disabled"
+      ]
+    },
+    "budget": {
+      "additionalProperties": false,
+      "properties": {
+        "max_duration_s": {
+          "type": "integer"
+        },
+        "max_steps": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_duration_s",
+        "max_steps"
+      ],
+      "type": "object"
+    },
+    "class": {
+      "enum": [
+        "standard",
+        "login",
+        "fixture_reset",
+        "teardown",
+        "canary",
+        "paper_send_ok",
+        "explorer_candidate"
+      ]
+    },
+    "data_mode": {
+      "enum": [
+        "frozen",
+        "masked_live"
+      ]
+    },
+    "fixture": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "flow_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "normalize": {
+      "items": {
+        "$ref": "#/$defs/step"
+      },
+      "type": "array"
+    },
+    "origin": {
+      "additionalProperties": false,
+      "properties": {
+        "finding_ref": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "authored",
+            "recorder",
+            "explorer"
+          ]
+        },
+        "run_id": {
+          "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "type": "object"
+    },
+    "owner": {
+      "type": "string"
+    },
+    "persona": {
+      "enum": [
+        "active_trader",
+        "options_trader",
+        "futures_trader",
+        "swing_trader",
+        "beginner"
+      ]
+    },
+    "preconditions": {
+      "items": {
+        "$ref": "#/$defs/step"
+      },
+      "type": "array"
+    },
+    "requires": {
+      "items": {
+        "enum": [
+          "margin",
+          "options_L1",
+          "options_L2",
+          "options_L3",
+          "futures",
+          "forex",
+          "ira",
+          "portfolio_margin",
+          "multi_account",
+          "paper_send"
+        ]
+      },
+      "type": "array"
+    },
+    "requires_window": {
+      "default": "none",
+      "enum": [
+        "none",
+        "all_quiet",
+        "equities_quiet",
+        "futures_break"
+      ]
+    },
+    "schema_version": {
+      "const": 2,
+      "type": "integer"
+    },
+    "state_scope": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "steps": {
+      "items": {
+        "$ref": "#/$defs/step"
+      },
+      "type": "array"
+    },
+    "surface": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "surfaces": {
+      "items": {
+        "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "teardown": {
+      "items": {
+        "$ref": "#/$defs/step"
+      },
+      "type": "array"
+    },
+    "tier": {
+      "enum": [
+        1,
+        2,
+        3
+      ]
+    },
+    "title": {
+      "type": "string"
+    },
+    "workspace": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "flow_id",
+    "title",
+    "class",
+    "tier",
+    "owner",
+    "persona",
+    "surface",
+    "surfaces",
+    "requires",
+    "workspace",
+    "fixture",
+    "data_mode",
+    "agent_fallback",
+    "budget",
+    "normalize",
+    "preconditions",
+    "steps",
+    "teardown"
+  ],
+  "title": "flow (flow)",
+  "type": "object"
+}

@@ -1,0 +1,40 @@
+{
+  "$id": "sentinel:schemas/profile.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "defaults": {
+      "additionalProperties": {},
+      "type": "object"
+    },
+    "id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "kind": {
+      "enum": [
+        "app_settings",
+        "order_defaults"
+      ]
+    },
+    "owner": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "settings": {
+      "additionalProperties": {},
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "id",
+    "kind",
+    "owner"
+  ],
+  "title": "profile (profile)",
+  "type": "object"
+}

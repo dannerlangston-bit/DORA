@@ -5,6 +5,9 @@ persona: swing_trader
 file: corpus/workspaces/ws.tier-a.swing-trader/workspace.sentinel-swing
 file_sha256: "sha256:d067f76fd1fcc30b33e85c568c77c22e868b89c8b4e6a2849fb05615789ab7b2"
 display_config: {width: 1920, height: 1080, scale_percent: 100, theme: dark, font_size: medium}
+tabs: [Monitor, Trade, Analyze, Scan, MarketWatch, Charts, Tools]   # placeholder until Phase 0 reads the pinned build's tab bar (4.6)
+windows:
+  - {title_regex: "thinkorswim", rect: {x: 0, y: 0, w: 1920, h: 1040}}
 link_groups:
   - {color: red, symbol_ref: aapl}
 gadgets_present:

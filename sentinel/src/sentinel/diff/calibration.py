@@ -47,6 +47,7 @@ import cv2
 import numpy as np
 import yaml
 
+from ..canonical import calibration_filename
 from ..records import DATA_MODES
 from . import load_params
 from .engine import DiffContext, DiffResult, Terminal, diff_pair
@@ -284,8 +285,9 @@ def _proposal(union: np.ndarray | None, landmark: str | None, anchor_pos: Mappin
 
 @dataclass
 class CalibrationFile:
-    """`calibration/<fingerprint_id>.yaml` (4.8): per checkpoint and region, the four derived
-    thresholds plus the measured floors, for one fingerprint."""
+    """`calibration/<hex>.yaml` (4.8, 4.12): per checkpoint and region, the four derived thresholds plus the
+    measured floors, for one calibration key; `<hex>` is the key without its `sha256:` prefix
+    (`canonical.calibration_filename`, SD-36 with SD-69). The `fingerprint_id` field holds that key."""
 
     fingerprint_id: str
     calibration_run_id: str
@@ -362,15 +364,15 @@ class CalibrationFile:
         return out
 
     def save(self, directory: str | os.PathLike) -> Path:
-        path = Path(directory) / f"{self.fingerprint_id.replace(':', '_')}.yaml"
+        path = Path(directory) / calibration_filename(self.fingerprint_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(yaml.safe_dump(self.to_dict(), sort_keys=False), encoding="utf-8")
         return path
 
     @staticmethod
-    def load(directory: str | os.PathLike, fingerprint_id: str) -> "CalibrationFile | None":
-        """The file for a fingerprint, or None when none exists (every region `uncalibrated`, L-FPR-04)."""
-        path = Path(directory) / f"{fingerprint_id.replace(':', '_')}.yaml"
+    def load(directory: str | os.PathLike, calibration_key: str) -> "CalibrationFile | None":
+        """The file for a calibration key, or None when none exists (every region `uncalibrated`, L-FPR-04)."""
+        path = Path(directory) / calibration_filename(calibration_key)
         if not path.exists():
             return None
         return CalibrationFile.from_dict(yaml.safe_load(path.read_text(encoding="utf-8")))

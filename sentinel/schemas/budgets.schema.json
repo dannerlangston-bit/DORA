@@ -1,0 +1,76 @@
+{
+  "$id": "sentinel:schemas/budgets.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "approved_by": {
+      "type": "string"
+    },
+    "rescue": {
+      "additionalProperties": false,
+      "properties": {
+        "max_actions": {
+          "default": 25,
+          "type": "integer"
+        },
+        "max_rescued_steps_per_run": {
+          "default": 25,
+          "type": "integer"
+        },
+        "max_seconds": {
+          "default": 90,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "reviewer_items": {
+      "additionalProperties": false,
+      "properties": {
+        "merge": {
+          "default": 200,
+          "type": "integer"
+        },
+        "pr": {
+          "default": 60,
+          "type": "integer"
+        },
+        "rc": {
+          "default": 500,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "usd": {
+      "additionalProperties": false,
+      "properties": {
+        "per_explorer_session": {
+          "default": 25,
+          "type": "number"
+        },
+        "per_run": {
+          "default": 50,
+          "type": "number"
+        },
+        "per_week": {
+          "default": 500,
+          "type": "number"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "reviewer_items",
+    "rescue",
+    "usd"
+  ],
+  "title": "budgets (budgets)",
+  "type": "object"
+}

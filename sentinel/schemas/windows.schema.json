@@ -1,0 +1,165 @@
+{
+  "$defs": {
+    "quiet_window": {
+      "additionalProperties": false,
+      "properties": {
+        "end": {
+          "additionalProperties": false,
+          "properties": {
+            "calendar": {
+              "enum": [
+                "XNYS",
+                "CMES"
+              ]
+            },
+            "time": {
+              "type": "string"
+            },
+            "weekday": {
+              "enum": [
+                "Mon",
+                "Tue",
+                "Wed",
+                "Thu",
+                "Fri",
+                "Sat",
+                "Sun"
+              ]
+            }
+          },
+          "required": [
+            "weekday",
+            "time"
+          ],
+          "type": "object"
+        },
+        "rule": {
+          "type": "string"
+        },
+        "start": {
+          "additionalProperties": false,
+          "properties": {
+            "calendar": {
+              "enum": [
+                "XNYS",
+                "CMES"
+              ]
+            },
+            "time": {
+              "type": "string"
+            },
+            "weekday": {
+              "enum": [
+                "Mon",
+                "Tue",
+                "Wed",
+                "Thu",
+                "Fri",
+                "Sat",
+                "Sun"
+              ]
+            }
+          },
+          "required": [
+            "weekday",
+            "time"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$id": "sentinel:schemas/windows.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "maintenance_windows": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "end": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "start": {
+            "type": "string"
+          },
+          "weekday": {
+            "enum": [
+              "Mon",
+              "Tue",
+              "Wed",
+              "Thu",
+              "Fri",
+              "Sat",
+              "Sun"
+            ]
+          }
+        },
+        "required": [
+          "weekday",
+          "start",
+          "end",
+          "source"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "operating_day": {
+      "additionalProperties": false,
+      "properties": {
+        "end": {
+          "type": "string"
+        },
+        "start": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "start",
+        "end"
+      ],
+      "type": "object"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "windows": {
+      "additionalProperties": false,
+      "properties": {
+        "all_quiet": {
+          "$ref": "#/$defs/quiet_window"
+        },
+        "equities_quiet": {
+          "$ref": "#/$defs/quiet_window"
+        },
+        "futures_break": {
+          "$ref": "#/$defs/quiet_window"
+        },
+        "none": {
+          "$ref": "#/$defs/quiet_window"
+        }
+      },
+      "required": [
+        "all_quiet",
+        "equities_quiet",
+        "futures_break",
+        "none"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "schema_version",
+    "operating_day",
+    "windows",
+    "maintenance_windows"
+  ],
+  "title": "windows (windows_file)",
+  "type": "object"
+}

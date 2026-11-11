@@ -2,7 +2,7 @@
 
 This section defines what Sentinel looks at, how it decides what to look at for a given run, and what it says when it cannot look. Five test kinds and one bounded activity (the Explorer) produce checkpoints; every checkpoint ends in exactly one outcome from the closed taxonomy in 1.10 Outcome taxonomy (authoritative), chosen by the precedence order stated there. Comparison, the Region Registry and the reviewer are in 3.7 Three-granularity diff: algorithms and parameters, 3.8 Region Registry semantics and 3.12 The reviewer: inputs and prompt contract; file formats are in 4.5 Surface Registry entry, 4.6 Workspace Corpus entry and 4.7 Flow file. This section owns the registry content, the census, the size sweeps, flows and assertions, the invariant catalog, the Oracle, the Dependency Map, scope computation and coverage accounting.
 
-Every checkpoint id in this section follows one grammar: `<kind>/<surface-id>/<qualifier>`. The kind is `census`, `sweep`, `split` or `flow`; the surface id is the registry's dotted slug with hyphens inside segments; the qualifier is `<workspace-id>` for census (plus an optional dimension segment, 2.4), `<host>/<w>x<h>` for sweep, `<splitter>/<fraction>` for split and `<flow-id>/<step-id>` for flow. The lint in 4.15 Cross-file rules and the lint pipeline and the schema in 8.3 Schema accept exactly this grammar and nothing else.
+Every checkpoint id in this section follows one grammar: `<kind>/<surface-id>/<qualifier>`. The kind is `census`, `sweep`, `split` or `flow`; the surface id is the registry's dotted slug with hyphens inside segments; the qualifier is `<workspace-id>` for census (plus an optional dimension segment, 2.4), `<host>/<w>x<h>` for sweep (`<host>/<w>x<h>-asc` for a step of Ladder F's ascending pass, 2.5.2), `<splitter>/<fraction>` for split and `<flow-id>/<step-id>` for flow. The lint in 4.15 Cross-file rules and the lint pipeline and the schema in 8.3 Schema accept exactly this grammar and nothing else.
 
 ### 2.1 The five test kinds and the Explorer
 
@@ -32,9 +32,11 @@ The registry is YAML in git (`registry/surfaces/*.yaml`): one file per top-level
 | `path` | Ordered reach steps from a named workspace state in the step vocabulary of 4.7 (`click_named` targets name registry controls, which carry the JAB name, template and OCR rungs of the locator ladder, 5.5 Locator ladder); CI requires at least two rungs per targeted control |
 | `primitives` | Hosting primitives consumed (FlexibleGrid, Docking, ColumnModel, Theme, FontMetrics, ChartEngine, OrderTicketCore, LadderModel, and so on); keys into the Dependency Map |
 | `roots` | Class or package prefixes implementing the surface; used by the static impact step; derived from source, human-overridable |
-| `personas` | Subset of `active_trader`, `options_trader`, `futures_trader`, `swing_trader`, `beginner`; matrix columns |
+| `personas` | Subset of `active_trader`, `options_trader`, `futures_trader`, `swing_trader`, `beginner`; matrix columns. `personas[0]` is the primary persona, which sweep and split checkpoints count toward (2.12) |
 | `tier` | 1 money and orders, 2 analysis, 3 everything else |
-| `resizable`, `hosts` | Set only from probe P8 or a declared in-host splitter; `hosts` is a subset of {tab, sidebar, flexgrid, detached, dialog} |
+| `critical` | Default false; allowed only on tier 1. Makes the surface's checkpoints critical checkpoints, which the mutant catalog must bind (4.11 L-MUT-03, 10.3) |
+| `resizable`, `hosts` | Set only from probe P8 or a declared in-host splitter; `hosts` is a subset of {tab, sidebar, flexgrid, detached, dialog}. Only flexgrid, detached and dialog hosts take w x h sizes; tab and sidebar hosts are swept through their splitters (2.5.1) |
+| `streaming` | Default false; true when the whole surface is a streaming region (news, video), which excludes it from sweeps (2.5.3) |
 | `splitters` | In-host sweep splitters: list of `{id, host, template, fractions, collapsible}`. A fraction outside the list is not a checkpoint; 0.00 and 1.00 appear only when `collapsible: true` |
 | `target_window` | `{kind: main or detached or dialog or popup, title_regex}`; Capture selects the window by kind plus title regex |
 | `data_mode` | `frozen` or `masked_live`; default for census and sweep checkpoints, flows may override |
@@ -42,7 +44,8 @@ The registry is YAML in git (`registry/surfaces/*.yaml`): one file per top-level
 | `enumerable_by` | Probe P1 to P8 that lists the entry in the running app, or none |
 | `census.workspaces` | The corpus workspaces the census visits the surface in, the canonical one first. The census also visits the surface in every other corpus workspace whose derived hosted-surface list (from `gadgets_present`, 4.6) contains it (2.3); lint requires at least one tier A workspace to host every surface |
 | `landmarks`, `anti_anchors`, `labels`, `controls` | Must-see landmark templates (`must_see: true`) proving the surface is open and OCR strings that must be absent; required labels for INV-05; controls with `required: true` for INV-10 and `deny: true` for the gateway deny list (tier 1 must list its primary action labels and controls) |
-| `smoke`, `owner` | PR smoke subset membership (rule in 2.11); flow owner for routing |
+| `invariants` | Optional per-surface invariant inputs: `min_font_px`, `overlap_allowlist` (pairs of controls), `signed_columns`, `allowed_scrollbars`, `focus_order` (2.7 Common rules) |
+| `smoke`, `owner` | PR smoke subset membership, a flag the registry owner sets (rule in 2.11; tier 1 does not imply it); flow owner for routing |
 
 ```yaml
 schema_version: 1
@@ -131,7 +134,7 @@ Pairing rule for renames. Before the result table is applied, within one probe's
 
 #### 2.2.4 Registry lint
 
-CI rejects: duplicate or renamed ids without a rename map; a path step with fewer than two rungs; a tier-1 entry without `labels` and `controls`; a `primitives` value absent from the Dependency Map; a `census.workspaces` entry absent from the corpus; a surface hosted by no tier A workspace (so every surface is reached at least once per merge run); an `entitlements` value outside the vocabulary; `resizable: true` with empty `hosts`; a `splitters` entry whose `host` is not in `hosts`; more than 40 entries with `smoke: true` (the registry owner removes flags; the run never raises the cap). The same lint runs at preflight item G1 (12.7 Preflight checklist); a failure there ends the run `aborted_harness (reason: config_invalid)` before any product action, so a broken registry never yields a partial census.
+CI rejects: duplicate or renamed ids without a rename map; a path step with fewer than two rungs; a tier-1 entry without `labels` and `controls`; a `primitives` value absent from the Dependency Map; a `census.workspaces` entry absent from the corpus; a surface hosted by no tier A workspace (so every surface is reached at least once per merge run); an `entitlements` value outside the vocabulary; `resizable: true` with empty `hosts`; a `splitters` entry whose `host` is not in `hosts`; `critical: true` on an entry that is not tier 1 (L-SRF-16); more than 40 entries with `smoke: true` (the registry owner removes flags; the run never raises the cap). The same lint runs at preflight item G1 (12.7 Preflight checklist); a failure there ends the run `aborted_harness (reason: config_invalid)` before any product action, so a broken registry never yields a partial census.
 
 ### 2.3 Workspace Corpus
 
@@ -141,7 +144,7 @@ CI rejects: duplicate or renamed ids without a rename map; a path step with fewe
 | B power user | Real internal power-user workspaces with detached windows, Flexible Grid charts, dense sidebars, custom columns; at least two saved under the previous release | Census under realistic density; migration dialogs; RC only | 4 to 8 |
 | C sweep harness | One Flexible Grid workspace with a single cell, empty sidebar, parking area for detached windows, link groups fixed | Size sweeps | 1 |
 
-Each workspace is a file in git with content hash, persona tag, the release it was saved under, and a derived list of surfaces it hosts (the probes run against it once at commit time and again whenever the registry changes). That list is the `hosted_by` relation the census (2.4) and scope computation (2.11) use; a surface in no tier A workspace fails lint (2.2.4). Rules: no news, video or chat gadgets in tiers A and C; link colors fixed; fonts and theme pinned; symbols from the symbol fixture only. The Rig Manager copies the files into the install's usergui folder on snapshot build and the hash check after load is the `workspace_loaded` gate. Workspaces are local state; studies, scans, watchlists, drawings and most Application Settings are server-side and restored by the fixture reset flow (7.5 State model, 7.6 Fixture reset flow and verify_account_fixture). Tier B workspaces carry migration: the candidate loads a workspace saved under the previous release and every conversion or first-launch dialog is a captured checkpoint (Migration flow class, 2.6.3). A fresh install from the public installer cannot pin a build (the launcher downloads the current build), so fresh install and upgrade in place are not corpus items; they are the release-night upgrade flow under DR-04 branch B (11.8 Phase 0 spike plan: seven decision records).
+Each workspace is a file in git with content hash, persona tag, the release it was saved under, and a derived list of surfaces it hosts (the probes run against it once at commit time and again whenever the registry changes). That list is the `hosted_by` relation the census (2.4) and scope computation (2.11) use; a surface in no tier A workspace fails lint (2.2.4). Rules: no news, video or chat gadgets in tiers A and C; link colors fixed; fonts and theme pinned; symbols from the symbol fixture only. The tier counts in the table and the gadget rule are linted (L-WSP-08 and L-WSP-09 in 4.6 Workspace Corpus entry). The Rig Manager copies the files into the install's usergui folder on snapshot build and the hash check after load is the `workspace_loaded` gate. Workspaces are local state; studies, scans, watchlists, drawings and most Application Settings are server-side and restored by the fixture reset flow (7.5 State model, 7.6 Fixture reset flow and verify_account_fixture). Tier B workspaces carry migration: the candidate loads a workspace saved under the previous release and every conversion or first-launch dialog is a captured checkpoint (Migration flow class, 2.6.3). A fresh install from the public installer cannot pin a build (the launcher downloads the current build), so fresh install and upgrade in place are not corpus items; they are the release-night upgrade flow under DR-04 branch B (11.8 Phase 0 spike plan: seven decision records).
 
 ### 2.4 Surface census procedure
 
@@ -178,7 +181,7 @@ Rules the pseudocode relies on:
 - Preconditions. The sequence is one `reset_ui`, one workspace reload, then `env_error (gate: workspace_loaded, reason: precondition:<check>)` for this visit; the next visit re-checks. Three consecutive `env_error` visits in one workspace mark the workspace's remaining visits on that shard `env_error` with the same gate without attempting them, the shard moves to its next workspace, and on-call is told once per workspace.
 - Settle. A capture is never retried across a settle timeout; `not_settled` stands with the failing condition and the next surface starts after `reset_input_state`.
 - App failure. A dead process or frozen Event Dispatch Thread during a visit makes that visit `assertion_failed (assertion: app_alive)` with a tier-1 `app_crash` finding carrying hs_err_pid, dumps and the log slice; the Watchdog relaunches and the census resumes at the next surface after the gates pass again (10.2 Watchdog). A relaunch budget spent ends the run `aborted_budget (reason: app_restart_budget)`.
-- Base side. The base build runs the identical visit list. A visit the base could not complete (`landmark_missing`, `not_settled`, `env_error`, `harness_error` on the base) leaves the candidate's capture `needs_baseline` when the manifest marks the surface `new_surface: true`, else `not_run (reason: base_step_failed)` for the registry owner; the Invariant Checker and the Oracle still run on the candidate capture either way and their findings are reported in Unexpected (3.1).
+- Base side. The base build runs the identical visit list. A base step failure (a path step that still fails on the base after its retry) makes the checkpoint `not_run (reason: base_step_failed)` for the registry owner, unless the manifest entry declaring the surface has `new_surface: true`, which gives `needs_baseline (reason: new_surface)`. A base capture failure (`not_settled`, `env_error` or `harness_error` at the base capture) is re-captured once; if it still fails, the checkpoint is `needs_baseline` with reason `base_not_settled`, `base_env_error` or `base_harness_error` (3.11 input B). In both cases the Invariant Checker and the Oracle still run on the candidate capture and their findings are reported in Unexpected (3.1).
 
 Budget: the tier A census pass is 900 checkpoints (five tier A workspaces times roughly 180 hosted surfaces). A visit is planned at 12 seconds p50 (planning assumption in 11.1), about 185 rig-minutes for the pass, with a sensitivity bound of 20 seconds per visit (about 5 rig-hours) that makes base-capture reuse mandatory rather than an optimization; Phase 0 measures the real figure. Merge runs shard the pass over the 4-rig pool and PR runs take a subset (2.11); rig math is in 11.2 Cadence and time budgets per run type and 11.3 Sharding and parallelism.
 
@@ -192,7 +195,7 @@ A gadget is sized through one of three mechanisms, in order of preference:
 2. Flexible Grid cell. In the tier C workspace, set the gadget as cell content (if P8 lists it) and drag the grid splitters with the drag primitive (at least 10 intermediate moves). Measure the cell by template-locating its borders.
 3. In-host splitter. For panels inside a tab (Active Trader ladder against its side panels, Trade tab sections, sidebar against main area, Monitor sections), drag the splitter named in the registry's `splitters` list to a fraction of the host extent and measure the panel rect by its border templates.
 
-A surface lists its applicable modes in `hosts` and is swept in every one of them, because the ladder inside the Trade tab and the same ladder detached take different Docking paths. A detach control or splitter the locator ladder cannot find ends the first step of that host's ladder `failed`; its checkpoint is `landmark_missing` with the side it failed on, and every later step of that (surface, host) ladder is `not_run (reason: step_failed:<step>)`. The next host or surface starts after `reset_input_state` and a reload of the tier C workspace. An app failure during a step (process gone or EDT frozen, 2.6.1) makes that step's checkpoint `assertion_failed (assertion: app_alive)` and the rest of that (surface, host) ladder `not_run (reason: app_crash)`; after the relaunch the next ladder starts from its preconditions, and a ladder never resumes mid-way, because the descending order of 2.5.2 needs the layout computed large first.
+Tab and sidebar hosts have no w x h sizing; they are swept through their splitters only (mechanism 3, `split` checkpoints), because the main frame rect is pinned (INV-09). The w x h ladders of 2.5.2 apply to the flexgrid, detached and dialog hosts. A surface lists its applicable modes in `hosts` and is swept in every one of them, because the ladder inside the Trade tab and the same ladder detached take different Docking paths. A detach control or splitter the locator ladder cannot find ends the first step of that host's ladder `failed`; its checkpoint is `landmark_missing` with the side it failed on, and every later step of that (surface, host) ladder is `not_run (reason: step_failed:<step>)`. The next host or surface starts after `reset_input_state` and a reload of the tier C workspace. An app failure during a step (process gone or EDT frozen, 2.6.1) makes that step's checkpoint `assertion_failed (assertion: app_alive)` and the rest of that (surface, host) ladder `not_run (reason: app_crash)`; after the relaunch the next ladder starts from its preconditions, and a ladder never resumes mid-way, because the descending order of 2.5.2 needs the layout computed large first.
 
 Every step measures the achieved size after the set or drag and compares it with the request. Three cases, closed:
 
@@ -206,7 +209,7 @@ Corner steps such as (240, 160) are expected to clamp on most gadgets; the clamp
 
 #### 2.5.2 The ladders
 
-Sizes are client-area pixels on the pinned 1920x1080 rig at 100 percent DPI. MAXW and MAXH are the largest client width and height of a maximized main window, measured at calibration and stored in the fingerprint (expected about 1904 and 1000); the ladder stores the symbols so a Windows build change cannot shift it silently. The two ladders are named sets; a registry entry references them by name and may override with its own ladder only with a stated reason.
+Sizes are client-area pixels on the pinned 1920x1080 rig at 100 percent DPI. MAXW and MAXH are the work area of the pinned display configuration, `work_area: {w, h}` on its entry in `configs/allowed.yaml` (4.6); the ladder stores the symbols so a Windows build change cannot shift it silently. Corpus sizes come from `corpus/measured_sizes.yaml` (owner: registry owner, 4.1): probe P8 measures each gadget's size per workspace on the first validated run and the Reporter's registry PR writes the file. Until the file lists a gadget, its corpus-size steps are `not_run (reason: scope)` and run health prints a line saying so. The two ladders are named sets; a registry entry references them by name and may override with its own ladder only with a stated reason.
 
 Ladder F (RC runs):
 
@@ -214,8 +217,8 @@ Ladder F (RC runs):
 |---|---|---|
 | Grid | Every width in {320, 400, 480, 640, 800, 960} by every height in {300, 360, 420, 480, 600, 720} | 36 |
 | Corners | (240, 160), (240, MAXH), (MAXW, 160), (MAXW, MAXH) | 4 |
-| Corpus sizes | The gadget's actual size in every tier A and B workspace hosting it | per corpus |
-| Ascending pass | The six grid widths at height 480, smallest first | 6 |
+| Corpus sizes | The gadget's size in every tier A and B workspace hosting it, from `corpus/measured_sizes.yaml` | per corpus |
+| Ascending pass | The six grid widths at height 480, smallest first; ids end in `-asc` | 6 |
 | Order | Grid descending by width then by height, corners, corpus sizes, ascending pass | about 46 plus corpus |
 
 Ladder S (PR and merge runs):
@@ -227,7 +230,7 @@ Ladder S (PR and merge runs):
 
 Splitter positions as fractions of the host extent: full set (RC) 0.00, 0.15, 0.30, 0.50, 0.70, 0.85, 1.00; short set (PR, merge) 0.15, 0.50, 0.85. The positions 0.00 (collapsed) and 1.00 exist only for splitters the registry declares `collapsible: true`; for every other splitter they are not checkpoints, and the registry's `fractions` list may narrow the set further with a stated reason.
 
-Most overlap bugs appear when a layout computed large is shrunk, so the descending order is mandatory and the ascending pass is RC-only. Ladder S deliberately contains 480x360, the cell size at which the reference ladder overlap reproduces (1.11 Worked example: the Flexible Grid change that overlaps the Active Trader ladder), so a PR run catches it. Each step is a checkpoint, id `sweep/<surface-id>/<host>/<w>x<h>` or `split/<surface-id>/<splitter>/<fraction>`, for example `sweep/trade.active-trader.ladder/flexgrid/480x360`, diffed against the base at the same step and run through the invariants. The base build runs the same ladder in the same order; a step the base failed or clamped differently follows 2.5.1 and the base-side rule of 2.4. Overlap at a size is `invariant_violation` on that step, and the Reporter names the first failing size and the failing range, which is what the PR comment needs.
+Most overlap bugs appear when a layout computed large is shrunk, so the descending order is mandatory and the ascending pass is RC-only. Ladder S deliberately contains 480x360, the cell size at which the reference ladder overlap reproduces (1.11 Worked example: the Flexible Grid change that overlaps the Active Trader ladder), so a PR run catches it. Each step is a checkpoint, id `sweep/<surface-id>/<host>/<w>x<h>` or `split/<surface-id>/<splitter>/<fraction>`, for example `sweep/trade.active-trader.ladder/flexgrid/480x360`, diffed against the base at the same step and run through the invariants. The ascending pass revisits sizes the descending pass already has, so its steps take the id `sweep/<surface-id>/<host>/<w>x<h>-asc` (for example `sweep/trade.active-trader.ladder/flexgrid/480x480-asc`) and are planned after the descending pass, corners and corpus sizes, in ladder order. The base build runs the same ladder in the same order; a step the base failed or clamped differently follows 2.5.1 and the base-side rule of 2.4. Overlap at a size is `invariant_violation` on that step, and the Reporter names the first failing size and the failing range, which is what the PR comment needs.
 
 #### 2.5.3 Which gadgets get the sweep
 
@@ -235,9 +238,9 @@ Most overlap bugs appear when a layout computed large is shrunk, so the descendi
 |---|---|
 | `resizable` is set only from P8 or a declared in-host splitter | Nothing is swept by hand-set flag |
 | Tier 1 | Ladder S in PR when in scope, ladder S in merge, ladder F in RC; splitters short, full in RC |
-| Tier 2 | Ladder S in merge, ladder F in RC |
-| Tier 3 | Ladder S in RC only |
-| Whole surface is a streaming region (news, video) | Excluded; every sweep checkpoint of the surface is `not_run (reason: scope)` |
+| Tier 2 | Ladder S in merge, ladder F in RC; splitters short, full in RC |
+| Tier 3 | Ladder S and splitters short in RC only |
+| `streaming: true` (the whole surface is a streaming region: news, video) | Excluded; every sweep checkpoint of the surface is `not_run (reason: scope)` |
 | Chart surfaces | Swept in `frozen` mode only; under DR-02 branch B without OnDemand they are `not_run (reason: scope)` and the count prints in run health |
 
 Sweep checkpoints default to `frozen`; a gadget that cannot be frozen (Level II under DR-02 branch B) sweeps under `masked_live` with its rule regions, and invariants still run because they do not depend on values.
@@ -255,7 +258,7 @@ A flow is YAML in git (`flows/<tier>/<surface>/<name>.yaml`): metadata (id, surf
 
 Step outcomes: `passed`; `passed_after_retry` (one retry per step, never across a capture; the first attempt's screenshot is kept); `passed_via_agent_fallback` (locator failure recorded as a finding; the post-recovery capture is tagged rescued and its checkpoint is `needs_human (reason: rescued_capture)` unless a higher-precedence outcome applies); `failed`; `blocked_by_gateway`. A `failed` or `blocked_by_gateway` step ends the flow and teardown runs. The checkpoint that step led to is `landmark_missing` when the locator failed on every rung (with the side it failed on), `assertion_failed` when an assertion failed, or `env_error (gate: <gate>)` when a popup with action abort, a disconnect or a session gate caused the failure. For `blocked_by_gateway` the checkpoint is `not_run (reason: step_failed:<step>)` because nothing was captured; the drop goes to the safety log and on-call, and a blocked attempted send on a scripted flow ends the run `aborted_safety` (6.2 Never-send guard at the keystroke layer). Every later checkpoint of the flow is `not_run (reason: step_failed:<step>)` pointing at the step finding, so the matrix shows them as not looked at rather than as broken. Candidate-only step failure is a suspected regression ranked in Unexpected with the pre-attempt screenshot; failure on both builds is a flow bug for the flow owner, with the same outcomes.
 
-Base-side step failure: when the base build fails a step the candidate passed, the checkpoint is `needs_baseline` if the manifest marks the surface `new_surface: true`, else `not_run (reason: base_step_failed)` for the flow owner; later checkpoints of the flow on that side follow the same rule, and the candidate's captures still run the Invariant Checker and the Oracle, whose findings are reported in Unexpected even though the outcome is `not_run` (3.1).
+Base-side failure, two cases. A base step failure (the base build still fails, after its retry, a step the candidate passed) makes the checkpoint `not_run (reason: base_step_failed)` for the flow owner, unless the manifest entry declaring the surface has `new_surface: true`, which gives `needs_baseline (reason: new_surface)`; later checkpoints of the flow on that side follow the same rule. A base capture failure (`not_settled`, `env_error` or `harness_error` at a base checkpoint the steps reached) is re-captured once; if it still fails, the checkpoint is `needs_baseline` with reason `base_not_settled`, `base_env_error` or `base_harness_error` (3.11 input B). In both cases the candidate's captures still run the Invariant Checker and the Oracle, whose findings are reported in Unexpected even when the outcome is `not_run` (3.1).
 
 App failure during a flow: if the thinkorswim process tree is gone or the Event Dispatch Thread is frozen past the checkpoint's max wait (Watchdog detection, 10.2 Watchdog), the checkpoint being captured is `assertion_failed (assertion: app_alive)`, every later checkpoint of the flow is `not_run (reason: app_crash)`, and a tier-1 finding `app_crash` carries the hs_err_pid file, heap dump and log slice. An error or exception dialog on screen at capture with the app alive is `invariant_violation` INV-14 (2.7), not an app failure. After the relaunch the next flow starts from its preconditions. The first three app failures in a shard are each relaunched; a fourth marks the shard's remaining checkpoints `not_run (reason: budget)` and the run `aborted_budget (reason: app_restart_budget)` (10.2). A crash or hang during the relaunch gates, or during the gate sequence of the shard's first launch, is another `app_alive` failure that consumes that budget, never `env_error`. The cause (`jvm_crash`, `hang`, `oom`, `process_exit`) is stored in `detail` of the `app_alive` record (4.13).
 
@@ -274,7 +277,7 @@ Assertions in an expect block are evaluated by the Oracle on typed extractions f
 | `export_equals` | export column, region | CSV or clipboard total equals the on-screen value within tolerance |
 | `api_within` | region, api field, tolerance | Within tolerance of the API value as of the modeled time (2.8.2) |
 | `rule` | rule id R01 to R10 | An arithmetic invariant from 2.8.3 on the checkpoint's extractions |
-| `sign_color_agrees` | region | Numeric sign and dominant text color agree with the pinned palette |
+| `sign_color_agrees` | region | Numeric sign and dominant text color agree with the pinned palette (`palettes/<theme>.yaml`, 2.7) |
 
 #### 2.6.3 Flow classes and the minimum set
 
@@ -303,8 +306,9 @@ Common rules:
 - Bounds. Branch A: JAB contexts (role, name, rect, states) walked from the frame; custom-painted containers exposing no children are marked opaque and their interior falls to branch B rules. Branch B: OCR word boxes (3x upscale, confidence floor 70), template-located controls from registry anchors and Region Registry landmarks, grid lines from projection profiles.
 - Persistence. A violation must appear on all 3 settled frames, else it is discarded and counted in flake statistics. A violation that holds is re-captured once by the targeted re-run of 3.10 to confirm persistence; if the re-capture does not reproduce it, the checkpoint is `not_settled (reason: unstable)` with the violation kept as evidence for the flow owner.
 - Pre-existing. A violation present on both builds is reported once as pre-existing, one severity level lower, keyed by diff signature so a human decision suppresses it later; never dropped, and the outcome stays `invariant_violation` on the candidate capture. Candidate-only violations get full severity.
-- Bounds source failure. Under branch A, a bridge that is down at run start fails the preflight self-test and the run is `aborted_harness` before any product action; a bridge that dies mid-run makes every later checkpoint of the shard `harness_error (reason: bounds_source_unavailable)` until the Watchdog's relaunch restores it. A single element whose bounds cannot be read is recorded per rule and the checkpoint is `needs_human (reason: bounds_unreadable)` unless a higher-precedence outcome applies. Under branch B, an OCR calibration miss is `harness_error (reason: ocr_calibration)` (2.8.1). Masks never apply to invariants: a clipped label inside a masked region is still a violation.
-- Allowlist. Legitimately overlapping components (tooltips, chart crosshair, drag ghosts, popup menus, overlay badges) are listed per surface; an allowlisted pair never fires INV-01, INV-02 or INV-11.
+- Bounds source failure. Under branch A, a bridge that is down at run start fails the preflight self-test and the run is `aborted_harness` before any product action; a bridge that dies mid-run makes every later checkpoint of the shard `harness_error (reason: bounds_source_unavailable)` until the Watchdog's relaunch restores it, and a bridge still down after one relaunch ends the run `aborted_harness (reason: bounds_source_unavailable)` (1.10). A single element whose bounds cannot be read is recorded per rule and the checkpoint is `needs_human (reason: bounds_unreadable)` unless a higher-precedence outcome applies. Under branch B, an OCR calibration miss is `harness_error (reason: ocr_calibration)` (2.8.1). Masks never apply to invariants: a clipped label inside a masked region is still a violation.
+- Per-surface inputs. The registry entry's optional `invariants` block (4.5) carries what the table below calls "listed per surface" or "declared": `min_font_px` (INV-07), `overlap_allowlist` as pairs of controls (INV-01, INV-02, INV-11), `allowed_scrollbars` (INV-06), `signed_columns` (INV-15) and `focus_order` (INV-13); required labels and controls are the entry's `labels` and `controls` (INV-05, INV-10). The INV-15 palette is `palettes/<theme>.yaml` (owner: registry owner, 4.1), chosen by the theme of the workspace's `display_config`.
+- Allowlist. Legitimately overlapping components (tooltips, chart crosshair, drag ghosts, popup menus, overlay badges) are listed per surface in `invariants.overlap_allowlist`; an allowlisted pair never fires INV-01, INV-02 or INV-11.
 - Severity. S1 heads the Unexpected section; S2 is listed; S3 is under a fold. A tier-1 surface bumps S2 to S1 and S3 to S2.
 - Outcome. Every fired invariant produces `invariant_violation` with id, the rects involved and a native crop. The reviewer never reclassifies it.
 
@@ -335,13 +339,15 @@ Branch B is noisier on dense dark grids; the controls above are the minimum, and
 | Source | Reads | Applies to | Source validation and failure |
 |---|---|---|---|
 | OCR on upscaled crops | Typed fields (money, integer, percent, date, text) from anchored regions; 3x upscale, inverted, per-field character whitelist | Every checkpoint with rule regions or assertions | A calibration panel of checked-in crops with known values, at least one per field type, is OCRed at preflight (item H9, run `aborted_harness` on a miss) and again at the `canary_flow_passed` gate; a miss there makes every OCR-dependent assertion of the run `harness_error (reason: ocr_calibration)`, never `assertion_failed` |
-| CSV export | Account Statement Export to File (confirmed); Position Statement, watchlist, scan and chain exports (verify in Phase 0; an export that does not exist on the build makes its flow class entries `not_run (reason: scope)` with the count in run health) | Export flows; totals cross-check | Header set must equal the declared set, else `harness_error (reason: export_header_mismatch)` on that checkpoint; no file within the step timeout is step `failed` |
+| CSV export | Account Statement Export to File (confirmed); Position Statement, watchlist, scan and chain exports (verify in Phase 0; an export that does not exist on the build makes its flow class entries `not_run (reason: scope)` with the count in run health) | Export flows; totals cross-check | Header set must equal the export step's declared `headers` (4.7), else `harness_error (reason: export_header_mismatch)` on every checkpoint that depends on the export; no file within the step timeout is step `failed` with step reason `export_timeout`, and an export control the build does not offer is step `failed` with `export_unavailable` (4.13) |
 | Grid copy | Copy or Copy All to clipboard (unverified; verify in Phase 0) | Grid reads without a file dialog | Must parse as tab-separated with the declared header; else fall back to OCR and record step event `oracle_source_fallback`; run health counts fallbacks per source and three on one grid in a week open a flow task |
 | JAB values | Accessible value and text of cells | Branch A, surfaces where the spike showed values | Per-build tree dump at intake compared with the previous build; a cell the tree no longer exposes falls back to OCR with `oracle_source_fallback` recorded |
 | Market-data API | Quote, chain, price history from the internal feed or Schwab market-data API | `api_within` assertions; symbol fixture checks | Preflight item N3 at run start; unreachable makes every checkpoint with an `api_within` assertion `env_error (gate: preflight.N3)`; a mid-run failure makes the remaining ones `env_error (gate: connectivity)` |
 | Fixture | Values from the deterministic fixture (DR-02 branch A) or the pinned OnDemand timestamp (DR-02 branch B) | `frozen` checkpoints | Verified at the `fixture_verified` gate; failure is `env_error (gate: fixture_verified)` for every `frozen` checkpoint of the run |
 
-Every extraction is stored in SQLite (8.3 Schema) beside the capture with source, confidence and crop reference, so rules re-run offline and the base build's numbers reach the reviewer as text.
+Every extraction is stored (8.3 `oracle_extractions`) beside the capture with source, confidence and crop reference, so rules re-run offline over the stored rows and the base build's numbers reach the reviewer as text.
+
+Census and sweep checkpoints carry no flow assertions; they run every `rule` region of their regions file (3.8). A `diff` or `freeze` region gets an Oracle check only as a flow assertion naming the region; the census half of the money-cell rule is L-RGN-04 (4.8).
 
 Extraction confidence. Every OCR read carries a confidence. The floor is 70 for text and 85 for money, price, integer and percent fields. A read below the floor, or two passes (3x and 2x upscale) that disagree on digit count, is unreadable. The Oracle then tries the alternate source the checkpoint declares (JAB value under branch A; grid copy or export where the surface has one). If no source reads above the floor, the checkpoint is `needs_human (reason: oracle_unreadable)` with the crop, the field name and both reads, never `assertion_failed` and never a pass. On a tier-1 money cell the item is ranked with tier-1 Unexpected findings, and the same cell unreadable in three consecutive runs on one build opens an OCR calibration task for the flow owner (a larger crop, a per-field whitelist change or a `rule` region re-declaration). The calibration panel holds at least one sample of every money field type, so the nightly money-cell canaries M03 to M05 (12.5) prove the read path end to end and a blind OCR path surfaces as canary state `detector_blind` (the missed mutant's record is `harness_error (reason: detector_blind)`, the Nightly run itself stays `complete`, 10.3), not as quiet passes.
 
@@ -379,7 +385,46 @@ Multipliers come from a fixture table: equity and SPX options 100, /ES 50, /NQ 2
 | R09 | Export total equals the on-screen total for the same grid |
 | R10 | Number format matches field type: no NaN, Infinity, null, double sign or misplaced separator |
 
-A rule failure is `assertion_failed`, reported with field, expected, extracted and native crop. It fires even when base and candidate are pixel-identical, which is the point: a number wrong in both builds is otherwise invisible. Rule ids R01 to R10 are the operand of the `rule` assertion kind (2.6.2) and the ids the flow lint checks; a rule whose operand regions are not all declared on the checkpoint fails lint, never silently skips.
+Rule operands. A `rule` assertion (4.7) binds each operand by name in its `inputs` to a region of the checkpoint or, where the type allows, a literal. This table is the operand list; the lint's and the Oracle's operand lists are generated from it. Types are the field types of 2.8.1 (`money`, `price`, `integer`, `percent`, `date`, `text`) plus `decimal` for Greeks.
+
+| Rule | Operand | Type | Required |
+|---|---|---|---|
+| R01 | `qty` | integer | yes |
+| R01 | `price` | price | yes |
+| R01 | `multiplier` | integer (a literal, or a region of symbols whose multipliers come from the fixture table above) | yes |
+| R01 | `total` | money | yes |
+| R02 | `bp_effect` | money | yes |
+| R02 | `notional` | money | yes |
+| R03 | `bid` | price | yes |
+| R03 | `mark` | price | yes |
+| R03 | `ask` | price | yes |
+| R03 | `last` | price | no (with `low` and `high`, all three or none) |
+| R03 | `low` | price | no |
+| R03 | `high` | price | no |
+| R04 | `count` | integer (the row count of the region) | yes |
+| R04 | `selector` | text | yes |
+| R05 | `delta` | decimal | yes |
+| R05 | `gamma` | decimal | no |
+| R05 | `vega` | decimal | no |
+| R05 | `theta` | decimal | no |
+| R06 | `call` | price | yes |
+| R06 | `put` | price | yes |
+| R06 | `strike` | price | yes |
+| R06 | `underlying` | price | yes |
+| R06 | `rate` | percent | no |
+| R06 | `dte` | integer | no |
+| R07 | `dte` | integer | yes |
+| R07 | `expiration` | date | yes |
+| R08 | `pl_open` | money | yes |
+| R08 | `mark` | price | yes |
+| R08 | `trade_price` | price | yes |
+| R08 | `qty` | integer | yes |
+| R08 | `multiplier` | integer (as in R01) | yes |
+| R09 | `export_total` | money | yes |
+| R09 | `screen_total` | money | yes |
+| R10 | `value` | text (checked against the assertion's `format`) | yes |
+
+A rule failure is `assertion_failed`, reported with field, expected, extracted and native crop. It fires even when base and candidate are pixel-identical, which is the point: a number wrong in both builds is otherwise invisible. Rule ids R01 to R10 are the operand of the `rule` assertion kind (2.6.2) and the ids the flow lint checks; a rule whose required operands are not all bound to regions declared on the checkpoint (or to literals) fails lint (L-FLW-11), never silently skips.
 
 ### 2.9 Explorer
 
@@ -391,7 +436,7 @@ A sixth, bounded activity, not a test kind. Under DR-07 branch B (computer use n
 - Order stage in a session: if the ticket or dialog flag (`order_stage`, 6.2) is ever set in an Explorer session, the gateway drops all input, closes the window through its recovery path (Escape token), and the session ends with the finding `explorer_order_stage` (S1, paged and notified per 9.10, plus the Explorer owner); the event counts toward the per-run trip of 10 (5.4.8) and the RC run itself continues. The 30-second open-dialog kill-switch timer of 6.6 applies to scripted flows and agent rescue only, never to an Explorer session.
 - Budgets, enforced by the Orchestrator and never by the prompt: 400 actions, 90 minutes wall clock, 25 dollars per session (plus the weekly cap of 11.4), and early stop after 20 consecutive actions with no new screenshot hash. The RC run's capture deadline caps the session as well: a session that starts late ends at the deadline (1.9). Exhaustion ends the session with a run-health line naming the budget hit; it never ends the run. If the model endpoint is unavailable at T+6:20 (`agent_available: false` after preflight N2 or N5, 12.7, with no recovery logged), the session does not start: it is `not_run (reason: model_unavailable)`, the RC report's Explorer section and run health print "Explorer: not run, model endpoint unavailable", the Explorer owner is notified, and the run is unaffected; a recovery logged before T+6:20 lets it start as planned.
 - Steering: toward surfaces with the fewest flow checkpoints in the current RC run and surfaces whose `primitives` intersect the manifest's touched primitives, from a target list the Orchestrator computes before the session starts. Odd inputs come from the seeded corpus with the pass rule of 2.6.3.
-- Logging per action (`step_events`, 8.3 Schema): index, time, stated target and expected outcome, resolved rect, keys, gate decision, pre and post screenshot hashes, 96x96 click crop, model id, prompt hash, usage. Before each action the agent states target and expected outcome; after it, the post-action state is verified by the cheapest means available (JAB focused element under branch A, else a template or OCR check of the expected anchor). A mismatch is logged `agent_error` and is never a product finding.
+- Logging per action (one `step_events` row with `mode: explorer`, 8.3 Schema): index (`seq`), time (`wall_at`, `mono_ms`), stated target (`target_text`) and expected outcome (`expected_outcome`), resolved rect (`screen_x`, `screen_y`, `rect_w`, `rect_h`), keys (`keys`), gate decision (`gate_decision`, `gate_reason`), pre and post screenshot hashes (`pre_hash`, `post_hash`), 96x96 click crop (`click_crop_sha256`), model id (`model_id`), prompt hash (`prompt_hash`), usage (`usage_json`). Before each action the agent states target and expected outcome; after it, the post-action state is verified by the cheapest means available (JAB focused element under branch A, else a template or OCR check of the expected anchor). A mismatch is logged `agent_error` and is never a product finding.
 - Findings: record with signature (surface, invariant or observation, crop hash), severity, confidence, raw values, trace reference, build, first and last seen; the same signature on a later night updates last seen instead of opening a new finding. Each is emitted as a candidate flow in `flows/quarantine/<finding-id>.yaml` (class `explorer_candidate`, 4.7 Flow file) from the trace since the last named stable state, anchored by click crops, and replayed exactly once in scripted mode on the same build within the RC run. No automatic trace minimization: a replay with steps removed costs minutes per probe against a live session, so trimming is a human step (an owner may enable a bounded mode of at most 8 replays for one finding). Only a reproducing finding is reported, through the replayed flow's own checkpoint outcomes: `invariant_violation` or `assertion_failed` when the finding is one of those, else `needs_baseline (reason: explorer_replay)` with the Explorer trace and the candidate flow attached, since a new flow has no base capture; never `needs_human`. A non-reproducing one is held with triage state `agent_mistake` or `expected_behavior` (8.3), listed under "Explorer: not reproduced" in the RC report (9.4 Merge and RC report structure) and counted in Explorer precision. A human trims and promotes the flow into the library; until the next good build captures a baseline, the promoted flow's checkpoints are `needs_baseline`.
 - Teardown: every session ends by replaying the server-side mutation ledger (items the Explorer created on its login), deleting each and verifying by reading, then the snapshot revert (6.8).
 - Metrics per RC run: Explorer precision (reproduced over emitted findings), agent-error ratio (agent errors over actions), deny-list hits, budget hit, dollars. Precision under 30 percent on two consecutive RC runs pauses the Explorer until the steering list or toolset is fixed; the pause is a run-health line, not silence.
@@ -438,11 +483,13 @@ The map is derived, not hand-written. A pipeline job runs a bytecode dependency 
 
 #### 2.10.2 Static impact step
 
-PR runs do not trust the committed map alone. The Orchestrator takes the diff's changed classes, computes their reverse transitive dependents on the candidate build's own dependency index (depth bounded at 6, configurable), intersects with every surface's `roots`, and obtains the surfaces the change can reach. Any such surface not reached through the committed map's expansion of the touched primitives and not declared in the manifest produces `dependency_map_gap` naming the missing edge (primitive or unowned class root, surface) and opens a proposed PR against the map. A changed class in no primitive's and no surface's `roots` is reported in the same finding as an unowned root, so the primitive vocabulary grows instead of silently missing an edge.
+PR runs do not trust the committed map alone. The Orchestrator takes the diff's changed classes, computes their reverse transitive dependents on the candidate build's own dependency index (depth bounded at 6, configurable), intersects with every surface's `roots`, and obtains the surfaces the change can reach. Any such surface not reached through the committed map's expansion of the touched primitives and not declared in the manifest produces `dependency_map_gap` (detail `missing_edge`) naming the missing edge (primitive, surface) and opens a proposed PR against the map. A changed class in no primitive's and no surface's `roots` is a gap only when it reaches a registered surface; it is then recorded as one `dependency_map_gap` (detail `unowned_root`), separate from the `missing_edge` findings, so the primitive vocabulary grows instead of silently missing an edge. A changed class that reaches no surface (backend code) is not a gap.
 
 ### 2.11 Scope computation per run type
 
-Inputs: registry R, committed Dependency Map D, manifest M (declared surfaces, touched primitives, tickets; may be absent), diff delta, candidate dependency index S (may be absent), entitlement profile E, quarantine list Q, flow library F, corpus W with its `hosted_by` relation, budget B with per-item durations from the run database, and the rig pool for the run.
+Inputs: registry R, committed Dependency Map D, manifest M (declared surfaces, touched primitives, tickets; may be absent), diff delta, candidate dependency index S (may be absent), entitlement profile E, quarantine list Q, flow library F, corpus W with its `hosted_by` relation, the capture budget B per rig with per-item durations, and the rig pool for the run.
+
+Budget B is capture time per rig, by one rule for every run type: `B = capture_time(run_type)`, the run type's wall budget (11.2) minus the 10-minute report margin minus the session startup of the 11.2 capacity table for every session the rig runs (4 minutes, 8 minutes when the session includes a fixture reset). Per-item durations are the 30-day p50 from the run store, with the planning defaults of 11.1 for an item without history, and each workspace switch costs its measured load time. The minute marks of 1.7 and 1.8 are illustrative; this budget and the capacity model of 11.2 are normative.
 
 ```
 function common_filters(items, E, Q):
@@ -452,10 +499,13 @@ function common_filters(items, E, Q):
   return items
 
 function order_and_cut(items, B, rigs):
-  sort by (tier asc, kind order flows, sweeps, census, estimated_duration desc)
-  shard by stable hash of item.id across rigs; flows sharing a fixture stay on one rig
+  sort by (tier asc, declared surface first within a tier, kind order flows, sweeps, census,
+           estimated_duration desc); census items grouped by workspace
+  shard: census items keyed by (surface tab, data_mode); flows by stable hash of flow_id within their tier;
+         flows sharing a state_scope (4.7) or a fixture pinned to one shard; shards packed longest first
+         (LPT) by measured p50, session startups included (4 min, 8 min with a fixture reset; 11.2)
   frozen items: base then candidate on the same rig, back to back; a stored base capture is reused when
-                fingerprint and fixture epoch match (3.1)
+                its reuse key matches (3.1); a frozen shard may run on an idle pair rig
   masked_live items: two identically fingerprinted rigs in lockstep; with one rig free they are
                 not_run(budget), never captured minutes apart
   while estimated duration on any rig > B:
@@ -464,8 +514,13 @@ function order_and_cut(items, B, rigs):
   return items per rig
 
 function smoke_subset(R):
-  return { s in R : s.smoke }   # all tier-1 surfaces, one surface per top-level tab,
-                                 # every attested Application Settings page; lint caps it at 40 (2.2.4)
+  return { s in R : s.smoke }   # flagged by the registry owner, at most 40 (2.2.4): tier-1 surfaces with
+                                 # money cells or order entry first, one surface per top-level tab,
+                                 # every attested Application Settings page
+
+function sweeps(s, ladder, splitter_steps):          # 2.5.1: w x h steps only on hosts that take a size;
+  sized = s.hosts intersect {flexgrid, detached, dialog}   # tab and sidebar hosts only through splitters
+  return { (s, host, step) : host in sized, step in ladder } union { (s, step) : step in splitter_steps(s) }
 
 function scope_pr(R, D, M, delta, S, E, Q, F, B):
   declared        = M.surfaces if M present else {}
@@ -478,38 +533,43 @@ function scope_pr(R, D, M, delta, S, E, Q, F, B):
      if static_surfaces union map_expanded non-empty or S absent:
           emit manifest_missing                      # case (a): UI-touching PR; diffs will be collateral
      else: mark run no_manifest                      # case (b): non-UI PR; diffs will be needs_human(no_manifest)
-  for s in static_surfaces - map_expanded - declared:
-      emit dependency_map_gap(edge = (owning_primitive_or_unowned_root(s, changed), s)); propose map PR
+  for s in static_surfaces - map_expanded - declared, reached from a changed class owned by primitive p:
+      emit dependency_map_gap(missing_edge = (p, s)); propose map PR
   for c in changed with no owning primitive and no owning surface, and reverse_closure(S, {c}) reaching a surface:
-      emit dependency_map_gap(unowned_root = c)    # a UI-reaching class nobody owns; a backend class that reaches no surface is not a gap
+      emit dependency_map_gap(unowned_root = c)    # one finding per class, separate from missing_edge;
+                                                   # a backend class that reaches no surface is not a gap
   change_surfaces = declared union map_expanded union static_surfaces
   census_surfaces = change_surfaces union smoke_subset(R)
-  census_items    = { (s, s.census.workspaces[0]) : s in census_surfaces }   # the canonical workspace only in PR runs
-  sweep_items     = { (s, host, step) : s in change_surfaces, s.resizable, s.tier == 1,
-                      host in s.hosts, step in ladder_S union splitters_short(s) }    # smoke adds census only (11.2 budget)
+  census_items    = { (s, w) : s in change_surfaces, w in s.census.workspaces }
+                    union { (s, s.census.workspaces[0]) : s in smoke_subset(R) - change_surfaces }
+                                                   # undeclared smoke surfaces: the canonical workspace only
+  sweep_items     = union over s in change_surfaces with s.resizable and s.tier == 1
+                      of sweeps(s, ladder_S, splitters_short)     # smoke adds census only (11.2 budget)
   flow_items      = { f in F : f.tier == 1 and (f.surfaces intersects change_surfaces
                                                 or f.primitives intersects touched_prims) }
   if run is no_manifest (case (b)):                # no UI scope, but a backend change can still move values
      flow_items  = flow_items union { f in F : f.tier == 1, f.class == standard, f.surfaces intersects smoke_subset(R) }
   for s in R - census_surfaces: outcome(s) = not_run(scope)
-  return order_and_cut(common_filters(census_items union sweep_items union flow_items, E, Q), B = 45 min, rigs)
+  return order_and_cut(common_filters(census_items union sweep_items union flow_items, E, Q),
+                       B = capture_time(pr), rigs)
 
 function scope_merge(R, E, Q, F, W, B):
   census_items = { (s, w) : s in R, w in W.tierA, s hosted_by w or s.global }
-  sweep_items  = { (s, host, step) : s in R, s.resizable, s.tier <= 2, host in s.hosts,
-                   step in ladder_S union splitters_short(s) }
+  sweep_items  = union over s in R with s.resizable and s.tier <= 2 of sweeps(s, ladder_S, splitters_short)
   flow_items   = { f in F : f.tier == 1 }
   for (s, w) with s not hosted_by w and not s.global: outcome = not_run(scope)
-  return order_and_cut(common_filters(census_items union sweep_items union flow_items, E, Q), B = 3 h, rigs)
+  return order_and_cut(common_filters(census_items union sweep_items union flow_items, E, Q),
+                       B = capture_time(merge), rigs)
 
 function scope_rc(R, E, Q, F, W, B):
   census_items = { (s, w) : s in R, w in W.tierA union W.tierB, s hosted_by w or s.global }
-  sweep_items  = { (s, host, step) : s in R, s.resizable, host in s.hosts,
-                   step in (ladder_F union splitters_full(s) if s.tier <= 2 else ladder_S) }
+  sweep_items  = union over s in R with s.resizable of
+                   (sweeps(s, ladder_F, splitters_full) if s.tier <= 2       # splitters_full for tiers 1 and 2,
+                    else sweeps(s, ladder_S, splitters_short))               # splitters_short for tier 3
   flow_items   = F                          # all tiers and classes, migration flows on tier B
   soak_items   = the 24 soak cycle checkpoints flow/<workspace-surface-id>/soak/c<nn> on rig 5 (10.11 Soak; 1.9)
   plan = order_and_cut(common_filters(census_items union sweep_items union flow_items union soak_items, E, Q),
-                       B = 8 h - 10 min - explorer_budget, rigs)   # explorer_budget = 90 min (2.9); scripted work ends by T+6:20
+                       B = capture_time(rc) - explorer_budget, rigs)   # explorer_budget = 90 min (2.9); scripted work ends by T+6:20
   append Explorer session on rig 6 with its own login, last (2.9); a later start is cut at the deadline (1.9)
   return plan
 ```
@@ -517,25 +577,28 @@ function scope_rc(R, E, Q, F, W, B):
 Rules the pseudocode relies on:
 
 - A manifest with zero declared surfaces is allowed (pure refactor) and still yields the static impact set. A missing manifest file has two cases, decided by the static impact step. Case (a), the PR touches UI code (`static_surfaces` or `map_expanded` is non-empty): finding `manifest_missing`, the run proceeds with nothing declared, and every above-threshold diff is `collateral`, because an undeclared UI change is by definition unexpected and the developer must declare it or fix it. Case (b), the PR touches no UI code: no finding, `intended` is disabled, and every above-threshold diff is `needs_human (reason: no_manifest)`, since a side effect from non-UI code is possible but intent cannot be checked. The PR comment header states which case applied and links the manifest template.
+- Tier 1 does not imply smoke. The smoke subset is the set of surfaces the registry owner flags, at most 40 (2.2.4); an unflagged tier-1 surface is still reached by the merge and RC census and by the tier-1 standard flows.
 - Budget cuts hit the highest tier number first and never a declared or smoke surface. If those alone exceed the PR budget the run proceeds, run health prints the projected overrun at scope time, and at the 45-minute deadline the Orchestrator marks every unreached checkpoint `not_run (reason: budget)` and the run `aborted_budget` (1.7 How a PR run works, minute by minute); the comment still posts.
 - Every registry surface outside the computed scope is `not_run (reason: scope)`, so the PR matrix shows exactly what was not looked at.
 - Checkpoints a run never reached because it aborted take the abort's class: `env_error` for `aborted_safety`, `harness_error` for `aborted_harness`, `not_run (reason: budget)` for `aborted_budget` (1.10).
 - Nightly and calibration runs compute no scope; they take the canary and calibration checkpoint lists (10.3 Canary Service and the mutant catalog; 3.9 A/A calibration and threshold derivation).
 - If the candidate's dependency index is missing from the pipeline artifact, the static step is skipped, all other outcomes are produced, and one `dependency_map_gap` with reason `no_dependency_index` appears in run health. Without the index case (b) cannot be told from case (a), so a missing manifest with a missing index is treated as case (a). The absence is never silent.
-- `splitters_short(s)` and `splitters_full(s)` are the short and full fraction sets of 2.5.2 intersected with each declared splitter's `fractions` list (2.2.1); a surface with no `splitters` contributes no split checkpoints.
+- `splitters_short(s)` and `splitters_full(s)` are the short and full fraction sets of 2.5.2 intersected with each declared splitter's `fractions` list (2.2.1); a surface with no `splitters` contributes no split checkpoints. `ladder_F` includes Ladder F's ascending pass, whose steps carry the `-asc` id suffix (2.5.2). A surface with `streaming: true` contributes no sweep items; its sweep checkpoints are `not_run (reason: scope)` (2.5.3).
 
 ### 2.12 Coverage accounting and the matrix
 
 The Reporter prints the coverage matrix for every run, defined exactly so runs compare cell by cell.
 
 - Rows: every surface id at the build's registry commit, plus one synthetic row per `unregistered_surface` found this run.
-- Columns: persona (active trader, options trader, futures trader, swing trader, beginner; a tier B workspace maps to its persona tag) times entitlement profile (phase 1: paperMoney margin, paperMoney IRA; more as logins are granted).
+- Columns: persona (active trader, options trader, futures trader, swing trader, beginner; a tier B workspace maps to its persona tag, which every tier B entry must carry, 4.6; the tier C harness carries none, so its sweeps count toward the surface's primary persona) times entitlement profile (phase 1: paperMoney margin, paperMoney IRA; more as logins are granted).
 - Cell key: (surface id, persona, entitlement profile). State is exactly one of `covered`, `not_run`, `not_registered`.
 
 ```
 cell(surface, persona, profile):
   if surface is synthetic: return not_registered
-  C = checkpoints this run with this surface, a workspace carrying persona, a login with profile
+  C = checkpoints this run with this surface, a workspace carrying persona, a login with profile;
+      sweep and split checkpoints count toward the surface's primary persona (personas[0], 4.5),
+      wherever they run
   if C is empty:
      if not surface.entitlements subset_of profile.entitlements: return not_run(entitlement)
      if surface in Q:                                        return not_run(quarantine)
@@ -570,12 +633,12 @@ What the model does not look at is printed, not implied. Each class below has a 
 
 | Id | Not detectable | How it is labeled | Changes in |
 |---|---|---|---|
-| B01 | Anything after Send: fills, rejections, server-side validation (buying power, price limits, exchange quantity rules), Working to Filled, cancel and replace, Blast All, status rows | Flows carry `requires: [paper_send]`; every cell `not_run (entitlement)`; the count and the line "send policy: no sends" print in every report | Phase 2 if `paper_send_ok` is approved (6.7 Send policy: both branches), else never; fills stay labeled untested even then until a human verifies that paperMoney simulates them on the delayed feed |
+| B01 | Anything after Send: fills, rejections, server-side validation (buying power, price limits, exchange quantity rules), Working to Filled, cancel and replace, Blast All, status rows | Flows carry `requires: [paper_send]`; every cell `not_run (entitlement)`; every report prints the line "send policy: default (no sends); N order-lifecycle surfaces not run (entitlement)" (9.2) | Phase 2 if `paper_send_ok` is approved (6.7 Send policy: both branches), else never; fills stay labeled untested even then until a human verifies that paperMoney simulates them on the delayed feed |
 | B02 | A value wrong in both builds with no Oracle rule or assertion over it | Ends as `identical` or `noise`; an Oracle coverage table lists per tier-1 surface the value regions with and without a rule | Grows with rules; never complete |
 | B03 | Temporal behavior: cell flashes, ladder re-centering, Level II and Time and Sales churn, flicker, frozen quotes | Captures are stills; streaming regions are `rule` or `mask`; the report lists surfaces with masked streaming regions and their masked share | Phase 3 soak adds frame-energy checks on a few checkpoints |
 | B04 | Entitlement states paperMoney cannot produce: option approval tiers, cash-account unsettled funds, pattern day trade counter, portfolio margin, multi-account | `not_run (entitlement)` on every cell of the missing profile; the profile list prints what exists, and a paperMoney-versus-live known-gaps line (delayed data, simulated fills, no real rejections) prints under it | When fixed-entitlement test logins are granted; whether paperMoney mirrors the live login's option approval level is unverified and is read in-platform in Phase 0 |
 | B05 | Live-feed data-format defects when `frozen` mode replays data (OnDemand or fixture) | Every checkpoint records its data mode; the report prints `frozen` versus `masked_live` counts per tier; `masked_live` chain and quote checkpoints stay in merge runs for this reason | DR-02 branch A reduces, never removes |
-| B06 | Rendering at non-canonical configurations: 125 and 150 percent scaling, light theme, large app font, 1366x768, mixed-DPI multi-monitor | Configuration is in the fingerprint; the matrix is per configuration and prints "configurations covered: 1 of N planned" | Phase 3 tier B configurations; mixed-DPI needs physical hardware |
+| B06 | Rendering at non-canonical configurations: 125 and 150 percent scaling, light theme, large app font, 1366x768, mixed-DPI multi-monitor | Configuration is in the fingerprint; the matrix is per configuration and the report header prints "configurations covered: N of M" (9.2) | Phase 3 tier B configurations; mixed-DPI needs physical hardware |
 | B07 | macOS and Linux builds | Non-goal; no registry entries; the report header prints "platform: Windows 11 desktop only" | Not in phases 1 to 3; the registry, flow and checkpoint formats carry no Windows-only field, so nothing precludes it |
 | B08 | Study mathematics beyond the verification set and thinkScript corpus | Only corpus studies have expected values; the report prints corpus size and the count of corpus-workspace studies without expectations | Grows with the corpus |
 | B09 | Accessibility conformance | Branch A diffs the accessible tree build to build and reports lost names as `collateral`; nothing absolute is asserted; branch B prints "accessible tree: not available" | Not a goal |

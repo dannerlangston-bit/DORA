@@ -1,0 +1,114 @@
+{
+  "$id": "sentinel:schemas/eval-report.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "canary_run_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "eval_set_version": {
+      "type": "string"
+    },
+    "gates": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "gate": {
+            "type": "string"
+          },
+          "passed": {
+            "type": "boolean"
+          },
+          "threshold": {
+            "type": "number"
+          },
+          "value": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "gate",
+          "value",
+          "threshold",
+          "passed"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "reviewer_version": {
+      "additionalProperties": false,
+      "properties": {
+        "crop_policy_version": {
+          "type": "string"
+        },
+        "effort": {
+          "type": "string"
+        },
+        "few_shot_ids": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "model_id": {
+          "type": "string"
+        },
+        "prompt_sha256": {
+          "pattern": "^sha256:[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "redaction_version": {
+          "type": "string"
+        },
+        "request_settings": {
+          "additionalProperties": {},
+          "type": "object"
+        },
+        "schema_version": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "model_id",
+        "prompt_sha256",
+        "schema_version",
+        "few_shot_ids",
+        "effort",
+        "request_settings",
+        "crop_policy_version",
+        "redaction_version"
+      ],
+      "type": "object"
+    },
+    "reviewer_version_sha256": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "run_at": {
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "split": {
+      "enum": [
+        "held_out"
+      ]
+    }
+  },
+  "required": [
+    "schema_version",
+    "reviewer_version",
+    "reviewer_version_sha256",
+    "eval_set_version",
+    "split",
+    "run_at",
+    "gates"
+  ],
+  "title": "eval-report (eval_report)",
+  "type": "object"
+}

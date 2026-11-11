@@ -260,7 +260,7 @@ def test_tbd_glob_warns_in_phase0_and_errors_after(base):
 def test_unresolved_branch_warns_in_phase0_and_errors_after(base):
     for phase, sev in ((0, "warn"), (1, "error")):
         r = copy.deepcopy(base)
-        r.docs[BRANCHES].data["session_rule"] = "TBD"
+        r.docs[BRANCHES].data["session_rule"] = {"branch": "undecided", "deadline": "2026-12-01"}   # 4.16 branch_choice
         assert [v.severity for v in lint_repo(r, phase, TODAY).violations if v.rule == "L-XREF-15"] == [sev]
 
 
@@ -395,13 +395,16 @@ def _fingerprint() -> dict:
             "cleartype": {"smoothing": True, "type": "FE_FONTSMOOTHINGCLEARTYPE", "gamma": 1800, "contrast": 1400, "orientation": "RGB"},
             "gpu": {"name": "Hyper-V Video", "driver_version": "10.0.26100.1"},
             "os_theme": {"apps_light": False, "system_light": False, "transparency": False, "animations": False},
-            "app_theme": "dark", "workspace_hash": {"ws.tier-a.futures-trader": h}, "settings_profile_hash": h,
+            "app_theme": {"scheme": "dark", "font_size": "medium"}, "workspace_hash": {"ws.tier-a.futures-trader": h},
+            "settings_profile_hash": h,
             "time_zone": {"os": "Eastern Standard Time", "app_display": "America/New_York", "chart": "America/New_York"},
-            "keyboard": {"layout": "0x0409", "layout_count": 1, "toggle_keys": {"caps": False, "num": True, "scroll": False}},
-            "data_epoch": h, "input_desktop": "Default",
+            "keyboard": {"layout": "0x0409", "layout_count": 1, "toggle_keys": {"caps": False, "num": True, "scroll": False},
+                         "locale": "en-US"},
+            "data_epoch": {"epoch_id": h, "data_mode": "backend_fixture"}, "input_desktop": "Default",
             "harness": {"version": "1.4.2", "ocr_engine": "tesseract-5.3.4", "ocr_model": "eng-best-4.1", "capture_lib": "mss-9.0.1",
                         "settle_params_sha256": h, "diff_engine_params_sha256": h, "redaction_version": "r3",
-                        "config_commit": "c41a0f2", "allowlist_sha256": h},
+                        "region_registry_version": "rr-12", "config_commit": "c41a0f2", "config_tarball_sha256": h,
+                        "allowlist_sha256": h},
             "render_probe_hash": "e3b0c44298fc1c14"},
         "record": {"jar_listing_hash": h, "account": {"account_id_sha256": h, "login_sha256": h, "role": "empty"},
                    "rig": {"hostname": "tos-rig-01", "hypervisor": "hyperv", "hypervisor_version": "10.0.26100",

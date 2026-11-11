@@ -2,7 +2,7 @@
 
 **What it is for.** A change to one part of thinkorswim breaks another part, and nobody looks there. The standard example: a Flexible Grid change makes the Active Trader ladder overlap its order buttons at one cell size. User testing of Flexible Grid passes, and the ladder bug ships. Sentinel drives the whole desktop product the way a user does, compares every screen against the build before the change, and reports two things for every change. First, the intended change, with before and after pictures, so the developer no longer hand-screenshots their work. Second, anything else that moved or broke, ranked, with the reason it was tested.
 
-**How it decides what changed and why.** Attribution comes from a build pair, not from AI. A PR run compares the branch build with its merge-base main build, a merge run compares new main with previous main, and an RC run compares the release candidate with the last released build. Both builds run on identically fingerprinted rigs against the same data. If a screen differs, the difference was caused by the code between those two builds.
+**How it decides what changed and why.** Attribution comes from a build pair, not from AI. A PR run compares the branch build with its merge-base main build (or the nearest earlier main build, at most 20 commits back), a merge run compares new main with previous main, and an RC run compares the release candidate with the last released build. Both builds run on identically fingerprinted rigs against the same data. If a screen differs, the difference was caused by the code between those two builds.
 
 **How it tests.** Five kinds of test feed one result model:
 

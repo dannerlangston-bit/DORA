@@ -83,6 +83,7 @@ import numpy as np
 from skimage.color import deltaE_ciede2000, rgb2lab
 from skimage.metrics import structural_similarity
 
+from ..canonical import fingerprint_id  # noqa: F401  (4.12, 7.4: the one definition, re-exported)
 from ..records import Component, DiffSummary, Finding, RegionDiff
 from ..taxonomy import load as load_taxonomy
 from . import load_params
@@ -255,13 +256,6 @@ class DiffResult:
 # --------------------------------------------------------------------------------------------
 # Fingerprint comparability (3.3, 4.12, 7.4)
 # --------------------------------------------------------------------------------------------
-
-def fingerprint_id(match: Mapping[str, Any]) -> str:
-    """sha256 over the canonical JSON of the match fields without `build_id` (4.12, 7.4)."""
-    body = {k: v for k, v in match.items() if k != "build_id"}
-    canon = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
-    return "sha256:" + hashlib.sha256(canon.encode("utf-8")).hexdigest()
-
 
 def compare_fingerprints(base: Mapping[str, Any], candidate: Mapping[str, Any]) -> Terminal | None:
     """The comparability rule of 3.3 and L-FPR-03/05: every `match` field equal except `build_id`;

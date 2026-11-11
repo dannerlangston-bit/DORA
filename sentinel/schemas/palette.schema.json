@@ -1,0 +1,48 @@
+{
+  "$id": "sentinel:schemas/palette.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "colors": {
+      "additionalProperties": false,
+      "properties": {
+        "negative": {
+          "type": "string"
+        },
+        "neutral": {
+          "type": "string"
+        },
+        "positive": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "positive",
+        "negative",
+        "neutral"
+      ],
+      "type": "object"
+    },
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "theme": {
+      "enum": [
+        "dark",
+        "light"
+      ]
+    },
+    "tolerance": {
+      "default": 60,
+      "type": "number"
+    }
+  },
+  "required": [
+    "schema_version",
+    "theme",
+    "colors"
+  ],
+  "title": "palette (palette)",
+  "type": "object"
+}

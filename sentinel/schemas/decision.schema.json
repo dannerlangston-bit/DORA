@@ -1,0 +1,220 @@
+{
+  "$id": "sentinel:schemas/decision.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "action": {
+      "enum": [
+        "confirm_bug",
+        "mark_intended",
+        "request_mask",
+        "noise_signature",
+        "agent_mistake",
+        "expected_behavior",
+        "approve_baseline",
+        "reject_baseline",
+        "fixed_in_build"
+      ]
+    },
+    "baseline_ref": {
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "build_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "cluster_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "confirmed_by": {
+      "type": "string"
+    },
+    "decided_at": {
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+      "type": "string"
+    },
+    "decided_by": {
+      "type": "string"
+    },
+    "decision_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "expires_at": {
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+      "type": "string"
+    },
+    "finding_ref": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "fixed_in_build": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "mask_ref": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "reason": {
+      "type": "string"
+    },
+    "reopen_count": {
+      "default": 0,
+      "type": "integer"
+    },
+    "revoked": {
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$",
+          "type": "string"
+        },
+        "by": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "by",
+        "at",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "role": {
+      "enum": [
+        "triage_rotation",
+        "flow_owner",
+        "system_owner",
+        "release_manager",
+        "pr_author",
+        "ticket_resolver"
+      ]
+    },
+    "run_id": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "signature": {
+      "additionalProperties": false,
+      "properties": {
+        "bbox_q4": {
+          "additionalProperties": false,
+          "properties": {
+            "h": {
+              "type": "integer"
+            },
+            "w": {
+              "type": "integer"
+            },
+            "x": {
+              "type": "integer"
+            },
+            "y": {
+              "type": "integer"
+            }
+          },
+          "required": [
+            "x",
+            "y",
+            "w",
+            "h"
+          ],
+          "type": "object"
+        },
+        "category": {
+          "enum": [
+            "intended",
+            "collateral",
+            "noise",
+            "needs_human",
+            "invariant_violation",
+            "assertion_failed"
+          ]
+        },
+        "checkpoint_id": {
+          "pattern": "^(?:census/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+)*(?:/[a-z]+=[A-Za-z0-9.-]+(?:,[a-z]+=[A-Za-z0-9.-]+)*)?|sweep/[a-z0-9]+(?:[.-][a-z0-9]+)*/(?:flexgrid|detached|dialog)/[0-9]+x[0-9]+(?:-asc)?|split/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+)*/(?:0|1)\\.[0-9]{2}|flow/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z0-9]+(?:[.-][a-z0-9]+)*/[a-z][a-z0-9-]*)$",
+          "type": "string"
+        },
+        "hamming_tolerance": {
+          "type": "integer"
+        },
+        "phash": {
+          "type": "string"
+        },
+        "region_id": {
+          "anyOf": [
+            {
+              "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+              "type": "string"
+            },
+            {
+              "pattern": "^g-[0-7]-[0-7]$",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "required": [
+        "checkpoint_id",
+        "region_id",
+        "phash",
+        "category"
+      ],
+      "type": "object"
+    },
+    "source": {
+      "default": "report_ui",
+      "enum": [
+        "report_ui",
+        "pr_comment",
+        "jira_sync",
+        "explorer_triage"
+      ]
+    },
+    "status": {
+      "enum": [
+        "active",
+        "expired",
+        "superseded",
+        "reopened",
+        "revoked"
+      ]
+    },
+    "supersedes": {
+      "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+      "type": "string"
+    },
+    "ticket": {
+      "type": "string"
+    },
+    "verdict": {
+      "enum": [
+        "confirmed_bug",
+        "intended",
+        "noise"
+      ]
+    }
+  },
+  "required": [
+    "decision_id",
+    "signature",
+    "action",
+    "verdict",
+    "decided_by",
+    "role",
+    "decided_at",
+    "run_id",
+    "build_id",
+    "finding_ref",
+    "reason",
+    "status"
+  ],
+  "title": "decision (decision)",
+  "type": "object"
+}

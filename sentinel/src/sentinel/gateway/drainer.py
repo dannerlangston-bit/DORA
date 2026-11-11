@@ -15,7 +15,8 @@ before the store writes the rows loses none: on resume `ingest_journal` reads th
 Usage (the slow half): `Drainer(ctx, journal=..., next_seq=..., wall_at=wall_from(clock))`; the emitter calls
 `note_token` for every token it writes (stage 5) and `set_context` when the step, mode, latest capture or drill
 phase changes; the drainer thread calls `drain_ring(segment.buf)`; a stage 4 refusal goes through `refused`;
-the rows go to `Store.write_events`.
+the rows go to `Store.write_events`. A caller with no segment (the simulated rig, whose `Rig.send_input` returns
+each event with its `HookDecision`) builds the records with `segment.record_for` and calls `drain`.
 
 Choices where the spec is silent or ambiguous (reported):
 

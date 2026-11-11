@@ -9,9 +9,11 @@ import pytest
 
 from sentinel.gateway import segment as sg
 from sentinel.gateway.drainer import JOURNAL_NAME, DrainContext, Drainer, TokenNote, ingest_journal, wall_from
-from sentinel.gateway.segment import HookEvent, SegmentWriter, append_record, decide_from_segment, to_ns
+from sentinel.gateway.segment import (HookEvent, SegmentWriter, append_record, decide_from_segment, record_for,
+                                      reinstall_record, to_ns)
 from sentinel.orchestrator.clock import ManualClock
-from sentinel.orchestrator.gateway import GATEWAY_REASONS, Action, Flag, GatewayState, SafetyContext, slow_half
+from sentinel.orchestrator.gateway import (GATEWAY_REASONS, Action, Flag, GatewayState, InputEvent, SafetyContext,
+                                           hook_decide, slow_half)
 from sentinel.store.store import RunPlan, ScopeEntry, ShardPlan, Store
 
 T = 100.0
@@ -80,6 +82,22 @@ def test_ring_records_become_rows_with_every_5_4_8_field(tmp_path):
     assert all(r.gate_reason is None or r.gate_reason in GATEWAY_REASONS for r in rows)
 
 
+def test_decisions_without_a_segment_drain_through_record_for(tmp_path):
+    g = GatewayState(armed=True)
+    g.stamp_watcher(Flag.CLEAR, T)
+    move = InputEvent("move", 640, 480)
+    recs = [record_for(move, hook_decide(g, move, T), to_ns(T))]                   # the absolute move: no record
+    t = g.issue_click(640, 480, T)                                                  # as SimulatedRig emits a click
+    d = drainer(tmp_path)
+    d.note_token(TokenNote(t.id, "scripted", "f.ladder", "s3", target_text="Buy"))
+    for e in (InputEvent("button_down", 640, 480, button="left"), InputEvent("button_up", 640, 480, button="left")):
+        recs.append(record_for(e, hook_decide(g, e, T), to_ns(T)))
+    assert recs[0] is None
+    rows = d.drain([r for r in recs if r is not None])
+    assert [(r.gate_decision, r.screen_x, r.screen_y, r.keys, r.token_id, r.target_text) for r in rows] == [
+        ("emitted", 640, 480, "button_down:left", t.id, "Buy"), ("emitted", 640, 480, "button_up:left", t.id, "Buy")]
+
+
 def test_journal_lines_equal_the_dropped_rows(tmp_path):
     g = GatewayState(armed=True)
     g.stamp_watcher(Flag.SET, T)
@@ -118,8 +136,8 @@ def test_probe_and_hook_reinstalled_records(tmp_path):
     buf = segment(g)
     pid = SegmentWriter(buf).issue_probe(5, 5, to_ns(T))
     decide_from_segment(buf, HookEvent("move", 5, 5), to_ns(T))
-    append_record(buf, event_type="control", origin="console", reason="hook_reinstalled", mono_ns=to_ns(T), aux=1)
-    append_record(buf, event_type="control", origin="console", reason="hook_reinstalled", mono_ns=to_ns(T), aux=0)
+    append_record(buf, reinstall_record(to_ns(T), True))
+    append_record(buf, reinstall_record(to_ns(T), False))
     probe, ok, failed = drainer(tmp_path).drain_ring(buf)
     assert (probe.mode, probe.reason, probe.token_id, probe.gate_decision, probe.keys) == (
         "system", "liveness_probe", pid, "emitted", "move")

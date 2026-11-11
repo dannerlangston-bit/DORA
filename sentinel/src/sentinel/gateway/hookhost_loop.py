@@ -119,8 +119,7 @@ class HookHost:
         request = sg.read_header(self.buf).reinstall_request
         if request != self._handled:
             ok = self.os.reinstall_hooks()
-            sg.append_record(self.buf, event_type="control", origin="console", reason="hook_reinstalled",
-                             mono_ns=now, aux=int(ok))
+            sg.append_record(self.buf, sg.reinstall_record(now, ok))
             sg.answer_reinstall(self.buf, request, ok)
             self._handled = request
         return None

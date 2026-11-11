@@ -17,8 +17,8 @@ from sentinel.gateway import segment as sg
 from sentinel.gateway.segment import (INT64_MIN, LAYOUT_VERSION, MAGIC, RING_SLOTS, SEGMENT_SIZE, Decision, HookEvent,
                                       LayoutMismatch, RingReader, Segment, SegmentError, SegmentWriter,
                                       append_record, apply_token_states, answer_reinstall, decide_from_segment,
-                                      init_segment, layout_ok, read_header, read_snapshot, read_tokens, stamp_alive,
-                                      to_ns, to_seconds, token_states)
+                                      init_segment, layout_ok, read_header, read_snapshot, read_tokens, record_for,
+                                      stamp_alive, to_ns, to_seconds, token_states)
 from sentinel.orchestrator import gateway as gw
 from sentinel.orchestrator import simrig
 from sentinel.orchestrator.gateway import (Chord, DenyRect, Flag, GatewayState, InputEvent, Rect, hook_decide)
@@ -310,8 +310,9 @@ def test_shared_memory_create_and_attach_see_the_same_bytes():
 
 # -- the drop ring -------------------------------------------------------------------------------------------
 def _rec(buf, i):
-    return append_record(buf, event_type="key_down", origin="foreign_process", reason="no_token", mono_ns=i,
-                         vk_or_button=0x41, mods={"ctrl"})
+    rec = record_for(HookEvent("key_down", vk=0x41, mods=frozenset({"ctrl"}), origin="foreign_process"),
+                     Decision(False, "no_token"), i)
+    return append_record(buf, rec)
 
 
 def test_ring_wraps_at_4096_and_keeps_order_by_seq():
@@ -364,6 +365,18 @@ def test_drops_and_consumed_tokens_write_records_and_allowed_moves_do_not():
     assert recs[0].injected is False and recs[1].injected is True
     assert recs[2].aux == 1250 - 500 and recs[2].button == "left"                  # the late_up delay in ms
     assert recs[3].secret and recs[3].token_id == k.id and recs[4].aux == 240
+
+
+def test_record_for_is_the_hooks_record_rule_without_a_segment():
+    gd = gw.HookDecision(True, token_id=7, late_up=True)
+    rec = record_for(InputEvent("button_up", 3, 4, button="right", mods=frozenset({"shift", "capslock"})), gd, 99,
+                     secret=False, delay_ms=40)
+    assert rec == sg.RingRecord(0, "button_up", "emitter", "late_up", frozenset({"shift"}), True, False, 99, 3, 4,
+                                2, 40, 7)
+    assert record_for(InputEvent("move", 1, 1), gw.HookDecision(True), 1) is None             # untokened allowed
+    drop = record_for(InputEvent("wheel", 1, 1, delta=-120, origin="console"), gw.HookDecision(False, "foreign_input"), 1)
+    assert (drop.reason, drop.decision, drop.injected, drop.aux, drop.token_id) == ("foreign_input", "dropped", False,
+                                                                                  -120, None)
 
 
 # -- the probe -----------------------------------------------------------------------------------------------

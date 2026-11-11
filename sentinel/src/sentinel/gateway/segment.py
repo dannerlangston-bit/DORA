@@ -564,21 +564,41 @@ def answer_reinstall(buf: Any, request: int, ok: bool) -> None:
     _U32.pack_into(buf, OFF_REINSTALL_DONE, request)
 
 
-def append_record(buf: Any, *, event_type: str, origin: str, reason: str, mono_ns: int, mods: Iterable[str] = (),
-                  secret: bool = False, x: int = 0, y: int = 0, vk_or_button: int = 0, aux: int = 0,
-                  token_id: int | None = None) -> int:
-    """Write one ring record at `ring_head` and advance it (the hook only). The record's seq is invalidated
-    first and written last, so a reader the hook laps sees the change. Returns the record's sequence number."""
+def append_record(buf: Any, rec: RingRecord) -> int:
+    """Write one ring record at `ring_head` and advance it (the hook only; `rec.seq` is replaced by the head).
+    The record's seq is invalidated first and written last, so a reader the hook laps sees the change. Returns the
+    record's sequence number."""
     head = _U64.unpack_from(buf, OFF_RING_HEAD)[0]
     off = OFF_RING + (head % RING_SLOTS) * RING_RECORD_SIZE
-    flags = mod_bits(mods) | (RF_INJECTED if origin != "console" else 0) | (RF_SECRET if secret else 0)
+    flags = mod_bits(rec.mods) | (RF_INJECTED if rec.injected else 0) | (RF_SECRET if rec.secret else 0)
     _U32.pack_into(buf, off, _INVALID_SEQ)
-    struct.pack_into("<BBBBqiiHhI", buf, off + 4, EVENT_CODE[event_type], ORIGIN_CODE[origin], REASON_CODE[reason],
-                     flags, mono_ns, _i32(x), _i32(y), vk_or_button & 0xFFFF, max(-32768, min(32767, aux)),
-                     token_id or 0)
+    struct.pack_into("<BBBBqiiHhI", buf, off + 4, EVENT_CODE[rec.event_type], ORIGIN_CODE[rec.origin],
+                     REASON_CODE[rec.reason], flags, rec.mono_ns, _i32(rec.x), _i32(rec.y), rec.vk_or_button & 0xFFFF,
+                     max(-32768, min(32767, rec.aux)), rec.token_id or 0)
     _U32.pack_into(buf, off, head & 0xFFFF_FFFF)
     _U64.pack_into(buf, OFF_RING_HEAD, head + 1)
     return head
+
+
+def record_for(e: EventLike, d: Decision | Any, now_ns: int, *, secret: bool = False,
+               delay_ms: int = 0) -> RingRecord | None:
+    """The ring record the hook writes for decision `d` on event `e` (choice 5), or None for an allowed event
+    that matched no token. `d` is a `Decision` or an `orchestrator.gateway.HookDecision`; `secret` is the matched
+    token's flag and `delay_ms` how late a `late_up` came. The hook uses it, and so can a caller with no segment
+    (the simulated rig) that hands its decisions to the drainer."""
+    if d.allowed and d.token_id is None:
+        return None
+    bov = BUTTON_CODE.get(e.button or "", 0) if e.type in ("button_down", "button_up") else e.vk or 0
+    aux = e.delta if e.type == "wheel" else delay_ms if d.late_up else 0
+    reason = ("late_up" if d.late_up else "emitted") if d.allowed else d.reason or "no_token"
+    return RingRecord(0, e.type, e.origin, reason, mod_names(mod_bits(e.mods)), e.origin != "console", secret,
+                      now_ns, e.x, e.y, bov, aux, d.token_id)
+
+
+def reinstall_record(now_ns: int, ok: bool) -> RingRecord:
+    """The hook host's log of one reinstall attempt (choice 5: a control record, aux 1 when it worked)."""
+    return RingRecord(0, "control", "console", "hook_reinstalled", frozenset(), False, False, now_ns, 0, 0, 0,
+                      int(ok), None)
 
 
 def _i32(v: int) -> int:
@@ -737,21 +757,10 @@ def _commit(buf: Any, e: EventLike, now_ns: int, d: Decision, t: TokenSlot | Non
         buf[off + 4] = new_state
         buf[off + 5] = reason
         _U32.pack_into(buf, off, t.id)
-    if d.allowed and d.token_id is None:
-        return d
-    if e.type in ("button_down", "button_up"):
-        bov = BUTTON_CODE.get(e.button or "", 0)
-    else:
-        bov = e.vk or 0
-    if e.type == "wheel":
-        aux = e.delta
-    elif d.late_up and t is not None:
-        aux = (now_ns - t.expires_ns) // 1_000_000
-    else:
-        aux = 0
-    append_record(buf, event_type=e.type, origin=e.origin, reason=d.decision if d.allowed else d.reason or "no_token",
-                  mono_ns=now_ns, mods=e.mods, secret=bool(t is not None and t.flags & TF_SECRET), x=e.x, y=e.y,
-                  vk_or_button=bov, aux=aux, token_id=d.token_id)
+    late = (now_ns - t.expires_ns) // 1_000_000 if d.late_up and t is not None else 0
+    rec = record_for(e, d, now_ns, secret=bool(t is not None and t.flags & TF_SECRET), delay_ms=late)
+    if rec is not None:
+        append_record(buf, rec)
     return d
 
 

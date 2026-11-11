@@ -381,6 +381,16 @@ _CRED_KEY = re.compile(r"(?i)(?<![A-Za-z0-9])(?:password|passwd|pwd|secret)[A-Za
 _CRED_VALUE = re.compile(r":\s*['\"]?(?P<v>[^\s'\",{}\[\]#]{20,})")
 
 
+def _chord(key: str) -> str:
+    """A key or chord in one spelling for L-POP-02: lower case, `+` separated, modifier and key synonyms folded
+    (control and ctl to ctrl; return, numpad and keypad enter to enter; spacebar to space), modifiers sorted first."""
+    if key and not key.strip():
+        return "space"
+    parts = [_KEY_SYNONYMS.get(k, k) for k in (p.strip().casefold().replace(" ", "_") for p in key.split("+")) if k]
+    mods = sorted(p for p in parts if p in ("ctrl", "alt", "shift", "win"))
+    return "+".join(mods + [p for p in parts if p not in mods])
+
+
 def _klass(c: str) -> int:
     return 0 if c.isupper() else 1 if c.islower() else 2 if c.isdigit() else 3
 
@@ -1004,34 +1014,8 @@ class _Linter:
                     self.add("L-BLD-03", doc.rel, f"{ch} builds do not carry {f}", f"build.{f}")
             if ("released_at" in b) != (ch == "released"):
                 self.add("L-BLD-06", doc.rel, "released_at is present if and only if channel is released", "build.released_at")
-        table = {
-            "pr": ("merge_base_main", "branch", "main"), "merge": ("previous_main", "main", "main"),
-            "rc": ("last_released", "rc", "released"), "nightly": ("same_build", None, None),
-            "calibration": ("same_build", None, None),
-        }
         for rel, p in self.pairs:
-            cand, base, rule, rt = p.get("candidate"), p.get("base"), p.get("base_rule"), p.get("run_type")
-            if rt in table:
-                want_rule, want_c, want_b = table[rt]
-                if rule != want_rule:
-                    self.add("L-BLD-04", rel, f"run_type {rt} requires base_rule {want_rule}, not {rule}", "build_pair.base_rule")
-                cc = _d(self.builds.get(cand)).get("channel", _channel(cand))
-                bc = _d(self.builds.get(base)).get("channel", _channel(base))
-                if want_c and cc != want_c:
-                    self.add("L-BLD-04", rel, f"run_type {rt} requires a {want_c} candidate, not {cc}", "build_pair.candidate")
-                if want_b and bc != want_b:
-                    self.add("L-BLD-04", rel, f"run_type {rt} requires a {want_b} base, not {bc}", "build_pair.base")
-                if rt == "pr":
-                    mb = _s(_d(self.builds.get(cand)).get("merge_base_sha"))
-                    base_sha = _s(_d(self.builds.get(base)).get("commit_sha"))
-                    if not mb:
-                        self.add("L-BLD-04", rel, f"candidate {cand} has no merge_base_sha in builds/", "build_pair.candidate")
-                    elif (base_sha and base_sha != mb) or (not base_sha and not mb.startswith(_short_sha(base))):
-                        self.add("L-BLD-04", rel, f"base {base} is not the candidate's merge base {mb[:7]}", "build_pair.base")
-                if rt == "rc" and not p.get("lineage_baseline_set"):
-                    self.add("L-BLD-04", rel, "rc pairs carry lineage_baseline_set", "build_pair.lineage_baseline_set")
-            if cand == base and rule != "same_build":
-                self.add("L-BLD-05", rel, f"candidate equals base ({cand}) without base_rule same_build", "build_pair")
+            self.out.extend(check_pair(p, self.builds, rel))
 
     # -- 4.3 manifests ---------------------------------------------------------------------------
 
@@ -1846,9 +1830,10 @@ class _Linter:
                 self.add("L-FIX-02", f, f"exactly one golden and at most one empty account (found {roles.count('golden')} and {roles.count('empty')})", "accounts")
             for sid, s in symbols.items():
                 if s.get("asset") == "future" and set(_l(s.get("purpose"))) & {"ticket", "ladder"}:
-                    rd = _date(s.get("roll_date"))
-                    if not FUTURE_MONTH.match(_s(s.get("symbol"))) or rd is None or rd <= self.today:
-                        self.add("L-FIX-03", f, f"futures symbol {sid} needs a month code, year and a future roll_date (expired contracts fail)", "symbols")
+                    problem = self._contract_problem(_s(s.get("symbol")), _date(s.get("roll_date")))
+                    if problem:
+                        self.add("L-FIX-03", f, f"futures symbol {sid} {problem}; ticket and ladder futures carry a month "
+                                                "code, year and a future roll_date, and expired contracts fail", "symbols")
             if not _s(fx.get("login_ref")).startswith("vault://"):
                 self.add("L-FIX-04", f, "login_ref is a vault:// reference, never the value", "login_ref")
             for loc, line in _walk_strings(fx):
@@ -1870,6 +1855,21 @@ class _Linter:
                 self.add("L-FIX-05", f, f"order_defaults_profile {fx.get('order_defaults_profile')} is not an order_defaults profile in profiles/", "order_defaults_profile")
             self._fixture_epoch(fx, f, symbols)
             self._fixture_positions(fx, f, accounts, symbols, ids)
+
+    def _contract_problem(self, symbol: str, roll: date | None) -> str | None:
+        """L-FIX-03 on one futures symbol: month code and year present, contract month not before today's month,
+        roll_date in the future and not after the contract month (a roll falls before the contract expires)."""
+        m = FUTURE_MONTH.match(symbol)
+        if not m:
+            return f"{symbol!r} has no month code and year"
+        year, month = 2000 + int(m.group("year")), MONTH_CODES.index(m.group("month")) + 1
+        if (year, month) < (self.today.year, self.today.month):
+            return f"{symbol} is an expired contract ({year}-{month:02d})"
+        if roll is None or roll <= self.today:
+            return f"roll_date {roll} is not in the future"
+        if (roll.year, roll.month) > (year, month):
+            return f"roll_date {roll} falls after the contract month {year}-{month:02d}"
+        return None
 
     def _fixture_epoch(self, fx: dict, f: str, symbols: dict[Any, dict]) -> None:
         ep = fx.get("epoch")
@@ -1974,8 +1974,13 @@ class _Linter:
             except re.error as exc:
                 self.add("L-POP-01", f, f"title_regex does not compile: {exc}", f"{at}.title_regex")
             action, oa = p.get("action"), p.get("on_abort")
-            if action == "dismiss_key" and _s(p.get("key")).replace(" ", "").casefold() in ENTER_KEYS:
+            if action == "dismiss_key" and isinstance(p.get("key"), str) and _chord(p["key"]) in ENTER_KEYS:
                 self.add("L-POP-02", f, f"dismiss key {p.get('key')} is Enter, Space or Ctrl+Enter", f"{at}.key")
+            for fld, owner in (("key", "dismiss_key"), ("target", "click"), ("wait_timeout_ms", "wait")):
+                if action == owner and p.get(fld) is None and owner != "click":   # a click target is checked below
+                    self.add("L-POP-04", f, f"action {owner} requires {fld}", f"{at}.{fld}")
+                elif action != owner and p.get(fld) is not None:
+                    self.add("L-POP-04", f, f"{fld} belongs to action {owner}, not {action}", f"{at}.{fld}")
             if rx and any(rx.search(t) for t in ("Order Confirmation", "Confirm", "Send")):
                 oad = _d(oa)
                 if not (p.get("class") == "safety" and action not in ("dismiss_key", "click") and oad.get("outcome") == "aborted_run"
@@ -2033,7 +2038,9 @@ class _Linter:
             if ids.count(mid) > 1:
                 self.add("L-MUT-01", f, f"mutant_id {mid} is not unique", f"{at}.mutant_id")
             gen = _d(m.get("generator"))
-            if gen.get("seed", MUTANT_SEED) != MUTANT_SEED:
+            if "seed" not in gen:
+                self.add("L-MUT-01", f, f"generator seed is missing; every entry carries seed {MUTANT_SEED}", f"{at}.generator.seed")
+            elif gen.get("seed") != MUTANT_SEED:
                 self.add("L-MUT-01", f, f"generator seed {gen.get('seed')} is not the catalog seed {MUTANT_SEED}", f"{at}.generator.seed")
             cid = _s(m.get("checkpoint_id"))
             if m.get("region_ref") not in self.region_map(cid):
@@ -2293,6 +2300,52 @@ def lint(root: str | Path, phase: int = 0, today: date | None = None) -> LintRep
 
 def _fpr(rule: str, file: str, message: str, path: str = "") -> Violation:
     return Violation(file, rule, RULES[rule].severity, path, message)
+
+
+# 4.2 L-BLD-04: run type -> (base_rule, candidate channel, base channel)
+PAIR_RULES = {
+    "pr": ("merge_base_main", "branch", "main"), "merge": ("previous_main", "main", "main"),
+    "rc": ("last_released", "rc", "released"), "nightly": ("same_build", None, None),
+    "calibration": ("same_build", None, None),
+}
+
+
+def check_pair(pair: Any, builds: Mapping[str, Any], file: str = "build_pair") -> list[Violation]:
+    """L-BLD-04 and L-BLD-05 on one build pair record, the check run at run creation (4.2): a pair with any
+    violation is refused, the run is never queued, and the requester gets the rule ids.
+
+    `pair` is the 4.2 `build_pair` (run_type, candidate, base, base_rule, lineage_baseline_set); `builds` maps a
+    build id to its 4.2 `build` record (channel, commit_sha, merge_base_sha). A build absent from `builds` is read
+    by its id's channel prefix. The config lint runs the same check on every `builds/*.yaml` pair."""
+    p = _d(pair)
+    out: list[Violation] = []
+
+    def add(rule: str, message: str, path: str) -> None:
+        out.append(_fpr(rule, file, message, path))
+
+    cand, base, rule, rt = p.get("candidate"), p.get("base"), p.get("base_rule"), p.get("run_type")
+    if rt in PAIR_RULES:
+        want_rule, want_c, want_b = PAIR_RULES[rt]
+        if rule != want_rule:
+            add("L-BLD-04", f"run_type {rt} requires base_rule {want_rule}, not {rule}", "build_pair.base_rule")
+        cc = _d(builds.get(cand)).get("channel", _channel(cand))
+        bc = _d(builds.get(base)).get("channel", _channel(base))
+        if want_c and cc != want_c:
+            add("L-BLD-04", f"run_type {rt} requires a {want_c} candidate, not {cc}", "build_pair.candidate")
+        if want_b and bc != want_b:
+            add("L-BLD-04", f"run_type {rt} requires a {want_b} base, not {bc}", "build_pair.base")
+        if rt == "pr":
+            mb = _s(_d(builds.get(cand)).get("merge_base_sha"))
+            base_sha = _s(_d(builds.get(base)).get("commit_sha"))
+            if not mb:
+                add("L-BLD-04", f"candidate {cand} has no merge_base_sha in builds/", "build_pair.candidate")
+            elif (base_sha and base_sha != mb) or (not base_sha and not mb.startswith(_short_sha(base))):
+                add("L-BLD-04", f"base {base} is not the candidate's merge base {mb[:7]}", "build_pair.base")
+        if rt == "rc" and not p.get("lineage_baseline_set"):
+            add("L-BLD-04", "rc pairs carry lineage_baseline_set", "build_pair.lineage_baseline_set")
+    if cand == base and rule != "same_build":
+        add("L-BLD-05", f"candidate equals base ({cand}) without base_rule same_build", "build_pair")
+    return out
 
 
 def lint_fingerprint(fp: Any, file: str = "fingerprint") -> list[Violation]:

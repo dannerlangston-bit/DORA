@@ -20,7 +20,7 @@ from sentinel.orchestrator.popups import (
 from sentinel.orchestrator.windows import TitleSets, classify_windows
 
 CATALOG_PATH = Path(__file__).resolve().parents[1] / "config" / "example" / "popups" / "catalog.yaml"
-RAW = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))
+RAW = yaml.safe_load(CATALOG_PATH.read_text(encoding="utf-8"))["entries"]     # the SD-47 wrapper form
 CAT = load_catalog(CATALOG_PATH)
 RUN = PopupContext(phase="running", gate="running", flow_id="flow.watchlist.add", step_id="s2")
 
@@ -51,10 +51,10 @@ def one(**fields):
 # -- the catalog (4.10, SD-47) ------------------------------------------------------------------------------------
 
 def test_both_catalog_forms_parse_to_the_same_entries():
-    assert CAT.bare_list and len(CAT.entries) == 22
-    wrapped = parse_catalog({"schema_version": 1, "entries": RAW})
-    assert not wrapped.bare_list and wrapped.schema_version == 1
-    assert wrapped.entries == CAT.entries
+    bare = parse_catalog(RAW)                  # the example is in the wrapper form (SD-47); the bare list still parses
+    assert bare.bare_list and len(bare.entries) == 22
+    assert not CAT.bare_list and CAT.schema_version == 1
+    assert bare.entries == CAT.entries
 
 
 @pytest.mark.parametrize("bad, words", [

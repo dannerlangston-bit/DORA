@@ -100,16 +100,30 @@ jab_properties_present`, `jab_query_answers`; unread means not checked), a relau
 `bounds.after_relaunch`; the Executor reports a bridge lost mid-run through `bounds_lost(checkpoint_id)` and reads
 `bounds_outcome()` before a checkpoint; the next `flow_boundary` relaunches with cause `bounds_source`, which spends
 no budget (`RELAUNCH_BUDGETS`). Branch B has no bridge: nothing here applies.
+
+Gate hooks: `gate_hooks` maps `provisioned`, `settings_attested` and `relaunched` to the caller's checks after that
+gate passed (the 4.12 fingerprint's OS fields at `provisioned`, the whole fingerprint, its rig specification and
+pair check after attestation, the re-read after a relaunch, 7.4); a result is applied like any gate's.
+
+The fixture reset (7.6): with `RunContext.stage1` (a `stage1.Stage1Profile`), the fixture document and a rig that
+offers the write path (`stage1.ProfileResetPort`), Stage 1 runs between the paper-mode assertion and attestation and
+its `profile_drift` reaches `attest`; with the fixture document and a rig that offers `stage2_reads`, `fixture_verified`
+is `fixture_checks.check_stage2` (accounts with buying power and the run's own tagged rows, OnDemand, the delay badge,
+connectivity, alerts, prices, the pinned quote, symbols). The `provisioned` gate passes the harness's DPI awareness
+(`process_dpi_awareness`) to H3, `launched` the launcher log's hash, `authenticated` whether the gate failed last run
+and the MFA branch, `workspace_loaded` the enumerated windows when the corpus entry lists windows (SD-77).
 """
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
 
 from ..records import DeclaredSend, RunOutcome
 from . import killflag
+from .fixture_checks import check_stage2
+from .stage1 import run_stage1
 from .bounds import (BoundsState, after_relaunch, bridge_lost, checkpoint_outcome, jab_enablement,
                      relaunch_due)
 from .attestation import SAFETY_ROWS, AttestationProfile, RowReads, a9_passed, attest, matches, readable
@@ -171,6 +185,10 @@ class RunContext:
     attempt: int = 1
     order_hotkeys: DefaultOrderHotkeys | None = None         # the loaded gateway/default_order_hotkeys.yaml (5.4.7)
     bounds_branch: str = "B"                                  # DR-01: A reads bounds from the JAB tree (5.9, 7.5)
+    mfa_branch: str = "A"                                     # phase0 login_mfa: the two-step prompt's branch (7.7)
+    fixture_doc: Mapping[str, Any] | None = None              # the 4.9 fixture: stage 1 and stage 2 read it (7.6)
+    stage1: Any = None                                        # stage1.Stage1Profile: the profiles Stage 1 restores
+    paper_send_ok: bool = False                               # the gated branch's own-tag Cancel All (7.6 stage 2)
 
     def default_hotkeys(self) -> DefaultOrderHotkeys:
         """The pinned build's default order chords loaded at `settings_attested` (5.4.7): the loaded file, or the
@@ -219,7 +237,8 @@ class Orchestrator:
                  spend: SpendTracker | None = None, model: ModelAvailability | None = None,
                  counters: RateCounters | None = None,
                  safety_listener: Callable[[SessionSafety], None] | None = None,
-                 heartbeat_policy: Any = None, life: Any = None):
+                 heartbeat_policy: Any = None, life: Any = None,
+                 gate_hooks: Mapping[str, Callable[["Orchestrator"], ControlResult | None]] | None = None):
         self.rig = rig
         self.ctx = ctx
         self.sink = sink
@@ -230,6 +249,7 @@ class Orchestrator:
         self.heartbeat = heartbeat
         self.heartbeat_policy = heartbeat_policy     # executor.heartbeat.HeartbeatPolicy: gate writes carry its fields
         self.life = life                             # executor.heartbeat.AppLife: uptime and restart count (10.2)
+        self.hooks = dict(gate_hooks or {})          # the caller's checks after a gate (module docstring)
         self.watchdog_status = watchdog_status or rig.watchdog_status
         self.kill_flag, self.kill_pipe = rig.kill_channels()
         self.wall = wall if wall is not None else WallBudget.for_run(ctx.run_type, self.clock.monotonic())
@@ -255,6 +275,7 @@ class Orchestrator:
         self._a1: str | None = None
         self._a2: str | None = None
         self.bounds = BoundsState(ctx.bounds_branch)       # the session's bounds source (5.9, 7.5)
+        self.stage1_steps: tuple[str, ...] = ()            # Stage 1's run-health lines (7.6)
 
     # -- recording --------------------------------------------------------------------------------------
     def apply(self, r: ControlResult) -> ControlResult:
@@ -348,17 +369,20 @@ class Orchestrator:
         if start == "provisioned":
             if not self._gate("provisioned"):
                 return False
+            dpi = getattr(rig, "process_dpi_awareness", None)    # H3: the harness's own awareness (3.4 rule 5)
             r = self.apply(check_provisioned(rig.preflight(), repeat_gates=frozenset(
-                g for g in ctx.history.failed_gates_last_run if g.startswith("preflight."))))
-            if not r.passed:
+                g for g in ctx.history.failed_gates_last_run if g.startswith("preflight.")),
+                dpi_awareness=dpi() if dpi is not None else None))
+            if not r.passed or not self._hook("provisioned"):
                 return False
         first = start == "provisioned"
         while True:
             if not self._gate("launched"):
                 return False
             obs = rig.launch()
+            log = getattr(rig, "launcher_log_sha256", None)       # 7.3: for the on-call channel on a mismatch
             r = self.apply(check_launched(obs, expected_build=ctx.expected_build, first_launch=first,
-                                          budgets=self.budgets))
+                                          budgets=self.budgets, launcher_log_sha256=log() if log else None))
             if r.has("relaunch") and self.stop is None:
                 rig.kill_process_tree()
                 first = False
@@ -379,34 +403,51 @@ class Orchestrator:
         if not self._gate("authenticated"):
             return False
         self.counters.login(self.clock.now())
-        r = self.apply(check_authenticated(rig.login()))
+        r = self.apply(check_authenticated(rig.login(), repeat="authenticated" in ctx.history.failed_gates_last_run,
+                                           mfa_branch=ctx.mfa_branch))
         if not r.passed:
             return False
         self._new_session()
         if not self._gate("paper_mode_asserted") or not self._paper_mode():
             return False
-        if not self._gate("settings_attested") or not self._attest():
+        drift = self._stage1()
+        if drift is None:
+            return False
+        if not self._gate("settings_attested") or not self._attest(drift) or not self._hook("settings_attested"):
             return False
         if not self._gate("workspace_loaded"):
             return False
-        self.apply(check_workspace(rig.load_workspace(), ctx.workspace))
+        self.apply(check_workspace(rig.load_workspace(), ctx.workspace,
+                                   windows=rig.enumerate_windows() if ctx.workspace.windows else None))
         if self.stop:
             return False
         if not self._gate("fixture_verified"):
             return False
-        first_read = rig.verify_account_fixture()
-        r = check_fixture(first_read, ctx.fixture, reseed_due_passed=ctx.reseed_due_passed)
-        if r.has("reset_empty_account"):
+        if ctx.fixture_doc is not None and hasattr(rig, "stage2_reads"):
+            if not self._stage2():
+                return False
+        else:
+            first_read = rig.verify_account_fixture()
+            r = check_fixture(first_read, ctx.fixture, reseed_due_passed=ctx.reseed_due_passed)
+            if r.has("reset_empty_account"):
+                self.apply(r)
+                rig.reset_empty_account()
+                r = check_fixture(first_read, ctx.fixture, after_reset=rig.verify_account_fixture(),
+                                  reseed_due_passed=ctx.reseed_due_passed)
             self.apply(r)
-            rig.reset_empty_account()
-            r = check_fixture(first_read, ctx.fixture, after_reset=rig.verify_account_fixture(),
-                              reseed_due_passed=ctx.reseed_due_passed)
-        self.apply(r)
-        if self.stop:
-            return False
+            if self.stop:
+                return False
         if not self._gate("canary_flow_passed"):
             return False
         self.apply(check_canary_flow(rig.run_canary_flow()))
+        return self.stop is None
+
+    def _hook(self, name: str) -> bool:
+        """The caller's check after gate `name` (`gate_hooks`): its result is applied; False when the run stopped."""
+        fn = self.hooks.get(name)
+        r = fn(self) if fn is not None else None
+        if r is not None:
+            self.apply(r)
         return self.stop is None
 
     def _bounds_at_launch(self, obs: LaunchObservation, *, relaunch: bool) -> bool:
@@ -430,6 +471,47 @@ class Orchestrator:
     def bounds_outcome(self, *, needs_bounds: bool = True) -> Outcome | None:
         """The outcome a checkpoint takes from the bounds source now (`bounds.checkpoint_outcome`), or None."""
         return checkpoint_outcome(self.bounds, needs_bounds=needs_bounds)
+
+    def _stage1(self) -> bool | None:
+        """Stage 1 of the fixture reset (7.6, `stage1.run_stage1`) between the paper-mode assertion and attestation,
+        when the context carries the profiles and the rig its write path (`ProfileResetPort`): a safety row changed
+        since the last run aborts (None); otherwise whether a profile row is still wrong after the one correction
+        pass (`profile_drift` for attestation), and its steps go to run health."""
+        ctx = self.ctx
+        if ctx.stage1 is None or ctx.fixture_doc is None or not hasattr(self.rig, "read_page"):
+            return False
+        s1 = run_stage1(self.rig, ctx.fixture_doc, ctx.stage1)
+        self.stage1_steps = s1.steps
+        if s1.result is not None:
+            self._contain(self.apply(s1.result))
+            if self.stop is not None:
+                return None
+        return s1.profile_drift
+
+    def _stage2(self) -> bool:
+        """Stage 2 at `fixture_verified` (7.6, `fixture_checks.check_stage2`): every result applied in order up to
+        the first that sets a run outcome; a `reset_empty_account` resets, re-reads and checks again with the
+        re-read, a `cancel_all` (the gated branch's own-tag rows) cancels, re-reads and checks again. False when the
+        run stopped."""
+        ctx, rig = self.ctx, self.rig
+        reads = rig.stage2_reads(ctx.fixture_doc, self.clock.now())
+        for _ in range(3):
+            results = check_stage2(reads, ctx.fixture_doc, reseed_due_passed=ctx.reseed_due_passed,
+                                   paper_send_ok=ctx.paper_send_ok, run_tag=ctx.run_id)
+            for r in results:
+                self._contain(self.apply(r))
+                if self.stop is not None:
+                    return False
+            last = results[-1]
+            if last.has("reset_empty_account") and reads.after_reset is None:
+                rig.reset_empty_account()
+                reads = replace(reads, after_reset=rig.stage2_reads(ctx.fixture_doc, self.clock.now()).accounts)
+            elif last.has("cancel_all") and not reads.after_cancel:
+                rig.cancel_all()
+                reads = replace(rig.stage2_reads(ctx.fixture_doc, self.clock.now()), after_cancel=True)
+            else:
+                break
+        return self.stop is None
 
     def _read_identity(self) -> tuple[ControlResult, SelectorRead]:
         """One paper-mode assertion (6.4): a selector read, and under deny-all a second one 1 s later when the first
@@ -485,7 +567,7 @@ class Orchestrator:
         self._contain(r)
         return False
 
-    def _attest(self) -> bool:
+    def _attest(self, profile_drift: bool = False) -> bool:
         rig, ctx = self.rig, self.ctx
         firsts = {i: rig.read_setting(i) for i in SAFETY_ROWS}
         bad = [i for i, r in firsts.items() if not readable(r, ctx.profile)]
@@ -510,7 +592,7 @@ class Orchestrator:
         if ctx.profile.a9_runs == 2:
             evidence["A9_second"] = a9b.screenshot_sha256 if a9b else None
         res = attest(reads, ctx.profile, a9=a9, a9_second=a9b, a10=a10, rc_run=rc, evidence=evidence,
-                     previous_unreadable=ctx.history.attestation_unreadable_last_run)
+                     previous_unreadable=ctx.history.attestation_unreadable_last_run, profile_drift=profile_drift)
         self.apply(res.result)
         if not res.result.passed:
             return False
@@ -679,7 +761,7 @@ class Orchestrator:
         self._clear_safety()
         self.flow = None
         self.clock.sleep(SESSION_RELEASE_WAIT_S)
-        return self._gates(start="launched") and self._gate("running")
+        return self._gates(start="launched") and self._gate("running") and self._hook("relaunched")
 
     # -- ending ----------------------------------------------------------------------------------------
     def _finish(self) -> RunReport:

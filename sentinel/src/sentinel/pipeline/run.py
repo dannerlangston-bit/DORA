@@ -142,7 +142,7 @@ from ..classify import REVIEWER_ROWS, Classified, Condition, Facts, HarnessFailu
 from ..coverage import Profile, build_matrix
 from ..diff import load_params
 from ..diff.calibration import CalibrationFile, Capture as CalCapture, calibrate_checkpoint
-from ..diff.engine import (DiffContext, DiffResult, compare_fingerprints, diff_pair, fingerprint_id,
+from ..diff.engine import (DiffContext, DiffResult, diff_pair, fingerprint_id,
                            global_shift_prepass)
 from ..capture import (RedactionContext, RedactionList, RedactionResult, Sweep, SyntheticOcr, redact_pair,
                        redaction_version)
@@ -151,6 +151,16 @@ from ..capture.capture import (ForeignWindowLog, TargetWindow, capture_meta, cho
                                occlusion_grid, pid_tree, put_capture, select_windows)
 from ..capture.sweep import SizeLadder, compare_minimums, minimums_summary, size_step_event
 from ..orchestrator.version_read import DEFAULT_TITLE_REGEX
+from ..orchestrator import fixture_checks
+from ..orchestrator.popups import (BuildCounts, PopupContext, PopupSentinel, dismiss_action, popup_event,
+                                   popup_rate_findings)
+from .orchestration import popup_catalog
+from ..login_history import login_history
+from .. import churn
+from ..canonical import calibration_key
+from ..fingerprint import (build_fingerprint, cheap_reread, g5, harness_block, midrun_fingerprint_change,
+                           mismatch_note, os_fields, pair_check, rig_spec_check)
+from ..records import Fingerprint
 from ..diff.phash import phash
 from ..egress import EgressAllowlist, EgressGate, reconcile
 from ..synth import THEME
@@ -195,7 +205,7 @@ from ..orchestrator.drill import DrillPreconditions, DrillResult, SimDrillPort, 
 from ..orchestrator.explorer import load_deny_list
 from ..orchestrator.ports import SessionSafety
 from ..orchestrator.machine import Orchestrator, RunContext, RunReport
-from ..orchestrator.results import ControlResult, Outcome, RunVerdict, worse
+from ..orchestrator.results import ControlResult, Outcome, RunVerdict, SubsetOutcome, step_failed, worse
 from ..orchestrator.rig import CrashSignal
 from ..orchestrator.simrig import SimScenario, SimulatedRig, default_context
 from ..orchestrator.watchdog import HANG_FLOOR_S, HeartbeatWriter, app_failure
@@ -423,6 +433,9 @@ class _Run:
         self.params = load_params()
         epoch = str(((cfg.fixture.get("epoch") or {}).get("epoch_id")) or "epoch-unknown")
         self.fp_match, self.fp_id = _fingerprint(epoch)
+        self.fp_base_id = self.fp_id
+        self.cal_key: str | None = None                  # 4.12 calibration key of the run's fingerprint (7.13)
+        self.fp_ids: dict[str, str] = {}                 # shard -> its candidate fingerprint_id (4.12)
         self.epoch = epoch
         self.calibration: CalibrationFile | None = None
         self.rules: dict[str, inv.SurfaceRules] = {}
@@ -509,19 +522,20 @@ class _Run:
     # -- 3.9 A/A calibration and the 2.7 enablement test -------------------------------------
     def calibrate(self, planned: Sequence[PlannedCheckpoint], out_dir: Path) -> None:
         """The Calibration run of 1.6 on the base build, before any threshold is used."""
-        cal = CalibrationFile.load(out_dir / "calibration", self.fp_id) or CalibrationFile(self.fp_id, f"cal-{self.run_id}")
+        key = self.cal_key or self.fp_id                # 7.13: floors are keyed by the calibration key (4.12)
+        cal = CalibrationFile.load(out_dir / "calibration", key) or CalibrationFile(key, f"cal-{self.run_id}")
         pairs: dict[str, list[inv.AAPair]] = {}
         for cp in planned:
             caps = [self.capture(cp, "base", tick=10 + k) for k in range(6)]
             reg = self.registry(cp, caps[0])
             if cp.checkpoint_id not in cal.checkpoints:     # a fingerprint is calibrated once (3.9, 7.13)
-                key = (self.fp_id, self.base_app.build, cp.checkpoint_id, cp.data_mode, _registry_key(reg))
-                if key not in _CALIBRATIONS:
-                    _CALIBRATIONS[key] = calibrate_checkpoint(
+                ck = (key, self.base_app.build, cp.checkpoint_id, cp.data_mode, _registry_key(reg))
+                if ck not in _CALIBRATIONS:
+                    _CALIBRATIONS[ck] = calibrate_checkpoint(
                         [CalCapture(c.screen.image, time_to_settle_ms=3 * 250) for c in caps], reg,
                         data_mode=cp.data_mode, system_masks=[park_rect(_park(caps[0]))], now=self.now,
                         params=self.params)
-                cal.checkpoints[cp.checkpoint_id] = _CALIBRATIONS[key]
+                cal.checkpoints[cp.checkpoint_id] = _CALIBRATIONS[ck]
             pairs.setdefault(f"{cp.surface_id}|{cp.data_mode}", []).append(
                 inv.AAPair(cp.data_mode, caps[0].models, caps[5].models))
         for key, ps in sorted(pairs.items()):
@@ -1000,7 +1014,8 @@ class _Writer:
             meta = capture_meta(sha256=hashlib.sha256(png).hexdigest(), run_id=run.run_id,
                                 checkpoint_id=cp.checkpoint_id, side=side, window=ev.window,
                                 captured_at=_ts(self.today, self.clock, 600), sweep=run.sweep, dpi=96, scale_percent=100,
-                                dpi_awareness="PER_MONITOR_AWARE_V2", fingerprint_id=run.fp_id,
+                                dpi_awareness="PER_MONITOR_AWARE_V2",
+                                fingerprint_id=run.fp_ids.get(ev.shard_id or "", run.fp_id),
                                 app_uptime_s=ev.app_uptime_s, app_restart_count=ev.app_restart_count, mode="scripted",
                                 action_path=f"{cp.flow_id}/{cp.step_id}" if cp.flow_id else cp.checkpoint_id,
                                 settle_ms=ev.settle_ms, redaction_version=run.red_header.version,
@@ -1056,7 +1071,8 @@ class _Writer:
             test_kind=cp.test_kind, tier=cp.tier, flow_id=cp.flow_id, step_id=cp.step_id,
             size_step=dict(cp.size_step) if cp.size_step else None, diff=diff, artifacts=arts,
             recaptures=ev.recaptures, synthetic=synthetic, flow_class=_flow_class(self.run.cfg, cp),
-            fingerprint_id=self.run.fp_id, data_epoch_id=self.run.epoch, paper_assertion=ev.paper,
+            fingerprint_id=self.run.fp_ids.get(ev.shard_id or "", self.run.fp_id), data_epoch_id=self.run.epoch,
+            paper_assertion=ev.paper,
             captured_at=_ts(self.today, self.clock, 600), recorded_at=_ts(self.today, self.clock, 900),
             outcome_id=self.run.next_outcome_id(), pair_id=self.run.pair_id, profile_id=PROFILE,
             diff_pixels=sum(m.changed_px for m in ev.diff.regions) if diff is not None else None,
@@ -1262,6 +1278,24 @@ def scripted_flow(doc: Mapping[str, Any], flow_id: str, script: RigScript) -> Ma
     return {**doc, "steps": steps}
 
 
+class _LiveTeardown(dict):
+    """A flow document whose teardown is read when it runs (`run_unit` reads `doc.get("teardown")` then): a
+    `close_dialog` or `clear_ticket` whose dialog is not open has nothing to close, so it runs as the target-less
+    teardown action (`SimUnitPorts.teardown_action`, no input) instead of a click the ladder cannot place (2.6.1)."""
+
+    def __init__(self, doc: Mapping[str, Any], rig: SimulatedRig):
+        super().__init__(doc)
+        self.rig = rig
+
+    def get(self, key: str, default: Any = None) -> Any:
+        value = super().get(key, default)
+        if key != "teardown" or self.rig.dialog_open:
+            return value
+        return [{k: v for k, v in st.items() if k != "target"}
+                if st.get("action") in ("close_dialog", "clear_ticket") and st.get("target") else st
+                for st in value or ()]
+
+
 def _spec_step(spec: Any) -> str | None:
     """The step a finding spec of the emitter names in its JSON detail (`locator_failure`), if any."""
     try:
@@ -1269,6 +1303,21 @@ def _spec_step(spec: Any) -> str | None:
     except (TypeError, ValueError):
         return None
     return str(detail["step_id"]) if isinstance(detail, dict) and detail.get("step_id") else None
+
+
+def _churn_rows(today: date, cfg: SentinelConfig, planned: Sequence[PlannedCheckpoint], at: str) -> list[list[str]]:
+    """Run health's churn lines (4.9, 7.9): the checkpoints today's `reapprove` events mark for re-approval and the
+    reseed tasks of the calendar."""
+    rows = []
+    marked = churn.reapprove(today, cfg.fixture, planned, cfg)
+    if marked:
+        rows.append(["Churn re-approval", "; ".join(f"{cid} ({why})" for cid, why in sorted(marked.items()))])
+    soon = today + timedelta(days=7)                # the owner's heads-up: reseeds due within a week
+    tasks = [t for t in churn.reseed_tasks(cfg.fixture, opened_at=at) if today <= date.fromisoformat(
+        t.ref.rsplit("/", 1)[-1]) <= soon]
+    if tasks:
+        rows.append(["Reseed tasks", "; ".join(f"{t.ref}: {t.detail}" for t in tasks)])
+    return rows
 
 
 def _branches_doc(cfg: SentinelConfig) -> dict:
@@ -1329,6 +1378,10 @@ class _Shard:
     emitting: bool = False                                 # the emitter is sending: the rig's observer holds off
     interrupt: ControlResult | None = None                 # an app failure seen inside a step (`_after_step`)
     unit: Any = None                                       # the unit in progress
+    fp: dict[str, Fingerprint] | None = None               # the shard's 4.12 fingerprints by side (7.4)
+    popups: Any = None                                     # orchestrator.popups.PopupSentinel (7.8)
+    proactive: bool = False                                # POP-11 asked for a proactive relaunch (7.8, 10.2)
+    close_after: list[int] = field(default_factory=list)   # app error dialogs closed after their capture (4.10)
     host: tuple[str, str | None] | None = None             # the sweep host the shard ran last (2.5.1)
     rest: list[PlannedCheckpoint] = field(default_factory=list)   # the unit's later checkpoints outside it
 
@@ -1377,6 +1430,9 @@ class _ShardWork:
         self.sides: dict[str, str] = {}                      # the side the Executor ran for a step-decided outcome
         self.foreign_log = ForeignWindowLog()                # 5.7: one alert per run per foreign image name
         self.ladders: dict[tuple[str, str, str], SizeLadder] = {}   # (surface, host, side) -> its 2.5.1 ladder
+        self.health_rows: list[list[str]] = []               # run-health rows the wiring adds (report.model)
+        self.catalog = popup_catalog(cfg)                    # 4.10: the popup sentinel's catalog
+        self.shown: set[tuple[str, str]] = set()             # the scenario's popups already on screen
 
     # -- the shards -------------------------------------------------------------------------------------
     def run_shards(self, specs: Sequence[tuple[str, int, str, list[PlannedCheckpoint]]]) -> None:
@@ -1398,8 +1454,10 @@ class _ShardWork:
         sc = self.scenario
         clock = ManualClock(start=self.run.now.astimezone(timezone.utc), mono=1000.0 + 10_000 * shard_no)
         ctx, sim = shard_setup(self.cfg, run_id=sc.run_id, run_type="pr", shard_id=shard_id, shard_no=shard_no,
-                               build_id=sc.candidate.build_id, workspace_id=cps[0].workspace_id, script=self.script,
-                               rig_id=rig_id, kill_root=self.out / "rigs")
+                               build_id=sc.candidate.build_id,
+                               workspace_id=(cps or self.planned)[0].workspace_id, script=self.script,
+                               rig_id=rig_id, kill_root=self.out / "rigs", today=self.today,
+                               history=login_history(self.store, login_alias(rig_id)))     # 6.3, 6.4, 9.10
         sim.vault = self.vault                          # the LOGIN secret is a leased secret step (6.9)
         rig = SimulatedRig(sim, clock=clock)
         sink = ShardSink([cp.checkpoint_id for cp in cps])
@@ -1415,13 +1473,18 @@ class _ShardWork:
             if holder:
                 holder[0].assertion(holder[0].orch.paper_stamp())
 
-        orch = self.orchestrator(rig, ctx, sink, clock, hb, sim, listener, policy=policy, life=life)
+        hooks = {"provisioned": lambda o: self._fp_provisioned(holder[0]),
+                 "settings_attested": lambda o: self._fp_build(holder[0]),
+                 "relaunched": lambda o: self._fp_relaunched(holder[0])}
+        rig.g5 = lambda: self._g5(holder[0])
+        orch = self.orchestrator(rig, ctx, sink, clock, hb, sim, listener, policy=policy, life=life, hooks=hooks)
         st = _Shard(shard_id, rig_id, list(cps), orch, rig, sink, clock, ctx, policy=policy, life=life)
         st.drainer = Drainer(DrainContext(sc.run_id, shard_id, "candidate", mode="scripted"),
                              journal=self.out / "journal" / sc.run_id / f"shard-{shard_no}" / JOURNAL_NAME,
                              next_seq=lambda: next(st.seq), wall_at=wall_from(clock))
         rig.on_input = lambda action, res: self._drain(st, action, res)
         self._executor(st)
+        st.popups = PopupSentinel(self.catalog) if self.catalog is not None else None
         holder.append(st)
         _, hotkeys_error = order_hotkeys(self.cfg)
         if hotkeys_error is not None:                   # 5.4.7: fails the shard closed at settings_attested
@@ -1455,7 +1518,7 @@ class _ShardWork:
     def orchestrator(self, rig: SimulatedRig, ctx: RunContext, sink: Any, clock: ManualClock,
                      hb: HeartbeatWriter | None, sim: SimScenario,
                      listener: Callable[[SessionSafety], None], *, policy: HeartbeatPolicy | None = None,
-                     life: AppLife | None = None) -> Orchestrator:
+                     life: AppLife | None = None, hooks: Mapping[str, Any] | None = None) -> Orchestrator:
         """One shard's Orchestrator (5.2) with the run's budgets: the 11.2 wall budget from the shard's start, the
         spend ceiling, the model availability of preflight N2 and N5 (10.7), the login's 6.4 rate counters (no
         store helper seeds them yet: a fresh login) and the session safety listener (`rig.set_session_safety`)."""
@@ -1463,7 +1526,95 @@ class _ShardWork:
         return Orchestrator(rig, ctx, sink, clock=clock, ledger=self.ledger, heartbeat=hb,
                             wall=WallBudget.for_run(ctx.run_type, clock.monotonic()), spend=SpendTracker(),
                             model=ModelAvailability.from_preflight("N2" not in fails, "N5" not in fails),
-                            counters=RateCounters(), safety_listener=listener, heartbeat_policy=policy, life=life)
+                            counters=RateCounters(), safety_listener=listener, heartbeat_policy=policy, life=life,
+                            gate_hooks=hooks)
+
+    # -- the 4.12 fingerprint of each shard (3.3, 7.4, 12.7 G5) -------------------------------------------------
+    def _harness(self, st: _Shard) -> dict:
+        """The fingerprint's `harness` field (7.4, 8.5) of this run: the simulated harness, OCR and capture, the
+        run's redaction version, the config commit and tarball hash and the allowlist's hash."""
+        sha = tree_sha256(self.cfg.root)
+        return harness_block(version="sentinel-core-0.1.0-sim", ocr_engine="sim-ocr-1", ocr_model="synth-drawn-text",
+                             capture_lib="sim-capture-1", redaction_version=self.run.red_header.version,
+                             region_registry_version=sha[:12], config_commit=sha[:12],
+                             config_tarball_sha256="sha256:" + sha, allowlist_sha256="sha256:" + st.ctx.allowlist.sha256,
+                             diff_params=self.run.params)
+
+    def _g5(self, st: _Shard) -> str:
+        """12.7 G5 at `provisioned`: the halves' OS-class fields compared (`fingerprint.g5`). Both halves run on the
+        shard's one rig back to back (7.4): the second half's OS fields are the rig's, read once for both. An
+        unreadable read is the `provisioned` hook's outcome, not G5's."""
+        fields = os_fields(st.rig.read_os(), self._harness(st))
+        return "pass" if isinstance(fields, ControlResult) else g5(fields, fields)
+
+    def _fp_provisioned(self, st: _Shard) -> ControlResult | None:
+        """At `provisioned`: the OS fields (`fingerprint.os_fields`), or `env_error (fingerprint_unreadable:<field>)`."""
+        r = os_fields(st.rig.read_os(), self._harness(st))
+        return r if isinstance(r, ControlResult) else None
+
+    def _fp_build(self, st: _Shard) -> ControlResult | None:
+        """After `settings_attested` (7.4): both halves' fingerprints from the rig's reads (the base half on the same
+        rig, its app fields with the scenario's `base_fingerprint`), stored once per shard and side
+        (`Store.write_fingerprint`); the rig specification (`rig_spec_check`, L-FPR-02) and the pair check before
+        the second half's first capture (`pair_check`, L-FPR-03, L-FPR-05). The shard's captures and outcomes carry
+        the candidate's `fingerprint_id`; the run's floors are keyed by its calibration key."""
+        sc, rig = self.scenario, st.rig
+        if st.fp is not None:                 # a relaunch passes attestation again: the `relaunched` hook re-checks
+            return None
+        harness = self._harness(st)
+        os_r, app_r = rig.read_os(), rig.read_app()
+        fixture_acct = st.ctx.fixture_account
+        common = dict(data_epoch={"epoch_id": self.run.epoch, "data_mode": "backend_fixture"},
+                      account={"account_id_sha256": account_id_sha256(fixture_acct),
+                               "login_sha256": account_id_sha256(login_alias(st.rig_id)), "role": "empty"},
+                      read_at=st.clock.now().isoformat())
+        cand = build_fingerprint(os_r, app_r, sc.run_id, st.shard_id, "candidate", st.rig_id, harness, **common)
+        if isinstance(cand, ControlResult):
+            return cand
+        base_app = dataclasses.replace(app_r, build_id_title=sc.base.build_id, build_id_about=sc.base.build_id,
+                                       **dict(self.script.base_fingerprint))
+        base = build_fingerprint(os_r, base_app, sc.run_id, st.shard_id, "base", st.rig_id, harness, **common)
+        if isinstance(base, ControlResult):
+            return base
+        self.store.write_fingerprint(cand)
+        self.store.write_fingerprint(base)
+        st.fp = {"candidate": cand, "base": base}
+        self.run.fp_ids[st.shard_id] = cand.fingerprint_id
+        if self.run.cal_key is None:
+            self.run.fp_id, self.run.fp_base_id = cand.fingerprint_id, base.fingerprint_id
+            self.run.cal_key = calibration_key(cand.match)
+        r = rig_spec_check(cand, rig_kind="vm", display_config=self._display_config(st),
+                           allowlist_sha256=harness["allowlist_sha256"])
+        return r or pair_check(cand, base)
+
+    def _display_config(self, st: _Shard) -> Mapping[str, Any] | None:
+        """The shard's workspace display configuration (`configs/allowed.yaml` entry it names, 7.1)."""
+        ws = st.cps[0].workspace_id if st.cps else None
+        entry = next((d.data for d in self.cfg.repo.of("workspace") if (d.data or {}).get("id") == ws), {}) or {}
+        want = entry.get("display_config") or {}
+        allowed = next((d.data for d in self.cfg.repo.docs.values() if isinstance(d.data, dict)
+                        and isinstance(d.data.get("configs"), list)), {}) or {}
+        return next((c for c in allowed.get("configs") or () if all(c.get(k) == v for k, v in want.items())), None)
+
+    def _fp_relaunched(self, st: _Shard) -> ControlResult | None:
+        """After every relaunch (7.4): the fingerprint rebuilt from fresh reads against the session's start
+        (`midrun_fingerprint_change`) and the base half (`pair_check`)."""
+        if st.fp is None:
+            return None
+        sc, rig = self.scenario, st.rig
+        start = st.fp["candidate"]
+        new = build_fingerprint(rig.read_os(), rig.read_app(), sc.run_id, st.shard_id, "candidate", st.rig_id,
+                                start.match["harness"], data_epoch=start.match["data_epoch"],
+                                account=start.record["account"], read_at=st.clock.now().isoformat())
+        if isinstance(new, ControlResult):
+            return new
+        return midrun_fingerprint_change(start, new) or pair_check(new, st.fp["base"])
+
+    def _fp_boundary(self, st: _Shard) -> ControlResult | None:
+        """At every flow boundary: the cheap fields re-read against the session's start fingerprint (3.3, 7.4)."""
+        if st.fp is None:
+            return None
+        return midrun_fingerprint_change(st.fp["candidate"], cheap_reread(st.rig.read_os(), st.rig.read_title_build_id()))
 
     def _executor(self, st: _Shard) -> None:
         """The shard's Executor (5.4.3, 5.5, 10.2): its `ExecContext` (the run's drop ledger, the shard's budgets, the
@@ -1532,6 +1683,12 @@ class _ShardWork:
         if id(r) in st.noted:
             return
         st.noted.add(id(r))
+        fields = (r.evidence or {}).get("fields") if r.control in ("fingerprint_pair", "fingerprint_reread") else None
+        note = mismatch_note(fields) if fields else None
+        if note:                                         # L-FPR-05: the morning report's sentence
+            row = ["Fingerprint", f"{st.shard_id}: {note} (differing: {', '.join(fields)})"]
+            if row not in self.health_rows:
+                self.health_rows.append(row)
         self.persist(st, r, flow_id or st.last_flow)
         if r.control == "relaunch":
             ev = r.evidence or {}
@@ -1575,6 +1732,8 @@ class _ShardWork:
             return [cp for cp in rest if cp in todo]
         if selector == "first_unreached":
             return todo[:1]
+        if fixture_checks.handles(selector):      # account_state, account_state:golden, order_bearing, symbol:<id>
+            return fixture_checks.select_subset(selector, todo, self.cfg)
         if selector.startswith("workspace:"):     # 2.4: the shard's remaining census visits in that workspace
             ws = selector.split(":", 1)[1]
             return [cp for cp in todo if cp.test_kind == "census" and cp.workspace_id == ws]
@@ -1603,11 +1762,24 @@ class _ShardWork:
             orch = st.orch
             if orch.stop is not None or not [cp for cp in unit if cp in self._todo(st)]:
                 continue
-            r = orch.apply(check_build_unchanged(st.rig.read_title_build_id(), st.ctx.expected_build))
+            title = st.rig.read_title_build_id()          # 7.3: the About read stands in when the title misses
+            r = orch.apply(check_build_unchanged(title, st.ctx.expected_build,
+                                                 about_build_id=st.rig.read_about_build_id() if title is None else None,
+                                                 launcher_log_sha256=st.rig.launcher_log_sha256()))
             self._note(st, r)
             if not r.passed:
                 continue
             flow_id = unit[0].flow_id if unit[0].test_kind == "flow" else None
+            if st.proactive and orch.stop is None:      # POP-11: the relaunch its memory warning asked for
+                st.proactive = False
+                orch.relaunch("proactive")
+                self._note_new(st)
+                if orch.stop is not None:
+                    continue
+            fp = self._fp_boundary(st)                  # 3.3, 7.4: the cheap fields at every flow boundary
+            if fp is not None:
+                self._note(st, orch.apply(fp))
+                continue
             orch.flow_boundary(BoundaryObservations(order_dialog_visible=st.rig.dialog_open), flow_id=flow_id,
                                p50_s=None)          # 5.2, 6.4, 6.6, 10.2, 11.2; no measured p50 yet: 5 minutes
             self._note_new(st, flow_id=flow_id)
@@ -1663,6 +1835,7 @@ class _ShardWork:
             st.last_flow = u.unit_id
         hooks = UnitHooks(before_step=lambda step: self._before_step(st, u, step),
                           after_step=lambda step: self._after_step(st))
+        u = dataclasses.replace(u, doc=_LiveTeardown(u.doc, st.rig))
         r = run_unit(u, st.ports, st.ladder, planner, st.exec, hooks=hooks, failures=st.failures, faults=self.faults,
                      streak=st.streak if u.kind == "census" and cps and cps[0].test_kind == "census" else None)
         self._absorb(st, u, r, cps)
@@ -1675,6 +1848,20 @@ class _ShardWork:
         st.clock.advance(STEP_S)
         sid, kind = str(step.get("id")), str(step.get("type"))
         st.ladder.ctx = dataclasses.replace(st.ladder.ctx, step_id=sid, step_type=kind, teardown=False)
+        ends = self._sweep(st, sid, u.unit_id if u.kind == "flow" else None, at_capture=False,
+                           census=u.kind == "census", order_stage=step.get("order_stage") is True)
+        if ends is not None:
+            return _applied(ends)
+        if kind not in ("checkpoint", "wait_for", "assert", "precondition") and st.popups is not None:
+            fg = st.popups.foreground(st.rig.foreground_window(), (APP_PID,), self._popup_ctx(st, sid, None))
+            if fg is not None:                          # 7.8 hardening: a foreign foreground; the batch is not sent
+                fg = st.orch.apply(fg)
+                self._note(st, fg, flow_id=u.unit_id if u.kind == "flow" else None)
+                # the step fails unsent: the checkpoint it led to takes the occlusion, the rest of the flow step_failed
+                subsets = tuple(SubsetOutcome(sel, o) for sel, o in (("in_progress", fg.checkpoint),
+                                                                     ("rest_of_flow", step_failed(sid))) if o)
+                return _applied(dataclasses.replace(fg, outcomes=subsets,
+                                                    actions=tuple(dict.fromkeys(fg.actions + ("end_flow",)))))
         if u.kind != "flow":
             return None
         cp = next((c for c in self.planned if c.checkpoint_id == step.get("checkpoint_id")), None) \
@@ -1816,6 +2003,9 @@ class _ShardWork:
                                                      running_flow=cp.flow_id)), checkpoint=cp, flow_id=cp.flow_id)
             st.seen = len(st.orch.results)
             return None
+        if self._sweep(st, cp.step_id or "visit", cp.flow_id, at_capture=True, census=cp.test_kind == "census",
+                       checkpoint_id=cid) is not None or cid in st.sink.done:
+            return None
         window = self._window(st, cp, rest)
         if window is None:
             return None
@@ -1834,9 +2024,86 @@ class _ShardWork:
         ev.shard_id, ev.session, ev.rig_id = st.shard_id, len(st.sessions) - 1, st.rig_id
         ev.app_uptime_s, ev.app_restart_count = st.life.tags(st.clock.monotonic())     # 10.2
         ev.window = window
+        for hwnd in st.close_after:                     # 4.10: an app error dialog is captured first, then closed
+            st.rig.close_window(hwnd)
+        st.close_after.clear()
         self.evals.append(ev)
         st.sink.done.add(cid)
         return ev
+
+    def _popup_ctx(self, st: _Shard, step_id: str | None, flow_id: str | None, *, at_capture: bool = False,
+                   census: bool = False, order_stage: bool = False) -> PopupContext:
+        return PopupContext(phase="running", gate="running", flow_id=flow_id, step_id=step_id,
+                            order_stage=order_stage or st.exec.order_stage, at_capture=at_capture, census=census,
+                            agent_enabled=False, relaunched=st.life.restarts > 0, relogin_budget=st.orch.relogin,
+                            build_id=self.scenario.candidate.build_id)
+
+    def _sweep(self, st: _Shard, step_id: str, flow_id: str | None, *, at_capture: bool, census: bool = False,
+               order_stage: bool = False, checkpoint_id: str | None = None) -> ControlResult | None:
+        """The popup sentinel before a step or a capture (4.10, 7.8; `PopupSentinel.sweep` over the rig's windows, the
+        main frame and an order dialog the flow opened expected): every new hit is a `popup` step event; a dismiss key
+        goes through the gateway, an unknown or error window gets WM_CLOSE (an error dialog after its capture), a
+        wait polls its timeout (`wait_over`), POP-11 asks for the proactive relaunch at the next flow boundary; each
+        decision goes through `Orchestrator.apply`. The result that ends the unit, or None."""
+        if st.popups is None:
+            return None
+        for at, title in self.script.popups:            # the scenario's windows appear here
+            if at == step_id and (at, title) not in self.shown:
+                self.shown.add((at, title))
+                st.rig.extra_windows.append(title)
+        rig, sc = st.rig, self.scenario
+        ctx = self._popup_ctx(st, step_id, flow_id, at_capture=at_capture, census=census, order_stage=order_stage)
+        expected = {1} | ({rig._dialog_hwnd} if rig.dialog_open and st.exec.order_stage else set())
+        ends: ControlResult | None = None
+        for hit in st.popups.sweep(rig.enumerate_windows(), ctx, expected_hwnds=expected):
+            ev = hit.result.evidence or {}
+            if hit.new:
+                st.events.append(popup_event(hit, run_id=sc.run_id, shard_id=st.shard_id, side="candidate",
+                                             seq=next(st.seq), wall_at=st.clock.now().isoformat(),
+                                             mono_ms=int(st.clock.monotonic() * 1000), flow_id=flow_id,
+                                             step_id=step_id, checkpoint_id=checkpoint_id))
+                if (ev.get("input") or {}).get("key") and hit.entry is not None:
+                    rig.send_input(dismiss_action(hit.entry))
+                if ev.get("close") in ("wm_close", "agent_dismiss"):
+                    if ev.get("capture_first") and at_capture:
+                        st.close_after.append(hit.window.hwnd)
+                    else:
+                        rig.close_window(hit.window.hwnd)
+                if ev.get("proactive_relaunch"):
+                    st.proactive = True
+            r: ControlResult | None = hit.result
+            if hit.new and ev.get("wait_timeout_ms"):  # 4.10 wait: poll the window until its timeout
+                st.clock.advance(float(ev["wait_timeout_ms"]) / 1000.0)
+                r = st.popups.wait_over(hit, ctx, cleared=hit.window.hwnd not in {w.hwnd for w in
+                                                                                  rig.enumerate_windows()})
+            if r is None or (r.passed and not r.outcomes and r.run is None):
+                continue
+            r = st.orch.apply(r)
+            cp = next((c for c in st.cps if c.checkpoint_id == checkpoint_id), None)
+            self._note(st, r, checkpoint=cp, flow_id=flow_id)
+            if checkpoint_id is not None and r.checkpoint is not None and cp is not None:
+                o = r.checkpoint
+                if o.outcome in SIDED and not o.detail:   # 4.13: name the window still present at max wait
+                    o = dataclasses.replace(o, detail=f"window {hit.window.title!r} present at max wait")
+                self._decide(st, cp, o, "candidate" if o.outcome in SIDED else None)
+            unit = st.unit
+            later = [c for c in st.cps if unit is not None and c.checkpoint_id in unit.checkpoints]
+            self._subsets(st, r, cp, later)
+            st.seen = len(st.orch.results)
+            if ends is None and (r.run is not None or r.has("end_flow") or r.has("teardown") or r.outcomes
+                                 or r.step == "failed"):
+                ends = r
+        return ends
+
+    def popup_findings(self) -> list[Finding]:
+        """7.8 policy 3: `popup_rate_increase` for each catalog popup whose hits per run rose on the candidate build
+        against the base (`popup_rate_findings`; the base half of the pair ran no popup sweep in the simulation)."""
+        events = [e for st, _ in self.reports for e in st.events]
+        sc = self.scenario
+        history = [BuildCounts(sc.base.build_id, 1, {}),
+                   BuildCounts.from_events(sc.candidate.build_id, events, side="candidate", runs=1)]
+        return [spec.to_finding(f"fnd-{sc.run_id}-pop-{i:03d}", sc.run_id, created_at=_ts(self.today, sc.clock, 900))
+                for i, spec in enumerate(popup_rate_findings(history), 1)]
 
     def _decide(self, st: _Shard, cp: PlannedCheckpoint, o: Outcome, side: str | None = None) -> None:
         """A checkpoint outcome Capture decided before any evaluation (3.4, 2.5.1)."""
@@ -1978,7 +2245,9 @@ class _ShardWork:
             workspace_id=cp.workspace_id, persona=cp.persona, data_mode=cp.data_mode,
             surface_id=cp.surface_id, test_kind=cp.test_kind, tier=cp.tier, flow_id=cp.flow_id, step_id=cp.step_id,
             size_step=dict(cp.size_step) if cp.size_step else None, flow_class=_flow_class(self.cfg, cp),
-            fingerprint_id=self.run.fp_id, data_epoch_id=self.run.epoch, recorded_at=_ts(self.today, sc.clock, 900),
+            fingerprint_id=self.run.fp_ids.get(next((s.shard_id for s, _ in self.reports if cp in s.cps), ""),
+                                               self.run.fp_id),
+            data_epoch_id=self.run.epoch, recorded_at=_ts(self.today, sc.clock, 900),
             assertion_ids=[o.reason.split(":", 1)[1]] if o.outcome == "assertion_failed" and (o.reason or "")
             .startswith("assertion:") else None, outcome_id=self.run.next_outcome_id(), pair_id=self.run.pair_id,
             profile_id=PROFILE)
@@ -2296,13 +2565,11 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
             return _abort_config(store, scenario, cfg_root, [str(exc)], list(exc.rule_ids), out, today, started,
                                  expiring=start.expiring)
         planned = list(plan.planned)
+        skipped = churn.skip_outcomes(today, cfg.fixture, planned, cfg)      # 4.9: the day's churn calendar
+        churn_rows = _churn_rows(today, cfg, planned, started)
         rig_of = {cp.checkpoint_id: it.rigs[0] for it in plan.items for cp in it.checkpoints}
         run = _Run(cfg, scenario.run_id, "pr", scenario.base, scenario.candidate, now, manifest, plan, plan.x_input)
         run.budget = RerunBudget(len(planned), run.params)
-        # 3.3: fingerprint equality on every field but build id, before any capture
-        mismatch = compare_fingerprints({"match": dict(run.fp_match, build_id=base_id)},
-                                        {"match": dict(run.fp_match, build_id=scenario.candidate.build_id)})
-        assert mismatch is None
         # -- T+0:00 to 0:02: the run row, its scope and shards (1.7)
         secrets = run_secrets(RIGS)                       # 6.9: the plaintexts the run's logins used, by reference
         scanner = SecretScanner(secrets)
@@ -2338,7 +2605,8 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         if isinstance(rev, CollectingReviewer):
             rev.item_for = items
         # -- 5.2: every shard through the Orchestrator; 5.17 per checkpoint inside `running`
-        work.run_shards([(shard_of[r], i, r, [cp for cp in planned if rig_of[cp.checkpoint_id] == r])
+        work.run_shards([(shard_of[r], i, r, [cp for cp in planned if rig_of[cp.checkpoint_id] == r
+                                              and cp.checkpoint_id not in skipped])
                          for i, r in enumerate(used, 1)])
         work.write_events()                    # first: the shard's seq is then the store's MAX(seq) for later rows
         evals = work.evals
@@ -2353,7 +2621,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
             if gf is not None:
                 store.write_finding(dataclasses.replace(gf, created_at=started))
         calls = _review_pass(run, evals, rev, scenario.reviewer_cap, gate)
-        for f in list(plan.findings) + work.sweep_minimums()[1]:
+        for f in list(plan.findings) + work.sweep_minimums()[1] + work.popup_findings():
             store.write_finding(dataclasses.replace(f, created_at=f.created_at or started))
         for f in _expired_findings(scenario.run_id, start.expired, run.expiry_notices, run.expired_exceptions,
                                    started):
@@ -2380,6 +2648,9 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                 store.write_finding(f)
         for s, sid in work.steps:                         # each with its gateway_event (8.3 gate_* columns)
             store.write_steps([s], shard_id=sid, side="candidate")
+        for cid, o in sorted(skipped.items()):         # 4.9: not_run (scope) with the churn event in detail
+            cp = planned_for(cfg, cid)
+            work.write_record(dataclasses.replace(work.bare_outcome(cp, o), recorded_at=started))
         for c in plan.cuts:
             if c.checkpoint is not None:
                 work.write_record(dataclasses.replace(c.outcome(scenario.run_id), recorded_at=started,
@@ -2426,6 +2697,10 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         minimums, _ = work.sweep_minimums()
         if minimums:                                    # 2.5.1: stored with the run, the report's minimum line
             summary["sweep_minimums"] = minimums
+        stage1 = sorted({line for st, _ in work.reports for line in st.orch.stage1_steps})
+        rows = list(work.health_rows) + churn_rows + ([["Fixture Stage 1", "; ".join(stage1)]] if stage1 else [])
+        if rows:
+            summary["health_rows"] = rows
         if secret is not None:
             summary["secret_scan"] = {"result": secret.run_reason, "detail": secret.detail, "report_withheld": True}
         dims = summary["coverage"]["matrix"]          # 1.4 G2 and L-OUT-07 on the stored rows, before anything reports
@@ -2570,7 +2845,7 @@ def _summary(store: Store, cfg: SentinelConfig, plan: ScopePlan, run: _Run, scen
     outcomes = store.outcomes(scenario.run_id)
     health: dict[str, Any] = {
         "wall_clock": _mmss(wall), "budget": "45:00", "shards": shards,
-        "fingerprint": {"candidate": run.fp_id[7:13], "base": run.fp_id[7:13]},
+        "fingerprint": {"candidate": run.fp_id[7:13], "base": run.fp_base_id[7:13]},
         "reviewer": {"cost_usd": 0.0},
         "safety": safety,
         "integrations": {"pr_comment": {"state": "posted", "time": "(simulated: written to pr-comment.md)"},

@@ -54,6 +54,16 @@ Choices (reported):
    4.7 `secret` step run by `executor.secret.run_secret_step`: leased at typing time, typed as `VK_PACKET` pairs
    with `secret` tokens, its lease kept in `leases` for the teardown plaintext scan; a lease that fails twice types
    nothing and the login reports `vault_lease: false` (6.9, 7.7).
+8. The 4.12 fingerprint reads (`read_os`, `read_app`, a `ports.FingerprintReader`) are the 7.1 specification of a
+   VM rig, the same on every simulated rig; the app's build is the one launched. Knobs blank a read
+   (`fp_unreadable`), change a cheap OS field after its n-th read (`fp_change`) or override app fields (`fp_app`).
+9. Fixture stages (7.6): `stage2_reads` is a clean `fixture_verified` read (the accounts as `verify_account_fixture`
+   gives them with buying power equal to cash, the epoch's delay badge, a connected status bar, prices recomputed
+   from `SimQuotes`, the pinned quote equal to its dataset, every symbol present), `stage2` overriding fields; the
+   Stage 1 write path keeps the settings pages and watchlists the scenario seeds and changes them when asked.
+10. Popups (7.8): the other app windows (`extra_windows`) are dialogs over the screen's centre; Escape that reaches
+   the app closes the topmost one, `close_window` (WM_CLOSE) any of them; `foreground_window` is a foreign program's
+   window when the scenario puts one there (`foreign_foreground`), else the topmost app window.
 7. Input planned by the Executor (`executor.primitives.PlannedAction`) runs unit by unit through the hook exactly as
    5.4.10 tabulates (double clicks, drags, wheels, chords, typed characters, the `reset_input_state` releases); the
    simulated app reacts to the pointer events and to Enter or Space on the open dialog as before. A click labelled
@@ -65,7 +75,7 @@ builds the `RunContext` that matches the default scenario (the example config's 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
@@ -79,7 +89,7 @@ from .attestation import AttestationProfile
 from .clock import Clock, ManualClock
 from .explorer import DEFAULT_DENY_LIST, DenyEntry, load_deny_list, match_deny
 from .gates import PREFLIGHT_ITEMS, AccountExpectation, WorkspaceExpectation
-from .gateway import (DISMISS_ALLOWLIST, VK_RETURN, VK_SPACE, Action, Chord, Flag, GatewayState, InputEvent, Rect,
+from .gateway import (DISMISS_ALLOWLIST, VK_ESCAPE, VK_RETURN, VK_SPACE, Action, Chord, Flag, GatewayState, InputEvent, Rect,
                       SafetyContext, hook_decide, slow_half)
 from .gateway_config import DISMISS_ALLOWLIST_PATH, load_dismiss_allowlist
 from .identity import Allowlist, account_id_sha256
@@ -87,7 +97,9 @@ from .killflag import FileFlagChannel, MemoryKillChannel, h5_passed, h5_round_tr
 from .killswitch import TripWires
 from .machine import RunContext
 from .orderbook import ORDER_GRIDS, POSITION_GRID, POSITION_LAYOUT, GridLayout, MonitorBook, build_order_book
-from .ports import Frame, KillChannel, SessionSafety
+from .ports import AccountState as PortAccountState
+from .ports import AppReads, ConnectivityObservation, DelayBadge, Frame, KillChannel, OsReads, SessionSafety
+from .fixture_checks import EpochRead, Stage2Reads, SymbolFacts, data_delay, parse_price_rule, recompute_prices
 from .ports import WindowInfo as ScreenWindow
 from .rig import (AccountState, CanaryFlowObservation, CancelAllResult, ConfirmationCheck, CrashSignal, EmitResult,
                   GatewayLog, HotkeyRow, LaunchObservation, LoginObservation, NotificationsRead, OrderBook, OrderRow,
@@ -112,12 +124,34 @@ DIALOG_RECT = (860, 560, 300, 120)          # holds SEND_RECT and DELETE_POINT
 FRAME_ORIGIN = (840, 560)                   # the synthetic grab's area (choice 2)
 FRAME_SIZE = (760, 380)
 GRAB_EPS_S = 1e-9
+EXTRA_HWND = 2000                           # the first hwnd of the other app windows (`extra_windows`)
 FREE_BYTES = 500 * 1024 ** 3
 H6_THEME = (18, 18, 18)                     # the simulated dark theme's background
 LOGIN_ID_KEYS = tuple(ord(c) for c in "SIM")
 SECRET_KEYS = (ord("X"), ord("Y"), ord("Z"))  # stand-ins: the secret's value never reaches the simulation (6.9)
 SIM_TITLES = TitleSets.compile(order_dialog=(r"^Order Confirmation$",), detached_ticket=(r"^Order Entry\b",),
                                order_event=(r"(?i)^order (submitted|rejected|filled)\b",))
+_H = "sha256:" + hashlib.sha256(b"sentinel-sim-rig").hexdigest()
+SIM_OS_READS: dict[str, Any] = dict(           # the 7.1 rig specification of a VM rig (choice 8)
+    windows_build={"current_build": "26100", "ubr": "2314"},
+    display={"width": 1920, "height": 1080, "bits": 32, "frequency": 60, "scale_percent": 100, "dpi": 96,
+             "awareness": "PER_MONITOR_AWARE_V2", "monitors": 1},
+    cleartype={"smoothing": True, "type": "FE_FONTSMOOTHINGCLEARTYPE", "gamma": 1800, "contrast": 1400,
+               "orientation": "RGB"},
+    gpu={"name": "Hyper-V Video", "driver_version": "10.0.26100.1"},
+    os_theme={"apps_light": False, "system_light": False, "transparency": False, "animations": False},
+    keyboard={"layout": "0x0409", "layout_count": 1, "toggle_keys": {"caps": False, "num": True, "scroll": False},
+              "locale": "en-US"},
+    time_zone_os="Eastern Standard Time", input_desktop="Default",
+    rig={"hostname": "tos-rig-sim", "hypervisor": "hyperv", "hypervisor_version": "10.0.26100",
+         "snapshot_ids": ("snap-2026-10-28-base",), "vm_image_id": "tos-rig-win11-2026-10-28"})
+SIM_OS_CHANGES = {"cleartype": {"gamma": 2200}, "display": {"scale_percent": 125, "dpi": 120}}
+SIM_APP_READS: dict[str, Any] = dict(
+    jre_release={"sha256": _H, "java_version": "17.0.12"}, vmoptions_hash=_H,
+    java2d_pipeline={"pinned": "software", "confirmed": "software"}, app_theme={"scheme": "dark", "font_size": "medium"},
+    workspace_hash={"ws.sim": _H}, settings_profile_hash=_H,
+    time_zone_app={"app_display": "America/New_York", "chart": "America/New_York"},
+    render_probe_hash="e3b0c44298fc1c14", jar_listing_hash=_H)
 SIM_ORDER_LAYOUT = GridLayout(header=("Order ID", "Symbol", "Qty", "Status"), key=("Order ID",), status="Status",
                               symbol="Symbol", qty="Qty")
 SIM_LAYOUTS = {"working": SIM_ORDER_LAYOUT, "filled": SIM_ORDER_LAYOUT, "canceled": SIM_ORDER_LAYOUT,
@@ -208,6 +242,16 @@ class SimScenario:
     capture_fails: bool = False                      # every grab fails: the flag is unknown (5.4.6)
     titles: TitleSets = SIM_TITLES                   # the Watcher's title regexes (the popup catalog's sets, 7.8)
     vault: Any = None                                # a ports.VaultPort: the LOGIN secret is a leased secret step
+    fp_unreadable: str | None = None                 # a 4.12 read the rig cannot make (an OsReads or AppReads field)
+    fp_change: tuple[str, int] | None = None         # (cheap OS field, n): that read changes after its n-th read (7.4)
+    fp_app: dict[str, Any] = field(default_factory=dict)   # AppReads fields that differ from the pinned reads
+    dpi_awareness: str = "PER_MONITOR_AWARE_V2"     # the harness process's DPI awareness (H3, 3.4 rule 5)
+    main_rect: tuple[int, int, int, int] = MAIN_RECT  # the main frame's DWM bounds (the corpus entry's window, SD-77)
+    profile_pages: dict[str, dict[str, Any]] = field(default_factory=dict)   # Stage 1's settings pages as read
+    watchlists: dict[str, tuple[str, ...]] = field(default_factory=dict)     # the login's own watchlists
+    at_quantity: int | None = None                   # every Active Trader panel's default quantity
+    stage2: dict[str, Any] = field(default_factory=dict)    # Stage2Reads fields that differ from a clean read
+    foreign_foreground: str | None = None            # a foreign program's window title in the foreground (7.8)
     secret_ref: str = "login.password"               # the LOGIN flow's secret step vault_ref (4.7)
 
 
@@ -246,6 +290,11 @@ class SimulatedRig(Rig):
         self._dialog_hwnd = 1000
         self._shown: tuple[bool, bool] | None = None
         self._grabs = 0
+        self._os_reads = 0
+        self._hwnds: list[int] = []
+        self._next_hwnd = EXTRA_HWND
+        self._pages = {k: dict(v) for k, v in self.s.profile_pages.items()}
+        self._watchlists = dict(self.s.watchlists)
         self.session_tokens = 0
         self.allowed = 0
         self.drops = 0
@@ -253,6 +302,7 @@ class SimulatedRig(Rig):
         self.sent_orders = 0
         self.on_input: Callable[[Action, EmitResult], None] | None = None    # an observer of every decision
         self.leases: list[Any] = []               # the secret steps' vault leases, for the teardown scan (6.9)
+        self.g5: Callable[[], str] | None = None  # 12.7 G5: `fingerprint.g5` over the two halves' OS fields
         self.secret_results: list[Any] = []       # every LOGIN secret step's executor.secret.SecretResult
 
     def _configuration(self) -> tuple[frozenset[str], tuple[DenyEntry, ...]]:
@@ -279,6 +329,11 @@ class SimulatedRig(Rig):
             items["H5"] = h5_passed(h5)
             if not items["H5"]:
                 detail["H5"] = h5.detail or "the kill channels did not round-trip"
+        if items["G5"] and self.g5 is not None:       # 12.7 G5 over the halves' OS fields (the caller's compare)
+            res = self.g5()
+            items["G5"] = res == "pass"
+            if res != "pass":
+                detail["G5"] = res
         if items["H6"]:
             h6 = h6_self_test(H6_THEME, self.s.redaction_ocr)
             items["H6"] = h6.passed
@@ -429,6 +484,147 @@ class SimulatedRig(Rig):
         if not self.s.hook_dead:
             self.gw.hook_alive_mono_ts = now
 
+    # -- the 4.12 fingerprint reads (ports.FingerprintReader, 7.4) ---------------------------------------
+    def read_os(self) -> OsReads:
+        """The OS-class reads, equal to the 7.1 specification of a VM rig (choice 8); `fp_unreadable` blanks one,
+        `fp_change` alters a cheap field after its n-th read (a ClearType or display change mid-run)."""
+        self._os_reads += 1
+        values = dict(SIM_OS_READS)
+        if self.s.fp_change is not None and self._os_reads > self.s.fp_change[1]:
+            name = self.s.fp_change[0]
+            values[name] = {**values[name], **SIM_OS_CHANGES.get(name, {})}
+        if self.s.fp_unreadable in values:
+            values[self.s.fp_unreadable] = None
+        return OsReads(**values)
+
+    def read_app(self) -> AppReads:
+        """The app-class reads of the launched build (choice 8), with `fp_app`'s fields; `fp_unreadable` blanks
+        one."""
+        build = self.title_build_id or BUILD
+        values = {**SIM_APP_READS, "build_id_title": build, "build_id_about": build, **self.s.fp_app}
+        if self.s.fp_unreadable in values:
+            values[self.s.fp_unreadable] = None
+        return AppReads(**values)
+
+    def close_window(self, hwnd: int) -> bool:
+        """`WM_CLOSE` (choice 10): an app window other than the main frame and the order dialog goes away."""
+        self._log(f"close_window:{hwnd}")
+        self._extra_hwnds()
+        if hwnd in self._hwnds:
+            k = self._hwnds.index(hwnd)
+            del self.extra_windows[k], self._hwnds[k]
+            return True
+        return False
+
+    def _extra_hwnds(self) -> list[int]:
+        """One hwnd per other app window, new for each window that appears (a closed window's hwnd is not reused)."""
+        while len(self._hwnds) < len(self.extra_windows):
+            self._next_hwnd += 1
+            self._hwnds.append(self._next_hwnd)
+        del self._hwnds[len(self.extra_windows):]
+        return self._hwnds
+
+    def foreground_window(self) -> ScreenWindow | None:
+        """`GetForegroundWindow` (choice 10): a foreign program's window when the scenario puts one there, else the
+        topmost app window."""
+        if self.s.foreign_foreground is not None:
+            return ScreenWindow(9100, 5100, "Notepad", self.s.foreign_foreground, rect=MAIN_RECT, z_order=0,
+                                process_name="notepad.exe")
+        wins = [w for w in self.enumerate_windows() if isinstance(w, ScreenWindow)]
+        return min(wins, key=lambda w: w.z_order if w.z_order is not None else 99, default=None)
+
+    def process_dpi_awareness(self) -> str:
+        """`GetProcessDpiAwareness` of the harness process (H3, 3.4 rule 5)."""
+        return self.s.dpi_awareness
+
+    def launcher_log_sha256(self) -> str:
+        """The launcher log's hash, for the on-call channel on a version mismatch (7.3)."""
+        return _sha(f"launcher-log:{self.s.rig_id}:{self._launch_i}")
+
+    def read_about_build_id(self) -> str | None:
+        """Help > About's build, read when the title misses (7.3): the running build."""
+        return self.title_build_id if self.app_running else None
+
+    # -- fixture stage 2 (7.6, 7.9, 7.11; orchestrator.fixture_checks) ------------------------------------------
+    def stage2_reads(self, fixture: Mapping[str, Any], now: Any) -> Stage2Reads:
+        """Everything `fixture_verified` reads (choice 9): the accounts with buying power and the run's own tagged
+        rows, no OnDemand toolbar, the delay badge the epoch pins, a connected status bar with a fresh quote, the
+        prices recomputed from the simulated quotes, the pinned quote equal to its dataset, every fixture symbol
+        present; `stage2` overrides any field."""
+        delay, minutes = data_delay(fixture)
+        accts = tuple(PortAccountState(a.account_id, a.role, dict(a.positions), a.working_orders, a.cash,
+                                       buying_power=a.cash, alert_count=0) for a in self.verify_account_fixture())
+        badge = DelayBadge("Real-time" if delay == "realtime" else f"Delayed {minutes} min", delay != "realtime",
+                           None if delay == "realtime" else minutes)
+        pinned = EpochRead(last=100.0, bid=99.99, ask=100.01, quote_time="2026-11-09T15:30:00-05:00")
+        reads = dict(accounts=accts, ondemand_toolbar=False, delay_badge=badge,
+                     connectivity=ConnectivityObservation("Connected", True), reconnects_since_launch=0,
+                     quote_age_s=30.0, prices=recompute_prices(fixture, SimQuotes(fixture), now),
+                     symbols=tuple(SymbolFacts(str(s["id"]), True) for s in fixture.get("symbols") or ()),
+                     pinned=pinned, dataset=pinned)
+        reads.update(self.s.stage2)
+        return Stage2Reads(**reads)
+
+    # -- fixture stage 1's write path (7.6; stage1.ProfileResetPort) -------------------------------------------
+    def read_page(self, page: str) -> Mapping[str, Any]:
+        self._log(f"read_page:{page}")
+        return dict(self._pages.get(page, {}))
+
+    def apply_setting(self, page: str, control: str, value: Any) -> None:
+        self._log(f"apply_setting:{page}.{control}")
+        self._pages.setdefault(page, {})[control] = value
+
+    def watchlists(self) -> Mapping[str, tuple[str, ...]]:
+        return dict(self._watchlists)
+
+    def delete_watchlist(self, name: str) -> None:
+        self._watchlists.pop(name, None)
+
+    def import_watchlist(self, name: str, symbols: tuple[str, ...]) -> None:
+        self._watchlists[name] = tuple(symbols)
+
+    def alert_count(self) -> int:
+        return 0
+
+    def delete_alerts(self) -> None:
+        self._log("delete_alerts")
+
+    def saved_order_count(self) -> int:
+        return 0
+
+    def delete_saved_orders(self) -> None:
+        self._log("delete_saved_orders")
+
+    def note_count(self, symbols: tuple[str, ...]) -> int:
+        return 0
+
+    def delete_notes(self, symbols: tuple[str, ...]) -> None:
+        self._log("delete_notes")
+
+    def studies(self) -> tuple[str, ...]:
+        return ()
+
+    def import_studies(self, names: tuple[str, ...]) -> None:
+        self._log("import_studies")
+
+    def scans(self) -> tuple[str, ...]:
+        return ()
+
+    def import_scans(self, names: tuple[str, ...]) -> None:
+        self._log("import_scans")
+
+    def clear_drawings(self, symbols: tuple[str, ...]) -> None:
+        self._log("clear_drawings")
+
+    def apply_chart_settings(self) -> None:
+        self._log("apply_chart_settings")
+
+    def active_trader_quantity(self, panel: str) -> int | None:
+        return self.s.at_quantity
+
+    def profile_checkpoints(self) -> Mapping[str, bool]:
+        return {}
+
     def poll_flag(self) -> Flag:
         """A fresh Window Watcher poll and the flag it leaves (5.4.6): what the Executor's emitter reads."""
         self._watch()
@@ -440,9 +636,10 @@ class SimulatedRig(Rig):
             wins.append(ScreenWindow(self._dialog_hwnd, 4100, "SunAwtDialog", "Order Confirmation", rect=DIALOG_RECT,
                                      z_order=0))
         if self.app_running:
-            wins += [ScreenWindow(2000 + i, 4100, "SunAwtDialog", t) for i, t in enumerate(self.extra_windows)]
+            wins += [ScreenWindow(h, 4100, "SunAwtDialog", t, rect=(760, 440, 400, 200), z_order=0)
+                     for h, t in zip(self._extra_hwnds(), self.extra_windows)]
             wins.append(ScreenWindow(1, 4100, "SunAwtFrame", f"Main@thinkorswim [build {self.title_build_id}]",
-                                     rect=MAIN_RECT, z_order=1, enabled=not self.dialog_open))   # a modal disables it
+                                     rect=self.s.main_rect, z_order=1, enabled=not self.dialog_open))   # a modal disables it
         return tuple(wins)
 
     def window_tripwires(self) -> TripWires:
@@ -526,6 +723,10 @@ class SimulatedRig(Rig):
                 self._cancel_working()
         if e.type == "key_down" and self.dialog_open and e.vk in (VK_RETURN, VK_SPACE):
             self._send()
+        elif e.type == "key_down" and e.vk == VK_ESCAPE and self.extra_windows and not self.dialog_open:
+            self._extra_hwnds()
+            self.extra_windows.pop()                 # Escape dismisses the topmost app window (choice 10)
+            self._hwnds.pop()
         if e.type == "button_down" and self.dialog_open and SEND_RECT.contains(e.x, e.y):
             self._send()
 
@@ -669,6 +870,25 @@ class SimulatedRig(Rig):
 
     def free_bytes(self) -> int:
         return self.s.free_bytes
+
+
+class SimQuotes:
+    """The simulated Oracle API's delayed quotes (`fixture_checks.QuoteSource`): for every fixture price, the quote its
+    rule turns back into the fixture's value, so the recompute of 7.6 step 6 confirms the fixture (choice 9)."""
+
+    name = "api"
+
+    def __init__(self, fixture: Mapping[str, Any]):
+        symbols = {s["id"]: str(s["symbol"]) for s in fixture.get("symbols") or ()}
+        self.quotes: dict[str, float] = {}
+        for p in fixture.get("prices") or ():
+            rule, value = parse_price_rule(str(p["rule"])), float(p["value"])
+            k = float(rule.operand)
+            self.quotes[symbols[p["symbol_ref"]]] = {"-": value + k, "+": value - k, "x": value / k,
+                                                     "/": value * k}[rule.op]
+
+    def last_delayed(self, symbol: str) -> float | None:
+        return self.quotes.get(symbol)
 
 
 class _NoCapture:

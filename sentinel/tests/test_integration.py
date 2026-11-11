@@ -151,9 +151,10 @@ def test_a_shard_context_from_the_config_passes_every_gate_on_the_simulated_rig(
                                                                       sink.done.add(S07)))
     assert report.verdict.status == "complete" and report.proof.line == "PROVEN: no orders sent"
     assert seen == ["b-1"]                      # the build re-read sees the build the launched gate accepted
-    assert [r.gate for r in report.results][:8] == ["provisioned", "launched", "authenticated", "paper_mode_asserted",
-                                                    "settings_attested", "workspace_loaded", "fixture_verified",
-                                                    "canary_flow_passed"]
+    # fixture_verified is stage 2 of 7.6 (fixture_checks.check_stage2): its connectivity check has its own gate
+    gates = [g for g in dict.fromkeys(r.gate for r in report.results) if g != "connectivity"]
+    assert gates[:8] == ["provisioned", "launched", "authenticated", "paper_mode_asserted", "settings_attested",
+                         "workspace_loaded", "fixture_verified", "canary_flow_passed"]
 
 
 def test_the_shard_sink_holds_only_its_own_unreached_checkpoints():
@@ -168,8 +169,10 @@ def test_clean_runs_pass_every_gate_page_nobody_and_prove_no_orders_sent(runs):
     assert alerts(out) == [] and r.proof == "PROVEN: no orders sent"
     (run,) = orchestrator(out)
     assert {s["verdict"] for s in run["shards"]} == {"complete"} and len(run["shards"]) == len(r.shards) == 4
-    assert all([g["control"] for g in s["gates"]][:8] == ["preflight", "launch", "login", "paper_mode", "attestation",
-                                                          "workspace", "fixture", "canary_flow"] for s in run["shards"])
+    stage2 = {"ondemand", "delay_badge", "connectivity", "alerts", "prices", "pinned_quote", "symbols"}   # 7.6
+    assert all([c for c in dict.fromkeys(g["control"] for g in s["gates"]) if c not in stage2][:8] == [
+        "preflight", "launch", "login", "paper_mode", "attestation", "workspace", "fixture", "canary_flow"]
+        for s in run["shards"])
     assert all(any(g["control"] == "build_reread" for g in s["gates"]) for s in run["shards"])
     assert (out / "heartbeat" / "shard-1.json").exists()
     # once at each shard's gate and again before every unit of work (6.4 Schedule, flow_boundary)

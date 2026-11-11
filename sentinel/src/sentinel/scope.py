@@ -846,6 +846,9 @@ def _flow_item(ctx: _Ctx, f: Flow) -> PlanItem:
                     ctx.duration(f.flow_id, "flow"))
 
 
+UNSCHEDULED_CLASSES = ("fixture_reset", "login")
+
+
 def _flow_primitives(f: Flow, registry: Registry) -> set[str]:
     """A flow's primitives: the registry primitives of its surfaces (4.7 carries none of its own)."""
     return {p for sid in f.surfaces if sid in registry for p in registry[sid].primitives}
@@ -1035,7 +1038,8 @@ def compute_scope(run_type: str, manifest: Manifest | None, dep_map: DependencyM
     if run_type not in BUDGET_S:
         raise ValueError(f"unknown run type {run_type!r}")
     wmap = {w.id: w for w in workspaces}
-    flow_map = {f.flow_id: f for f in flows}
+    # the fixture reset and LOGIN flows are the Orchestrator's own, run at their gates (7.6, 7.7): never scheduled
+    flow_map = {f.flow_id: f for f in flows if f.flow_class not in UNSCHEDULED_CLASSES}
     E, Q = frozenset(entitlements), frozenset(quarantine)
     fs = _Findings(run_id, "scope")
     smoke = registry.smoke_subset()

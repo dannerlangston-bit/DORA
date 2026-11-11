@@ -69,8 +69,13 @@ def mutant(cat: list, mid: str) -> dict:
     return next(m for m in cat if m["mutant_id"] == mid)
 
 
-def popup(cat: list, pid: str) -> dict:
-    return next(p for p in cat if p["popup_id"] == pid)
+def popup(cat: list | dict, pid: str) -> dict:
+    return next(p for p in entries(cat) if p["popup_id"] == pid)
+
+
+def entries(cat: list | dict) -> list:
+    """The catalog's entries: the example is in the `{schema_version, entries}` form (SD-47)."""
+    return cat["entries"] if isinstance(cat, dict) else cat
 
 
 def region(rf: dict, rid: str) -> dict:
@@ -202,7 +207,7 @@ MUTATIONS: list[tuple[str, str | None, Callable]] = [
     ("L-FIX-09", FIXTURE, lambda d: d["positions"].pop()),
     ("L-FIX-10", FIXTURE, lambda d: d["positions"].append({"account_ref": "D-20481134", "symbol_ref": "aapl", "qty": 1,
                                                           "avg_price": 1.0, "seeded_by": "x", "seeded_at": "2026-10-06T10:15:00-04:00"})),
-    ("L-POP-00", POPUPS, lambda d: d[0].update({"class": "nuisance"})),
+    ("L-POP-00", POPUPS, lambda d: entries(d)[0].update({"class": "nuisance"})),
     ("L-POP-01", POPUPS, lambda d: popup(d, "POP-16").update(popup_id="POP-99")),
     ("L-POP-02", POPUPS, lambda d: popup(d, "POP-07").update(key="enter")),
     ("L-POP-03", POPUPS, lambda d: popup(d, "POP-14").update({"class": "dismissable"})),
@@ -546,11 +551,11 @@ def test_fingerprint_differences_is_the_one_pair_comparison():
     (FLOW, ("steps", 1, "target"), {"a": 1}, "L-FLW-00"),
     (FIXTURE, ("accounts", 0, "account_id"), [], "L-FIX-00"),
     (MUTANTS, (0, "checkpoint_id"), [], "L-MUT-00"),
-    (POPUPS, (0, "popup_id"), {}, "L-POP-00"),
+    (POPUPS, ("entries", 0, "popup_id"), {}, "L-POP-00"),
     (WS_AT, ("gadgets_present",), "trade.active-trader.ladder", "L-WSP-00"),
     (S07, ("regions", 0, "landmark"), [], "L-RGN-00"),
     (STOCK, ("parent",), [], "L-SRF-00"),
-    (POPUPS, (0, "on_abort", "reason"), 7, "L-POP-04"),
+    (POPUPS, ("entries", 0, "on_abort", "reason"), 7, "L-POP-04"),
 ])
 def test_malformed_values_do_not_crash(base, rel, path, bad, rule):
     """A list or map where a scalar belongs fails the schema; the rules still run (schemas.coerce_shapes)."""

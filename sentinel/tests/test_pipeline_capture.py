@@ -50,7 +50,7 @@ def test_every_capture_is_stored_with_its_metadata(clean):
     assert meta.sha256 == caps[(S07, "candidate")]["sha256"] and meta.fingerprint_id == by[S07].fingerprint_id
     assert meta.redaction_version and meta.app_restart_count == 0 and meta.mode == "scripted"
     main = meta_from_json(arts.get(metas[(S03, "candidate")]["sha256"]))
-    assert main.window_class == "SunAwtFrame" and main.rect == (0, 0, 1920, 1080)
+    assert main.window_class == "SunAwtFrame" and main.rect == (0, 0, 1920, 1040)   # the corpus entry's window
 
 
 def test_a_masked_live_checkpoint_stores_the_later_frames_of_its_median(clean):

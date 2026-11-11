@@ -61,8 +61,8 @@ if TYPE_CHECKING:
 
 BLOCKED_REASONS = ("unproven_proof", "identity_unreadable_twice", "cancel_all_failed", "recovery_login_failed",
                    "explorer_teardown_incomplete", "drill_order_placed", "incident", "rotation", "session_unavailable",
-                   "live_identity")                                   # 8.3 logins.blocked_reason
-DISABLE_REASONS = ("kill_switch", "undeclared_order_row", "unproven_twice")
+                   "live_identity", "authentication_failed")          # 8.3 logins.blocked_reason
+DISABLE_REASONS = ("kill_switch", "undeclared_order_row", "unproven_twice", "version_mismatch")
 TARGET_KINDS = ("flow", "rig", "login", "activity")                  # 8.3 safety_quarantines.target_kind
 ACTIVITIES = ("order_stage_flows", "explorer_stage", "report_publication")
 SAFETY_QUARANTINE_REASONS = ("fire_drill", "safety_canary", "kill_switch", "gateway_drops")   # 10.5, the safety rows
@@ -89,9 +89,11 @@ LOGIN_EVIDENCE: dict[str, Requirement | None] = {
     "drill_order_placed": DRILL, "cancel_all_failed": DRILL, "recovery_login_failed": DRILL, "incident": DRILL,
     "unproven_proof": ("safety_canary", ("proof",)), "session_unavailable": ("safety_canary", ("proof",)),
     "identity_unreadable_twice": ("safety_canary", ("identity",)), "live_identity": ("safety_canary", ("identity",)),
-    "explorer_teardown_incomplete": ("safety_canary", ("deny_list",)), "rotation": None}
-RIG_EVIDENCE: dict[str, Requirement] = {"kill_switch": DRILL, "undeclared_order_row": DRILL,
-                                        "unproven_twice": ("safety_canary", ("proof",))}
+    "explorer_teardown_incomplete": ("safety_canary", ("deny_list",)), "rotation": None,
+    "authentication_failed": None}           # 7.7: the accounts owner clears a lockout; no canary proves a credential
+RIG_EVIDENCE: dict[str, Requirement | None] = {"kill_switch": DRILL, "undeclared_order_row": DRILL,
+                                               "unproven_twice": ("safety_canary", ("proof",)),
+                                               "version_mismatch": None}   # 7.3: a human re-pins the install
 _CAUSE = {"safety_canary": re.compile(rf"^safety_canary_blind:({'|'.join(CANARY_NAMES)})$"),
           "fire_drill": re.compile(r"^drill_failed:[a-z0-9_]+$")}
 
@@ -580,6 +582,8 @@ def blocked_reason_for(result: ControlResult) -> str:
         return "identity_unreadable_twice"
     if result.control == "explorer_teardown":
         return "explorer_teardown_incomplete"
+    if result.control == "login" and result.unreached is not None and result.unreached.reason == "authentication_failed":
+        return "authentication_failed"                 # 7.7: a lockout blocks every later run on the rig
     if result.control == "proof" and (result.detail or "").startswith("UNPROVEN: "):
         cause = (result.detail or "")[len("UNPROVEN: "):]
         return cause if cause in UNPROVEN_BLOCKS else "unproven_proof"
@@ -587,9 +591,12 @@ def blocked_reason_for(result: ControlResult) -> str:
 
 
 def disable_reason_for(result: ControlResult) -> str:
-    """Why a result asks for `disable_rig`: an undeclared row, two UNPROVEN proofs, or a kill-switch trip (6.6)."""
+    """Why a result asks for `disable_rig`: an undeclared row, two UNPROVEN proofs, a build the rig did not expect
+    (`version_mismatch` at `launched` or POP-01's update progress, 7.3), or a kill-switch trip (6.6)."""
     if result.control == "proof":
         return "undeclared_order_row" if result.run_reason == "undeclared_order_row" else "unproven_twice"
+    if result.unreached is not None and result.unreached.reason == "version_mismatch":
+        return "version_mismatch"
     return "kill_switch"
 
 

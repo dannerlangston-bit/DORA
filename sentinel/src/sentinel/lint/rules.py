@@ -813,7 +813,7 @@ _SCHEMA_OF: dict[str, tuple[str, str]] = {      # doc kind -> (schema name, rule
     "palette": ("palette", "L-XREF-30"), "soak": ("soak", "L-XREF-27"),
     "calibration": ("calibration", "L-RGN-00"), "eval_report": ("eval-report", "L-XREF-29"),
 }
-_CATALOGS = {"popups": ("popup#popup", "L-POP-00", "popups"), "mutants": ("mutant#mutant", "L-MUT-00", "mutants")}   # one catalog entry
+_CATALOGS = {"popups": ("popup#popup", "L-POP-00", "entries"), "mutants": ("mutant#mutant", "L-MUT-00", "mutants")}   # one catalog entry
 
 
 def _rule_view(repo: Repo) -> Repo:
@@ -2299,16 +2299,21 @@ class _Linter:
         return doc.rel, [_d(x) for x in _l(items)]
 
     def check_popups(self) -> None:
-        f, items = self._catalog("popups", "popups")
+        f, items = self._catalog("popups", "entries")
         if not f:
             return
         ids = [p.get("popup_id") for p in items]
+        # SD-95: ids past the 12.8 table continue its sequence (POP-23, POP-24, ...) without gaps
+        extra = sorted(int(pid[4:]) for pid in ids if isinstance(pid, str) and POP_ID.match(pid)
+                       and pid not in POP_IDS_12_8)
+        in_sequence = {f"POP-{n:02d}" for k, n in enumerate(extra) if n == len(POP_IDS_12_8) + 1 + k}
         names = [p.get("name") for p in items]
         released = sorted((t, bid) for bid, b in self.builds.items() if b.get("channel") == "released" and (t := _ts(b.get("released_at"))))
         for i, p in enumerate(items):
             at, pid = f"[{i}]", p.get("popup_id")
-            if not (isinstance(pid, str) and POP_ID.match(pid)) or pid not in POP_IDS_12_8:
-                self.add("L-POP-01", f, f"popup_id {pid!r} is not an id of the 12.8 table", f"{at}.popup_id")
+            if not (isinstance(pid, str) and POP_ID.match(pid)) or (pid not in POP_IDS_12_8 and pid not in in_sequence):
+                self.add("L-POP-01", f, f"popup_id {pid!r} is neither an id of the 12.8 table nor the next id in "
+                                        "sequence after it (SD-95)", f"{at}.popup_id")
             if ids.count(pid) > 1:
                 self.add("L-POP-01", f, f"popup_id {pid} is not unique", f"{at}.popup_id")
             if names.count(p.get("name")) > 1:
@@ -2531,12 +2536,12 @@ class _Linter:
         if sdir.is_dir():
             for name, problem in schemas.check_schemas(sdir):
                 self.add("L-XREF-09", f"schemas/{name}", problem)
-        _f, pops = self._catalog("popups", "popups")
+        _f, pops = self._catalog("popups", "entries")
         if not _f:
             self.add("L-XREF-12", "popups/catalog.yaml", "popups/catalog.yaml is missing")
         else:
             got = {p.get("popup_id") for p in pops}
-            if got != set(POP_IDS_12_8):
+            if not set(POP_IDS_12_8) <= got:          # SD-95: later ids extend the table (L-POP-01 checks them)
                 self.add("L-XREF-12", _f, "popup ids differ from POP-01 to POP-22 of 12.8: " + _id_diff(got, POP_IDS_12_8))
         f_mut, mutants = self._catalog("mutants", "mutants")
         if not f_mut:

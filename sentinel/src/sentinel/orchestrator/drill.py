@@ -54,6 +54,10 @@ Choices for `run_drill` (reported):
   read (taken before the revert), and the clean read that made `Cancel All` click counts too (the larger
   new-row count wins), so re-reads that go unreadable after the click never hide a sent order: with no usable
   read the new-row count is 0 and item 5 fails, so the drill is never PROVEN without it.
+- Item 5's `deny_all` is measured when it is seen in effect, not when it is written: right after the deny-all write
+  one drill-tagged raw key down of an inert key (`DENY_ALL_PROBE_VK`) goes to the hook, which must drop it
+  `deny_all`; any other decision leaves `deny_all_s` None, so item 5 fails "hook not in deny-all" (6.5 Failure
+  handling). That drop is drained in the drill's raw phase and recorded in the ledger as exempt (5.4.8).
 - `run_drill` executes the drill's own steps only; the actions of the result (block the login, quarantine,
   the kill switch after a new row) are the caller's, as for every control result.
 - A selector text that is not an allowlist entry at item 5's recovery login is the 6.4 mismatch (killswitch choice
@@ -70,7 +74,7 @@ from typing import Protocol, runtime_checkable
 
 from . import alerts
 from .clock import Clock
-from .gateway import VK_ESCAPE, VK_RETURN, VK_SPACE, Action, Chord, DropLedger, InputEvent, drain, refusal
+from .gateway import VK_ESCAPE, VK_F24, VK_RETURN, VK_SPACE, Action, Chord, DropLedger, InputEvent, drain, refusal
 from .identity import Allowlist
 from .killswitch import GRIDS, PROVEN_NONE, ProofInputs, cancel_new_working, post_run_proof, recovery_login
 from .ports import KillChannel, KillRequest
@@ -231,6 +235,7 @@ def score_drill(obs: DrillObservation, chords: Sequence[Chord]) -> DrillResult:
 
 # -- driving the drill on a rig (6.5) -----------------------------------------------------------------------
 DRILL_UNIT = "flow.fire-drill"          # the drill flow's unit in the DropLedger (its drops are exempt, 5.4.8)
+DENY_ALL_PROBE_VK = VK_F24             # item 5's inert raw key: the hook in deny-all drops it `deny_all` (6.5)
 DRILL_TARGETS = ("confirm_and_send", "delete", "ladder_buy_cell", "ticket_buy_button")
 DIALOG_TITLE = "Order Confirmation"
 CTRL = frozenset({"ctrl"})
@@ -329,6 +334,17 @@ class _Drive:
             self.could_not_run.setdefault(item, f"{what} not located")
         return p
 
+    def deny_all_holds(self) -> bool:
+        """Item 5's "hook in deny-all" (6.5): one drill-tagged raw key down of an inert key, injected after the deny-all
+        write, which the hook must drop `deny_all`. Its drop goes to the ledger as exempt (5.4.8), never into the
+        items 1 to 4 set."""
+        raw = InputEvent("key_down", vk=DENY_ALL_PROBE_VK, origin="drill")
+        r = self.rig.send_input(Action("press", keys=(DENY_ALL_PROBE_VK,), flow_class="canary"), events=(raw,))
+        for d, e in zip(r.decisions, r.events):
+            if not d.allowed:
+                self.ledger.record(drain(d, e, drill_phase=True), unit=DRILL_UNIT, exempt=True)
+        return bool(r.decisions) and all(not d.allowed and d.reason == "deny_all" for d in r.decisions)
+
 
 def _new_rows(start: OrderBook, end: OrderBook | None) -> int:
     """New Working, Filled and Canceled rows against the run-start snapshot (6.5); 0 without a readable read."""
@@ -400,7 +416,7 @@ def _item5(d: _Drive, *, clock: Clock, kill_channel: KillChannel, rig_id: str, s
         d.port.clear_drill_ticket()
         return Item5(None, None, False, False, None, False), ()
     d.rig.set_hook_phase("kill_switch")
-    deny_all_s = clock.monotonic() - t0
+    deny_all_s = clock.monotonic() - t0 if d.deny_all_holds() else None      # seen in effect, not just written
     tree_gone_s = clock.monotonic() - t0 if d.rig.kill_process_tree() else None
     d.rig.reset_input_state()
     d.rig.set_hook_phase("recovery")                 # the recovery-only arm, as in the sequence itself (6.6 step 5)

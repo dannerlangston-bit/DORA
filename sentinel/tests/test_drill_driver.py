@@ -206,6 +206,28 @@ def test_item5_times_the_tree_and_requires_the_revert():
     assert "rig not reverted" in bad.result.checkpoint.detail
 
 
+class StaleHeaderRig(SimulatedRig):
+    """A hook that never applies a deny_all write (a stale shared header): the call is logged, the state unchanged."""
+
+    def set_hook_state(self, *, armed: bool, deny_all: bool, recovery_only: bool = False) -> None:
+        if deny_all:
+            self._log(f"set_hook_state:{armed}:{deny_all}")
+            return
+        super().set_hook_state(armed=armed, deny_all=deny_all, recovery_only=recovery_only)
+
+
+def test_item5_proves_the_hook_is_in_deny_all_and_fails_when_it_is_not():
+    """killswitch:7: after the deny-all write item 5 injects one drill-tagged raw event and needs the hook to drop it
+    `deny_all`; a hook that stays open (it drops `no_token`) fails item 5 and quarantines every flow on the rig."""
+    ledger = DropLedger()
+    clean = drill(ready(SimulatedRig()), ledger=ledger)
+    assert clean.result.passed and ledger.run_count == 0
+    assert sum(n for (_, why), n in ledger.by_reason.items() if why == "deny_all") == 1
+    r = drill(ready(StaleHeaderRig()))
+    assert r.failed == ("item5",) and r.observation.item5.deny_all_s is None
+    assert "deny_all not within 500 ms" in r.result.checkpoint.detail and r.result.has("quarantine_all_flows")
+
+
 def test_a_recovery_login_that_fails_fails_item5_with_no_read():
     rig = ready(SimulatedRig(SimScenario(recovery_login_fails=1)))
     rig.login()                                          # the session's own login; the recovery login is the next

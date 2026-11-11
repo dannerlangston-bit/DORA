@@ -34,7 +34,8 @@ def test_a_census_checkpoint_runs_every_rule_region_of_its_regions_file():
     checks = checks_for(CENSUS, CENSUS_FILE)
     assert isinstance(checks, CensusChecks) and checks.kind == "census"
     assert [r.region_id for r in checks.rules] == ["rgn.ps.mark", "rgn.ps.pl-open"]
-    assert checks.assertion_ids == ("rule.rgn.ps.mark.field", "rule.rgn.ps.mark.decimals", "rule.rgn.ps.mark.min",
+    # the mark column holds stock, future and forex marks, so the example declares no decimals for it (2.8.2)
+    assert checks.assertion_ids == ("rule.rgn.ps.mark.field", "rule.rgn.ps.mark.min",
                                     "rule.rgn.ps.mark.min_rows", "rule.rgn.ps.pl-open.field",
                                     "rule.rgn.ps.pl-open.decimals")
     results = evaluate(POSITIONS)
@@ -53,9 +54,12 @@ def test_a_census_rule_region_reading_nan_is_assertion_failed():
 
 
 def test_a_census_money_cell_that_is_not_a_rule_region_is_listed():
-    assert checks_for(CENSUS, CENSUS_FILE).unchecked_money_cells == ("rgn.ps.qty",)   # the example's diff money cell
+    assert checks_for(CENSUS, CENSUS_FILE).unchecked_money_cells == ()     # SD-28: the example's qty is no money cell
+    diffed = {**CENSUS_FILE, "regions": [dict(r, money_cell=True) if r["id"] == "rgn.ps.qty" else r
+                                         for r in CENSUS_FILE["regions"]]}
+    assert checks_for(CENSUS, diffed).unchecked_money_cells == ("rgn.ps.qty",)   # a diff money cell on a census
     fixed = {**CENSUS_FILE, "regions": [
-        dict(r, type="rule", rule={"field": "int", "min_rows": 1}) if r["id"] == "rgn.ps.qty" else r
+        dict(r, type="rule", rule={"field": "int", "min_rows": 1}, money_cell=True) if r["id"] == "rgn.ps.qty" else r
         for r in CENSUS_FILE["regions"]]}
     checks = checks_for(CENSUS, fixed)
     assert checks.unchecked_money_cells == () and "rule.rgn.ps.qty.min_rows" in checks.assertion_ids

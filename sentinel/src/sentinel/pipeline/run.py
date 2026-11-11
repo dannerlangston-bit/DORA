@@ -72,9 +72,13 @@ send is `aborted_safety`. The default order chords come from `gateway/default_or
 control result's 9.10 route goes to `alerts.json`; the shards, their gates and proofs (`Proof.line`, 6.6), the
 gateway events and the actions the Orchestrator does not perform itself go to `orchestrator.json`.
 
-The Oracle (2.8, `pipeline.assertions`): every flow checkpoint that declares assertions is evaluated
-on both builds; the candidate's verdict feeds `classify.Facts` (3.11 G and H) and the failed
-assertion's raw values of both builds go to `Finding.evidence.raw_values` and the finding text.
+The Oracle (2.8, `pipeline.assertions`): every flow checkpoint that declares assertions or rule regions, and
+every census, sweep or split checkpoint whose regions file has rule regions (SD-29, `oracle.checks_for`), is
+evaluated on both builds; the candidate's verdict feeds `classify.Facts` (3.11 G and H), the failed
+assertion's raw values of both builds go to `Finding.evidence.raw_values` and the finding text, its signature
+region is the region the result names (`AssertionResult.region`), and every read is stored
+(`Store.write_extractions`, SD-09). The Invariant Checker gets the checkpoint's rule regions
+(`oracle.invariant_rule_regions`, 2.7).
 
 Choices (reported):
 
@@ -111,7 +115,7 @@ from ..diff.calibration import CalibrationFile, Capture as CalCapture, calibrate
 from ..diff.engine import (DiffContext, DiffResult, compare_fingerprints, diff_pair, fingerprint_id,
                            global_shift_prepass)
 from ..diff.phash import phash
-from ..diff.regions import RegionsFile, effective_registry, park_rect
+from ..diff.regions import RegionsFile, effective_registry, locate, park_rect
 from ..diff.settle import Recapture, RerunBudget, SettleResult, diff_stability, settle
 from ..lint.repo import Repo
 from ..lint.rules import EXPIRY_KINDS, ExpiredRecord, Violation, check_pair
@@ -127,6 +131,8 @@ from ..store.artifacts import ManifestHeader, Redaction, StoredArtifact
 from ..store.store import PostRunProof, RunPlan, ScopeEntry, ShardPlan
 from ..taxonomy import checkpoint_parts, load
 from ..oracle.assertions import AssertionResult, step_assertions
+from ..oracle.extraction_log import to_rows
+from ..oracle.region_rules import invariant_rule_regions
 from ..oracle.tables import OracleConfigError
 from ..gateway.drainer import JOURNAL_NAME, DrainContext, Drainer, TokenNote, wall_from
 from ..gateway.segment import record_for
@@ -478,6 +484,9 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
     evaluated on both builds (module docstring)."""
     reg = run.registry(cp, base if base is not None else cand)
     rules = run.surface_rules(cp)
+    placed = locate(reg, {lm.id: lm.expected for lm in reg.landmarks if lm.expected is not None})
+    if rule_rects := invariant_rule_regions(reg, placed):     # 2.7: INV-03 and INV-04 read the rule regions
+        rules = dataclasses.replace(rules, rule_regions=rule_rects)
     park = _park(cand)
     spec = SimApp.settle_spec(reg, park)
     fkw: dict[str, Any] = dict(manifest=x, primitive=primitive, manifest_entry_ref=entry_ref,
@@ -540,12 +549,14 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
                           fix_list_item=fix, invariant_ids=inv_ids, invariant_stability=inv_stab,
                           invariant_stability_cause=inv_cause, bounds_unreadable=comparison.unreadable, **fkw)
     checks: tuple[OracleCheck | None, OracleCheck | None] = (None, None)
-    if oracle is not None and cp.test_kind == "flow" and s_c.settled and facts.landmark is None and facts.harness is None:
+    if oracle is not None and s_c.settled and facts.landmark is None and facts.harness is None:
+        def side_check(capture: Capture, side: str, located: Mapping[str, tuple[int, int]]) -> OracleCheck | None:
+            if cp.test_kind == "flow":
+                return oracle.check(cp.flow_id or "", cp.step_id or "", cp.data_mode, capture, reg, located, side)
+            return oracle.check_census(cp.checkpoint_id, cp.data_mode, capture, reg, located, side)   # SD-29
         try:
-            c_chk = oracle.check(cp.flow_id or "", cp.step_id or "", cp.data_mode, cand, reg, _located(reg, res, 1),
-                                 "candidate")
-            b_chk = oracle.check(cp.flow_id or "", cp.step_id or "", cp.data_mode, base, reg, _located(reg, res, 0),
-                                 "base") if base is not None and c_chk is not None else None
+            c_chk = side_check(cand, "candidate", _located(reg, res, 1))
+            b_chk = side_check(base, "base", _located(reg, res, 0)) if base is not None and c_chk is not None else None
         except OracleConfigError:              # a flow the lint accepted that the Oracle cannot evaluate: harness
             c_chk = b_chk = None
             facts = dataclasses.replace(facts, harness=HarnessFailure("exception:OracleConfigError", _event_id(run, cp)))
@@ -599,7 +610,9 @@ def _asserted_region(ev: Evaluated, cand_lm: Mapping[str, tuple[int, int]]) -> t
         return None
     fields = [e.field for e in failed[0].operands.values()]
     moved = {m.region_id for m in (ev.diff.regions if ev.diff is not None else ()) if m.above_threshold}
-    rid = next((f for f in fields if f in moved), fields[-1] if fields else None)
+    # the result names the region it read (a rule region's own check, AssertionResult.region); else the operand the
+    # diff saw move, else the last operand
+    rid = failed[0].region or next((f for f in fields if f in moved), fields[-1] if fields else None)
     try:
         r = ev.registry.region(rid) if rid else None
     except KeyError:
@@ -1788,6 +1801,10 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                                      recorded_at=_ts(today, scenario.clock, 600))]
             store.write_checkpoint(o, findings=fs, artifacts=stored, shard_id=shard_of[rig_of[ev.cp.checkpoint_id]],
                                    steps=steps)
+            for side, chk in (("candidate", ev.oracle), ("base", ev.oracle_base)):   # SD-09: every extraction
+                if chk is not None:
+                    store.write_extractions(to_rows(chk.verdict.results, run_id=scenario.run_id,
+                                                    checkpoint_id=ev.cp.checkpoint_id, side=side, read_at=run.now))
         by_cp = {}
         for f in work.findings:
             by_cp.setdefault(f.checkpoint_id, []).append(f)
@@ -2042,7 +2059,9 @@ NOT_SIMULATED = {
     "M11": "clipped_label (ellipsis) needs OCR of the pixels, as M10",
     "M13": "missing_row expects an Oracle assertion (R08); the simulated Oracle reads what synth drew, not a mutant's "
            "pixels, so the Nightly pass runs without it",
-    "M15": "placeholder lands on a rule region asserted by the Oracle, which reads drawn text, not a mutant's pixels",
+    "M15": "placeholder expects INV-08, which reads the surface's value regions; the example registry declares none "
+           "for the Position Statement, and the Nightly pass runs without the Oracle that asserts the census rule "
+           "region in PR runs (SD-29)",
     "M16": "font_height needs OCR cap heights from the pixels",
     "M17": "scrollbar needs a template match of the drawn thumb",
     "M19": "redaction is proven by the redaction stage and the egress log, which the simulation has no rig for",

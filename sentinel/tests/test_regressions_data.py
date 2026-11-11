@@ -446,8 +446,9 @@ def test_s21_identity_field_redaction_box_over_a_money_cell():
     # S-21, 4.8 mask budget: "any money_cell region 0 percent"; identity_field exempts the panel share only.
     repo = Repo.load(EXAMPLE)
     red = repo.docs["redaction/anchors.yaml"].data
-    box = next(r for r in red["regions"] if r["id"] == "rgn.redact.ps-account-number")
-    box["rect"] = {"dx": 0, "dy": 44, "w": 60, "h": 120}           # exactly over rgn.ps.qty
+    # SD-28: the Position Statement's qty column is no money cell, so the box goes over the confirmation's qty
+    box = next(r for r in red["regions"] if r["id"] == "rgn.redact.confirm-account-number")
+    box["rect"] = {"dx": 90, "dy": 48, "w": 48, "h": 20}            # exactly over rgn.confirm.qty
     assert "L-MSK-03" in lint_repo(repo, today=TODAY).rules()
 
 

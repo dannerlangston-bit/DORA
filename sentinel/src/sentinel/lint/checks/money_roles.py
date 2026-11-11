@@ -6,12 +6,10 @@ ticket's Confirm and Send button is `send`). A region names its role with `money
 when `money_role` is set, and a role sits only on a region whose `panel` is `order_confirmation` or `order_ticket`.
 The role values themselves are the schema's enum (L-RGN-00).
 
-This module checks the half of the "if and only if" that every region carrying a role must meet: a `money_role`
-needs `money_cell: true` and an order panel. Left out, and reported for the integrator: the other half, a
-`money_cell: true` region without a `money_role`. Every money cell of the example regions predates SD-28 and carries
-no role, and some sit on panels outside the closed list (the Position Statement and Active Trader quantity columns),
-whose tier-1 surfaces L-XREF-02 still requires to have a money cell; that half lands with the regions migration and a
-decision on L-XREF-02 for tier-1 surfaces without an order panel.
+Both halves of the "if and only if" are checked: a `money_role` needs `money_cell: true` and an order panel, and a
+`money_cell: true` region needs a `money_role`. A quantity column outside the two order panels (the Position
+Statement, the Active Trader ladder and cell) is not a money cell (SD-28); L-XREF-02 asks for a money cell only on a
+tier-1 surface that shows an order panel.
 """
 from __future__ import annotations
 
@@ -25,13 +23,17 @@ RULE_IDS = ("L-RGN-08",)
 
 
 def check(repo: Repo, add: Callable[..., None], phase: int, today: date) -> None:
-    """Report every region whose `money_role` lacks `money_cell: true` or sits outside the two order panels."""
+    """Report every region whose `money_role` lacks `money_cell: true` or sits outside the two order panels, and
+    every `money_cell: true` region without a `money_role`."""
     for doc in repo.of("regions"):
         regions = doc.data.get("regions") if isinstance(doc.data, dict) else None
         for i, x in enumerate(regions if isinstance(regions, list) else []):
             x = x if isinstance(x, dict) else {}
             role: Any = x.get("money_role")
             if role is None:
+                if x.get("money_cell") is True:
+                    add("L-RGN-08", doc.rel, f"region {x.get('id')} is a money cell without a money_role; a money cell "
+                                             "names its role from the closed list (SD-28)", f"regions[{i}].money_role")
                 continue
             if x.get("money_cell") is not True:
                 add("L-RGN-08", doc.rel, f"region {x.get('id')} has money_role {role} without money_cell: true",

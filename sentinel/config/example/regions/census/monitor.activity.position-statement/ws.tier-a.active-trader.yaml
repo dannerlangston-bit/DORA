@@ -1,11 +1,13 @@
+# rgn.ps.mark declares no decimals: the column holds stock, future and forex marks, whose ticks differ (2.8.2).
+# rgn.ps.qty is no money cell: the Position Statement is not an order panel (SD-28).
 schema_version: 1
 checkpoint_id: census/monitor.activity.position-statement/ws.tier-a.active-trader
 landmarks:
   - {id: lm.position-statement-header, template: regions/landmarks/lm.position-statement-header.png, confidence_min: 0.92}
 regions:
   - {id: rgn.ps.header, type: diff, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 0, dy: 24, w: 600, h: 18}}
-  - {id: rgn.ps.qty, type: diff, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 0, dy: 44, w: 60, h: 120}, money_cell: true}
+  - {id: rgn.ps.qty, type: diff, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 0, dy: 44, w: 60, h: 120}}
   - {id: rgn.ps.trade-price, type: diff, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 64, dy: 44, w: 90, h: 120}}
-  - {id: rgn.ps.mark, type: rule, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 158, dy: 44, w: 90, h: 120}, rule: {field: price, decimals: 2, min: 0, min_rows: 1}}
+  - {id: rgn.ps.mark, type: rule, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 158, dy: 44, w: 90, h: 120}, rule: {field: price, min: 0, min_rows: 1}}
   - {id: rgn.ps.pl-open, type: rule, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 252, dy: 44, w: 110, h: 120}, rule: {field: money, decimals: 2}}
   - {id: rgn.ps.last-update, type: mask, landmark: lm.position-statement-header, panel: position_statement, rect: {dx: 480, dy: 0, w: 120, h: 18}, mask_ref: msk.ps.last-update-01}

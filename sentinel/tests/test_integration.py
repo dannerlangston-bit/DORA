@@ -89,7 +89,11 @@ def test_every_example_flow_checkpoint_passes_its_assertions_on_the_base_build(c
         for st in cfg.flow_docs[flow]["steps"]:
             if st.get("type") == "checkpoint" and st.get("expect"):
                 chk = _check(cfg, SimBuild("b"), st["id"], flow)
-                assert [r.status for r in chk.verdict.results] == ["passed"] * len(st["expect"]), (flow, st["id"])
+                # the step's `expect` assertions, then the checkpoint's rule regions (2.8.2, SD-29)
+                ids = [r.assertion_id for r in chk.verdict.results]
+                assert ids[:len(st["expect"])] == [a["id"] for a in st["expect"]], (flow, st["id"])
+                assert all(i.startswith("rule.") for i in ids[len(st["expect"]):]), (flow, st["id"])
+                assert [r.status for r in chk.verdict.results] == ["passed"] * len(ids), (flow, st["id"])
 
 
 def test_the_oracle_reads_what_synth_drew_and_catches_a_transposed_cost(cfg):

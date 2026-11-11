@@ -281,6 +281,7 @@ def test_money_cell_rules(base):
     assert "L-RGN-04" in found
     r = copy.deepcopy(base)
     region(r.docs[PS_CENSUS].data, "rgn.ps.last-update").update(rect={"dx": 0, "dy": 50, "w": 20, "h": 20})
+    region(r.docs[PS_CENSUS].data, "rgn.ps.qty").update(money_cell=True)     # SD-28: the example's qty is no money cell
     assert any(v.rule == "L-MSK-03" and "money cell rgn.ps.qty" in v.message for v in lint_repo(r, 0, TODAY).violations)
 
 

@@ -348,9 +348,10 @@ S07_MASK = "masks/flow/dialog.order-confirmation/flow.trade.order-ticket.stock.l
 
 def blind_overlay(config_dir: Path) -> dict[str, str]:
     """A config edit that lint accepts and the canary catches: the Buying Power Effect region loses its
-    money_cell flag and the dialog's clock mask is pasted with that cell's offset (rect dx 24, dy 120)."""
+    money_cell flag and its money_role (SD-28) and the dialog's clock mask is pasted with that cell's offset (rect
+    dx 24, dy 120)."""
     text = (config_dir / S07).read_text(encoding="utf-8")
-    old = "rect: {dx: 24, dy: 120, w: 200, h: 20}, money_cell: true}"
+    old = "rect: {dx: 24, dy: 120, w: 200, h: 20}, money_cell: true, money_role: bp_effect}"
     if old not in text:
         raise ValueError(f"{S07} does not carry the example's bp-effect line")
     text = text.replace(old, "rect: {dx: 24, dy: 120, w: 200, h: 20}}")

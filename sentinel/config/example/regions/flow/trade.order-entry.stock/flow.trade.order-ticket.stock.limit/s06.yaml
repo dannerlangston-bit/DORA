@@ -5,9 +5,9 @@ landmarks:
 regions:
   - {id: rgn.order-entry.header-symbol, type: diff, landmark: lm.order-entry-header, panel: order_ticket, rect: {dx: 130, dy: 0, w: 100, h: 20}}
   - {id: rgn.order-entry.side, type: diff, landmark: lm.order-entry-header, panel: order_ticket, rect: {dx: 0, dy: 30, w: 50, h: 20}}
-  - {id: rgn.order-entry.qty, type: diff, landmark: lm.order-entry-header, panel: order_ticket, rect: {dx: 56, dy: 30, w: 60, h: 20}, money_cell: true}
+  - {id: rgn.order-entry.qty, type: diff, landmark: lm.order-entry-header, panel: order_ticket, rect: {dx: 56, dy: 30, w: 60, h: 20}, money_cell: true, money_role: qty}
   - {id: rgn.order-entry.order-type, type: diff, landmark: lm.order-entry-header, panel: order_ticket, rect: {dx: 122, dy: 30, w: 50, h: 20}}
-  - {id: rgn.order-entry.price, type: diff, landmark: lm.order-entry-header, panel: order_ticket, rect: {dx: 178, dy: 30, w: 80, h: 20}, money_cell: true}
+  - {id: rgn.order-entry.price, type: diff, landmark: lm.order-entry-header, panel: order_ticket, rect: {dx: 178, dy: 30, w: 80, h: 20}, money_cell: true, money_role: price}
   - {id: rgn.order-entry.tif, type: diff, landmark: lm.order-entry-header, panel: order_ticket, rect: {dx: 264, dy: 30, w: 50, h: 20}}
   - {id: rgn.order-entry.divider, type: diff, landmark: lm.order-entry-header, panel: order_ticket, rect: {dx: 0, dy: 56, w: 420, h: 2}}
-  - {id: rgn.order-entry.confirm-button, type: diff, landmark: lm.order-entry-header, panel: order_ticket, rect: {dx: 300, dy: 64, w: 120, h: 24}, money_cell: true}
+  - {id: rgn.order-entry.confirm-button, type: diff, landmark: lm.order-entry-header, panel: order_ticket, rect: {dx: 300, dy: 64, w: 120, h: 24}, money_cell: true, money_role: send}

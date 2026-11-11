@@ -132,6 +132,39 @@ def test_the_drainer_writes_every_gateway_decision_the_login_typing_included(tmp
     assert all(s["first"] > last.get(s["shard_id"], 0) for s in steps)  # one seq per shard, no collision (8.3)
 
 
+def test_a_census_rule_region_is_asserted_and_its_reads_are_stored(tmp_path, monkeypatch):
+    """SD-29, 2.8.2, SD-09: a census checkpoint runs every rule region of its regions file (`checks_for`,
+    `RegionRuleChecker`); a failed rule is `assertion_failed (assertion: rule.<region>.<field>)` whose signature region
+    is the rule region (`AssertionResult.region`), every read goes to `oracle_extractions`, and the Invariant Checker
+    is given the rule regions (`invariant_rule_regions`)."""
+    from sentinel import invariants as inv
+    ps = "census/monitor.activity.position-statement/ws.tier-a.active-trader"
+    rel = f"regions/{ps}.yaml"
+    text = (EXAMPLE / rel).read_text().replace("rule: {field: price, min: 0, min_rows: 1}",
+                                               "rule: {field: price, min: 0, max: 1, min_rows: 1}")
+    seen: list[tuple] = []
+    real = inv.compare
+
+    def compare(base, cand, rules, **kw):
+        seen.append(tuple(r.id for r in rules.rule_regions))
+        return real(base, cand, rules, **kw)
+
+    monkeypatch.setattr(inv, "compare", compare)
+    sc = clean_scenario(TODAY)
+    sc = type(sc)(**{**sc.__dict__, "overlay": dict(sc.overlay, **{rel: text})})
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    (o,) = [o for o in r.outcomes if o.checkpoint_id == ps]
+    assert (o.outcome, o.reason, o.assertion_ids) == ("assertion_failed", "assertion:rule.rgn.ps.mark.max",
+                                                      ["rule.rgn.ps.mark.max"])
+    (f,) = [f for f in r.findings if f.checkpoint_id == ps and f.kind == "assertion_failed"]
+    assert f.region_id == "rgn.ps.mark"
+    with Store(tmp_path / "sentinel.db") as store:
+        rows = store.extractions(sc.run_id, ps)
+    assert {(x.side, x.assertion_id) for x in rows} >= {("candidate", "rule.rgn.ps.mark.field"),
+                                                       ("base", "rule.rgn.ps.pl-open.field")}
+    assert ("rgn.ps.mark", "rgn.ps.pl-open") in seen
+
+
 def test_the_default_order_chords_come_from_the_gateway_file(tmp_path):
     """5.4.7: `gateway/default_order_hotkeys.yaml` gives the shard's default order chords; a file that breaks
     L-XREF-17 fails the shard closed at `settings_attested` (`GatewayConfigError.result`)."""

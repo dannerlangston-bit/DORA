@@ -121,3 +121,41 @@ def test_an_uncounted_gateway_drop_ends_the_flow_with_an_outcome_for_every_later
     assert (r.status, r.reason) == ("complete", None) and "post_run_check" not in summary
     assert stock == {"s03": ("identical", None), "s06": ("not_run", "step_failed:s04"),
                      "s07": ("not_run", "step_failed:s04")}
+
+
+def test_a_failed_post_run_check_after_a_safety_abort_keeps_aborted_safety_and_reports(tmp_path, monkeypatch):
+    """pipeline:4 (8.2, 4.13 L-OUT-07, 1.4 G2, 9.2): a post-run check that fails in a run whose shards ended
+    `aborted_safety` does not try to end the run `aborted_harness` (the store refuses a less severe outcome): the run
+    stays `aborted_safety (paper_mode_mismatch)` with the check's failures and `report_withheld` in its summary, the
+    silent checkpoint takes the abort's `env_error (running, paper_mode_mismatch)` (1.10), and the withheld comment
+    and the `error` commit status are still written."""
+    import json
+
+    from sentinel.demo import clean_scenario
+    from sentinel.orchestrator.machine import Orchestrator
+    from sentinel.store import Store
+    monkeypatch.setattr(Orchestrator, "paper_stamp", lambda self: None)
+    real = pipeline_run._ShardWork.write_record
+    dropped: list[str] = []
+
+    def write_record(self, o, **kw):            # a harness bug: one record never reaches the store (L-OUT-07)
+        if not dropped:
+            dropped.append(o.checkpoint_id)
+            return o
+        return real(self, o, **kw)
+
+    monkeypatch.setattr(pipeline_run._ShardWork, "write_record", write_record)
+    sc = clean_scenario(TODAY)
+    r = pipeline_run.run_pipeline(EXAMPLE, sc, tmp_path, TODAY)
+    assert (r.status, r.reason) == ("aborted_safety", "paper_mode_mismatch")
+    with Store(tmp_path / "sentinel.db") as store:
+        row = store.query("SELECT lifecycle, outcome, abort_reason FROM runs WHERE run_id = ?", (sc.run_id,))[0]
+        summary = store.run_summary(sc.run_id)
+        assert not store.missing_outcomes(sc.run_id)
+        filled = [o for o in store.outcomes(sc.run_id) if o.checkpoint_id == dropped[0]]
+    assert tuple(row) == ("finished", "aborted_safety", "paper_mode_mismatch")
+    check = summary["post_run_check"]
+    assert check["report_withheld"] is True and check["failures"][0].startswith("L-OUT-07: 1 scoped checkpoint")
+    assert [(o.outcome, o.reason, o.gate) for o in filled] == [("env_error", "paper_mode_mismatch", "running")]
+    assert "L-OUT-07" in (tmp_path / "pr-comment.md").read_text()
+    assert json.loads((tmp_path / "commit-status.json").read_text())["state"] == "error"

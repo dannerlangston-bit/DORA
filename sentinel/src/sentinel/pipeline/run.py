@@ -189,7 +189,7 @@ from ..scope import (DependencyIndex, Manifest, PlannedCheckpoint, Rig, ScopeCon
 from ..store import ArtifactStore, Store
 from ..store.artifacts import ManifestHeader, Redaction, StoredArtifact
 from ..required_fields import WATCHDOG_EVENT
-from ..store.checks import end_taxonomy_check_failed, post_run_check
+from ..store.checks import FAILED_REASON as CHECK_FAILED, end_taxonomy_check_failed, post_run_check
 from ..store.safety import (AppliedSafety, activity_quarantined, apply_safety_actions, open_quarantines,
                             quarantined_flow, refuse_blocked)
 from ..store.secret_scan import SecretScanner, check_upload, scan_run
@@ -2840,11 +2840,19 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         dims = summary["coverage"]["matrix"]          # 1.4 G2 and L-OUT-07 on the stored rows, before anything reports
         failures = post_run_check(store, scenario.run_id, dims["surfaces"], dims["personas"], dims["profiles"],
                                   cells=summary["coverage"]["cells"])
-        if failures:
+        checked = worse(RunVerdict("aborted_harness", CHECK_FAILED), RunVerdict(status, reason)) if failures else None
+        if checked is not None and checked.status == "aborted_harness":
             store.update_summary(scenario.run_id, summary)
             runrec = end_taxonomy_check_failed(store, scenario.run_id, failures, last_gate=last_gate,
                                                watchdog_event_id=_event_id(run, None), ended_at=_ts(today, scenario.clock,
                                                                                                    int(wall)))
+        elif checked is not None:          # 8.2: a safety abort stays the run's outcome; the failed check withholds
+            store.fill_unreached(scenario.run_id, "env_error", reason, gate=last_gate,      # 1.10, as the abort's own
+                                 detail=f"watchdog_event: {_event_id(run, None)}; post-run check failed: {failures[0]}")
+            runrec = store.end_run(RunOutcome(scenario.run_id, "pr", status, last_gate, reason=reason,
+                                              started_at=started, ended_at=_ts(today, scenario.clock, int(wall))),
+                                   summary={**summary, "post_run_check": {"failures": list(failures),
+                                                                          "report_withheld": True}})
         else:
             runrec = store.end_run(RunOutcome(scenario.run_id, "pr", status, last_gate, reason=reason,
                                               started_at=started, ended_at=_ts(today, scenario.clock, int(wall))),

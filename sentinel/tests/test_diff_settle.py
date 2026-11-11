@@ -79,6 +79,22 @@ def test_anchor_missing_names_the_anchor_or_the_neutral_control():
     _reason_is_legal(res)
 
 
+def test_keep_focus_skips_the_focus_neutral_condition():
+    """SD-27, 3.5 condition 2: a keep_focus checkpoint keeps its field focused and still settles."""
+    held = frames([IMG] * 4, focus_dropped=False)
+    assert settle(held, spec()).reason == "anchor_missing"
+    res = settle(held, spec(keep_focus=True))
+    assert res.settled and res.capture_t_ms == 0
+    # the caret blinks inside its mask, so the frames stay identical outside masks
+    caret = Rect(300, 200, 2, 12)
+    blink = [IMG.copy() for _ in range(4)]
+    for k, f in enumerate(blink):
+        f[caret.y:caret.y + caret.h, caret.x:caret.x + caret.w] = 0 if k % 2 else 255
+    assert not settle(frames(blink, focus_dropped=False), spec(keep_focus=True)).settled
+    assert settle(frames(blink, focus_dropped=False),
+                  SettleSpec(anchors=[TITLE_ANCHOR], ignore=[CLOCK, caret], park=(630, 395), keep_focus=True)).settled
+
+
 def test_anti_anchor_present_by_text_or_template():
     res = settle(frames([IMG] * 61, texts=("Reconnecting",)), spec())
     assert res.reason == "anti_anchor_present" and "Reconnecting" in res.detail

@@ -186,6 +186,7 @@ MUTATIONS: list[tuple[str, str | None, Callable]] = [
         "approved_by": "a", "reason": "r", "ticket": "TOS-1", "expires_at": "2026-01-01T00:00:00Z"})),
     ("L-RGN-07", S06, lambda d: d["regions"].append({"id": "rgn.order-entry.tooltip", "type": "mask", "landmark": "lm.order-entry-header",
                                                     "rect": {"dx": 0, "dy": 100, "w": 10, "h": 10}, "mask_ref": "msk.x"})),
+    ("L-RGN-08", S07, lambda d: region(d, "rgn.confirm.qty").update(money_role="qty", panel="other")),
     ("L-MSK-00", MASK, lambda d: d.pop("reason")),
     ("L-MSK-01", MASK, lambda d: d.update(created_by="reviewer")),
     ("L-MSK-02", MASK, lambda d: d.update(expires_at="2026-11-01T00:00:00-05:00")),
@@ -317,7 +318,8 @@ def test_mask_budget_refuses_large_masks(base):
     r = copy.deepcopy(base)
     region(r.docs[PS_CENSUS].data, "rgn.ps.last-update").update(rect={"dx": 0, "dy": 166, "w": 600, "h": 60})
     found = [v for v in lint_repo(r, 0, TODAY).violations if v.rule == "L-MSK-03"]
-    assert found and "position_statement panel is" in found[0].message and found[0].severity == "error"
+    assert found and "position_statement panel on lm.position-statement-header is" in found[0].message
+    assert found[0].severity == "error"
 
 
 # -- file-level defects ----------------------------------------------------------------------------
@@ -474,3 +476,346 @@ def test_flw07_type_fixture_committing_with_enter_after_confirm_and_send(base):
         d["steps"].insert(i + 1, {"id": "t-enter", "type": "type_fixture", "target": "trade.order-entry.stock.qty-field",
                                   "fixture_ref": "fixture.order.qty", "commit": "enter"})
     assert "L-FLW-07" in _apply(base, FLOW, fn)
+
+
+# -- w1 lint safety and correctness: pairs at run creation ------------------------------------------------------------
+
+def _violations(base: Repo, rel: str | None, fn: Callable, phase: int = 0) -> list:
+    r = copy.deepcopy(base)
+    fn(r if rel is None else r.docs[rel].data)
+    return lint_repo(r, phase, TODAY).violations
+
+
+def test_check_pair_refuses_at_run_creation():
+    """04-pair-refusal-at-creation (4.2): the pair record alone gives the rule ids, no repository needed."""
+    builds = {"branch-1998.3.0-5d3e812": {"channel": "branch", "merge_base_sha": "4f1c9a2" + "e" * 33},
+              "main-1998.2.0-4f1c9a2": {"channel": "main", "commit_sha": "4f1c9a2" + "e" * 33}}
+    good = {"run_type": "pr", "candidate": "branch-1998.3.0-5d3e812", "base": "main-1998.2.0-4f1c9a2",
+            "base_rule": "merge_base_main"}
+    assert R.check_pair(good, builds) == []
+    refused = R.check_pair({**good, "base_rule": "same_build"}, builds)
+    assert [v.rule for v in refused] == ["L-BLD-04"] and refused[0].file == "build_pair"
+    same = R.check_pair({**good, "base": good["candidate"]}, builds, "builds/x.yaml")
+    assert "L-BLD-05" in {v.rule for v in same} and {v.file for v in same} == {"builds/x.yaml"}
+
+
+# -- 04-lint-not-oracle-config: assertions the Oracle refuses --------------------------------------------------------
+
+def _s07_expect(a: dict) -> Callable:
+    return lambda d: step(d, "s07")["expect"].append(a)
+
+
+ORACLE_PROBES = [
+    ("L-FLW-11", "r03", {"kind": "rule", "rule_id": "R03", "inputs": {"bid": "rgn.confirm.price", "mark": "rgn.confirm.price",
+                                                                      "ask": "rgn.confirm.price", "last": "rgn.confirm.price"}}),
+    ("L-FLW-11", "r10", {"kind": "rule", "rule_id": "R10", "inputs": {"value": "rgn.confirm.cost"}}),
+    ("L-FLW-11", "r04", {"kind": "rule", "rule_id": "R04", "inputs": {"count": "rgn.confirm.qty", "selector": 16}}),
+    ("L-FLW-11", "r01", {"kind": "rule", "rule_id": "R01", "inputs": {"qty": "rgn.confirm.qty", "price": "rgn.confirm.price",
+                                                                      "multiplier": 1.5, "total": "rgn.confirm.cost"}}),
+    ("L-FLW-00", "eq", {"kind": "equals", "region": "rgn.confirm.side"}),
+    ("L-FLW-00", "mt", {"kind": "matches", "region": "rgn.confirm.side"}),
+    ("L-FLW-00", "ct", {"kind": "count", "region": "rgn.confirm.side"}),
+    ("L-FLW-00", "ct2", {"kind": "count", "region": "rgn.confirm.side", "expected": "abc"}),
+    ("L-FLW-00", "ex", {"kind": "export_equals", "region": "rgn.confirm.cost"}),
+    ("L-FLW-00", "api", {"kind": "api_within", "region": "rgn.confirm.price"}),
+    ("L-FLW-00", "src", {"kind": "equals", "region": "rgn.confirm.side", "expected": "BUY", "source": "api"}),
+    ("L-FLW-00", "app_alive", {"kind": "present", "region": "rgn.confirm.side"}),
+    ("L-FLW-00", "ref", {"kind": "equals", "region": "rgn.confirm.price", "value_ref": "fixture.prices.nope.value"}),
+    ("L-FLW-00", "pat", {"kind": "matches", "region": "rgn.confirm.side", "pattern": "[0-9"}),
+    ("L-FLW-00", "fmt", {"kind": "equals", "region": "rgn.confirm.qty", "format": "int", "expected": "abc"}),
+    ("L-FLW-11", "qty", {"kind": "equals", "region": "rgn.confirm.qty", "expected": 100}),       # a second `qty` at s07
+]
+
+
+@pytest.mark.parametrize("rule,aid,body", ORACLE_PROBES, ids=[p[1] for p in ORACLE_PROBES])
+def test_assertions_the_oracle_refuses_fail_the_lint(base, rule, aid, body):
+    found = _violations(base, FLOW, _s07_expect({"id": aid, **body}))
+    assert any(v.rule == rule and f"[{aid}]" in v.path for v in found), [v.line() for v in found]
+
+
+def test_every_accepted_assertion_builds_in_the_oracle(base):
+    """The property behind the probes: an assertion the lint accepts is one the Oracle's parser accepts. Every
+    assertion of the example (which lints clean) builds, and so does a within_tol without tol (2.8.2 default)."""
+    from sentinel.oracle.assertions import Assertion
+    for doc in base.of("flow"):
+        for st in R._Linter._seq(doc.data):
+            expect = st.get("expect", []) if st.get("type") == "checkpoint" else []      # a teardown expect is a count
+            for a in expect + st.get("assertions", []) + ([st["verify"]] if "verify" in st else []):
+                Assertion.from_dict(a)
+    tol = {"id": "tw", "kind": "within_tol", "region": "rgn.confirm.price", "format": "price",
+           "value_ref": "fixture.prices.aapl_far_below.value"}
+    assert not [v for v in _violations(base, FLOW, _s07_expect(tol)) if "[tw]" in v.path]
+    Assertion.from_dict(tol)
+
+
+# -- 04-mask-budget-panel-bypass --------------------------------------------------------------------------------------
+
+def test_unlabeled_mask_over_a_panel_counts_toward_its_budget(base):
+    """A 670x34 mask (15 percent of the s07 Order Confirmation bounds) with the default panel `other` is L-MSK-03."""
+    clock = {"id": "rgn.confirm.clock", "type": "mask", "landmark": "lm.order-confirmation-title",
+             "rect": {"dx": 0, "dy": 166, "w": 670, "h": 34}, "mask_ref": "msk.confirm.clock-01"}
+    found = _violations(base, S07, lambda d: d["regions"].append(clock))
+    assert any(v.rule == "L-MSK-03" and "order_confirmation panel" in v.message and "15.2%" in v.message for v in found)
+
+
+def test_panel_share_counts_overlap_once_and_adds_a_proposed_mask():
+    regs = [{"id": "rgn.a", "type": "diff", "landmark": "lm", "panel": "order_ticket", "rect": {"dx": 0, "dy": 0, "w": 50, "h": 100}},
+            {"id": "rgn.b", "type": "diff", "landmark": "lm", "panel": "order_ticket", "rect": {"dx": 50, "dy": 0, "w": 50, "h": 100},
+             "money_role": "qty", "money_cell": True},
+            {"id": "rgn.m1", "type": "mask", "landmark": "lm", "rect": {"dx": 0, "dy": 0, "w": 10, "h": 80}, "mask_ref": "m1"},
+            {"id": "rgn.m2", "type": "mask", "landmark": "lm", "rect": {"dx": 0, "dy": 0, "w": 10, "h": 80}, "mask_ref": "m2"}]
+    budgets = {"order_ticket": 0.10}
+    (share,) = R.panel_share(regs, budgets=budgets)
+    assert (share.panel, share.landmark, share.share, share.exceeded) == ("order_ticket", "lm", 0.08, False)
+    box = {"id": "rgn.redact.x", "landmark": "lm", "rect": {"dx": 5, "dy": 0, "w": 10, "h": 80}}
+    assert R.panel_share(regs, [box], budgets=budgets)[0].share == pytest.approx(0.12)
+    assert R.panel_share(regs, [{**box, "identity_field": True}], budgets=budgets)[0].share == pytest.approx(0.08)
+    proposed = {"landmark": "lm", "rect": {"dx": 20, "dy": 0, "w": 10, "h": 50}}
+    assert R.panel_share(regs, (), proposed, budgets)[0].share == pytest.approx(0.13)
+    assert R.money_cells_covered(regs) == []
+    assert R.money_cells_covered(regs, (), {"landmark": "lm", "rect": {"dx": 60, "dy": 10, "w": 5, "h": 5}}) == [
+        ("rgn.b", "proposed mask")]
+
+
+@pytest.fixture
+def diff_params(tmp_path, monkeypatch):
+    """A Diff Engine parameters file the lint reads its mask budgets from; restored after the test."""
+    from sentinel import diff
+    data = yaml.safe_load(diff.DEFAULT_PARAMS_PATH.read_text())
+
+    def write(**budgets: float) -> None:
+        data["mask_budget"].update(budgets)
+        p = tmp_path / "diff_engine.yaml"
+        p.write_text(yaml.safe_dump(data))
+        monkeypatch.setenv("SENTINEL_DIFF_PARAMS", str(p))
+        diff.load_params.cache_clear()
+
+    yield write
+    monkeypatch.delenv("SENTINEL_DIFF_PARAMS", raising=False)
+    diff.load_params.cache_clear()
+
+
+def test_mask_budget_comes_from_the_diff_engine_parameters(base, diff_params):
+    def big(d: dict) -> None:
+        region(d, "rgn.ps.last-update").update(rect={"dx": 0, "dy": 166, "w": 600, "h": 60})
+    assert "L-MSK-03" in {v.rule for v in _violations(base, PS_CENSUS, big)}
+    diff_params(position_statement=0.5)
+    assert R.mask_budgets()["position_statement"] == 0.5
+    assert "L-MSK-03" not in {v.rule for v in _violations(base, PS_CENSUS, big)}
+
+
+# -- 04-regions-landmark-templates-unchecked --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("change,needle", [
+    ({"template": "regions/landmarks/missing.png"}, "does not exist"),
+    ({"confidence_min": 1.5}, "confidence_min"),
+])
+def test_regions_landmark_fields(base, change, needle):
+    found = _violations(base, S07, lambda d: d["landmarks"][0].update(change))
+    assert any(v.rule == "L-RGN-00" and needle in v.message and v.path.startswith("landmarks[0]") for v in found)
+
+
+def test_regions_landmark_ids_unique_and_redaction_templates_checked(base):
+    found = _violations(base, S07, lambda d: d["landmarks"].append(copy.deepcopy(d["landmarks"][0])))
+    assert any(v.rule == "L-RGN-00" and "landmark id lm.order-confirmation-title is not unique" in v.message for v in found)
+    found = _violations(base, "redaction/anchors.yaml", lambda d: d["landmarks"][0].update(template="regions/landmarks/nope.png"))
+    assert any(v.rule == "L-MSK-03" and v.path == "landmarks[0].template" for v in found)
+
+
+@pytest.mark.parametrize("size,fmt", [((800, 600), "PNG"), ((10, 10), "PNG"), ((150, 22), "JPEG")])
+def test_regions_landmark_template_size_and_format(tree, size, fmt):
+    from PIL import Image
+    Image.new("RGB", size).save(tree / "regions/landmarks/lm.chart-cell-header.png", format=fmt)
+    found = [v for v in lint(tree, today=TODAY).violations if v.rule == "L-RGN-00"]
+    assert [(v.file, v.path) for v in found] == [(CHART_CENSUS, "landmarks[0].template")]
+
+
+# -- 04-money-cell-closed-list (L-RGN-08) and 04-census-money-cell-unasserted (L-RGN-04 census half) --------------
+
+def test_money_role_needs_money_cell_and_an_order_panel(base):
+    found = _violations(base, S07, lambda d: region(d, "rgn.confirm.max-loss").update(money_role="max_loss", money_cell=False))
+    assert any(v.rule == "L-RGN-08" and "without money_cell" in v.message for v in found)
+    found = _violations(base, PS_CENSUS, lambda d: region(d, "rgn.ps.qty").update(money_role="qty"))
+    assert any(v.rule == "L-RGN-08" and "panel position_statement" in v.message for v in found)
+    assert not [v for v in _violations(base, S07, lambda d: region(d, "rgn.confirm.qty").update(money_role="qty"))
+                if v.rule == "L-RGN-08"]
+
+
+def test_census_money_cell_is_a_rule_region(base):
+    """SD-29: on a census checkpoint every money cell of the closed list is a rule region, never diff-only."""
+    cell = {"id": "rgn.ps.order-qty", "type": "diff", "landmark": "lm.position-statement-header", "panel": "order_ticket",
+            "money_role": "qty", "money_cell": True, "rect": {"dx": 0, "dy": 300, "w": 60, "h": 20}}
+    found = _violations(base, PS_CENSUS, lambda d: d["regions"].append(cell))
+    assert any(v.rule == "L-RGN-04" and "rgn.ps.order-qty" in v.message and "census" in v.message for v in found)
+    rule = {**cell, "type": "rule", "rule": {"field": "int"}}
+    assert not [v for v in _violations(base, PS_CENSUS, lambda d: d["regions"].append(rule))
+                if v.rule == "L-RGN-04" and "rgn.ps.order-qty" in v.message]
+
+
+# -- SD-01, SD-27 -------------------------------------------------------------------------------------------------------
+
+def test_tier1_does_not_imply_smoke(base):
+    assert "L-SRF-02" not in {v.rule for v in _violations(base, PS, lambda d: d.update(smoke=False))}
+
+
+def test_caret_mask_on_a_frozen_checkpoint_needs_keep_focus(base):
+    caret = {"id": "rgn.order-entry.caret", "type": "mask", "landmark": "lm.order-entry-header",
+             "rect": {"dx": 0, "dy": 100, "w": 4, "h": 14}, "mask_ref": "msk.x"}
+    found = _violations(base, S06, lambda d: d["regions"].append(caret))
+    assert any(v.rule == "L-RGN-07" and "keep_focus" in v.message for v in found)
+
+    def focused(r: Repo) -> None:
+        r.docs[S06].data["regions"].append(caret)
+        step(r.docs[FLOW].data, "s06")["keep_focus"] = True
+    assert "L-RGN-07" not in {v.rule for v in _violations(base, None, focused)}
+
+
+# -- 04-cancel-confirm-by-jab-name ---------------------------------------------------------------------------------
+
+def test_cancel_all_and_confirm_and_send_by_jab_name(base):
+    def cancel_all(r: Repo) -> None:
+        r.docs[LADDER].data["controls"].append({"id": "ca-btn", "template": "registry/templates/active-trader/flatten.png",
+                                                "jab": {"name": "Cancel All", "role": "push button"}})
+        r.docs[READBACK].data["steps"].insert(1, {"id": "x1", "type": "click_named", "target": "trade.active-trader.ladder.ca-btn"})
+    assert "L-FLW-19" in {v.rule for v in _violations(base, None, cancel_all)}
+
+    def confirm(r: Repo) -> None:
+        r.docs[STOCK].data["controls"].append({"id": "cs-btn", "template": "registry/templates/trade/confirm-and-send.png",
+                                               "jab": {"name": "Confirm and Send", "role": "push button"}})
+        r.docs[CANARY].data["steps"].insert(4, {"id": "x1", "type": "click_named", "target": "trade.order-entry.stock.cs-btn"})
+    assert any(v.rule == "L-FLW-07" and "x1" in v.message for v in _violations(base, None, confirm))
+
+
+# -- 06-paper-send-ok-flow-lint --------------------------------------------------------------------------------------
+
+SEND_POLICY = {"schema_version": 1, "decision": "approved", "enabled": True, "risk_owner": "risk.owner",
+               "signed_at": "2026-11-01T00:00:00-05:00", "signature": "sig-risk-owner"}
+
+
+def send_ok(r: Repo) -> None:
+    """The stock limit flow as a conforming paper_send_ok flow under a signed send policy (6.7)."""
+    r.docs["policy/send_policy.yaml"].data.clear()
+    r.docs["policy/send_policy.yaml"].data.update(SEND_POLICY)
+    r.docs[PS].data["controls"].append({"id": "cancel-order", "template": "registry/templates/active-trader/flatten.png",
+                                        "ocr_text": "Cancel", "deny": True})
+    fl = r.docs[FLOW].data
+    fl["class"] = "paper_send_ok"
+    step(fl, "s03")["expect"][0]["expected"] = 1
+    step(fl, "s04")["value"] = "1"
+    for cp in ("s06", "s07"):
+        next(a for a in step(fl, cp)["expect"] if a["id"] == "qty")["expected"] = 1
+    i = fl["steps"].index(step(fl, "s07"))
+    fl["steps"][i + 1:i + 1] = [
+        {"id": "send", "type": "click_named", "target": "dialog.order-confirmation.send-button"},
+        {"id": "a-working", "type": "assert",
+         "assertions": [{"id": "working_row", "kind": "matches", "region": "rgn.confirm.side", "pattern": "BUY \\+1 AAPL .* WORKING"}]},
+        {"id": "cancel", "type": "click_named", "target": "monitor.activity.position-statement.cancel-order"},
+    ]
+
+
+def _send_rules(base: Repo, *changes: Callable) -> list:
+    def fn(r: Repo) -> None:
+        send_ok(r)
+        for c in changes:
+            c(r)
+    return [v for v in _violations(base, None, fn) if v.rule in ("L-FLW-08", "L-FLW-13")]
+
+
+def test_conforming_paper_send_ok_flow_lints_clean(base):
+    assert _send_rules(base) == []
+
+
+def test_paper_send_ok_send_click_is_denied_without_the_policy(base):
+    found = _send_rules(base, lambda r: r.docs["policy/send_policy.yaml"].data.update(enabled=False))
+    assert {v.rule for v in found} == {"L-FLW-08", "L-FLW-13"}
+
+
+def _flow_step(r: Repo, sid: str) -> dict:
+    return step(r.docs[FLOW].data, sid)
+
+
+@pytest.mark.parametrize("name,change,needle", [
+    ("qty", lambda r: _flow_step(r, "s04").update(value="2"), "order qty '2'"),
+    ("market", lambda r: _flow_step(r, "s03")["expect"][1].update(expected="MKT"), "a limit order"),
+    ("gtc", lambda r: _flow_step(r, "s03")["expect"][2].update(expected="GTC"), "DAY time in force"),
+    ("near", lambda r: r.docs[FIXTURE].data["prices"][1].update(rule="last_delayed x 0.9, rounded to 0.01"), "at least 20 percent"),
+    ("literal", lambda r: (_flow_step(r, "s05").pop("value_ref"), _flow_step(r, "s05").update(value="150.25")),
+     "not a fixture.prices"),
+    ("symbol", lambda r: (_flow_step(r, "s02").pop("value_ref"), _flow_step(r, "s02").update(value="TSLA")),
+     "'TSLA' is not in fixture"),
+    ("row", lambda r: r.docs[FLOW].data["steps"].remove(_flow_step(r, "a-working")), "Working row"),
+    ("cancel", lambda r: r.docs[FLOW].data["steps"].remove(_flow_step(r, "cancel")), "no cancel step"),
+    ("two-sends", lambda r: r.docs[FLOW].data["steps"].insert(
+        r.docs[FLOW].data["steps"].index(_flow_step(r, "cancel")),
+        {"id": "send2", "type": "click_named", "target": "dialog.order-confirmation.send-button"}), "exactly one Send click"),
+    ("futures", lambda r: _flow_step(r, "s05").update(value_ref="fixture.prices.mes_far_below.value"), "tick_distance_futures"),
+    ("teardown", lambda r: r.docs[FLOW].data["teardown"].remove(_flow_step(r, "t4")), "working_orders_check"),
+])
+def test_paper_send_ok_order_constraints(base, name, change, needle):
+    found = _send_rules(base, change)
+    assert any(v.rule == "L-FLW-08" and needle in v.message for v in found), [v.message for v in found]
+
+
+def test_paper_send_ok_flows_stay_within_the_per_run_send_cap(base):
+    def six(r: Repo) -> None:
+        for i in range(5):
+            rel = f"flows/tier-1/copy-{i}.yaml"
+            r.docs[rel] = Doc(rel, "flow", copy.deepcopy(r.docs[FLOW].data))
+    found = _send_rules(base, six)
+    assert [(v.file, v.message) for v in found if v.file == "policy/send_policy.yaml"] == [
+        ("policy/send_policy.yaml", "6 paper_send_ok flows send 6 orders; the per-run send cap is 5")]
+
+
+# -- 04-flow-field-checks ------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("rule,rel,change,needle", [
+    ("L-FLW-00", FLOW, lambda d: d["preconditions"].append({"id": "px", "type": "press", "key": "escape"}), "only type precondition"),
+    ("L-FLW-06", FLOW, lambda d: d["steps"].insert(1, {"id": "sx", "type": "secret", "target": "trade.order-entry.stock.qty-field",
+                                                        "vault_ref": "plain", "commit": "tab"}), "vault://<path>#<field>"),
+    ("L-FLW-00", FLOW, lambda d: step(d, "t3")["assertions"][0].update(pattern="[0-9"), "does not compile"),
+    ("L-FLW-00", FLOW, lambda d: step(d, "s07")["target_window"].update(title_regex="(^Order"), "does not compile"),
+    ("L-FLW-00", FLOW, lambda d: step(d, "w-confirm")["anchor"].update(window_title_regex="(^Order"), "does not compile"),
+    ("L-FLW-00", FLOW, lambda d: step(d, "w-ticket")["anchor"].update(landmark="lm.nope"), "wait_for landmark lm.nope"),
+    ("L-RGN-00", S07, lambda d: region(d, "rgn.confirm.timestamp")["rule"].update(pattern="([0-9"), "rule pattern does not compile"),
+    ("L-RGN-00", S07, lambda d: region(d, "rgn.confirm.timestamp")["rule"].update(min=5, max=1), "rule min 5 is above max 1"),
+    ("L-RGN-00", PS_CENSUS, lambda d: region(d, "rgn.ps.mark")["rule"].update(must_advance=True), "must_advance"),
+])
+def test_flow_and_region_field_checks(base, rule, rel, change, needle):
+    found = _violations(base, rel, change)
+    assert any(v.rule == rule and needle in v.message for v in found), [v.line() for v in found]
+
+
+# -- 04b: mutant seed, expired contracts, popup actions ---------------------------------------------------------------
+
+def test_mutant_without_seed_is_l_mut_01(base):
+    found = _violations(base, MUTANTS, lambda d: mutant(d, "M01")["generator"].pop("seed"))
+    assert any(v.rule == "L-MUT-01" and "seed is missing" in v.message for v in found)
+
+
+@pytest.mark.parametrize("symbol,roll,needle", [
+    ("/MESZ24", "2027-01-01", "expired contract"),
+    ("/MESZ26", "2027-03-01", "falls after the contract month 2026-12"),
+])
+def test_expired_or_late_rolled_contracts(base, symbol, roll, needle):
+    found = _violations(base, FIXTURE, lambda d: d["symbols"][0].update(symbol=symbol, roll_date=roll))
+    assert any(v.rule == "L-FIX-03" and needle in v.message for v in found)
+
+
+@pytest.mark.parametrize("key", ["Control+Return", "ctrl + numpad enter", "Spacebar", " ", "return"])
+def test_enter_key_spellings_are_l_pop_02(base, key):
+    assert "L-POP-02" in {v.rule for v in _violations(base, POPUPS, lambda d: popup(d, "POP-07").update(key=key))}
+
+
+def test_escape_is_a_dismiss_key():
+    assert R._chord("Escape") == "escape" and R._chord("Shift+Ctrl+Tab") == "ctrl+shift+tab"
+
+
+@pytest.mark.parametrize("pid,change,needle", [
+    ("POP-07", lambda p: p.pop("key"), "action dismiss_key requires key"),
+    ("POP-04", lambda p: p.update(action="wait"), "action wait requires wait_timeout_ms"),
+    ("POP-04", lambda p: p.update(key="escape"), "key belongs to action dismiss_key, not abort"),
+    ("POP-02", lambda p: p.update(wait_timeout_ms=100), "wait_timeout_ms belongs to action wait"),
+])
+def test_popup_action_fields(base, pid, change, needle):
+    found = _violations(base, POPUPS, lambda d: change(popup(d, pid)))
+    assert any(v.rule == "L-POP-04" and needle in v.message for v in found), [v.message for v in found]

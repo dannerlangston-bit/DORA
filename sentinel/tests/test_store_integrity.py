@@ -7,11 +7,12 @@ import sqlite3
 
 import pytest
 
-from sentinel.records import (ACTION_VERDICT, CheckpointOutcome, Decision, DiffSummary, Finding,
-                              RunOutcome, Signature, StepOutcome)
+from sentinel.records import (ACTION_VERDICT, CheckpointOutcome, Decision, DiffSummary, Extraction, Finding,
+                              Fingerprint, RunOutcome, Signature, StepEvent, StepOutcome)
 from sentinel.store import RunPlan, ScopeEntry, ShardPlan, Store, StoreRefused
 from sentinel.store.artifacts import StoredArtifact
-from sentinel.store.store import ActiveDecisionExists, PaperAssertionMissing, RecordIncomplete
+from sentinel.store.store import (ActiveDecisionExists, PaperAssertionMissing, PostRunProof, RecordIncomplete,
+                                  RunNotComplete)
 
 RUN = "run-01"
 WS = "ws.tier-a.active-trader"
@@ -148,6 +149,38 @@ def test_the_session_stamp_is_required_on_a_captured_record(store):
     store.write_checkpoint(dataclasses.replace(o, paper_assertion=stamp()), artifacts=arts, shard_id=SHARD)
     row = store.conn.execute("SELECT paper_asserted_at FROM outcomes WHERE checkpoint_id = ?", (CENSUS,)).fetchone()
     assert row[0] == "2026-11-09T19:21:02+00:00"
+
+
+def test_the_repair_path_never_replaces_a_paper_mode_refusal(store):
+    # store:0, L-OUT-06: a captured record that also fails L-OUT-02 is refused for its stamp before any repair; it is
+    # never swapped for an exempt harness_error (store_write_failed) with its capture still indexed
+    store.set_session_context(SHARD, [ACCOUNT], [ASSERTED])
+    o, arts = _capture(store, CENSUS, outcome="invariant_violation", reason="INV-01")     # no invariant_ids: L-OUT-02
+    calls = []
+
+    def repair(r, errs):
+        calls.append("repair")
+        return r
+
+    def on_refused(r, errs):
+        calls.append("refused")
+        return "wd-1"
+
+    for bad in (None, stamp(account="sha256:live"), stamp(at="2026-11-08T09:00:00+00:00")):
+        rec = dataclasses.replace(o, paper_assertion=bad)
+        assert store.record_errors(rec)
+        with pytest.raises(PaperAssertionMissing):
+            store.write_checkpoint_or_repair(rec, repair=repair, on_refused=on_refused, artifacts=arts, shard_id=SHARD)
+    assert calls == [] and store.get_outcome(RUN, CENSUS) is None
+    assert store.conn.execute("SELECT count(*) FROM artifacts").fetchone()[0] == 0
+    with pytest.raises(StoreRefused, match="not stored"):     # every other non-L-OUT-02 refusal propagates too
+        store.write_checkpoint_or_repair(out(SWEEP, "invariant_violation", reason="INV-01", diff=D,
+                                             artifacts={"candidate": "e" * 64}), repair=repair, on_refused=on_refused)
+    assert calls == [] and store.get_outcome(RUN, SWEEP) is None
+    written = store.write_checkpoint_or_repair(dataclasses.replace(o, paper_assertion=stamp()), repair=repair,
+                                               on_refused=on_refused, artifacts=arts, shard_id=SHARD)
+    assert (written.outcome, written.reason) == ("harness_error", "store_write_failed") and calls == ["repair",
+                                                                                                     "refused"]
 
 
 def test_records_without_a_capture_are_exempt(store):
@@ -295,15 +328,89 @@ def test_the_same_click_again_returns_the_same_decision(store):
     assert store.conn.execute("SELECT count(*) FROM decisions").fetchone()[0] == 1
 
 
-def test_a_frozen_signature_needs_the_system_owner(tmp_path):
+FAR = "fedcba9876543210"                    # 64 bits from PH: outside every tolerance
+
+
+def test_supersedes_names_a_decision_on_the_same_signature(store):
+    # store:2, 9.7: Supersede replaces the active row of THIS signature; SD-79: fixed_in_build supersedes confirm_bug
+    finding(store, "F-1")
+    decide(store, "dec-000001", by="alice", finding_ref="F-1")
+    decide(store, "dec-000002", by="carol", region="rgn.unrelated")
+    decide(store, "dec-000003", by="carol", phash=FAR)
+    decide(store, "dec-000004", by="carol", category="invariant_violation")
+    for other in ("dec-000002", "dec-000003", "dec-000004"):
+        with pytest.raises(StoreRefused, match="another signature"):
+            decide(store, "dec-000005", "confirm_bug", by="bob", finding_ref="F-1", supersedes=other)
+        assert store.get_decision(other).status == "active"
+    assert store.get_decision("dec-000005") is None and not store.get_finding("F-1").contested
+    for b, at in (("b1", "2026-11-01T00:00:00+00:00"), ("b2", "2026-11-05T00:00:00+00:00")):
+        store.register_build(b, channel="branch", source_commit=b, pipeline_artifact_url="u", installer_sha256=b,
+                             first_seen_at=at)
+    with pytest.raises(StoreRefused, match="SD-79"):
+        decide(store, "dec-000005", "fixed_in_build", by="bob", supersedes="dec-000001",
+               call={"fixed_in_build_id": "b2", "build_id": "b1"})
+    assert store.get_decision("dec-000001").status == "active"
+    sup = decide(store, "dec-000005", "confirm_bug", by="bob", finding_ref="F-1", supersedes="dec-000001")
+    assert sup.supersedes == "dec-000001" and store.get_decision("dec-000001").status == "superseded"
+
+
+def test_superseding_your_own_decision_writes_a_new_row(store):
+    # store:3, 9.6 Supersede decision, 9.7: the idempotent return is for the same click again, never a supersession
+    finding(store, "F-1")
+    decide(store, "dec-000001", "confirm_bug", finding_ref="F-1", ticket="TOS-1")
+    with pytest.raises(ActiveDecisionExists, match="dec-000001"):          # a plain change is no repeat: refused
+        decide(store, "dec-000002", "confirm_bug", finding_ref="F-1", ticket="TOS-2")
+    new = decide(store, "dec-000002", "confirm_bug", finding_ref="F-1", ticket="TOS-2", supersedes="dec-000001")
+    assert (new.decision_id, new.ticket, new.supersedes) == ("dec-000002", "TOS-2", "dec-000001")
+    assert store.get_decision("dec-000001").status == "superseded"
+    assert store.get_finding("F-1").ticket == "TOS-2" and not store.get_finding("F-1").contested
+
+
+@pytest.fixture
+def frozen(tmp_path):
+    """A signature with two supersessions within 30 days (9.7), on a store whose system owner is olga."""
     with Store(tmp_path / "f.db", system_owners=["olga"]) as s:
         s.begin_run(plan())
         decide(s, "dec-000001", decided_at="2026-11-01T00:00:00+00:00")
         decide(s, "dec-000002", by="bob", supersedes="dec-000001", decided_at="2026-11-05T00:00:00+00:00")
         decide(s, "dec-000003", by="carl", supersedes="dec-000002", decided_at="2026-11-07T00:00:00+00:00")
-        with pytest.raises(StoreRefused, match="system owner"):
-            decide(s, "dec-000004", "confirm_bug", by="dana", supersedes="dec-000003")
-        assert decide(s, "dec-000004", "confirm_bug", by="olga", supersedes="dec-000003").decided_by == "olga"
+        yield s
+
+
+SIG = Signature(SWEEP, "rgn.ladder.bid-column", PH, "collateral")
+
+
+def test_a_frozen_signature_needs_the_system_owner(frozen):
+    s = frozen
+    assert s.lookup_decisions(SIG, at=TS).frozen
+    with pytest.raises(StoreRefused, match="system owner"):
+        decide(s, "dec-000004", "confirm_bug", by="dana", supersedes="dec-000003")
+    with pytest.raises(StoreRefused, match="system owner"):            # store:4: the role is not a key to the freeze
+        decide(s, "dec-000004", "confirm_bug", by="dana", supersedes="dec-000003", role="system_owner")
+    with pytest.raises(StoreRefused, match="system_owner"):
+        decide(s, "dec-000004", "confirm_bug", by="olga", supersedes="dec-000003", role="flow_owner")
+    owner = decide(s, "dec-000004", "confirm_bug", by="olga", supersedes="dec-000003")
+    assert (owner.decided_by, owner.role) == ("olga", "system_owner")
+    for at in (TS, "2027-06-01T00:00:00+00:00"):                       # store:4: the owner's decision ends the freeze
+        look = s.lookup_decisions(SIG, at=at)
+        assert not look.frozen and look.inherited.decision_id == "dec-000004"
+    decide(s, "dec-000005", "confirm_bug", by="bob", supersedes="dec-000004", decided_at="2026-11-10T00:00:00+00:00")
+    assert not s.lookup_decisions(SIG, at=TS).frozen                   # one supersession since the owner's decision
+    decide(s, "dec-000006", by="carl", supersedes="dec-000005", decided_at="2026-11-12T00:00:00+00:00")
+    assert s.lookup_decisions(SIG, at=TS).frozen                       # two more within 30 days freeze it again
+
+
+def test_a_revoke_does_not_lift_the_freeze(frozen):
+    # store:4, 9.7: the freeze is the signature's; revoking its active row (open to the 9.6 roles) leaves it frozen
+    s = frozen
+    s.revoke_decision("dec-000003", by="dana", reason="disputed", at="2026-11-08T00:00:00+00:00")
+    look = s.lookup_decisions(SIG, at=TS)
+    assert look.frozen and look.applicable == ()
+    with pytest.raises(StoreRefused, match="system owner"):
+        decide(s, "dec-000004", "confirm_bug", by="dana")
+    assert s.get_decision("dec-000004") is None
+    assert decide(s, "dec-000004", "confirm_bug", by="olga").role == "system_owner"
+    assert s.lookup_decisions(SIG, at=TS).inherited.decision_id == "dec-000004"
 
 
 def test_fixed_in_build_is_not_a_contest(store):
@@ -315,6 +422,38 @@ def test_fixed_in_build_is_not_a_contest(store):
     decide(store, "dec-000002", "fixed_in_build", by="bob", supersedes="dec-000001", finding_ref="F-1",
            call={"fixed_in_build_id": "b2", "build_id": "b1"})
     assert not store.get_finding("F-1").contested
+
+
+def by_decision(cid, outcome, did, **kw):
+    return out(cid, outcome, reason=f"decision:{did}", decision_ref=did, diff=D, recorded_at=TS, **kw)
+
+
+def test_a_decision_reason_names_a_live_decision_that_acts_on_this_checkpoint(store):
+    # store:8, 4.13 required fields: "decision:<id> and a decision_ref to an approved noise signature or an active
+    # mask decision"; 9.7: a decision matches its own signature only and noise_signature ends after 30 days
+    decide(store, "dec-000001", decided_at="2026-09-01T00:00:00+00:00", expires_at="2026-10-01T00:00:00+00:00")
+    decide(store, "dec-000002", region="rgn.b")
+    refused = {"dec-000001": "expired", "dec-000002": "checkpoint"}
+    for n, action in enumerate(("agent_mistake", "expected_behavior", "request_mask"), start=3):
+        decide(store, f"dec-00000{n}", action, region=f"rgn.{n}")
+        refused[f"dec-00000{n}"] = action
+    for did, why in refused.items():
+        with pytest.raises(StoreRefused, match=why):
+            store.write_checkpoint(by_decision(CENSUS if did == "dec-000002" else SWEEP, "noise", did))
+    store.record_decision(Decision("dec-000006", "reject_baseline", "confirmed_bug",
+                                   Signature(SWEEP, "rgn.6", PH, "collateral"), decided_by="alice", ticket="TOS-6",
+                                   reason="because", decided_at=TS), run_id=RUN, baseline_id=1)
+    with pytest.raises(StoreRefused, match="reject_baseline"):            # it moves a baseline, not the signature
+        store.write_checkpoint(by_decision(SWEEP, "collateral", "dec-000006", primitive="ladder"))
+    assert store.outcomes(RUN) == []
+    store.set_mask_ref("dec-000005", "mask-1")                              # the mask merged: it acts now
+    store.write_checkpoint(by_decision(SWEEP, "noise", "dec-000005"))
+    decide(store, "dec-000007", "confirm_bug", region="rgn.7")
+    decide(store, "dec-000008", "mark_intended", region="rgn.8")
+    for run_id, outcome, did in (("run-02", "collateral", "dec-000007"), ("run-03", "intended", "dec-000008")):
+        store.begin_run(plan(run_id=run_id))
+        store.write_checkpoint(by_decision(SWEEP, outcome, did, run_id=run_id))
+        assert store.get_outcome(run_id, SWEEP).reason == f"decision:{did}"
 
 
 # -- the run summary, review state and late verdicts (8.3, 8.7, 4.13, SD-23) ----------------------------------------
@@ -431,6 +570,37 @@ def test_a_silent_checkpoint_ends_the_run_aborted_harness_with_the_report_withhe
     assert post_run_check(store, RUN, 2, 1, 2, cells=cells()) == []
 
 
+def test_a_failed_check_keeps_a_shards_safety_abort(store):
+    # store:6, 8.2: the run outcome is the worst of the shards', so a failed post-run check on a run whose shard ended
+    # aborted_safety keeps that outcome (with the report withheld); 1.10: its silent checkpoints are env_error with the
+    # aborting gate and the abort reason. Nothing is written before the outcome is known, so end_run cannot refuse.
+    from sentinel.store.checks import end_taxonomy_check_failed, post_run_check
+    store.write_checkpoint(out(CENSUS, diff=D))
+    store.write_checkpoint(out(SWEEP, diff=D))
+    store.end_shard(SHARD, "aborted_safety", "attempted_send")
+    store.mark_shard_imported(SHARD)
+    failures = post_run_check(store, RUN, 2, 1, 2, cells=cells())
+    assert failures[0].startswith("L-OUT-07")
+    r = end_taxonomy_check_failed(store, RUN, failures, last_gate="running", watchdog_event_id="wd-32")
+    assert (r.status, r.reason, r.last_gate) == ("aborted_safety", "attempted_send", "running")
+    filled = store.get_outcome(RUN, FLOW)
+    assert (filled.outcome, filled.gate, filled.reason) == ("env_error", "running", "attempted_send")
+    assert filled.detail.startswith("watchdog_event: wd-32")
+    assert store.run_summary(RUN)["post_run_check"] == {"failures": failures, "report_withheld": True}
+
+
+def test_a_matrix_failure_on_a_safety_aborted_run_keeps_the_abort(store):
+    from sentinel.store.checks import end_taxonomy_check_failed, post_run_check
+    for cid in (CENSUS, SWEEP, FLOW):
+        store.write_checkpoint(out(cid, diff=D))
+    store.end_shard(SHARD, "aborted_safety", "paper_mode_mismatch")
+    store.mark_shard_imported(SHARD)
+    failures = post_run_check(store, RUN, 2, 1, 2, cells=cells()[:-1])
+    r = end_taxonomy_check_failed(store, RUN, failures, last_gate="paper_mode_asserted", watchdog_event_id="wd-33")
+    assert (r.status, r.reason) == ("aborted_safety", "paper_mode_mismatch")
+    assert store.run_summary(RUN)["post_run_check"]["report_withheld"] is True
+
+
 def test_a_retired_reason_fails_the_taxonomy_check(tmp_path):
     import copy
     from sentinel.store.checks import post_run_check
@@ -477,7 +647,7 @@ def test_late_rows_replace_the_dead_man_run(store):
     dead_man(store)
     rows = [out(cid, diff=D) for cid in (CENSUS, SWEEP, FLOW)]
     r = store.replace_dead_man_run(RUN, rows, outcome=RunOutcome(RUN, "pr", "complete", "reported"),
-                                   arrived_at="2026-11-09T16:05:00+00:00")
+                                   arrived_at="2026-11-09T16:05:00+00:00", proofs=[late_proof()])
     assert (r.status, r.reason) == ("complete", None) and r.counts["identical"] == 3
     assert {o.outcome for o in store.outcomes(RUN)} == {"identical"}
     kept = store.conn.execute("SELECT checkpoint_id, outcome, reason FROM outcomes_superseded ORDER BY 1").fetchall()
@@ -492,6 +662,85 @@ def test_late_rows_replace_the_dead_man_run(store):
         store.replace_dead_man_run(RUN, rows, outcome=RunOutcome(RUN, "pr", "complete", "reported"))
 
 
+def late_proof(shard=SHARD):
+    return PostRunProof(shard_id=shard, run_id=RUN, login_alias="paper-01", verdict="proven_no_sends",
+                        send_policy_ref="p", counts={}, cancel_all="not_needed", paper_mode_assertions=1,
+                        paper_mode_mismatches=0, gateway_events=2, gateway_drops=1, produced_at=TS)
+
+
+def test_the_late_arrival_carries_the_rigs_proof_events_and_each_rows_shard(store):
+    # store:1, 10.2: the rows the rig ships after a dead-man deadline (its post-run proof and step events among them)
+    # arrive in the one late batch, each row under its shard; 1.10: a complete late run needs every shard's proof
+    store.set_session_context(SHARD, [ACCOUNT], [ASSERTED])
+    dead_man(store)
+    store.register_build("b1", channel="branch", source_commit="b1", pipeline_artifact_url="u", installer_sha256="b1")
+    rows = [out(cid, diff=D) for cid in (CENSUS, SWEEP, FLOW)]
+    late = {"outcome": RunOutcome(RUN, "pr", "complete", "reported"), "arrived_at": "2026-11-09T16:05:00+00:00"}
+    with pytest.raises(RunNotComplete, match="post-run proof"):
+        store.replace_dead_man_run(RUN, rows, **late)
+    live, arts = _capture(store, CENSUS, paper_assertion=stamp(account="sha256:deadbeef"))
+    with pytest.raises(PaperAssertionMissing):                      # L-OUT-06 under the row's shard
+        store.replace_dead_man_run(RUN, [live, *rows[1:]], artifacts=arts, proofs=[late_proof()], **late)
+    with pytest.raises(StoreRefused, match="not a shard"):
+        store.replace_dead_man_run(RUN, rows, shard_of={CENSUS: "run-01/9"}, proofs=[late_proof()], **late)
+    assert (store.run_outcome(RUN).status, store.post_run_proofs(RUN)) == ("aborted_harness", [])
+    event = StepEvent(run_id=RUN, shard_id=SHARD, side="candidate", seq=1, source="gateway_hook", wall_at=TS,
+                      mono_ms=4242, mode="scripted", action="click", gate_decision="dropped",
+                      gate_reason="no_token", gate_class="safety")
+    step = StepOutcome(RUN, FLOW_ID, "s07", "passed", shard_id=SHARD)
+    x = Extraction(RUN, CENSUS, "candidate", "rule.rgn.qty.qty", "qty", "ocr", TS, region_id="rgn.qty", text="100",
+                   value="100", confidence=91.5)
+    fp = Fingerprint(RUN, "candidate", "rig-a1", TS, {"build_id": "b1"}, record={}, shard_id=SHARD)
+    r = store.replace_dead_man_run(RUN, rows, proofs=[late_proof()], events=[event], steps=[step], extractions=[x],
+                                   fingerprints=[fp], **late)
+    assert r.status == "complete" and store.post_run_proofs(RUN) == [late_proof()]
+    assert [(e.seq, e.gate_decision) for e in store.step_events(RUN)] == [(1, "dropped"), (2, "none")]
+    assert store.gateway_drops(RUN) == 1 and store.extractions(RUN) == [x] and store.fingerprint(SHARD, "candidate")
+    shards = store.conn.execute("SELECT DISTINCT shard_id FROM outcomes WHERE run_id = ?", (RUN,)).fetchall()
+    assert [row[0] for row in shards] == [SHARD]
+
+
+def test_a_late_row_of_a_run_with_several_shards_names_its_shard(tmp_path):
+    with Store(tmp_path / "two.db") as s:
+        for rig in ("rig-a1", "rig-a2"):
+            s.register_rig(rig, login_alias=f"paper-{rig[-1]}", owner="qa", snapshot_id="snap-1", allowlist_entry=1)
+        two = (f"{RUN}/1", f"{RUN}/2")
+        s.begin_run(plan(shards=(ShardPlan(two[0], "rig-a1"), ShardPlan(two[1], "rig-a2"))))
+        s.fill_unreached(RUN, "harness_error", "dead_man", detail="watchdog_event: wd-40")
+        s.end_run(RunOutcome(RUN, "pr", "aborted_harness", "running", reason="dead_man", ended_at=DEADLINE))
+        for sid in two:
+            s.end_shard(sid, "complete")
+            s.mark_shard_imported(sid)
+        rows = [out(cid, diff=D) for cid in (CENSUS, SWEEP, FLOW)]
+        proofs = [dataclasses.replace(late_proof(sid), login_alias=f"paper-{sid[-1]}") for sid in two]
+        done = RunOutcome(RUN, "pr", "complete", "reported")
+        where = {CENSUS: two[0], SWEEP: two[0], FLOW: two[1]}
+        with pytest.raises(StoreRefused, match="name the shard"):
+            s.replace_dead_man_run(RUN, rows, proofs=proofs, outcome=done)
+        with pytest.raises(RunNotComplete, match="post-run proof"):
+            s.replace_dead_man_run(RUN, rows, proofs=proofs[:1], outcome=done, shard_of=where)
+        s.replace_dead_man_run(RUN, rows, proofs=proofs, outcome=done, shard_of=where)
+        got = s.conn.execute("SELECT checkpoint_id, shard_id FROM outcomes ORDER BY checkpoint_id").fetchall()
+        assert [tuple(g) for g in got] == [(CENSUS, two[0]), (FLOW, two[1]), (SWEEP, two[0])]
+
+
+def test_a_partial_late_arrival_is_refused(store):
+    # store:5, 10.2 and 1.10: harness_error (dead_man) belongs only to an aborted_harness (dead_man) run, so the late
+    # arrival replaces every placeholder or none; the run stays dead_man until all its rows arrive
+    dead_man(store)
+    for status in ("complete", "complete_with_env_errors"):
+        with pytest.raises(StoreRefused, match="every dead_man placeholder"):
+            store.replace_dead_man_run(RUN, [out(CENSUS, diff=D)], outcome=RunOutcome(RUN, "pr", status, "reported"),
+                                       arrived_at="2026-11-09T16:05:00+00:00")
+    run = store.run_outcome(RUN)
+    assert (run.status, run.reason) == ("aborted_harness", "dead_man")
+    assert {o.reason for o in store.outcomes(RUN)} == {"dead_man"}
+    assert store.conn.execute("SELECT count(*) FROM outcomes_superseded").fetchone()[0] == 0
+    rows = [out(cid, diff=D) for cid in (CENSUS, SWEEP, FLOW)]
+    assert store.replace_dead_man_run(RUN, rows, outcome=RunOutcome(RUN, "pr", "complete", "reported"),
+                                      proofs=[late_proof()]).status == "complete"
+
+
 def test_a_run_that_did_not_end_dead_man_is_not_replaced(store):
     store.fill_unreached(RUN, "harness_error", "watchdog_dead", detail="watchdog_event: wd-41")
     store.end_run(RunOutcome(RUN, "pr", "aborted_harness", "running", reason="watchdog_dead"))
@@ -503,7 +752,7 @@ def test_a_refused_late_row_leaves_the_dead_man_run_as_it_was(store):
     dead_man(store)
     bad = out(SWEEP, diff=D, artifacts={"candidate": "e" * 64})           # names an artifact nobody stored
     with pytest.raises(StoreRefused, match="not stored"):
-        store.replace_dead_man_run(RUN, [out(CENSUS, diff=D), bad],
+        store.replace_dead_man_run(RUN, [out(CENSUS, diff=D), bad, out(FLOW, diff=D)],
                                    outcome=RunOutcome(RUN, "pr", "complete", "reported"))
     run = store.run_outcome(RUN)
     assert (run.status, run.reason) == ("aborted_harness", "dead_man")

@@ -21,7 +21,9 @@ Enforced here and, where SQL can say it, again by the schema:
 - decisions are human-only (4.14, L-DEC-01) and never edited in place: supersede and revoke only (8.3). Also
   refused at write: approve_baseline from a PR run, a run not complete, a synthetic outcome or by the change's
   author on tier 1 (L-DEC-05); a waiver without an expiry at most 30 days out (L-DEC-07); a fixed_in_build build
-  not newer, by first_seen_at, than build_id or the superseded row's build_id (L-DEC-08).
+  not newer, by first_seen_at, than build_id or the superseded row's build_id (L-DEC-08); a supersession of a
+  decision on another signature (checkpoint, region, category, pHash within the old row's tolerance; 9.7), and a
+  fixed_in_build superseding anything but the signature's confirm_bug or its reopened fix (SD-79).
 - the lookup reads only actions that act through the signature (request_mask once its mask_ref is set); a
   signature with two supersessions within 30 days is frozen; a mark_intended decision applies (counts toward the
   verdict set and inheritance) only within its 9.7 scope: made on this run or its build pair, or the run's loaded
@@ -32,19 +34,23 @@ Enforced here and, where SQL can say it, again by the schema:
   shard, no shard that ended worse than complete and every outcome-named artifact stored (1.10, 8.1, 8.2, 8.3, 8.9);
   no run ends with a scoped checkpoint silent (L-OUT-07), or less severe than its worst shard (8.2). An outcome that
   names an artifact the store has no row for is refused at write (8.2); an artifact row needs bytes on disk that
-  hash to its name, and an image its redaction version (8.3, 8.4); a `decision:<id>` reason needs an active decision
-  with the outcome's verdict (4.13).
+  hash to its name, and an image its redaction version (8.3, 8.4); a `decision:<id>` reason needs an active,
+  unexpired decision on the record's checkpoint with the outcome's verdict and an action that acts through the
+  signature (4.13, 9.7).
 - L-OUT-06: once `set_session_context` names a shard, a record written for it that references a capture needs the
   session's paper-mode stamp from an allowlisted account (`PaperAssertionMissing`; SD-48 exempts records without a
   capture). L-OUT-02: a `strict_records` store refuses a record the 4.13 required-fields table refuses
   (`RecordIncomplete`, through `sentinel.required_fields`); `write_checkpoint_or_repair` is the Orchestrator's
-  repair-once path ending in `harness_error (reason: store_write_failed)`.
+  repair-once path ending in `harness_error (reason: store_write_failed)`. It repairs only the required-fields
+  rules: every other refusal, L-OUT-06 first, is checked on the record as given and propagates.
 - 9.7 Two humans, one signature (`ActiveDecisionExists`), the frozen signature's system owner, 9.6 idempotency and
   L-DEC-03 (an explicit tolerance above the tier's default is refused) at `record_decision`; the 4.13 late verdict
   produces only intended or needs_human (SD-23).
 - the run row carries its pair (`register_pair`), its teardown summary (`end_run(summary=)`, `update_summary`) and
   its review state (unreviewed, partial, reviewed, recomputed as reviews land). A finished run is final except the
-  10.2 late arrival: `replace_dead_man_run` replaces a dead-man run with its real rows and outcome.
+  10.2 late arrival: `replace_dead_man_run` replaces a dead-man run with its real rows and outcome, all of them in
+  one batch (every placeholder covered; each row under its shard; the shards' events, steps, extractions,
+  fingerprints and post-run proofs with them; a complete outcome only with every shard's proof).
 - every write batch is one `BEGIN IMMEDIATE` transaction, appended to `results.jsonl` before it commits (8.2).
 
 Choices where the spec is ambiguous or silent (reported to the coordinator):
@@ -77,11 +83,15 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   its run's pair (8.3 has no decision columns for them); `bbox_q4` is stored as `x,y,w,h`.
 - 9.7 Two humans, one signature, and the 9.6 idempotency are the Reporter API's rules for a decision made on a
   finding (4.14 makes `finding_ref` required; only store-level fixtures and imports write one without), so they
-  apply to a decision that names its finding: the same (finding, action, decided_by) on an active row returns that
-  row; a plain decision is refused with `ActiveDecisionExists` while an applicable (9.7 scope) active decision
-  matches the signature. approve_baseline and reject_baseline move a baselines row and are not signature
-  decisions. The frozen-signature rule (the next decision needs the system owner) applies to every signature
-  decision; the system owners are the store's configured `system_owners`. A supersession by another human marks the
+  apply to a decision that names its finding: the same (finding, action, decided_by) on an active row with the same
+  verdict, ticket and signature returns that row when the request supersedes nothing (the same click again; a
+  supersession or a changed field is a new request); a plain decision is refused with `ActiveDecisionExists`
+  while an applicable (9.7 scope) active decision matches the signature. approve_baseline and reject_baseline move
+  a baselines row and are not signature decisions. The frozen-signature rule (the next decision needs the system
+  owner) applies to every signature decision; the system owners are the store's configured `system_owners`. The
+  freeze is the signature's: every decision ever made on it counts (a revoke does not lift it), and the system
+  owner's decision, stored with role `system_owner` (a role only a configured system owner may claim), ends it, so
+  only supersessions after it count. A supersession by another human marks the
   findings of both rows contested; fixed_in_build superseding its confirm_bug is the 4.14 lifecycle, not a contest.
   The triage-channel notice to the earlier decider is the Reporter's (an outbox job needs its payload stored).
 - Step outcomes become `step_events` rows with source orchestrator, action `step`, mode `agent` for an agent rung
@@ -186,6 +196,10 @@ PENDING_REASONS = ("reviewer_unavailable", "global_shift")      # 4.13: pending 
 RUN_SEVERITY = ("complete", "complete_with_env_errors", "aborted_budget", "aborted_harness", "aborted_safety")
 # 4.13 required fields: the verdict a `decision:<id>` reason names, by outcome.
 DECISION_REASON_VERDICT = {"noise": "noise", "intended": "intended", "collateral": "confirmed_bug"}
+# The actions whose decision a `decision:<id>` reason may name: the ones that act on a later checkpoint outcome
+# through the signature, as the lookup reads them (request_mask once its mask_ref is set; 4.13, 4.14, 8.3).
+DECISION_REASON_ACTIONS = {"noise": ("noise_signature", "request_mask"), "intended": ("mark_intended",),
+                           "collateral": ("confirm_bug", "fixed_in_build")}
 LOCATOR_LEVELS = ("jab", "image", "ocr", "agent")
 GATEWAY_EVENT_KEYS = frozenset({"decision", "reason", "class"})   # 4.13 step_outcome.gateway_event
 # 8.3 post_run_proofs CHECKs (6.6): the five verdicts and what Cancel All did
@@ -765,19 +779,26 @@ def _match(r: sqlite3.Row) -> DecisionMatch:
     return DecisionMatch(d, r["distance"], build_pair_id=d.build_pair_id)
 
 
-def _frozen(conn: sqlite3.Connection, rows: Iterable[sqlite3.Row]) -> bool:
-    """9.7: two supersessions within 30 days on one signature freeze it (S-05). Walks each row's chain."""
-    for row in rows:
-        times, seen = [], set()
-        while row is not None and row["supersedes_decision_id"] is not None and row["decision_id"] not in seen:
-            seen.add(row["decision_id"])
-            times.append(datetime.fromisoformat(row["decided_at"]))
-            row = conn.execute("SELECT decision_id, decided_at, supersedes_decision_id FROM decisions "
-                               "WHERE decision_id = ?", (row["supersedes_decision_id"],)).fetchone()
-        times.sort()
-        if any(b - a <= timedelta(days=FREEZE_DAYS) for a, b in zip(times, times[1:])):
-            return True
-    return False
+# Every decision ever made on the signature, whatever its status now (9.7: the freeze is the signature's).
+_FREEZE_SQL = """SELECT decided_at, supersedes_decision_id, role FROM decisions
+WHERE checkpoint_id = :cp AND region_id = :region AND category = :cat
+  AND action NOT IN ('approve_baseline','reject_baseline')
+  AND hamming(phash, :phash) <= hamming_tolerance
+ORDER BY decided_at, decision_id"""
+
+
+def _frozen(conn: sqlite3.Connection, args: Mapping[str, Any]) -> bool:
+    """9.7: two supersessions within 30 days on one signature freeze it, and the next decision on it needs the
+    system owner (S-05). The freeze belongs to the signature, not to its active row: every decision on it counts,
+    revoked, superseded and expired ones included, so a revoke does not lift it; only supersessions made after the
+    signature's latest decision in the system owner's role count, so that decision ends it."""
+    times: list[datetime] = []
+    for r in conn.execute(_FREEZE_SQL, args):
+        if r["role"] == "system_owner":
+            times = []
+        elif r["supersedes_decision_id"] is not None:
+            times.append(datetime.fromisoformat(r["decided_at"]))
+    return any(b - a <= timedelta(days=FREEZE_DAYS) for a, b in zip(times, times[1:]))
 
 
 def _in_ticket_scope(d: Decision, run_id: str | None, run_pair: str | None, entries: frozenset[str],
@@ -818,7 +839,7 @@ def lookup_decisions(conn: sqlite3.Connection, signature: Signature, *, at: str 
     found = [_match(r) for r in rows]
     outside = [m for m in found if not _in_ticket_scope(m.decision, run_id, pair, entries, tickets)]
     related = [_match(r) for r in conn.execute(RELATED_SQL, args)]
-    return DecisionLookup(tuple(found), tuple(related), frozen=_frozen(conn, rows), out_of_scope=tuple(outside))
+    return DecisionLookup(tuple(found), tuple(related), frozen=_frozen(conn, args), out_of_scope=tuple(outside))
 
 
 def apply_inheritance(outcome: CheckpointOutcome, lookup: DecisionLookup) -> CheckpointOutcome:
@@ -1537,16 +1558,32 @@ class Store:
             raise ImportConflict(f"finding {f.finding_id} is already recorded with other content (8.2)")
 
     def _check_decision_reason(self, o: CheckpointOutcome, code: str | None) -> None:
-        """4.13 required fields: `decision:<id>` names an active (or reopened) decision whose verdict is the one the
-        outcome claims (noise, intended, or confirmed_bug for a known-bug collateral); a decision_ref exists."""
+        """4.13 required fields: `decision:<id>` names a decision the lookup could have matched for this record: active
+        (or reopened), not expired at the record's `recorded_at` (now when unset), on the record's checkpoint, with
+        the verdict the outcome claims (noise, intended, or confirmed_bug for a known-bug collateral) and an action
+        that acts through the signature (`DECISION_REASON_ACTIONS`; 9.7); a decision_ref exists."""
         did = None
         if code == "decision":
             did = self._split_reason(o.outcome, o.reason)[1]
             want = DECISION_REASON_VERDICT.get(o.outcome)
-            row = self._one("SELECT status, verdict FROM decisions WHERE decision_id = ?", (decision_int(did),))
-            if row is None or row["status"] not in ("active", "reopened") or row["verdict"] != want:
-                raise StoreRefused(f"{o.outcome} (reason: decision:{did}) needs an active decision {did} with verdict "
-                                   f"{want} (4.13)")
+            row = self._one("SELECT status, verdict, action, mask_ref, checkpoint_id, expires_at FROM decisions "
+                            "WHERE decision_id = ?", (decision_int(did),))
+            at = datetime.fromisoformat(utc(o.recorded_at) or now())
+            why = None
+            if row is None or row["status"] not in ("active", "reopened"):
+                why = "is not an active decision"
+            elif row["verdict"] != want:
+                why = f"has verdict {row['verdict']}"
+            elif (row["action"] not in DECISION_REASON_ACTIONS.get(o.outcome, ())
+                  or (row["action"] == "request_mask" and row["mask_ref"] is None)):
+                why = f"is a {row['action']} decision, which acts on no checkpoint outcome through the signature"
+            elif row["checkpoint_id"] != o.checkpoint_id:
+                why = f"is on checkpoint {row['checkpoint_id']}"
+            elif row["expires_at"] is not None and datetime.fromisoformat(row["expires_at"]) <= at:
+                why = f"expired at {row['expires_at']}"
+            if why is not None:
+                raise StoreRefused(f"{o.outcome} (reason: decision:{did}) needs an active {want} decision on "
+                                   f"{o.checkpoint_id} that acts through the signature; {did} {why} (4.13, 9.7)")
         if o.decision_ref and o.decision_ref != did and self._one(
                 "SELECT 1 FROM decisions WHERE decision_id = ?", (decision_int(o.decision_ref),)) is None:
             raise StoreRefused(f"{o.checkpoint_id} names unknown decision {o.decision_ref} (4.13 decision_ref)")
@@ -1584,9 +1621,10 @@ class Store:
 
     def _prepare_checkpoint(self, outcome: CheckpointOutcome, steps: Sequence[StepOutcome],
                             findings: Sequence[Finding], artifacts: Sequence[StoredArtifact], shard_id: str | None,
-                            step_side: str | None) -> _Prepared | None:
+                            step_side: str | None, *, required: bool = True) -> _Prepared | None:
         """Every write-time check of one checkpoint batch; None for a replay of the record already written. Reads
-        only, so it also runs inside a batch (`replace_dead_man_run`)."""
+        only, so it also runs inside a batch (`replace_dead_man_run`). `required=False` leaves out the two rules of
+        the 4.13 required-fields table (strict L-OUT-02 and review_state pending), which the repair path repairs."""
         o = _revalidate(outcome)
         placed = [(s, *self._step_place(s, shard_id, step_side)) for s in map(_revalidate, steps)]
         findings = [_revalidate(f) for f in findings]
@@ -1600,10 +1638,10 @@ class Store:
             raise ImportConflict(f"{o.checkpoint_id} in {o.run_id} already has an outcome; outcomes are written "
                                  "once (4.13, 8.2)")
         self._check_paper(o, shard_id)                              # L-OUT-06 before anything repairable
-        if self.strict_records and (errs := self.record_errors(o)):
+        if required and self.strict_records and (errs := self.record_errors(o)):
             raise RecordIncomplete(errs)                            # L-OUT-02
         code = self._split_reason(o.outcome, o.reason)[0]
-        if o.review_state == "pending" and code not in PENDING_REASONS:
+        if required and o.review_state == "pending" and code not in PENDING_REASONS:
             raise StoreRefused("review_state pending only with reason reviewer_unavailable or global_shift (4.13)")
         self._check_decision_reason(o, code)
         if o.base_source_run_id is not None and self._one("SELECT 1 FROM runs WHERE run_id = ?",
@@ -1655,14 +1693,20 @@ class Store:
     def write_checkpoint_or_repair(self, outcome: CheckpointOutcome, *,
                                    repair: Callable[[CheckpointOutcome, list[str]], CheckpointOutcome],
                                    on_refused: Callable[[CheckpointOutcome, list[str]], str],
-                                   **kw: Any) -> CheckpointOutcome:
+                                   steps: Sequence[StepOutcome] = (), findings: Sequence[Finding] = (),
+                                   artifacts: Sequence[StoredArtifact] = (), shard_id: str | None = None,
+                                   step_side: str | None = None) -> CheckpointOutcome:
         """The Orchestrator's write under L-OUT-02 (4.13): a record the required-fields table refuses gets one
         `repair(record, errors)`; if the repaired record is still refused, `on_refused(record, errors)` logs the
         Watchdog event and returns its id, and the checkpoint is written `harness_error (reason:
-        store_write_failed)` with that id in `detail`. `kw` goes to `write_checkpoint`. Returns the record written.
-        L-OUT-06 and every other refusal propagate: they are not repairable."""
+        store_write_failed)` with that id in `detail`. The keywords are `write_checkpoint`'s. Returns the record
+        written (the record itself for a replay of it). L-OUT-06 and every other refusal propagate: they are not
+        repairable, so they are checked on the record as given before any repair, and a missing or foreign
+        paper-mode stamp is never replaced by an exempt harness_error (SD-48 exempts records that captured nothing)."""
         o = outcome
         if errs := self.record_errors(o):
+            if self._prepare_checkpoint(o, steps, findings, artifacts, shard_id, step_side, required=False) is None:
+                return o                                            # 8.2: a replay of the record as written
             o = repair(o, errs)
             if errs := self.record_errors(o):
                 event = on_refused(o, errs)
@@ -1673,19 +1717,25 @@ class Store:
                     test_kind=o.test_kind, tier=o.tier, flow_id=o.flow_id, step_id=o.step_id, size_step=o.size_step,
                     flow_class=o.flow_class, profile_id=o.profile_id, outcome_id=o.outcome_id, pair_id=o.pair_id,
                     synthetic=o.synthetic, mutant_id=o.mutant_id, recorded_at=o.recorded_at)
-        self.write_checkpoint(o, **kw)
+        self.write_checkpoint(o, steps=steps, findings=findings, artifacts=artifacts, shard_id=shard_id,
+                              step_side=step_side)
         return o
 
     def write_steps(self, steps: Sequence[StepOutcome], *, shard_id: str | None = None, side: str | None = None,
                     checkpoint_id: str | None = None) -> None:
         """Write step outcomes as `step_events` rows outside a checkpoint batch (8.3), each under its own shard and
         side, else the call's; a disagreement is refused."""
+        with self._batch("steps") as rows:
+            self._put_steps(rows, steps, shard_id, side, checkpoint_id)
+
+    def _put_steps(self, rows: list[dict], steps: Sequence[StepOutcome], shard_id: str | None, side: str | None,
+                   checkpoint_id: str | None) -> None:
+        """`write_steps` inside a batch (the late arrival's too): its checks, then its rows."""
         placed = [(s, *self._step_place(s, shard_id, side)) for s in map(_revalidate, steps)]
         for s, _, _ in placed:
             self._running(s.run_id)
-        with self._batch("steps") as rows:
-            for s, shard, sd in placed:
-                self._insert(rows, "step_events", self._step_row(s, shard, sd, checkpoint_id))
+        for s, shard, sd in placed:
+            self._insert(rows, "step_events", self._step_row(s, shard, sd, checkpoint_id))
 
     def write_finding(self, finding: Finding, *, synthetic: bool = False) -> None:
         """Write a finding outside a checkpoint batch, e.g. a run-level finding (4.13)."""
@@ -1717,17 +1767,30 @@ class Store:
     _KEEP_TRIGGERS = ("trg_outcome_keep", "trg_outcome_record_keep")
 
     def replace_dead_man_run(self, run_id: str, rows: Sequence[CheckpointOutcome], *, outcome: RunOutcome,
-                             artifacts: Sequence[StoredArtifact] = (), findings: Sequence[Finding] = (),
+                             shard_of: Mapping[str, str] | None = None, artifacts: Sequence[StoredArtifact] = (),
+                             findings: Sequence[Finding] = (), steps: Sequence[StepOutcome] = (),
+                             events: Sequence[StepEvent] = (), extractions: Sequence[Extraction] = (),
+                             fingerprints: Sequence[Fingerprint] = (), proofs: Sequence[PostRunProof] = (),
                              arrived_at: str | None = None) -> RunOutcome:
         """10.2 crash during teardown, late arrival: the run the control host ended `aborted_harness (reason:
         dead_man)` at the deadline takes its real rows and outcome when they arrive.
 
-        In one batch: the `harness_error (reason: dead_man)` placeholders of the checkpoints `rows` cover move to
-        `outcomes_superseded` (kept for diagnosis, never counted, 8.3); `rows`, their `artifacts` and `findings`
-        are written with every write-time check; the run is ended `outcome` with the late arrival in its summary
-        (`late_arrival` with the deadline, the arrival and the delay in seconds, also under `health`, and the
-        dead-man alert closed as "late arrival" in `alerts`). Refused for a run that did not end dead_man, and with
-        everything rolled back when any row or the outcome is refused. The caller ends and imports the shards first.
+        `rows` cover every `harness_error (reason: dead_man)` placeholder of the run, or nothing is replaced: that
+        reason belongs only to an `aborted_harness (reason: dead_man)` run (1.10), so the run keeps it until all its
+        rows have arrived. Everything else the rigs shipped comes in the same call, since the writers of a finished
+        run refuse it: the shards' step `events` (each with its own seq), `steps`, `extractions`, `fingerprints` and
+        post-run `proofs` (6.6), beside the rows' `artifacts` and `findings`. Each row is written under its shard,
+        `shard_of[checkpoint_id]`, else the run's only shard (a run with several shards names every row's): the row
+        keeps its `shard_id` and that shard's L-OUT-06 session context applies; a step without its own shard takes
+        the run's only shard. A `complete` late outcome needs a post-run proof of every shard (the run-level row of a
+        run without shards): 1.10 "the post-run proof reads PROVEN" (`RunNotComplete`). Every item is of `run_id`.
+
+        In one batch: the placeholders move to `outcomes_superseded` (kept for diagnosis, never counted, 8.3); the
+        run is reopened and every item is written with its own writer's checks; the run is ended `outcome` with the
+        late arrival in its summary (`late_arrival` with the deadline, the arrival and the delay in seconds, also
+        under `health`, and the dead-man alert closed as "late arrival" in `alerts`). Refused for a run that did not
+        end dead_man, and with everything rolled back when any item or the outcome is refused. The caller ends and
+        imports the shards first.
         """
         run = self._one("SELECT * FROM runs WHERE run_id = ?", (run_id,))
         if run is None:
@@ -1739,20 +1802,39 @@ class Store:
         if r.run_id != run_id or (r.status, self._split_reason(r.status, r.reason)[0]) == ("aborted_harness",
                                                                                            "dead_man"):
             raise StoreRefused("the late arrival carries the run's real outcome (10.2)")
-        if not rows or any(o.run_id != run_id for o in rows):
+        if not rows or any(i.run_id != run_id for i in (*rows, *steps, *events, *extractions, *fingerprints,
+                                                         *proofs)):
             raise StoreRefused(f"a late arrival carries rows of run {run_id}, and only of it (10.2)")
+        shards = [sid for (sid,) in self._conn.execute("SELECT shard_id FROM shards WHERE run_id = ? ORDER BY rowid",
+                                                       (run_id,))]
+        only = shards[0] if len(shards) == 1 else None
+        placed = []
+        for o in rows:
+            sid = (shard_of or {}).get(o.checkpoint_id, only)
+            if sid is None and shards:
+                raise StoreRefused(f"{o.checkpoint_id}: name the shard of each late row of a run with {len(shards)} "
+                                   "shards (shard_of; 8.3 outcomes.shard_id)")
+            placed.append((o, sid))
+        for sid in [sid for _, sid in placed if sid is not None] + [s.shard_id or only for s in steps] + [
+                f.shard_id for f in fingerprints]:
+            if sid not in shards:
+                raise StoreRefused(f"{sid} is not a shard of run {run_id} (8.3)")
         at = utc(arrived_at) or now()
         delay = int((datetime.fromisoformat(at) - datetime.fromisoformat(run["finished_at"])).total_seconds())
         old = json.loads(run["summary_json"] or "{}")
         late = {"dead_man_at": run["finished_at"], "arrived_at": at, "delay_s": delay}
         extra = {"late_arrival": late, "health": {**old.get("health", {}), "late_arrival": late},
                  "alerts": [*old.get("alerts", []), {"alert": "dead_man", "closed_as": "late arrival", "at": at}]}
-        ids = [o.checkpoint_id for o in rows]
-        marks = ",".join("?" * len(ids))
+        ids = {o.checkpoint_id for o in rows}
+        every = {c for (c,) in self._conn.execute(
+            "SELECT checkpoint_id FROM outcomes WHERE run_id = ? AND synthetic = 0 AND outcome = 'harness_error' "
+            "AND reason = 'dead_man'", (run_id,))}
+        if uncovered := sorted(every - ids):
+            # 1.10: harness_error (dead_man) is only an aborted_harness (dead_man) run's; all rows or none (10.2)
+            raise StoreRefused(f"a late arrival replaces every dead_man placeholder of run {run_id}; {len(uncovered)} "
+                               f"not covered, first {uncovered[0]} (10.2, 1.10)")
+        placeholders = sorted(every & ids)
         with self._batch("late_arrival") as batch:
-            placeholders = [c for (c,) in self._conn.execute(
-                f"SELECT checkpoint_id FROM outcomes WHERE run_id = ? AND checkpoint_id IN ({marks}) AND synthetic = 0 "
-                "AND outcome = 'harness_error' AND reason = 'dead_man'", (run_id, *ids))]
             if placeholders:
                 pm = ",".join("?" * len(placeholders))
                 self._conn.execute(f"INSERT INTO outcomes_superseded SELECT o.*, 1 FROM outcomes o WHERE o.run_id = ? "
@@ -1774,12 +1856,25 @@ class Store:
             for a in artifacts:
                 self._verify_artifact(a)
                 self._put_artifact(batch, a, run_id)
-            for o in rows:
-                p = self._prepare_checkpoint(o, (), (), (), None, None)
+            self._put_events(batch, events)             # before the steps, which take MAX(seq) + 1 (8.3)
+            for o, sid in placed:
+                p = self._prepare_checkpoint(o, (), (), (), sid, None)
                 if p is not None:
                     self._put_checkpoint(batch, p)
+            self._put_steps(batch, steps, only, None, None)
             for f in findings:
                 self._put_finding(batch, _revalidate(f), False)
+            self._put_extractions(batch, extractions)
+            for fp in fingerprints:
+                self._put_fingerprint(batch, fp)
+            for pr in proofs:
+                self._put_proof(batch, pr)
+            if r.status == "complete":
+                have = {sid for (sid,) in self._conn.execute("SELECT shard_id FROM post_run_proofs WHERE run_id = ?",
+                                                             (run_id,))}
+                if lacking := [sid for sid in shards or [None] if sid not in have]:
+                    raise RunNotComplete(f"run {run_id} cannot be complete: no post-run proof of "
+                                         f"{lacking[0] or 'the run'} arrived (1.10, 6.6)")
             reopened = self._one("SELECT * FROM runs WHERE run_id = ?", (run_id,))
             self._update(batch, "runs", {"run_id": run_id}, self._end_change(reopened, r, extra))
         return self.run_outcome(run_id)
@@ -1835,12 +1930,20 @@ class Store:
         """Write a shard's post-run proof (8.3 `post_run_proofs`, 6.6): one per shard, written once, before the run
         ends. Refuses a shard not of the run, an unregistered login and a finished run; the same row again is a
         no-op, a different row for the shard an ImportConflict (8.2)."""
+        with self._batch("post_run_proof") as rows:
+            self._put_proof(rows, proof)
+
+    def _check_shard(self, shard_id: str | None, run_id: str) -> None:
+        shard = self._one("SELECT run_id FROM shards WHERE shard_id = ?", (shard_id,))
+        if shard is None or shard["run_id"] != run_id:
+            raise StoreRefused(f"{shard_id} is not a shard of run {run_id} (8.3)")
+
+    def _put_proof(self, rows: list[dict], proof: PostRunProof) -> None:
+        """`write_proof` inside a batch (the late arrival's too): its checks, then its row (none for a replay)."""
         p = dataclasses.replace(proof)                  # re-validates
         self._running(p.run_id)
         if p.shard_id is not None:
-            shard = self._one("SELECT run_id FROM shards WHERE shard_id = ?", (p.shard_id,))
-            if shard is None or shard["run_id"] != p.run_id:
-                raise StoreRefused(f"{p.shard_id} is not a shard of run {p.run_id} (8.3)")
+            self._check_shard(p.shard_id, p.run_id)
             old = self._one("SELECT * FROM post_run_proofs WHERE shard_id = ?", (p.shard_id,))
         else:
             old = self._one("SELECT * FROM post_run_proofs WHERE run_id = ? AND shard_id IS NULL", (p.run_id,))
@@ -1851,8 +1954,7 @@ class Store:
                 return
             raise ImportConflict(f"{p.shard_id or p.run_id} already has a post-run proof; one per shard (or one "
                                  "run-level row), written once (8.2)")
-        with self._batch("post_run_proof") as rows:
-            self._insert(rows, "post_run_proofs", values)
+        self._insert(rows, "post_run_proofs", values)
 
     def post_run_proofs(self, run_id: str) -> list[PostRunProof]:
         """The run's post-run proofs, one per shard, in shard order (8.3 `post_run_proofs`)."""
@@ -2090,8 +2192,9 @@ class Store:
         and L-DEC-08 cases; any decision on a frozen signature by a login not in `system_owners` (9.7); and, for a
         decision made on a finding, a plain (not superseding) decision on a signature that already has an
         applicable active decision (`ActiveDecisionExists`, 9.7; `manifest_entries` and `manifest_tickets` of the
-        run give the mark_intended scope). The same action on the same finding by the same person again returns the
-        decision already written (9.6 idempotent).
+        run give the mark_intended scope). The same action on the same finding by the same person again, with the
+        same verdict, ticket and signature and superseding nothing, returns the decision already written (9.6
+        idempotent); with `supersedes` it always takes the supersede path.
         """
         d = _revalidate(decision)
         finding_id = self._same("finding_id", finding_id, d.finding_ref)
@@ -2134,17 +2237,34 @@ class Store:
             if f is None:
                 raise StoreRefused(f"unknown finding {finding_id}")
             source_finding = f["finding_id"]
-            again = self._one("SELECT decision_id FROM decisions WHERE source_finding_id = ? AND action = ? AND "
-                              "decided_by = ? AND status IN ('active','reopened')",
-                              (source_finding, d.action, d.decided_by))
-            if again is not None:                                   # 9.6: idempotent per finding and action
+            again = None if supersedes is not None else self._one(
+                "SELECT decision_id FROM decisions WHERE source_finding_id = ? AND action = ? AND decided_by = ? "
+                "AND status IN ('active','reopened') AND verdict IS ? AND ticket_ref IS ? AND checkpoint_id = ? "
+                "AND region_id = ? AND category = ? AND phash = ?",
+                (source_finding, d.action, d.decided_by, d.verdict, d.ticket, d.signature.checkpoint_id,
+                 d.signature.region_id, d.signature.category, phash_bytes(d.signature.phash)))
+            if again is not None:      # 9.6: the same click again (a supersession or a changed field is no repeat)
                 return self._stored_decision(decision_ref(again[0]))
         old = None
         if supersedes is not None:
-            old = self._one("SELECT status, build_id, decided_by, source_finding_id FROM decisions "
-                            "WHERE decision_id = ?", (decision_int(supersedes),))
+            old = self._one("SELECT status, build_id, decided_by, source_finding_id, checkpoint_id, region_id, "
+                            "category, phash, hamming_tolerance, action FROM decisions WHERE decision_id = ?",
+                            (decision_int(supersedes),))
             if old is None or old["status"] not in ("active", "reopened"):
                 raise StoreRefused(f"{supersedes} is not an active decision to supersede (8.3)")
+            sig, dist = d.signature, hamming(old["phash"], d.signature.phash)
+            if ((old["checkpoint_id"], old["region_id"], old["category"]) != (sig.checkpoint_id, sig.region_id,
+                                                                            sig.category)
+                    or dist > old["hamming_tolerance"]):
+                # 9.7: a supersession replaces the active row of this signature, the one the lookup matches
+                raise StoreRefused(f"{supersedes} is a decision on another signature ({old['checkpoint_id']} / "
+                                   f"{old['region_id']} / {old['category']}, pHash at Hamming {dist} with tolerance "
+                                   f"{old['hamming_tolerance']}); supersede the active decision of this signature "
+                                   "(9.7)")
+            if d.action == "fixed_in_build" and not (old["action"] == "confirm_bug" or (
+                    old["action"] == "fixed_in_build" and old["status"] == "reopened")):
+                raise StoreRefused(f"fixed_in_build supersedes the confirm_bug decision on the signature (or its "
+                                   f"reopened fix), not {old['action']} {supersedes} (SD-79, 4.14)")
         if d.action == "approve_baseline":
             self._approvable(run_id, d, cp["tier"])
         if d.action == "fixed_in_build" and fixed_in_build_id is not None:
@@ -2153,9 +2273,10 @@ class Store:
                   or ("confirmed_bug" if d.verdict == "confirmed_bug" else "open"))   # reject_baseline (4.14)
         self.taxonomy.check_member("triage_states", triage)
         with self._batch("decision") as rows:
+            role = d.role
             if d.action not in BASELINE_ACTIONS:                    # inside the batch: writes serialize (9.7)
-                self._check_signature_free(d, run_id, decided_at, supersedes, source_finding, manifest_entries,
-                                           manifest_tickets)
+                role = self._check_signature_free(d, run_id, decided_at, supersedes, source_finding,
+                                                  manifest_entries, manifest_tickets)
             self._insert(rows, "decisions", {
                 "decision_id": did, "checkpoint_id": d.signature.checkpoint_id, "region_id": d.signature.region_id,
                 "phash": phash_bytes(d.signature.phash), "hamming_tolerance": tolerance,
@@ -2165,7 +2286,7 @@ class Store:
                 "ticket_ref": d.ticket, "mask_ref": mask_ref, "baseline_id": baseline_id,
                 "fixed_in_build_id": fixed_in_build_id, "cluster_id": cluster_id, "expires_at": expires_at,
                 "status": "active", "supersedes_decision_id": decision_int(supersedes),
-                "source_finding_id": source_finding, "role": d.role, "reopen_count": d.reopen_count,
+                "source_finding_id": source_finding, "role": role, "reopen_count": d.reopen_count,
                 "bbox_q4": None if d.bbox_q4 is None else ",".join(map(str, d.bbox_q4))})
             if supersedes is not None:
                 self._update(rows, "decisions", {"decision_id": decision_int(supersedes)}, {"status": "superseded"})
@@ -2183,19 +2304,31 @@ class Store:
 
     def _check_signature_free(self, d: Decision, run_id: str, at: str, supersedes: str | None,
                               source_finding: int | None, manifest_entries: Iterable[str],
-                              manifest_tickets: Iterable[str]) -> None:
-        """9.7 Two humans, one signature: on a frozen signature only a system owner decides; a plain decision made
-        on a finding is refused while an applicable active decision matches the signature."""
+                              manifest_tickets: Iterable[str]) -> str | None:
+        """9.7 Two humans, one signature: on a frozen signature only a system owner decides, in that role (the role
+        to store is returned: `system_owner` there, the decision's own elsewhere; only a configured system owner
+        claims that role, since it ends a freeze); a plain decision made on a finding is refused while an applicable
+        active decision matches the signature."""
+        role = d.role
+        if role == "system_owner" and d.decided_by not in self.system_owners:
+            raise StoreRefused(f"{d.decided_by} is not a system owner of this store and cannot decide in that role "
+                               "(9.7: the system owner's decision ends a frozen signature)")
         look = lookup_decisions(self._conn, d.signature, at=at, run_id=run_id, manifest_entries=manifest_entries,
                                 manifest_tickets=manifest_tickets)
-        if look.frozen and d.decided_by not in self.system_owners:
-            raise StoreRefused(f"the signature of {d.signature.checkpoint_id} / {d.signature.region_id} is frozen "
-                               "(two supersessions within 30 days): the next decision needs the system owner (9.7)")
+        if look.frozen:
+            if d.decided_by not in self.system_owners:
+                raise StoreRefused(f"the signature of {d.signature.checkpoint_id} / {d.signature.region_id} is frozen "
+                                   "(two supersessions within 30 days): the next decision needs the system owner (9.7)")
+            if role not in (None, "system_owner"):
+                raise StoreRefused(f"the decision on a frozen signature is the system owner's: role system_owner, not "
+                                   f"{role} (9.7)")
+            role = "system_owner"
         active = [m.decision for m in look.applicable]
         if supersedes is None and source_finding is not None and active:
             ids = ", ".join(f"{a.decision_id} ({a.action} by {a.decided_by})" for a in active)
             raise ActiveDecisionExists(f"the signature already has an active decision: {ids}; supersede or revoke "
                                        "it (9.7)", active)
+        return role
 
     def revoke_decision(self, decision_id: str, *, by: str, reason: str, at: str | None = None) -> Decision:
         """Revoke a decision: the three revoke fields together and status revoked (8.3, 4.14); the row stays."""
@@ -2344,15 +2477,17 @@ class Store:
         """Write `step_events` rows (8.3): inputs, popups, captures, gateway decisions, Watchdog events and
         relaunches, with each event's own seq and mono_ms. Keyed (shard_id, seq): the same event again is a no-op,
         a different one an ImportConflict. Refuses a shard not of the event's run and a finished run."""
+        with self._batch("events") as rows:
+            self._put_events(rows, events)
+
+    def _put_events(self, rows: list[dict], events: Sequence[StepEvent]) -> None:
+        """`write_events` inside a batch (the late arrival's too): its checks, then its rows."""
         evs = [_revalidate(e) for e in events]
         for e in evs:
             self._running(e.run_id)
-            shard = self._one("SELECT run_id FROM shards WHERE shard_id = ?", (e.shard_id,))
-            if shard is None or shard["run_id"] != e.run_id:
-                raise StoreRefused(f"{e.shard_id} is not a shard of run {e.run_id} (8.3)")
-        with self._batch("events") as rows:
-            for e in evs:
-                self._write_once(rows, "step_events", {"shard_id": e.shard_id, "seq": e.seq}, self._event_row(e))
+            self._check_shard(e.shard_id, e.run_id)
+        for e in evs:
+            self._write_once(rows, "step_events", {"shard_id": e.shard_id, "seq": e.seq}, self._event_row(e))
 
     def step_events(self, run_id: str) -> list[StepEvent]:
         """The run's step events in shard and seq order (8.3)."""
@@ -2371,13 +2506,17 @@ class Store:
     def write_extractions(self, extractions: Sequence[Extraction]) -> None:
         """Store every Oracle extraction (2.8.1, 8.3 oracle_extractions); replays are no-ops, a different read for
         the same key an ImportConflict."""
+        with self._batch("extractions") as rows:
+            self._put_extractions(rows, extractions)
+
+    def _put_extractions(self, rows: list[dict], extractions: Sequence[Extraction]) -> None:
+        """`write_extractions` inside a batch (the late arrival's too): its checks, then its rows."""
         xs = [dataclasses.replace(x) for x in extractions]
         for x in xs:
             self._running(x.run_id)
-        with self._batch("extractions") as rows:
-            for x in xs:
-                row = {**dataclasses.asdict(x), "second_pass": int(x.second_pass), "read_at": utc(x.read_at)}
-                self._write_once(rows, "oracle_extractions", {k: row[k] for k in self._EXTRACTION_KEY}, row)
+        for x in xs:
+            row = {**dataclasses.asdict(x), "second_pass": int(x.second_pass), "read_at": utc(x.read_at)}
+            self._write_once(rows, "oracle_extractions", {k: row[k] for k in self._EXTRACTION_KEY}, row)
 
     def extractions(self, run_id: str, checkpoint_id: str | None = None) -> list[Extraction]:
         sql = "SELECT * FROM oracle_extractions WHERE run_id = ?" + (" AND checkpoint_id = ?" if checkpoint_id else "")
@@ -2390,6 +2529,11 @@ class Store:
     def write_fingerprint(self, fp: Fingerprint) -> None:
         """Write one side's fingerprint of a shard (8.3 env_fingerprints), once: the same fingerprint again is a
         no-op, a different one an ImportConflict (8.2). The build and rig must be registered."""
+        with self._batch("fingerprint") as rows:
+            self._put_fingerprint(rows, fp)
+
+    def _put_fingerprint(self, rows: list[dict], fp: Fingerprint) -> None:
+        """`write_fingerprint` inside a batch (the late arrival's too): its checks, then its row."""
         f = dataclasses.replace(fp)                      # re-validates; fingerprint_id recomputes (L-FPR-01)
         if f.shard_id is None:
             raise StoreRefused("a stored fingerprint names its shard (8.3 env_fingerprints.shard_id)")
@@ -2400,8 +2544,7 @@ class Store:
                "fields_json": canonical_json({"schema_version": f.schema_version, "match": f.match,
                                               "record": f.record}),
                "render_probe_hash": phash_bytes(probe) if isinstance(probe, str) and _PHASH_RE.match(probe) else None}
-        with self._batch("fingerprint") as rows:
-            self._write_once(rows, "env_fingerprints", {"shard_id": f.shard_id, "side": f.side}, row)
+        self._write_once(rows, "env_fingerprints", {"shard_id": f.shard_id, "side": f.side}, row)
 
     def fingerprint(self, shard_id: str, side: str) -> Fingerprint | None:
         r = self._one("SELECT * FROM env_fingerprints WHERE shard_id = ? AND side = ?", (shard_id, side))

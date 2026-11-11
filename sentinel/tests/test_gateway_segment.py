@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
-import multiprocessing
 import random
 import struct
+import subprocess
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -25,6 +24,7 @@ from sentinel.orchestrator.gateway import (Chord, DenyRect, Flag, GatewayState, 
 
 T = 100.0
 TESTS = Path(__file__).resolve().parent
+SRC = TESTS.parent / "src"
 
 
 def fresh() -> bytearray:
@@ -249,18 +249,22 @@ def test_a_writer_that_raises_leaves_seq_odd_so_the_hook_fails_closed():
     assert decide_from_segment(buf, ev("key_down", vk=0x41), to_ns(T)).allowed
 
 
-def _writer(name: str, rounds: int, started) -> None:
-    seg = Segment.attach(name)
-    w = SegmentWriter(seg.buf)
-    started.set()
-    for k in range(1, rounds + 1):
-        with w.transaction() as b:
-            for i in range(sg.TOKEN_SLOTS):                                        # every slot carries k
-                sg._TOKEN_SLOW.pack_into(b, sg.OFF_TOKENS + i * sg.TOKEN_SIZE, k, 1, 0, 1, k, k, 2, k)
-        gap = time.perf_counter_ns() + 20_000                                      # writes come in bursts, not
-        while time.perf_counter_ns() < gap:                                        # back to back (a seqlock
-            pass                                                                   # starves its readers then)
-    seg.close()
+WRITER = """
+import sys, time
+sys.path.insert(0, sys.argv[1])
+from sentinel.gateway import segment as sg
+seg = sg.Segment.attach(sys.argv[2])
+w = sg.SegmentWriter(seg.buf)
+print("started", flush=True)
+for k in range(1, int(sys.argv[3]) + 1):
+    with w.transaction() as b:
+        for i in range(sg.TOKEN_SLOTS):                      # every slot carries k
+            sg._TOKEN_SLOW.pack_into(b, sg.OFF_TOKENS + i * sg.TOKEN_SIZE, k, 1, 0, 1, k, k, 2, k)
+    gap = time.perf_counter_ns() + 20_000                    # writes come in bursts, not back to back
+    while time.perf_counter_ns() < gap:                      # (a seqlock starves its readers then)
+        pass
+seg.close()
+"""
 
 
 def _slot_values(snap: bytes) -> set[int]:
@@ -271,25 +275,22 @@ def _slot_values(snap: bytes) -> set[int]:
     return out
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="fork start method")
 def test_seqlock_across_two_processes_never_yields_a_torn_picture():
     seg = Segment.create(orchestrator_pid=1)
     try:
-        ctx = multiprocessing.get_context("fork")
-        started = ctx.Event()
-        p = ctx.Process(target=_writer, args=(seg.name, 5_000, started))
-        p.start()
-        assert started.wait(30)
+        p = subprocess.Popen([sys.executable, "-I", "-c", WRITER, str(SRC), seg.name, "5000"],
+                             stdout=subprocess.PIPE, text=True)
+        assert p.stdout.readline().strip() == "started"
         seen = set()
-        while p.is_alive():
+        while p.poll() is None:
             snap = read_snapshot(seg.buf, max_spins=1_000)
             if snap is None:                       # starved while the writer was descheduled mid-write: retry
                 continue
             vals = _slot_values(snap)
             assert len(vals) == 1, f"torn read: {vals}"
             seen |= vals
-        p.join(30)
-        assert p.exitcode == 0 and len(seen) > 1
+        assert p.wait(30) == 0 and len(seen) > 1
+        p.stdout.close()
     finally:
         seg.close()
         seg.unlink()

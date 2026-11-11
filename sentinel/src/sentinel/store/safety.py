@@ -565,7 +565,13 @@ def reenable(store: Store, kind: str, target: str, *, by: str, role: str, reason
 
 # -- one control result, persisted ------------------------------------------------------------------------------
 def blocked_reason_for(result: ControlResult) -> str:
-    """The 8.3 `blocked_reason` of a result that asks for `block_login` (6.4, 6.5, 6.6, 6.8)."""
+    """The 8.3 `blocked_reason` of a result that asks for `block_login` (6.4, 6.5, 6.6, 6.8).
+
+    The control that asked names it in `evidence["blocked_reason"]` when it can (the kill switch and the proof do);
+    that wins, and the mapping below covers the controls that do not."""
+    named = result.evidence.get("blocked_reason") if isinstance(result.evidence, dict) else None
+    if isinstance(named, str) and named:
+        return named
     if result.control == "fire_drill":
         return "drill_order_placed"
     if result.run_reason == "live_identity":

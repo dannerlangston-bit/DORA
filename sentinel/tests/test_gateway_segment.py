@@ -550,3 +550,23 @@ def test_parity_on_a_seeded_random_corpus():
         for _ in range(rng.randint(1, 12)):
             dual(g, _random_event(rng), T + rng.choice((0.0, 0.2, 0.5, 0.6, 1.2, 2.5)))
     assert dual.calls > 2000
+
+
+
+def test_a_new_send_ok_token_reopens_the_send_rect_once_and_the_writer_never_sets_it():
+    """6.7: each send_ok token passes the Send rectangle once; publishing clears the pass only for a new token."""
+    g = gw.GatewayState(armed=True)
+    g.deny_rects = (gw.DenyRect(gw.Rect(900, 600, 40, 20), "Send"),)
+    seg = Segment.create(orchestrator_pid=1)
+    try:
+        w = SegmentWriter(seg.buf)
+        click = gw.InputEvent("button_down", 920, 610, button="left", origin="emitter")
+        for _ in range(2):                              # two declared sends, each with its own token
+            g.issue_click(920, 610, T, send_ok=True, dialog_ok=True)
+            w.publish(g)
+            assert decide_from_segment(seg.buf, click, to_ns(T)).allowed
+            w.publish(g)                                # re-publishing the same token does not reopen it
+            assert seg.buf[sg.OFF_SEND_PASSED] == 1
+    finally:
+        seg.close()
+        seg.unlink()

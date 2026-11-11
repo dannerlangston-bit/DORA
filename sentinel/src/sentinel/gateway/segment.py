@@ -505,7 +505,12 @@ class SegmentWriter:
             tail[OFF_BLOCKED_VK - OFF_MOVE_ALLOW + (vk >> 3)] |= 1 << (vk & 7)
         for i, (bits, vk) in enumerate(chords):
             _CHORD.pack_into(tail, OFF_CHORDS - OFF_MOVE_ALLOW + i * _CHORD.size, bits, vk)
+        # a newly issued send_ok token reopens the Send rectangle once, as GatewayState.issue_click does (6.7);
+        # the writer only ever clears send_rect_passed: setting it is the hook's, so a pass is never overwritten
+        reopen = any(getattr(tokens[tid], "send_ok", False) for tid in tokens if tid not in self._published)
         with self.transaction() as b:
+            if reopen:
+                b[OFF_SEND_PASSED] = 0
             struct.pack_into("<BBB", b, OFF_ARMED, int(state.armed), int(state.deny_all), int(state.flag))
             struct.pack_into("<BB", b, OFF_DENY_COUNT, len(rects), len(chords))
             _I64.pack_into(b, OFF_WATCHER_TS, to_ns(state.watcher_mono_ts))

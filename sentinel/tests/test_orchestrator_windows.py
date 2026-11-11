@@ -5,7 +5,8 @@ import numpy as np
 import pytest
 
 from sentinel import synth
-from sentinel.orchestrator.gateway import DENY_INFLATE_PX, Flag, GatewayError, GatewayState, Rect
+from sentinel.orchestrator.gateway import (DENY_INFLATE_PX, Flag, GatewayError, GatewayState, InputEvent, Rect,
+                                           hook_decide)
 from sentinel.orchestrator.killswitch import TripWires, check_tripwires
 from sentinel.orchestrator.ports import Frame, WindowInfo
 from sentinel.orchestrator.windows import (DETECTOR_STALE_S, LADDER_COLUMN, SendTemplate, TitleSets, WindowWatcher,
@@ -136,6 +137,28 @@ def test_enumeration_or_capture_failure_is_unknown():
     assert w.poll([MAIN_WIN], stale, TEMPLATES, now=T0 + DETECTOR_STALE_S + 0.01)[0] == Flag.UNKNOWN
     w.poll([MAIN_WIN], frame(T0 + 2, ticket=False), TEMPLATES, now=T0 + 2)
     assert w.poll([MAIN_WIN], frame(T0 + 2, ticket=False), TEMPLATES, now=T0 + 2.1)[0] == Flag.CLEAR
+
+
+def test_a_failed_or_stale_capture_keeps_the_send_controls_the_last_good_capture_located():
+    """Choice 6 (5.4.2, 5.4.4, 5.4.6): a missing or stale grab makes the flag unknown and keeps the deny rectangles
+    of the last good capture, so the hook still drops a click on the dialog's Send; only a good capture that no
+    longer finds the control removes its rectangle."""
+    g = GatewayState(armed=True)
+    w = WindowWatcher(TITLES)
+    up = [MAIN_WIN, DIALOG_WIN]
+    want = [(send_bounds().inflate(DENY_INFLATE_PX), "Send")]
+    assert w.poll_into(g, up, frame(dialog=True), TEMPLATES, now=T0) == Flag.SET
+    assert [(d.rect, d.label) for d in g.deny_rects] == want
+    assert w.poll_into(g, up, None, TEMPLATES, now=T0 + 0.1) == Flag.UNKNOWN                     # no grab
+    assert [(d.rect, d.label) for d in g.deny_rects] == want
+    late = T0 + DETECTOR_STALE_S + 0.1
+    assert w.poll_into(g, up, frame(T0, dialog=True), TEMPLATES, now=late) == Flag.UNKNOWN        # a stale grab
+    assert [(d.rect, d.label) for d in g.deny_rects] == want
+    x, y = send_bounds().x + 20, send_bounds().y + 10
+    g.issue_click(x, y, late, dialog_ok=True)                    # a Delete-labelled token over Send after a nudge
+    assert hook_decide(g, InputEvent("button_down", x, y, button="left"), late).reason == "deny_rect"
+    w.poll_into(g, [MAIN_WIN], frame(T0 + 2, ticket=False), TEMPLATES, now=T0 + 2)               # dialog gone
+    assert g.deny_rects == []
 
 
 def test_a_failed_enumeration_keeps_the_dialog_age():

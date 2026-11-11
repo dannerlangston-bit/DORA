@@ -17,6 +17,10 @@ setting read On and no working orders. Outcomes:
   (`aborted_safety (reason: kill_switch)`). Dialog absent with no row: still `aborted_safety (reason:
   attestation_mismatch)`, because the confirmation path is unproven. A window whose title cannot be
   read counts as absent.
+- A3 "absent" (6.13 item 3, branch B: Phase 0 found no confirmation option): the profile's A3 reads
+  "absent", A3 must read "absent", and A9 is the sole attestation of the dialog, run twice at
+  `settings_attested`: both checks must pass, the second runs only after the first passed, and its
+  screenshot hash joins A11 as `A9_second`.
 - A10 (RC runs): a mismatch aborts the Explorer stage only; unreadable Notifications make the Explorer
   stage `not_run (reason: entitlement)`; the RC run continues either way.
 - A11: the content hashes of the A1 to A10 screenshots present on the run row, else `aborted_harness`.
@@ -31,7 +35,9 @@ floor, 5.4.6) and 90 for OCR until Phase 0 pins them. When several rows fail, th
 mismatch (A8 before A3 to A7, S1 before S2), then an unreadable row, then profile drift, since an unread
 safety setting is the graver unknown. A Hot Keys binding whose text cannot be parsed as a chord makes A6
 unreadable, because it cannot be loaded into the chord list. A7 is a mismatch when any panel in the read,
-named by the profile or not, shows Auto Send anything but Off.
+named by the profile or not, shows Auto Send anything but Off. An "absent" A3 or A4 is compared like A4 already
+was: a profile that expects "absent" and reads a toggle is a mismatch, and so is a profile that expects a toggle
+and reads "absent", since either way the pinned settings page is not the one attested.
 """
 from __future__ import annotations
 
@@ -47,6 +53,7 @@ from .rig import ConfirmationCheck, HotkeyRow, NotificationsRead, SettingRead
 GATE = "settings_attested"
 SAFETY_ROWS = ("A3", "A4", "A5", "A6", "A7", "A8")
 ORDER_WORDS = re.compile(r"buy|sell|send|cancel|flatten|blast", re.I)
+ABSENT = "absent"                                    # 6.13 items 2 and 3: the option is on no settings page
 
 
 @dataclass(frozen=True)
@@ -61,19 +68,34 @@ class Floors:
 class AttestationProfile:
     """The expected values: the checked-in settings profile (4.9) plus the corpus entry's Active Trader panels."""
 
-    order_confirmation: bool = True                 # A3 On
+    order_confirmation: bool | str = True           # A3 On, or "absent" if Phase 0 finds no such option (6.13 item 3)
     shift_click_send: bool | str = False            # A4 Off, or "absent" if Phase 0 finds no such option
     active_trader_hotkeys: bool = False             # A5 disabled
     non_order_actions: frozenset[str] = frozenset()  # A6 pinned list of non-order actions
     active_trader_panels: tuple[str, ...] = ()      # A7, from the corpus entry (4.6)
     sha256: str | None = None
 
+    def __post_init__(self) -> None:
+        for name in ("order_confirmation", "shift_click_send"):
+            v = getattr(self, name)
+            if not isinstance(v, bool) and v != ABSENT:
+                raise ValueError(f"{name} is a bool or {ABSENT!r} (6.13), got {v!r}")
+
+    @property
+    def a9_runs(self) -> int:
+        """How many A9 checks `settings_attested` needs: two when A3 is "absent" (6.13 item 3), else one."""
+        return 2 if self.order_confirmation == ABSENT else 1
+
     @classmethod
     def from_settings(cls, settings: Mapping[str, object], *, panels: tuple[str, ...] = (),
                       non_order_actions: frozenset[str] = frozenset(), sha256: str | None = None) -> "AttestationProfile":
-        """From the `settings` block of an `app_settings` profile (config/example/profiles)."""
-        return cls(order_confirmation=bool(settings.get("order_confirmation", True)),
-                   shift_click_send=settings.get("shift_click_send", False),  # type: ignore[arg-type]
+        """From the `settings` block of an `app_settings` profile (config/example/profiles); A3 and A4 keep an
+        "absent" value as it is."""
+        def toggle(key: str, default: bool) -> bool | str:
+            v = settings.get(key, default)
+            return ABSENT if v == ABSENT else bool(v)
+        return cls(order_confirmation=toggle("order_confirmation", True),
+                   shift_click_send=toggle("shift_click_send", False),
                    active_trader_hotkeys=bool(settings.get("active_trader_hotkeys", False)),
                    non_order_actions=non_order_actions, active_trader_panels=panels, sha256=sha256)
 
@@ -122,18 +144,23 @@ def readable(read: SettingRead, profile: AttestationProfile, floors: Floors = Fl
         return isinstance(v, Mapping) and all(isinstance(v.get(p), bool) for p in profile.active_trader_panels)
     if read.item == "A8":
         return isinstance(v, int) and not isinstance(v, bool) and v >= 0
-    if read.item == "A4":
-        return isinstance(v, bool) or v == "absent"
+    if read.item in ("A3", "A4"):
+        return isinstance(v, bool) or v == ABSENT
     return isinstance(v, bool)
+
+
+def _same_toggle(v: object, expected: bool | str) -> bool:
+    """A toggle or "absent" read against its expectation: a bool by identity, "absent" by equality."""
+    return v is expected if isinstance(v, bool) else v == expected == ABSENT
 
 
 def matches(read: SettingRead, profile: AttestationProfile) -> bool:
     """The row's value equals the checklist's expectation (12.6 Expected)."""
     v = read.value
     if read.item == "A3":
-        return v is profile.order_confirmation
+        return _same_toggle(v, profile.order_confirmation)
     if read.item == "A4":
-        return v == profile.shift_click_send
+        return _same_toggle(v, profile.shift_click_send)
     if read.item == "A5":
         return v is profile.active_trader_hotkeys
     if read.item == "A6":
@@ -146,11 +173,17 @@ def matches(read: SettingRead, profile: AttestationProfile) -> bool:
     raise ValueError(f"not an attestation row read here: {read.item}")
 
 
+def a9_passed(check: ConfirmationCheck) -> bool:
+    """A9's own verdict: the dialog appeared and Working is unchanged (6.3)."""
+    return check.dialog_appeared and check.working_new_rows == 0
+
+
 def attest(reads: Mapping[str, RowReads], profile: AttestationProfile, *, a9: ConfirmationCheck | None,
            evidence: Mapping[str, str | None], a10: NotificationsRead | None = None, rc_run: bool = False,
            profile_drift: bool = False, previous_unreadable: bool = False,
-           floors: Floors = Floors()) -> AttestationResult:
-    """Decide the `settings_attested` gate from the reads of A3 to A8, A9's check, A10 (RC runs) and A11."""
+           floors: Floors = Floors(), a9_second: ConfirmationCheck | None = None) -> AttestationResult:
+    """Decide the `settings_attested` gate from the reads of A3 to A8, A9's check (twice when A3 is "absent":
+    `a9_second`, taken only after `a9` passed), A10 (RC runs) and A11."""
     missing = [i for i in SAFETY_ROWS if i not in reads]
     if missing:
         raise ValueError(f"attestation needs every row A3 to A8; missing {missing}")
@@ -185,16 +218,23 @@ def attest(reads: Mapping[str, RowReads], profile: AttestationProfile, *, a9: Co
             detail="a non-safety profile row still wrong after the one re-apply (7.6 stage 1)"), rows, chords)
     if a9 is None:
         raise ValueError("A3 to A8 passed: A9 must run next")
-    if a9.working_new_rows > 0 or not a9.dialog_appeared:
+    checks = [("A9", a9)]
+    if profile.a9_runs == 2 and a9_passed(a9):
+        if a9_second is None:
+            raise ValueError("A3 reads 'absent': A9 is the sole attestation of the dialog and runs twice (6.13 item 3)")
+        checks.append(("A9 (second check)", a9_second))
+    for name, check in checks:
+        if a9_passed(check):
+            continue
         rows["A9"] = "mismatch"
-        new_row = a9.working_new_rows > 0
-        run, un = safety_abort_outcome(GATE, "kill_switch" if new_row else "attestation_mismatch", detail="A9")
+        new_row = check.working_new_rows > 0
+        run, un = safety_abort_outcome(GATE, "kill_switch" if new_row else "attestation_mismatch", detail=name)
         return AttestationResult(ControlResult(
             "attestation", False, GATE, run=run, unreached=un, alert=alerts.safety_abort(),
             actions=("kill_switch",), incident="S1" if new_row else "S2",
-            detail="A9: a new Working row after Confirm and Send" if new_row
-            else "A9: the Order Confirmation dialog did not appear; the confirmation path is unproven",
-            evidence={"screenshot": a9.screenshot_sha256}), rows, chords)
+            detail=f"{name}: a new Working row after Confirm and Send" if new_row
+            else f"{name}: the Order Confirmation dialog did not appear; the confirmation path is unproven",
+            evidence={"screenshot": check.screenshot_sha256}), rows, chords)
     rows["A9"] = "match"
     explorer_stage = None
     outcomes: tuple[SubsetOutcome, ...] = ()
@@ -208,7 +248,8 @@ def attest(reads: Mapping[str, RowReads], profile: AttestationProfile, *, a9: Co
             explorer_stage, rows["A10"] = "aborted_safety", "mismatch"
         else:
             explorer_stage, rows["A10"] = "allowed", "match"
-    need = ["A1", "A2", *SAFETY_ROWS, "A9"] + (["A10"] if rc_run else [])
+    need = ["A1", "A2", *SAFETY_ROWS, "A9"] + (["A9_second"] if profile.a9_runs == 2 else []) \
+        + (["A10"] if rc_run else [])
     absent = [i for i in need if not evidence.get(i)]
     if absent:
         rows["A11"] = "mismatch"

@@ -8,7 +8,8 @@ import sys
 
 import pytest
 
-from sentinel.records import CheckpointOutcome, Decision, DiffSummary, Finding, RunOutcome, Signature, StepOutcome
+from sentinel.records import (CheckpointOutcome, Component, Decision, DiffSummary, Finding, RunOutcome, Signature,
+                              StepOutcome)
 from sentinel.store import (ImportConflict, Review, RunNotComplete, RunPlan, ScopeEntry, ShardPlan, Store, StoreError,
                             StoreRefused, StoreWriteFailed, WriterLockError, apply_inheritance, connect_reader, hamming,
                             render_schema, seed_rows)
@@ -238,6 +239,17 @@ def test_outcome_mutation_refused(store):
     assert store.get_outcome(*key).outcome == "collateral"
 
 
+def test_a_component_without_a_region_box_reads_back(store):
+    # records.Component's bbox_region is null when the engine gave no region-relative box; Store.outcomes() reads
+    # such a stored component back as a plain Component instead of crashing on tuple(None)
+    comp = Component(area=40, bbox=(10, 20, 8, 5), region_id="rgn.ladder.bid-column")
+    o = out(CENSUS, "collateral", diff=DiffSummary(whole_pixel_fraction=0.02, whole_ssim=0.97, components=[comp]))
+    store.write_checkpoint(o)
+    (back,) = store.outcomes(RUN)
+    assert back.diff.components == [comp] and back.diff.components[0].bbox_region is None
+    assert store.get_outcome(RUN, CENSUS) == o
+
+
 def test_round_trip_of_records(store):
     o = out(SWEEP, "landmark_missing", reason="locator:s07", detail="rung jab missed", side="candidate", tier=2,
             diff=DiffSummary(whole_pixel_fraction=0.5))
@@ -255,17 +267,21 @@ def test_a_steps_gateway_event_is_stored_in_the_gate_columns_and_read_back(tmp_p
         s.register_rig("rig-a1", login_alias="paper-01", owner="qa", snapshot_id="snap-1", allowlist_entry=1)
         s.begin_run(plan(shards=(ShardPlan(f"{RUN}/1", "rig-a1"),)))
         refused = StepOutcome(RUN, flow, "s07+enter", "blocked_by_gateway",
-                              gateway_event={"decision": "refused", "reason": "guarded_key_refused", "class": "safety"})
+                              gateway_event={"decision": "refused", "reason": "guarded_key_refused", "class": "safety"},
+                              action="gateway_decision")
         dropped = StepOutcome(RUN, flow, "s06", "blocked_by_gateway",
-                              gateway_event={"decision": "dropped", "reason": "token_expired", "class": "integrity"})
-        emitted = StepOutcome(RUN, flow, "s05", "passed", gateway_event={"decision": "emitted", "class": "allowed"})
-        plain = StepOutcome(RUN, flow, "s04", "passed")
+                              gateway_event={"decision": "dropped", "reason": "token_expired", "class": "integrity"},
+                              action="gateway_decision")
+        emitted = StepOutcome(RUN, flow, "s05", "passed", gateway_event={"decision": "emitted", "class": "allowed"},
+                              action="click")
+        plain = StepOutcome(RUN, flow, "s04", "passed", action="wait")
         s.write_steps([refused, dropped, emitted, plain], shard_id=f"{RUN}/1", side="candidate")
         rows = s.conn.execute("SELECT step_id, gate_decision, gate_reason, gate_class FROM step_events ORDER BY seq")
         assert [tuple(r) for r in rows] == [("s07+enter", "refused", "guarded_key_refused", "safety"),
                                             ("s06", "dropped", "token_expired", "integrity"),
                                             ("s05", "emitted", None, "allowed"), ("s04", "none", None, None)]
-        assert s.step_outcomes(RUN) == [refused, dropped, emitted, plain]
+        placed = dict(side="candidate", shard_id=f"{RUN}/1", mode="scripted")   # stored under its shard and side
+        assert s.step_outcomes(RUN) == [dataclasses.replace(x, **placed) for x in (refused, dropped, emitted, plain)]
         assert s.gateway_drops(RUN) == 2                          # 9.11: dropped or refused rows
         for bad in ({"decision": "refused"},                                       # a refusal names its code
                     {"decision": "refused", "reason": "blocked", "class": "safety"},   # a coarse class, not a code
@@ -297,18 +313,30 @@ def test_an_orders_sent_proof_blocks_complete(tmp_path):
             s.conn.execute("UPDATE runs SET lifecycle = 'finished', outcome = 'complete' WHERE run_id = ?", (RUN,))
 
 
+
+def test_step_events_reads_back_a_run_with_step_outcomes(tmp_path):
+    """8.3: a step outcome row carries a vocabulary action, so `step_events` can read every row of the run back
+    (it used to store action 'step', which the reader refused)."""
+    with Store(tmp_path / "run.db") as s:
+        s.register_rig("rig-a1", login_alias="paper-01", owner="qa", snapshot_id="snap-1", allowlist_entry=1)
+        s.begin_run(plan(shards=(ShardPlan(f"{RUN}/1", "rig-a1"),)))
+        s.write_steps([StepOutcome(RUN, "flow.x", "s01", "passed"),
+                       StepOutcome(RUN, "flow.x", "s02", "blocked_by_gateway")], shard_id=f"{RUN}/1", side="candidate")
+        assert [e.action for e in s.step_events(RUN)] == ["wait", "gateway_decision"]
+
 def test_steps_and_findings_need_a_shard_and_round_trip(tmp_path):
     with Store(tmp_path / "run.db") as s:
         s.register_rig("rig-a1", login_alias="paper-01", owner="qa", snapshot_id="snap-1", allowlist_entry=1)
         s.begin_run(plan(shards=(ShardPlan(f"{RUN}/1", "rig-a1"),)))
         step = StepOutcome(RUN, "flow.trade.order-ticket.stock.limit", "s07", "passed_via_agent_fallback",
-                           locator_rung="agent", finding_ref="F-2")
+                           locator_rung="agent", finding_ref="F-2", action="click")
         f = Finding("F-1", RUN, "collateral", "ladder overlaps", RUN, checkpoint_id=FLOW, phash=ph(), tier=2,
                     category="collateral")
         with pytest.raises(StoreRefused, match="shard"):
             s.write_checkpoint(out(FLOW, "collateral"), steps=[step])
         s.write_checkpoint(out(FLOW, "collateral"), steps=[step], findings=[f], shard_id=f"{RUN}/1")
-        assert s.step_outcomes(RUN) == [step] and s.findings(RUN) == [f]
+        stored = dataclasses.replace(step, side="candidate", shard_id=f"{RUN}/1", mode="agent")
+        assert s.step_outcomes(RUN) == [stored] and s.findings(RUN) == [f]
         finish_all(s)
         with pytest.raises(RunNotComplete, match="not imported"):
             s.end_run(RunOutcome(RUN, "pr", "complete", "reported"))
@@ -326,13 +354,19 @@ def test_builds_and_fixed_in_build(store):
         store.register_build("branch-1998.3.0-7be42d0", **{**facts, "source_commit": "other"})
     store.register_build("branch-1998.2.0-1aa2b3c", **{**facts, "source_commit": "1aa2b3c"},
                          first_seen_at="2026-01-01T00:00:00+00:00")
-    with pytest.raises(StoreRefused):                       # fixed_in_build needs the build (8.3 CHECK)
-        record(store, "dec-000001", "fixed_in_build", "confirmed_bug", build_id="branch-1998.2.0-1aa2b3c")
-    with pytest.raises(StoreRefused):                       # ... and the older build it is newer than (L-DEC-08)
-        record(store, "dec-000001", "fixed_in_build", "confirmed_bug", fixed_in_build_id="branch-1998.3.0-7be42d0")
-    d = record(store, "dec-000001", "fixed_in_build", "confirmed_bug", build_id="branch-1998.2.0-1aa2b3c",
+    with pytest.raises(StoreRefused, match="SD-79"):        # fixed_in_build supersedes a confirm_bug (SD-79)
+        record(store, "dec-000001", "fixed_in_build", "confirmed_bug", build_id="branch-1998.2.0-1aa2b3c",
                fixed_in_build_id="branch-1998.3.0-7be42d0")
-    assert d.action == "fixed_in_build" and d.ticket == "TOS-1"
+    record(store, "dec-000001", "confirm_bug", "confirmed_bug", build_id="branch-1998.2.0-1aa2b3c")
+    with pytest.raises(StoreRefused):                       # fixed_in_build needs the build (8.3 CHECK)
+        record(store, "dec-000002", "fixed_in_build", "confirmed_bug", supersedes="dec-000001")
+    with pytest.raises(StoreRefused):                       # ... newer than the confirm_bug's build (L-DEC-08)
+        record(store, "dec-000002", "fixed_in_build", "confirmed_bug", supersedes="dec-000001",
+               fixed_in_build_id="branch-1998.2.0-1aa2b3c")
+    d = record(store, "dec-000002", "fixed_in_build", "confirmed_bug", supersedes="dec-000001",
+               fixed_in_build_id="branch-1998.3.0-7be42d0")
+    assert d.action == "fixed_in_build" and d.ticket == "TOS-1" and d.supersedes == "dec-000001"
+    assert store.get_decision("dec-000001").status == "superseded"
 
 
 # -- run completion (8.1, 8.3, 8.9) ---------------------------------------------------------------------------------
@@ -425,7 +459,7 @@ def test_end_of_review_without_verdict(store):
 
 def record(store, did, action, verdict, phash=ph(), cid=SWEEP, category="collateral", by="alice", **kw):
     ticket = kw.pop("ticket", "TOS-1" if action in ("confirm_bug", "mark_intended", "fixed_in_build") else None)
-    tol = kw.pop("hamming_tolerance", 8)
+    tol = kw.pop("hamming_tolerance", None)                 # unset: the 4.14 default for the tier
     d = Decision(did, action, verdict, Signature(cid, "rgn.ladder.bid-column", phash, category), decided_by=by,
                  ticket=ticket, reason="because", hamming_tolerance=tol,
                  decided_at=kw.pop("decided_at", "2026-11-09T15:05:32-05:00"))
@@ -481,6 +515,11 @@ def test_decision_defaults_and_tier1_tolerance(store):
     row = store.conn.execute("SELECT expires_at FROM decisions WHERE decision_id = 7").fetchone()
     assert row[0] == "2026-12-09T20:05:32+00:00"
     assert record(store, "dec-000008", "noise_signature", "noise", cid=CENSUS).hamming_tolerance == 6
+    with pytest.raises(StoreRefused, match="L-DEC-03"):     # an explicit 8 on tier 1 is refused, not clamped
+        record(store, "dec-000010", "noise_signature", "noise", cid=CENSUS, hamming_tolerance=8,
+               phash=ph(range(40)))
+    assert record(store, "dec-000011", "noise_signature", "noise", cid=CENSUS, hamming_tolerance=6,
+                  phash=ph(range(50))).hamming_tolerance == 6
     store.conn.execute("INSERT INTO regions (checkpoint_id, region_id, config_commit, kind, landmark_id, dx, dy, w, h, "
                        "hamming_tolerance) VALUES (?, 'rgn.ladder.bid-column', 'c0ffee', 'diff', 'lm', 0, 0, 9, 9, 3)",
                        (SWEEP,))

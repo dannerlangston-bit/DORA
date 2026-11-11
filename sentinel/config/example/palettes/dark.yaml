@@ -1,0 +1,6 @@
+# The INV-15 palette pinned for the dark theme (2.7, 4.16): a signed cell's color is classed as the nearest entry
+# within the tolerance. Placeholder colors until Phase 0 reads the pinned build's dark theme.
+schema_version: 1
+theme: dark
+colors: {positive: "#18c45c", negative: "#e23a34", neutral: "#c6c8cc"}
+tolerance: 60

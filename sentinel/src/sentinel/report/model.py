@@ -27,7 +27,48 @@ Inputs beyond the records, and where each comes from:
   `target_window`, `layout` {grid, cell}, `overlay` (evidence note), `violation` (short phrase
   for the re-run line), `reviewer` {verdict, change_types, pending_since, batch},
   `raw_values` {expected, read, source} (4.13), `near_decisions` [{decision_id, hamming}],
-  `conflicting_decisions` [{decision_id, verdict}], `side`, `pre_screenshot`, `base_screenshot`.
+  `conflicting_decisions` [{decision_id, verdict}], `side`, `pre_screenshot`, `base_screenshot`; on a
+  `redaction_miss` finding `candidate_only` (3.6).
+- `summary`: the run's `runs.summary_json` (`Store.run_summary`, 8.3, 8.7). `ReportInputs.from_store` reads
+  `coverage` and `health` from it; these further top-level keys are read whenever a summary is given, each optional
+  (the run's teardown writes them through `Store.end_run(summary=)` or `update_summary`):
+  - `coverage.matrix` {surfaces, personas, profiles}: the 2.12 matrix dimensions that G2 checks `coverage.cells`
+    against (`store.checks.matrix_failures`, 1.4 G2). Without it the Reporter does not check the matrix (the
+    store's `post_run_check` does). `coverage.cells` rows are the 8.3 `coverage_cells` form (`coverage.Cell.to_row`:
+    surface_id, persona, entitlement, state, not_run_reason, worst_outcome, checkpoint_count) or the short form
+    (surface, persona, state, worst, n, reason).
+  - `health.expired` [str]: `lint.rules.ExpiredRecord.run_health_line()` of every record that stopped applying at
+    run start (4.8 L-MSK-02, L-RGN-05, L-SRF-11), the "Expired records" row. `health.redaction` {base, candidate}:
+    the run's redaction box counts per side, summed over its checkpoints (`capture.RedactionResult.counts`, 3.6),
+    the "Redaction" row with the run's `redaction_miss` count.
+  - `abort` {incident, trigger, gate, screenshot, rig, login, proof, rule_ids, not_requeued, requeued, deadline,
+    last_heartbeat, runs_ahead, cost, cap}: the abort block facts of `ReportContext.abort`, persisted with the run;
+    a key the context also sets takes the context's value. `abort.incident` is the id that
+    `store.safety.apply_safety_actions` returned (`AppliedSafety.incident_id`): the commit status reads
+    `aborted_safety: incident {id}` and the abort block `Incident: {id}`.
+  - `manifest_lint` [str]: `[v.line() for v in lint.runstart.lint_manifest(...)]` of a manifest that failed the
+    lint and is treated as missing (4.3); printed in the Intended section with the manifest template link.
+  - `expiring` [str]: `lint.runstart.ExpiryWarning.line()` of every mask that expires within seven days
+    (`expiring_soon`), the owner warning of 3.8, the "Masks expiring within 7 days" row.
+  - `sweep_minimums` [{surface_id, host, w, h, clamped_w, clamped_h}]: the run's achieved minimum per gadget and
+    host (`capture.sweep.minimums_summary`, 2.5.1), one "Sweep minimums" line each (`MinSize.report_line`).
+  - `health_rows` [[label, text]]: further run-health rows the run adds as they are (the popup rate, the
+    fingerprint notes, the Phase 0 branches, the decision lifecycle lines), each printed only when present.
+  - `post_run_check` {failures [str], report_withheld bool}: what `store.checks.end_taxonomy_check_failed` writes.
+    `report_withheld` makes the comment and the page the abort block alone, with each failure (1.4 G2, L-OUT-07).
+  - `safety` {banner, nightly_run_id}: `orchestrator.safety_canaries.banner(results)` of the last Nightly (null when
+    no safety canary missed), printed after the detector banner, and that Nightly's run id, whose `canary_results`
+    rows `ReportInputs.from_store` reads.
+  - `alerts` [entry]: the run's 9.10 alerts for the page's Alerts panel (9.5), each a
+    `pipeline.orchestration.alert_entry` dict (run_id, shard_id, rule, priority, paged, notified, safety_table,
+    control, gate, incident, run_outcome, run_reason, detail) plus `account`, `working_orders_screenshot` (a sha256)
+    and `instruction`, copied from the control result's evidence when it has them (6.6 Cancel All failure). An entry
+    of another shape (the 10.2 late arrival `{alert, closed_as, at}`) prints its keys.
+- `SafetyRows`: the store rows the Safety row and the page's Safety proof section print (9.4 item 8): the run's
+  `post_run_proofs` (6.6; each proof's declared sends, `orchestrator.killswitch.send_lines(counts)`, and its buying
+  power line, `counts["rows"]["buying power"]`), the last Nightly's `canary_results` rows of kinds `fire_drill`
+  (6.5) and `safety_canary` (10.3), the open `incidents` and the overdue postmortems (`store.safety.incidents(
+  open_only=True)`, `overdue_postmortems`, 6.12).
 
 Choices where 9.2 is silent (reported to the coordinator):
 
@@ -51,7 +92,8 @@ Choices where 9.2 is silent (reported to the coordinator):
 - A census cluster of several surfaces in one workspace is described as "one census checkpoint
   per surface" (9.3 says "per cell" for its Flexible Grid cells; no record carries that noun).
 - Comparable scope for the coverage percent is in-scope cells minus `not_run (entitlement)`
-  minus not-compared (blocked) cells (2.12: blocked cells are not in the coverage percent).
+  minus not-compared (blocked) cells (2.12: blocked cells are not in the coverage percent). Every outcome a
+  `blocked:<outcome>` cell can name, `harness_error` included, is a Not compared column entry (`NOT_COMPARED`).
 - The Coverage table keeps the 2.12 surface-and-persona cells; beneath it one line counts the run's `not_run`
   checkpoints per reason ("Checkpoints not run: 7 app_crash (sweep steps after the crash)", `not_run_line`), so
   checkpoints that a cell's worse outcome hides from the table are still shown; no line when none is not_run.
@@ -67,32 +109,64 @@ Choices where 9.2 is silent (reported to the coordinator):
   and keep Suppressed, Coverage and Run health; `pool_saturated` and `dead_man` comments carry
   only the header and the abort text; a secret leak carries only the header, result, check and
   "report withheld; security contact notified".
+- A `redaction_miss` finding (3.6) is an Unexpected item of its own, ranked after `unknown_popup` (9.2 does not list
+  it), tier 1 when the miss is on the candidate only (a suspected identifier leak), else its finding's tier; it never
+  fails the check (the anchor list is the security contact's, not the PR's), and it is never a checkpoint's primary
+  finding.
+- G2 (1.4): when `coverage.matrix` is given and `matrix_failures` finds the cells do not sum, the Coverage table and
+  the matrix are replaced by "Coverage matrix withheld" and the failures; the not_run checkpoint line stays (it
+  counts checkpoints, not cells) and the commit status is unchanged (the post-run check ends the run).
+- The manifest template link is the report UI URL `/docs/manifest-template` (9.1: the only links are report UI
+  URLs). It follows the no-manifest line whenever no manifest is loaded (4.3 case (a), case (b) and a manifest that
+  failed the lint, 2.10.2), after the lint lines. A loaded manifest with no entries prints its `empty_reason` (4.3).
+- Run health gains a row only when it has something to say: Redaction, Expired records, Masks expiring within 7
+  days, Fire drill (last Nightly), Safety canaries (last Nightly) and Incidents (open incidents and overdue
+  postmortems). The Safety row adds each proof's declared sends and buying power line, prefixed with the shard when
+  the run has several proofs; so does the abort block's post-run proof line. A proof row's login alias is never
+  printed (8.3).
 """
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any
 
+from ..canary import CanaryResult
+from ..orchestrator.killswitch import CANCEL_ALL_CODES, CANCEL_ALL_TEXT, proof_line, send_lines
 from ..records import CheckpointOutcome, Decision, Finding, RunOutcome, StepOutcome
+from ..store import safety as store_safety
+from ..store.checks import matrix_failures
+from ..store.safety import Incident
+from ..store.store import PostRunProof
 from ..taxonomy import checkpoint_parts, load
 from .cluster import Cluster, Member, cluster_members
 from .inline import C, Image, Line, Link, T, Urls, join_and, number_word, plural, words_and
 
+if TYPE_CHECKING:
+    from ..store.store import Store
+
 CHECK_CONTEXT = "sentinel/pr-run"
 CHECK_MODES = ("informational", "blocking")
 
-# 9.2 Unexpected kind order (rank groups).
+# 9.2 Unexpected kind order (rank groups); `redaction_miss`, which 9.2 does not list, ranks last (module docstring).
 (APP_ALIVE, INVARIANT, ASSERTION, COLLATERAL, NO_MATCH, LANDMARK, UNREGISTERED, NEEDS_HUMAN,
- NEEDS_BASELINE, STEP_FAILED, AGENT_FALLBACK, MAP_GAP, MANIFEST_MISSING, UNKNOWN_POPUP) = range(14)
+ NEEDS_BASELINE, STEP_FAILED, AGENT_FALLBACK, MAP_GAP, MANIFEST_MISSING, UNKNOWN_POPUP, REDACTION_MISS) = range(15)
 FAILURE_GROUPS = (APP_ALIVE, INVARIANT, ASSERTION)
 # 9.2 commit status: tier-1 kinds that fail the check when undecided.
 CHECK_FAILING_GROUPS = {APP_ALIVE, INVARIANT, ASSERTION, COLLATERAL, NO_MATCH, LANDMARK, NEEDS_HUMAN,
                         STEP_FAILED}
 FINDING_ONLY = {"dependency_map_gap": MAP_GAP, "manifest_missing": MANIFEST_MISSING,
-                "unknown_popup": UNKNOWN_POPUP}
+                "unknown_popup": UNKNOWN_POPUP, "redaction_miss": REDACTION_MISS}
+# `canary_results` kinds of the Safety proof section: the fire drill (6.5) and the safety canaries (10.3, SD-81)
+SAFETY_CANARY_KINDS = ("fire_drill", "safety_canary")
+# 1.4 G2: what Coverage prints in place of the table and the matrix when the cells do not sum
+G2_WITHHELD = ("Coverage matrix withheld: its cells do not sum to surfaces x personas x entitlement profiles "
+               "(1.4 G2), so the Reporter publishes none")
 NOT_RUN_ORDER = ("scope", "budget", "entitlement", "quarantine", "step_failed", "base_step_failed",
                  "app_crash", "model_unavailable")
-NOT_COMPARED = ("env_error", "not_settled", "not_comparable", "landmark_missing", "not_run")
+# 2.12: the outcomes a `blocked:<outcome>` cell names, which stopped comparison: the Not compared column (9.2)
+NOT_COMPARED = ("env_error", "harness_error", "not_settled", "not_comparable", "landmark_missing", "not_run")
 # 1.10 not_run reasons, as the checkpoint line under the Coverage table says which checkpoints they are (9.2)
 NOT_RUN_WHICH = {
     "scope": "outside the run's scope",
@@ -187,6 +261,61 @@ def worst_proof(proofs: list[str]) -> str:
     if not proofs:
         raise ReportInputError("no post-run proof verdict (6.6)")
     return max(proofs, key=proof_severity)
+
+
+def _money(x: Any) -> str:
+    return "not read" if x is None else f"{float(x):,.2f}"
+
+
+def _drift_line(name: str, row: Mapping[str, Any]) -> str:
+    return (f"{name} {_money(row.get('start'))} to {_money(row.get('end'))}, drift {_money(row.get('drift'))}, "
+            f"{row.get('verdict', 'unknown')}")
+
+
+def buying_power_line(row: Mapping[str, Any]) -> str:
+    """The buying power line of a proof (6.6 step 5), from its `counts["rows"]["buying power"]`."""
+    return _drift_line("buying power", row)
+
+
+def proof_detail_lines(proofs: Sequence[PostRunProof]) -> list[str]:
+    """Each proof's declared sends (`killswitch.send_lines`) and buying power line, in proof order; prefixed with the
+    shard ("run level" for the SD-61 row) when the run has several proofs (6.6, 6.7)."""
+    out = []
+    for p in proofs:
+        lines = send_lines(p.counts)
+        bp = (p.counts.get("rows") or {}).get("buying power")
+        if bp:
+            lines.append(buying_power_line(bp))
+        prefix = f"shard {p.shard_id or 'run level'}: " if len(proofs) > 1 else ""
+        out += [prefix + line for line in lines]
+    return out
+
+
+@dataclass(frozen=True)
+class SafetyRows:
+    """The store rows the Safety row and the Safety proof section print (module docstring; 6.5, 6.6, 6.12, 9.4)."""
+
+    proofs: tuple[PostRunProof, ...] = ()        # the run's post_run_proofs (Store.post_run_proofs)
+    canaries: tuple[CanaryResult, ...] = ()      # the last Nightly's fire_drill and safety_canary rows
+    nightly_run_id: str | None = None            # the Nightly those rows belong to
+    incidents: tuple[Incident, ...] = ()         # open incidents (store.safety.incidents(open_only=True))
+    overdue: tuple[Incident, ...] = ()           # S1 and S2 postmortems past due (store.safety.overdue_postmortems)
+
+    def __post_init__(self) -> None:
+        for r in self.canaries:
+            if r.kind not in SAFETY_CANARY_KINDS:
+                raise ReportInputError(f"canary row {r.mutant_id} of kind {r.kind!r}: the Safety section prints "
+                                       f"{SAFETY_CANARY_KINDS} rows (6.5, 10.3)")
+
+    @classmethod
+    def from_store(cls, store: "Store", run_id: str, *, nightly_run_id: str | None = None,
+                   at: str | None = None) -> "SafetyRows":
+        """Read the rows of `run_id` (its proofs) and of `nightly_run_id` (its drill and safety canary rows), and the
+        open incidents and postmortems overdue at `at` (default now)."""
+        canaries = tuple(r for r in store.canary_results(nightly_run_id) if r.kind in SAFETY_CANARY_KINDS) \
+            if nightly_run_id else ()
+        return cls(tuple(store.post_run_proofs(run_id)), canaries, nightly_run_id,
+                   store_safety.incidents(store, open_only=True), store_safety.overdue_postmortems(store, at=at))
 
 
 @dataclass(frozen=True)
@@ -304,12 +433,19 @@ class RunReport:
     needs_baseline_line: Line | None
     suppressed: list[SuppressedRow]
     coverage_rows: list[tuple[str, ...]]
-    coverage_cells: list[dict]               # 2.12 matrix cells from the summary, when it carries them
+    coverage_cells: list[dict]               # 2.12 matrix cells from the summary (`coverage_cell` form), when given
     scope_line: Line
     not_run_line: Line | None                # 9.2: every not_run reason among the run's checkpoints, counted
     health_rows: list[tuple[str, Line]]
     history: tuple[dict, ...]
     outcomes: list[CheckpointOutcome]
+    manifest_lint_lead: Line | None = None   # 4.3: the manifest failed the lint and is treated as missing
+    manifest_lint: list[Line] = field(default_factory=list)      # one code line per lint violation
+    manifest_template: Line | None = None    # the template link, whenever no manifest is loaded (4.3, 2.10.2)
+    empty_reason_line: Line | None = None    # 4.3: a loaded manifest with no entries
+    g2_failures: list[str] = field(default_factory=list)         # 1.4 G2: the matrix is withheld when non-empty
+    safety_proof: list[tuple[str, list[Line]]] = field(default_factory=list)   # 9.4 item 8, for the page
+    alerts: list[Line] = field(default_factory=list)             # 9.5 Alerts panel, one line per alert
 
     @property
     def n_unexpected(self) -> int:
@@ -745,7 +881,8 @@ class _Prose:
 
 class _Builder:
     def __init__(self, run: RunOutcome, outcomes, findings, decisions, coverage, health, manifest,
-                 ctx: ReportContext, steps):
+                 ctx: ReportContext, steps, summary: Mapping[str, Any] | None = None,
+                 safety: SafetyRows | None = None):
         if ctx.check_mode not in CHECK_MODES:
             raise ReportInputError(f"check mode {ctx.check_mode!r}; expected one of {CHECK_MODES}")
         self.run, self.ctx = run, ctx
@@ -756,12 +893,15 @@ class _Builder:
         self.health = health or {}
         self.manifest = manifest
         self.steps = list(steps)
+        self.summary: Mapping[str, Any] = summary or {}
+        self.safety = safety or SafetyRows()
+        self.abort: dict = {**(self.summary.get("abort") or {}), **ctx.abort}   # the context's facts win
         self.urls = Urls(ctx.base_url.rstrip("/"), run.run_id)
         self.ladder = "F" if run.run_type == "rc" else "S"
         self.declared = {s for e in (manifest or {}).get("entries", []) for s in e.get("declared_surfaces", [])}
         self.by_cp: dict[str, list[Finding]] = {}
         for f in self.findings:
-            if f.checkpoint_id:
+            if f.checkpoint_id and f.kind != "redaction_miss":       # an item of its own, never a primary finding
                 self.by_cp.setdefault(f.checkpoint_id, []).append(f)
         self.sweep_sizes: dict[str, set[tuple[int, int]]] = {}
         self.split_positions: dict[str, int] = {}
@@ -843,8 +983,11 @@ class _Builder:
             group = FINDING_ONLY.get(f.kind)
             if group is None or f.decision_ref:
                 continue
-            key = (f.tier if f.tier is not None else 4, group, (1, 0), 0, 0, f.finding_id)
-            out.append(Item(0, f.tier, group, (), [], decided=False, pending=False, reviewer_call=False,
+            tier = f.tier
+            if group == REDACTION_MISS and _candidate_only(f):
+                tier = 1                                   # 3.6: a suspected identifier leak ranks tier 1
+            key = (tier if tier is not None else 4, group, (1, 0), 0, 0, f.finding_id)
+            out.append(Item(0, tier, group, (), [], decided=False, pending=False, reviewer_call=False,
                             finding=f, sort_key=key))
         return out
 
@@ -1006,24 +1149,27 @@ def _not_compared_tier1(outcomes: list[CheckpointOutcome]) -> tuple[set[str], li
 
 
 def status_from_items(run: RunOutcome, items: list[Item], outcomes: list[CheckpointOutcome],
-                      ctx: ReportContext, mode: str, target_url: str | None) -> CommitStatus:
-    """The 9.2 state table applied to ranked Unexpected items."""
+                      ctx: ReportContext, mode: str, target_url: str | None, *, abort: Mapping[str, Any] | None = None,
+                      withheld: bool = False) -> CommitStatus:
+    """The 9.2 state table applied to ranked Unexpected items. `abort` is the abort block facts (the summary's
+    under the context's, default the context's); `withheld` is a report the post-run check withheld (1.4 G2)."""
     if mode not in CHECK_MODES:
         raise ReportInputError(f"check mode {mode!r}; expected one of {CHECK_MODES}")
     reason = run.reason or ""
+    abort = ctx.abort if abort is None else abort
 
     def st(state: str, text: str) -> CommitStatus:
         return CommitStatus(state, text, mode, target_url)
 
     if run.status == "aborted_safety":
-        return st("error", f"aborted_safety: incident {ctx.abort.get('incident', 'unknown')}")
+        return st("error", f"aborted_safety: incident {abort.get('incident', 'unknown')}")
     if run.status == "aborted_harness":
         if reason in ("dead_man", "secret_leaked"):
             return st("error", "Sentinel did not report")
         return st("error", f"aborted_harness: {reason}")
     if run.status == "aborted_budget" and reason == "pool_saturated":
         return st("error", "Sentinel did not run")
-    if ctx.comment_overdue:
+    if ctx.comment_overdue or withheld:
         return st("error", "Sentinel did not report")
     if ctx.override:
         return st("success", f"forced success by {ctx.override.get('by', '?')}: {ctx.override.get('reason', '')}")
@@ -1078,6 +1224,30 @@ def coverage_rows(coverage: dict) -> list[tuple[str, ...]]:
         nr_text = ", ".join(f"{not_run.get(k, 0)} {k}" for k in NOT_RUN_ORDER)
         rows.append((str(tier), str(t.get("registered", 0)), str(in_scope), cov, nc_text, nr_text))
     return rows
+
+
+def coverage_cell(c: Mapping[str, Any]) -> dict:
+    """One summary matrix cell in the form the page prints, from the 8.3 `coverage_cells` row form
+    (`coverage.Cell.to_row`) or the short form (module docstring): surface, persona, entitlement, state, worst, n,
+    reason."""
+    return {"surface": c.get("surface", c.get("surface_id")), "persona": c.get("persona"),
+            "entitlement": c.get("entitlement", c.get("profile")), "state": c.get("state"),
+            "worst": c.get("worst", c.get("worst_outcome")), "n": int(c.get("n", c.get("checkpoint_count")) or 0),
+            "reason": c.get("reason", c.get("not_run_reason"))}
+
+
+def g2_failures(coverage: Mapping[str, Any]) -> list[str]:
+    """1.4 G2 on the summary's matrix: `store.checks.matrix_failures` of `coverage.cells` against `coverage.matrix`
+    {surfaces, personas, profiles}; empty when the summary gives no dimensions (module docstring)."""
+    dims = coverage.get("matrix")
+    if not dims:
+        return []
+    cells = [{"surface_id": c["surface"], "persona": c["persona"], "entitlement": c["entitlement"]}
+             for c in map(coverage_cell, coverage.get("cells", []))]
+    try:
+        return matrix_failures(cells, int(dims["surfaces"]), int(dims["personas"]), int(dims["profiles"]))
+    except (KeyError, TypeError, ValueError) as e:
+        raise ReportInputError(f"coverage.matrix {dims!r}: surfaces, personas and profiles are counts (2.12)") from e
 
 
 def not_run_line(outcomes: list[CheckpointOutcome]) -> Line | None:
@@ -1210,19 +1380,71 @@ def _canary_row(c: dict) -> Line:
                          f"detector state {state}", str(c.get("date", "unknown"))])),)
 
 
-def _safety_row(s: dict) -> Line:
+def _safety_row(s: dict, details: list[str]) -> Line:
     proof = s.get("proof", "unknown")
     severity = proof_severity(proof)
     text = (f"attestation {s.get('attestation', 'unknown')}, paper mode asserted "
             f"{plural(int(s.get('paper_mode_asserted', 0)), 'time')}, "
             f"gateway {plural(int(s.get('gateway_drops', 0)), 'drop')}, "
             f"Cancel All {s.get('cancel_all', 'unknown')}, proof {proof}")
+    if details:                                  # the declared sends and buying power of each proof (6.6)
+        text += "; " + "; ".join(details)
     login = s.get("login", "unknown")
     if severity == ORDERS_SENT_PROOF:
         text += "; " + orders_sent_note(login)
     elif severity == UNPROVEN_PROOF:
         text += f"; next run on {login_phrase(login)} blocked until a human verifies the account"
     return (T(text),)
+
+
+def _candidate_only(f: Finding) -> bool:
+    return bool(f.evidence.get("candidate_only")) or f.detail == "candidate_only"
+
+
+def _redaction_row(b: _Builder) -> Line | None:
+    """3.6: the run's redaction box counts per side and its `redaction_miss` findings; None with neither."""
+    counts = b.health.get("redaction")
+    misses = [f for f in b.findings if f.kind == "redaction_miss"]
+    if counts is None and not misses:
+        return None
+    lead = f"boxes: base {int(counts.get('base', 0))}, candidate {int(counts.get('candidate', 0))}; " \
+        if counts is not None else ""
+    only = sum(1 for f in misses if _candidate_only(f))
+    tail = f" ({only} candidate only, tier 1)" if only else ""
+    return (T(f"{lead}{len(misses)} "), C("redaction_miss"), T(tail))
+
+
+def _canary_rows_line(rows: Sequence[CanaryResult], nightly: str | None) -> Line:
+    """The last Nightly's drill items or safety canaries: how many were detected, and each miss with the outcome it
+    produced (6.5, 10.3)."""
+    text = f"{sum(1 for r in rows if r.state == 'detected')} of {len(rows)} detected"
+    if nightly:
+        text += f" (Nightly run {nightly})"
+    for r in rows:
+        if r.state != "detected":
+            text += f"; {r.mutant_id} {r.state}"
+            if r.produced_outcome:
+                text += f": {r.produced_outcome}" + (f" (reason: {r.produced_reason})" if r.produced_reason else "")
+    return (T(text),)
+
+
+def _incident_text(i: Incident) -> str:
+    where = [x for x in (f"rig {i.rig_id}" if i.rig_id else "", f"run {i.run_id}" if i.run_id else "") if x]
+    return f"{i.incident_id} {i.severity} ({i.trigger})" + (f" on {', '.join(where)}" if where else "")
+
+
+def _overdue_text(i: Incident) -> str:
+    return f"{i.incident_id} {i.severity} ({i.trigger}), due {i.postmortem_due_at}"
+
+
+def _incidents_line(s: SafetyRows) -> Line:
+    """6.12: the open incidents, and the S1 and S2 postmortems not linked by their due date."""
+    parts = []
+    if s.incidents:
+        parts.append(f"{len(s.incidents)} open: " + ", ".join(_incident_text(i) for i in s.incidents))
+    if s.overdue:
+        parts.append("postmortem overdue: " + ", ".join(_overdue_text(i) for i in s.overdue))
+    return (T("; ".join(parts)),)
 
 
 def _integrations_row(b: _Builder, items: list[Item]) -> Line:
@@ -1306,10 +1528,31 @@ def health_rows(b: _Builder, items: list[Item], intended_clusters: list[Cluster]
     ]
     if env or h.get("env_errors"):
         rows.insert(3, ("Environment errors", _env_errors_line(b, env)))
+    redaction = _redaction_row(b)
+    if redaction is not None:
+        rows.append(("Redaction", redaction))
+    if h.get("expired"):                          # records that stopped applying at run start (4.8 L-MSK-02)
+        rows.append(("Expired records", (T("; ".join(h["expired"])),)))
+    if b.summary.get("expiring"):                 # the seven-day owner warning (3.8)
+        rows.append(("Masks expiring within 7 days", (T("; ".join(b.summary["expiring"])),)))
+    if b.summary.get("sweep_minimums"):           # 2.5.1: the achieved minimum of every gadget and host
+        from ..capture.sweep import MinSize
+        lines = [MinSize(**m).report_line() for m in b.summary["sweep_minimums"]]
+        rows.append(("Sweep minimums", (T("; ".join(lines)),)))
+    for label, text in b.summary.get("health_rows") or ():
+        rows.append((str(label), (T(str(text)),)))
     if "canary" in h:
         rows.append(("Canary (last Nightly)", _canary_row(h["canary"])))
     if "safety" in h:
-        rows.append(("Safety", _safety_row(h["safety"])))
+        rows.append(("Safety", _safety_row(h["safety"], proof_detail_lines(b.safety.proofs))))
+    s = b.safety
+    for kind, label in (("fire_drill", "Fire drill (last Nightly)"),
+                        ("safety_canary", "Safety canaries (last Nightly)")):
+        rows_of = [r for r in s.canaries if r.kind == kind]
+        if rows_of:
+            rows.append((label, _canary_rows_line(rows_of, s.nightly_run_id)))
+    if s.incidents or s.overdue:
+        rows.append(("Incidents", _incidents_line(s)))
     rows.append(("Integrations", _integrations_row(b, items)))
     if b.ctx.override:
         rows.append(("Check override", (T(f"forced success by {b.ctx.override.get('by', '?')}: "
@@ -1341,8 +1584,24 @@ def _env_errors_line(b: _Builder, env: list[CheckpointOutcome]) -> Line:
 # Abort block and banners
 # --------------------------------------------------------------------------------------------
 
+def _withheld(b: _Builder, check: Mapping[str, Any]) -> tuple[str, str, list[Line]]:
+    """1.4 G2, 4.13 L-OUT-07: the post-run check failed and withheld the report; the abort block alone is posted."""
+    run = b.run
+    lines: list[Line] = []
+    if run.status == "aborted_harness":
+        lines.append((T("Reason: "), C(run.reason or "")))
+    lines.append((T(f"Last gate reached: {run.last_gate}"),))
+    lines += [(T(f"Post-run check: {f}"),) for f in check.get("failures") or ()]
+    lines.append((T("Report withheld: the post-run check failed (1.4 G2, 4.13 L-OUT-07), so no finding, matrix or "
+                    "count is published"),))
+    return "withheld", "Abort", lines
+
+
 def _abort(b: _Builder, members: list[Member]) -> tuple[str | None, str | None, list[Line]]:
-    run, a = b.run, b.ctx.abort
+    run, a = b.run, b.abort
+    check = b.summary.get("post_run_check") or {}
+    if check.get("report_withheld"):
+        return _withheld(b, check)
     reason = run.reason or ""
     if run.status == "aborted_budget":
         if reason == "pool_saturated":
@@ -1365,6 +1624,7 @@ def _abort(b: _Builder, members: list[Member]) -> tuple[str | None, str | None, 
         safety = b.health.get("safety", {})
         proof = a.get("proof") or safety.get("proof", "unknown")
         lines.append((T(f"Post-run proof: {proof}"),))
+        lines += [(T(d),) for d in proof_detail_lines(b.safety.proofs)]
         if proof != "unknown" and proof_severity(proof) == ORDERS_SENT_PROOF:
             note = orders_sent_note(a.get("login") or safety.get("login", "unknown"))
             lines.append((T(note[0].upper() + note[1:] + "."),))
@@ -1413,6 +1673,9 @@ def _banners(b: _Builder, members: list[Member], items: list[Item]) -> tuple[str
         banner = f"{what.upper().replace('_', ' ')} since {canary.get('since', canary.get('date', 'unknown'))}."
         if divergence:
             banner += " harness_error (reason: canary_path_divergence) recorded."
+    safety_banner = (b.summary.get("safety") or {}).get("banner")    # the blind safety canaries (10.3)
+    if safety_banner:
+        banner = f"{banner}\n{safety_banner}" if banner else safety_banner
     lines: list[Line] = []
     rd = b.ctx.reviewer_disabled
     if rd:
@@ -1438,6 +1701,119 @@ def _manifest_line(b: _Builder) -> Line | None:
     return (T("No manifest and no UI code touched: diffs are "), C("needs_human (reason: no_manifest)"))
 
 
+def _manifest_notes(b: _Builder) -> tuple[Line | None, list[Line], Line | None, Line | None]:
+    """The Intended section's manifest notes (4.3, 2.10.2): the lead and lines of a manifest that failed the lint,
+    the template link whenever no manifest is loaded, and a loaded manifest's `empty_reason` when it has no entries."""
+    if b.manifest is None:
+        lint = [str(x) for x in b.summary.get("manifest_lint") or ()]
+        lead = (T("The manifest failed the lint and is treated as missing (4.3):"),) if lint else None
+        template = (Link("Manifest template", b.urls.manifest_template), T(" (4.3)"))
+        return lead, [(C(x),) for x in lint], template, None
+    empty = None
+    if not b.manifest.get("entries") and b.manifest.get("empty_reason"):
+        empty = (T(f"No manifest entries: {b.manifest['empty_reason']}"),)
+    return None, [], None, empty
+
+
+# --------------------------------------------------------------------------------------------
+# Safety proof section and Alerts panel (6.5, 6.6, 6.12, 9.4 item 8, 9.5)
+# --------------------------------------------------------------------------------------------
+
+# the 8.3 `post_run_proofs.cancel_all` code as the 6.6 block says it (verified, failed, not needed)
+_CANCEL_ALL_SAID = {code: CANCEL_ALL_TEXT[k] for k, code in CANCEL_ALL_CODES.items()}
+
+
+def _count(x: Any) -> str:
+    return "not read" if x is None else f"{float(x):g}"
+
+
+def _proof_block(p: PostRunProof) -> tuple[str, list[Line]]:
+    """One `post_run_proofs` row as the 6.6 ORDER SAFETY PROOF block prints it; the login alias is never printed."""
+    title = f"ORDER SAFETY PROOF, shard {p.shard_id}" if p.shard_id else \
+        "ORDER SAFETY PROOF, run level (no shard started)"
+    lines: list[str] = [f"VERDICT {proof_line(p.verdict, p.reason, p.counts.get('undeclared') or [], p.cancel_all)}",
+                        f"identity: paper mode asserted {plural(p.paper_mode_assertions, 'time')}, "
+                        f"{p.paper_mode_mismatches} mismatches, {p.unreadable_count} unreadable"]
+    if p.attestation_ref:
+        lines.append(f"attestation {p.attestation_ref}")
+    lines += [f"send policy {p.send_policy_ref}",
+              f"gateway {plural(p.gateway_events, 'event')} allowed, {plural(p.gateway_drops, 'drop')}, "
+              f"{plural(p.refusals_count, 'refusal')}"]
+    for name, row in (p.counts.get("rows") or {}).items():
+        if "drift" in row:
+            lines.append(_drift_line(name, row))
+        else:
+            lines.append(f"{name}: start {_count(row.get('start'))}, end {_count(row.get('end'))}, new "
+                         f"{row.get('new', 0)}, expected {row.get('expected', 0)}, {row.get('verdict', 'unknown')}")
+    lines.append(f"cancel all {_CANCEL_ALL_SAID[p.cancel_all]}")
+    lines += send_lines(p.counts)
+    if p.verified_by:
+        lines.append(f"verified by hand by {p.verified_by} at {p.verified_at}")
+    out: list[Line] = [(T(x),) for x in lines]
+    return title, out
+
+
+def _canary_block(title: str, rows: Sequence[CanaryResult]) -> tuple[str, list[Line]]:
+    out = []
+    for r in rows:
+        text = f"{r.mutant_id}: {r.state}"
+        if r.produced_outcome:
+            text += f", {r.produced_outcome}" + (f" (reason: {r.produced_reason})" if r.produced_reason else "")
+        if r.absorbed_by:
+            text += f": {r.absorbed_by}"
+        out.append((T(text),))
+    return title, out
+
+
+def safety_proof_blocks(b: _Builder) -> list[tuple[str, list[Line]]]:
+    """9.4 item 8 for the page: each proof block, the last Nightly's fire drill and safety canary rows, the blind
+    safety canaries' banner, the open incidents and the overdue postmortems; empty when there is none of them."""
+    s = b.safety
+    blocks = [_proof_block(p) for p in s.proofs]
+    night = f" (Nightly run {s.nightly_run_id})" if s.nightly_run_id else ""
+    for kind, title in (("fire_drill", "Fire drill"), ("safety_canary", "Safety canaries")):
+        rows = [r for r in s.canaries if r.kind == kind]
+        if rows:
+            blocks.append(_canary_block(title + night, rows))
+    banner = (b.summary.get("safety") or {}).get("banner")
+    if banner:
+        blocks.append(("Safety canary banner", [(T(x),) for x in str(banner).splitlines()]))
+    if s.incidents:
+        blocks.append(("Open incidents", [(T(f"{_incident_text(i)}, opened {i.opened_at}"
+                                            + (f", postmortem due {i.postmortem_due_at}" if i.postmortem_due_at
+                                               else "")),) for i in s.incidents]))
+    if s.overdue:
+        blocks.append(("Postmortems overdue", [(T(_overdue_text(i) + ", no postmortem linked"),) for i in s.overdue]))
+    return blocks
+
+
+def _alert_line(b: _Builder, a: Mapping[str, Any]) -> Line:
+    """One 9.10 alert of the summary, with the 6.6 hand-over facts (account, Working Orders screenshot, instruction)
+    when the alert carries them."""
+    if "rule" in a:
+        text = f"{a.get('priority', '?')} {a['rule']}: {a.get('control', '?')} at {a.get('gate', '?')}"
+        if a.get("incident"):
+            text += f", incident {a['incident']}"
+        if a.get("detail"):
+            text += f": {a['detail']}"
+        if a.get("paged"):
+            text += f"; paged {', '.join(map(str, a['paged']))}"
+    else:
+        text = ", ".join(f"{k} {v}" for k, v in a.items()
+                         if k not in ("account", "working_orders_screenshot", "instruction"))
+    out: list = [T(text)]
+    if a.get("account"):
+        out.append(T(f"; account: {a['account']}"))
+    shot = a.get("working_orders_screenshot")
+    if shot:
+        img = b.urls.image("Working Orders screenshot", shot)
+        out += [T("; "), Link("Working Orders screenshot", img.url)] if img is not None else \
+            [T(f"; Working Orders screenshot {shot}")]
+    if a.get("instruction"):
+        out.append(T(f"; instruction: {a['instruction']}"))
+    return tuple(out)
+
+
 # --------------------------------------------------------------------------------------------
 # Entry point
 # --------------------------------------------------------------------------------------------
@@ -1445,11 +1821,14 @@ def _manifest_line(b: _Builder) -> Line | None:
 def build_report(run: RunOutcome, outcomes: list[CheckpointOutcome], findings: list[Finding],
                  decisions: list[Decision], coverage: dict | None, health: dict | None,
                  manifest: dict | None, context: ReportContext,
-                 steps: list[StepOutcome] = ()) -> RunReport:
-    """Arrange one run's records into the report of 9.2 (and 9.5 for the static page)."""
+                 steps: list[StepOutcome] = (), *, summary: Mapping[str, Any] | None = None,
+                 safety: SafetyRows | None = None) -> RunReport:
+    """Arrange one run's records into the report of 9.2 (and 9.5 for the static page). `summary` is the run's
+    `summary_json` and `safety` the store rows of the Safety section (module docstring); `ReportInputs.from_store`
+    reads both, with `coverage` and `health` from the summary."""
     synthetic = {o.checkpoint_id for o in outcomes if o.synthetic}
     b = _Builder(run, outcomes, [f for f in findings if f.checkpoint_id not in synthetic],
-                 decisions, coverage, health, manifest, context, steps)
+                 decisions, coverage, health, manifest, context, steps, summary, safety)
     listed, intended = b.members()
     clusters = cluster_members(listed)
     items = [b.cluster_item(cl) for cl in clusters if not cl.fully_suppressed_one_verdict]
@@ -1459,7 +1838,10 @@ def build_report(run: RunOutcome, outcomes: list[CheckpointOutcome], findings: l
     intended_items, intended_clusters = b.intended_items(intended)
     special, abort_title, abort_lines = _abort(b, listed)
     banner, banner_lines = _banners(b, listed, items)
-    status = status_from_items(run, items, b.outcomes, context, context.check_mode, b.urls.report)
+    status = status_from_items(run, items, b.outcomes, context, context.check_mode, b.urls.report, abort=b.abort,
+                               withheld=special == "withheld")
+    g2 = g2_failures(b.coverage)
+    lint_lead, lint, template, empty = _manifest_notes(b)
     pending = sum(1 for i in items if i.pending)
     result = run.status
     if run.status.startswith("aborted_"):
@@ -1479,10 +1861,50 @@ def build_report(run: RunOutcome, outcomes: list[CheckpointOutcome], findings: l
         show_findings=run.status not in ("aborted_safety", "aborted_harness") and special is None,
         unexpected=items, intended=intended_items, manifest_line=_manifest_line(b),
         reconciliation=b.reconciliation(), needs_baseline_line=nb_line,
-        suppressed=b.suppressed_rows(clusters), coverage_rows=coverage_rows(b.coverage),
-        coverage_cells=list(b.coverage.get("cells", [])), scope_line=scope_line(b),
-        not_run_line=not_run_line(b.outcomes),
-        health_rows=health_rows(b, items, intended_clusters), history=tuple(context.history), outcomes=b.outcomes)
+        suppressed=b.suppressed_rows(clusters),
+        coverage_rows=[] if g2 else coverage_rows(b.coverage),                    # 1.4 G2: the matrix is withheld
+        coverage_cells=[] if g2 else [coverage_cell(c) for c in b.coverage.get("cells", [])],
+        scope_line=scope_line(b), not_run_line=not_run_line(b.outcomes),
+        health_rows=health_rows(b, items, intended_clusters), history=tuple(context.history), outcomes=b.outcomes,
+        manifest_lint_lead=lint_lead, manifest_lint=lint, manifest_template=template, empty_reason_line=empty,
+        g2_failures=g2, safety_proof=safety_proof_blocks(b),
+        alerts=[_alert_line(b, a) for a in b.summary.get("alerts") or ()])
+
+
+@dataclass(frozen=True)
+class ReportInputs:
+    """Everything the Reporter reads for one finished run: its records, its `summary_json` and the Safety rows."""
+
+    run: RunOutcome
+    outcomes: list[CheckpointOutcome]
+    findings: list[Finding]
+    decisions: list[Decision]
+    steps: list[StepOutcome]
+    summary: dict
+    safety: SafetyRows
+
+    @classmethod
+    def from_store(cls, store: "Store", run_id: str, *, at: str | None = None) -> "ReportInputs":
+        """Read a finished run back from the store (9.2: rendered from the run's summary JSON at teardown, 8.7): the
+        run row, outcomes, findings, step outcomes, the decisions they name, `Store.run_summary`, and the Safety rows
+        (`SafetyRows.from_store` with the summary's `safety.nightly_run_id`); `at` dates the overdue postmortems."""
+        run = store.run_outcome(run_id)
+        if run is None:
+            raise ReportInputError(f"run {run_id} has not ended; the Reporter reads a finished run (9.2)")
+        summary = store.run_summary(run_id)
+        outcomes, findings = store.outcomes(run_id), store.findings(run_id)
+        ids = sorted({o.decision_ref for o in outcomes if o.decision_ref}
+                     | {f.decision_ref for f in findings if f.decision_ref})
+        decisions = [d for d in (store.get_decision(i) for i in ids) if d is not None]
+        nightly = (summary.get("safety") or {}).get("nightly_run_id")
+        safety = SafetyRows.from_store(store, run_id, nightly_run_id=nightly, at=at)
+        return cls(run, outcomes, findings, decisions, store.step_outcomes(run_id), summary, safety)
+
+    def build(self, manifest: dict | None, context: ReportContext) -> RunReport:
+        """The report of these inputs; `manifest` is the run's loaded manifest (4.3) as a dict, None when missing."""
+        return build_report(self.run, self.outcomes, self.findings, self.decisions, self.summary.get("coverage"),
+                            self.summary.get("health"), manifest, context, self.steps, summary=self.summary,
+                            safety=self.safety)
 
 
 def commit_status(run: RunOutcome, outcomes: list[CheckpointOutcome], mode: str = "informational", *,

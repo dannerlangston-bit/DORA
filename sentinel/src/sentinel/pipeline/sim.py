@@ -26,6 +26,10 @@ A sweep or split step without its own regions file reuses the file of another st
 surface and host (the config ships 480x360 only). A checkpoint with no regions file at all is
 diffed as one implicit `_rest` region, as 4.8's default says.
 
+Gadget minimum sizes (2.5.1). A build may carry a gadget's minimum size (`SimBuild.minimums`): a sweep step that
+requests less renders at the minimum on that axis, the way the real host clamps a gadget, so the sweep driver
+measures a clamped size.
+
 Census captures. A census checkpoint captures the surface's host cell or panel at the size that
 workspace gives it, not the whole 1920x1080 window: the synthetic workspace has nothing else to
 show, and a smaller image keeps the demo fast.
@@ -47,7 +51,7 @@ import numpy as np
 from .. import invariants as inv
 from .. import synth
 from ..diff.regions import Landmark, Region, RegionsFile, Rect, FloorException
-from ..diff.settle import Anchor, Frame, SettleSpec
+from ..diff.settle import Frame
 from ..scope import PlannedCheckpoint
 
 FRAME_MS = 250                                   # 3.5 frame interval
@@ -102,6 +106,10 @@ VISUAL_CHANGES: dict[str, VisualChange] = {c.change_id: c for c in (
                  "A pricing refactor transposes two digits of the Order Confirmation cost (15,205.00 for "
                  "100 x 150.25); every other pixel of the dialog is the base's",
                  frozenset({"dialog.order-confirmation"})),
+    VisualChange("confirm-account-echo", None,
+                 "A logging change echoes the selected account id in the Order Confirmation's top row, right of "
+                 "the account fields the redaction anchors cover (a suspected identifier leak, 3.6)",
+                 frozenset({"dialog.order-confirmation"})),
 )}
 
 
@@ -112,6 +120,14 @@ class SimBuild:
     build_id: str
     changes: frozenset[str] = frozenset()
     unsettled: frozenset[str] = frozenset()
+    minimums: tuple[tuple[str, int, int], ...] = ()     # (surface id, min w, min h): the gadget's minimum size
+
+    def clamp(self, surface_id: str, size: tuple[int, int]) -> tuple[int, int]:
+        """The size the build's gadget actually takes for a requested one: never below its minimum (2.5.1)."""
+        for sid, w, h in self.minimums:
+            if sid == surface_id:
+                return max(size[0], w), max(size[1], h)
+        return size
 
     def __post_init__(self) -> None:
         unknown = set(self.changes) - set(VISUAL_CHANGES)
@@ -346,6 +362,9 @@ def _order_confirmation(build: SimBuild, clock: str) -> tuple[dict, ScreenInfo]:
                      "rect": _at(lm, o, 24, dy, 200, 20)})
         kids.append({"type": "text", "name": f"confirm.{name}", "text": value, "align": "right", "rect": _at(lm, o, 24, dy, 200, 20)})
     kids.append({"type": "text", "name": "confirm.clock", "text": clock, "color": "dim", "rect": _at(lm, o, 260, 200, 110, 16)})
+    if build.has("confirm-account-echo"):
+        kids.append({"type": "text", "name": "confirm.echo", "text": EMPTY_ACCOUNT, "color": "dim",
+                     "rect": _at(lm, o, 400, 24, 120, 18)})
     for name, dx, label, style in (("send", 380, "Send", "primary"), ("cancel", 480, "Cancel", "default"),
                                    ("delete", 580, "Delete", "default")):
         kids.append({"type": "button", "name": f"confirm.{name}", "label": label, "style": style,
@@ -353,6 +372,7 @@ def _order_confirmation(build: SimBuild, clock: str) -> tuple[dict, ScreenInfo]:
     return dialog, ScreenInfo("dialog.title.label", target_window="dialog")
 
 
+EMPTY_ACCOUNT = "D-20481134"              # the fixture's empty account (4.9), the one a PR shard selects
 POSITIONS = (("AAPL", 100, 180.25, 1, 181.40), ("/MESZ26", 1, 6210.50, 5, 6195.25), ("CEI", 1000, 0.62, 1, 0.58),
              ("BKNG", 1, 4100.00, 1, 4122.80), (".AAPL261218C200", 1, 12.40, 100, 11.95),
              (".AAPL261218C210", -1, 8.10, 100, 7.60), ("EUR/USD", 10000, 1.0825, 1, 1.0871))
@@ -624,12 +644,12 @@ class SimApp:
         s, kind, b = cp.surface_id, cp.test_kind, self.build
         step = dict(cp.size_step or {})
         if s == "charts.flexible-grid.active-trader-cell":
-            size = (int(step["w"]), int(step["h"])) if kind == "sweep" else (640, 420)
+            size = b.clamp(s, (int(step["w"]), int(step["h"]))) if kind == "sweep" else (640, 420)
             layout, info = _atcell(size, b)
             return layout, size, info
         if s == "trade.active-trader.ladder":
             if kind == "sweep":
-                size = (int(step["w"]), int(step["h"]))
+                size = b.clamp(s, (int(step["w"]), int(step["h"])))
                 if step["host"] == "flexgrid":
                     layout, info = _atcell(size, b)
                 else:
@@ -644,7 +664,8 @@ class SimApp:
         if s == "charts.flexible-grid.chart-cell":
             sizes = {"ws.tier-a.swing-trader": (640, 420), "ws.tier-a.options-trader": (480, 420),
                      "ws.tier-a.futures-trader": (480, 360), "ws.tier-a.beginner": (640, 480)}
-            size = (int(step["w"]), int(step["h"])) if kind == "sweep" else sizes.get(cp.workspace_id, (640, 420))
+            size = b.clamp(s, (int(step["w"]), int(step["h"]))) if kind == "sweep" else \
+                sizes.get(cp.workspace_id, (640, 420))
             layout, info = _chart_cell(size, b)
             return layout, size, info
         if s == "charts.flexible-grid.level2-cell":
@@ -723,15 +744,3 @@ class SimApp:
         rf.validate()
         return rf
 
-    @staticmethod
-    def settle_spec(regfile: RegionsFile, park: tuple[int, int]) -> SettleSpec:
-        """Settle parameters (3.5): the landmark as must-see anchor, masks ignored, the parking point."""
-        anchors = []
-        for lm in regfile.landmarks:          # searched near where the landmark was cut, as 3.7 searches
-            th, tw = lm.template.shape[:2]
-            ex, ey = lm.expected or (0, 0)
-            anchors.append(Anchor(lm.id, template=lm.template, search=Rect(max(0, ex - 40), max(0, ey - 40),
-                                                                           tw + 80, th + 80)))
-        masks = [r.rect.offset(*regfile.landmark(r.landmark).expected) for r in regfile.regions
-                 if r.type == "mask" and regfile.landmark(r.landmark).expected is not None]
-        return SettleSpec(anchors=anchors, ignore=masks, park=park)

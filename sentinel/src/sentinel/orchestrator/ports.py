@@ -266,6 +266,13 @@ class DesktopPort(Protocol):
     def input_desktop(self) -> str:
         """The OpenInputDesktop name (4.12: must be Default)."""
 
+    def close_window(self, hwnd: int) -> bool:
+        """`WM_CLOSE` to one window (the popup sentinel's close of an unknown or error dialog, 4.10, 7.8); False when
+        the window stayed."""
+
+    def foreground_window(self) -> WindowInfo | None:
+        """`GetForegroundWindow` with its owner and image name (7.8 hardening, before every input batch)."""
+
 
 @runtime_checkable
 class InputPort(Protocol):

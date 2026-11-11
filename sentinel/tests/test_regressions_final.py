@@ -18,7 +18,7 @@ from sentinel.orchestrator.simrig import MemorySink, SimScenario, SimulatedRig, 
 from sentinel.pipeline.orchestration import login_alias, login_label
 from sentinel.pipeline.run import NightlyScenario, run_nightly, run_pipeline
 from sentinel.pipeline.sim import SimBuild
-from sentinel.records import CheckpointOutcome, RunOutcome
+from sentinel.records import CheckpointOutcome, DeclaredSend, RunOutcome
 from sentinel.report import render_pr_comment
 from sentinel.report.model import login_phrase, not_run_line, orders_sent_note
 from sentinel.store import ImportConflict, PostRunProof, RunPlan, ShardPlan, Store, StoreRefused
@@ -204,7 +204,9 @@ def test_every_proof_verdict_round_trips_through_its_8_3_row():
     book = OrderBook(position_rows=0, net_liq=2500.0)
     sent = OrderBook(working=(OrderRow("o-1", "working"),), position_rows=0, net_liq=2500.0)
     proofs = [post_run_proof(ProofInputs(book, book)),
-              post_run_proof(ProofInputs(book, sent, declared_sends=frozenset({"o-1"}))),
+              post_run_proof(ProofInputs(book, OrderBook(canceled=(OrderRow("o-1", "canceled", "CANCELED"),), position_rows=0, net_liq=2500.0),
+                                         declared_sends=(DeclaredSend("run", "run/1", "flow.paper.send", "s03", "o-1",
+                                                                      "2026-11-10T14:00:00+00:00"),))),
               post_run_proof(ProofInputs(None, None, session="never", tokens_issued=0)),
               post_run_proof(ProofInputs(book, None)),
               post_run_proof(ProofInputs(book, sent, cancel_all="failed"))]
@@ -246,11 +248,12 @@ def test_the_pipeline_writes_one_proof_per_shard_and_the_report_reads_them_back(
     (sent,) = [p for p in rows if p.verdict == "orders_sent"]
     assert sent.counts["undeclared"] == ["sim-order-1"] and sent.cancel_all == "performed_verified"
     assert {p.verdict for p in rows if p is not sent} == {"proven_no_sends"}
-    assert all(p.login_alias in aliases and p.send_policy_ref == "OPEN" and p.paper_mode_assertions == 1
+    # paper mode is asserted at the gate and again before every unit of work (6.4 Schedule, flow_boundary)
+    assert all(p.login_alias in aliases and p.send_policy_ref == "OPEN" and p.paper_mode_assertions > 1
                and p.start_snapshot_sha256 and p.end_snapshot_sha256 for p in rows)
     line = proof_line(sent.verdict, sent.reason, sent.counts["undeclared"], sent.cancel_all)
     assert line == r.proof == "ORDERS SENT: undeclared rows (sim-order-1); Cancel All verified"
-    assert f"Post-run proof: {line}" in r.comment and f"Cancel All verified, proof {line}" in r.comment
+    assert f"Post-run proof: {line}" in r.comment and f"Cancel All verified, proof {line}; shard " in r.comment
     assert re.search(r"an order reached the account: login rig-0\d paper login blocked and rig disabled", r.comment)
     assert "vault" not in r.comment + (tmp_path / "report.html").read_text()
 

@@ -1,6 +1,8 @@
 """Paper-mode assertion, settings attestation, fire drill, kill switch and proof, Explorer boundary (6.3 to 6.8)."""
 from __future__ import annotations
 
+import re
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -15,16 +17,24 @@ from sentinel.orchestrator.explorer import (ExplorerBudget, ExplorerSession, exp
 from sentinel.orchestrator.gateway import Chord, DropLedger, GatewayDrop
 from sentinel.orchestrator.identity import (Allowlist, assertion_due, classify, judge_fixture_account,
                                             judge_identity, load_allowlist, send_frame_fresh)
-from sentinel.orchestrator.killswitch import (ORDERS_SENT, PROVEN_DECLARED, PROVEN_NO_SESSION, PROVEN_NONE,
-                                              UNPROVEN, Proof, ProofInputs, TripWires, check_tripwires,
-                                              execute_kill_switch, kill_switch, post_run_proof, proof_result)
+from sentinel.orchestrator.killswitch import (CANCEL_BY_HAND, ORDERS_SENT, PROVEN_DECLARED, PROVEN_NO_SESSION,
+                                              PROVEN_NONE, UNPROVEN, UNPROVEN_BLOCK, Proof, ProofInputs, TripWires,
+                                              account_ref, book_sha256, cancel_new_working, check_tripwires,
+                                              config_invalid_proof,
+                                              execute_kill_switch, kill_switch, masked_account, post_run_proof,
+                                              proof_result, send_lines)
+from sentinel.orchestrator.orderbook import MonitorBook
+from sentinel.orchestrator.ports import KillRequest
 from sentinel.orchestrator.results import RunVerdict
-from sentinel.orchestrator.rig import (ConfirmationCheck, HotkeyRow, NotificationsRead, OrderBook, OrderRow, Rig,
-                                       SelectorRead, SettingRead)
+from sentinel.orchestrator.rig import (CancelAllResult, ConfirmationCheck, GatewayLog, HotkeyRow, NotificationsRead,
+                                       OrderBook, OrderRow, Rig, SelectorRead, SettingRead)
 from sentinel.orchestrator.simrig import EMPTY, GOLDEN, SimScenario, SimulatedRig, default_settings
+from sentinel.records import DeclaredSend
+from sentinel.store import RunPlan, Store
 
 ALLOW = Allowlist("rig-01", (GOLDEN, EMPTY), "0" * 64)
 EXAMPLE = Path(__file__).resolve().parents[1] / "config" / "example" / "gateway" / "allowlist.yaml"
+SCHEMA = Path(__file__).resolve().parents[1] / "src" / "sentinel" / "store" / "schema.sql"
 
 
 # -- 6.4 paper-mode assertion ---------------------------------------------------------------------------
@@ -243,6 +253,18 @@ def test_kill_switch_decision_marks_unreached_with_the_aborting_gate():
     assert r.run_reason == "kill_switch" and r.unreached.gate == "running" and r.unreached.reason == "kill_switch"
     assert r.actions[:2] == ("deny_all", "quarantine_flow") and r.alert.is_safety
     assert kill_switch("attempted_send", gate="running").run_reason == "attempted_send"
+    asked = KillRequest("rig-01", "cli", "asmith", "wrong build", "2026-11-10T14:00:00+00:00")
+    h = kill_switch("file_flag", gate="running", request=asked)
+    assert h.evidence["request"]["requested_by"] == "asmith" and "requested by asmith via cli: wrong build" in h.detail
+
+
+@pytest.mark.parametrize("trigger", ["file_flag", "named_pipe", "new_order_row", "order_event_window",
+                                     "dialog_open_30s", "ten_drops", "orchestrator_dead_flag_set"])
+def test_unreached_checkpoints_carry_kill_switch_for_human_channels_and_automatic_tripwires(trigger):
+    r = kill_switch(trigger, gate="running")                                            # SD-59
+    assert (r.run_status, r.run_reason) == ("aborted_safety", "kill_switch")
+    assert (r.unreached.outcome, r.unreached.gate, r.unreached.reason) == ("env_error", "running", "kill_switch")
+    assert r.has("recovery_login") and not r.has("block_login") and r.evidence["trigger"] == trigger
 
 
 START = OrderBook(position_rows=0, net_liq=2500.0)
@@ -278,21 +300,74 @@ def test_orders_sent_is_the_fifth_verdict_and_names_the_rows_and_cancel_all(canc
     assert r.detail == p.line and r.evidence["verdict"] == p.line and r.evidence["undeclared"] == ["x1", "f1"]
 
 
+def sent(key: str = "s1", step: str = "s05") -> DeclaredSend:
+    """A gated-branch send as SendGate records it (6.7): the token's flow and step and the Working row's key."""
+    return DeclaredSend("pr-48213-3", "shard-1", "flow.paper.send.spy-limit", step, key, "2026-11-10T14:02:11-05:00",
+                        token_id=1, symbol="SPY", qty=1)
+
+
+WORKING_S1 = OrderBook(working=(OrderRow("s1", "working", "WORKING"),), net_liq=2500.0)
+CANCELED_S1 = OrderBook(canceled=(OrderRow("s1", "canceled", "CANCELED"),), net_liq=2500.0)
+
+
 def test_a_failed_cancel_of_declared_sends_alone_is_unproven_and_the_verdicts_are_consistent():
-    declared = OrderBook(working=(OrderRow("s1", "working", "WORKING"),), net_liq=2500.0)
-    p = post_run_proof(ProofInputs(start=START, end=declared, cancel_all="failed", declared_sends=frozenset({"s1"})))
+    p = post_run_proof(ProofInputs(start=START, end=WORKING_S1, cancel_all="failed", declared_sends=(sent(),)))
     assert (p.verdict, p.reason, p.line) == (UNPROVEN, "cancel_all_failed", "UNPROVEN: cancel_all_failed")
     row = (OrderRow("x1", "working", "WORKING"),)
     with pytest.raises(ValueError, match="ORDERS SENT"):
         Proof(ORDERS_SENT)                                       # ORDERS SENT always names its rows
     with pytest.raises(ValueError, match="ORDERS SENT"):
         Proof(UNPROVEN, "cancel_all_failed", row)                # undeclared rows are never only UNPROVEN
+    with pytest.raises(ValueError, match="declared send"):
+        Proof(PROVEN_DECLARED)                                   # PROVEN: only declared sends names a send
+    with pytest.raises(ValueError, match="declared send"):
+        Proof(PROVEN_NONE, sends=(sent(),))                      # a run that sent is never "no orders sent"
+    with pytest.raises(TypeError):
+        ProofInputs(START, CANCELED_S1, declared_sends=("s1",))  # SendGate's records, not bare keys
+    with pytest.raises(ValueError):
+        ProofInputs(START, START, session="maybe")
 
 
-def test_proof_only_declared_sends_in_the_gated_branch():
-    end = OrderBook(canceled=(OrderRow("s1", "canceled", "CANCELED"),), net_liq=2500.0)
-    p = post_run_proof(ProofInputs(start=START, end=end, declared_sends=frozenset({"s1"})))
-    assert p.verdict == PROVEN_DECLARED and p.declared[0].key == "s1"
+def test_proof_only_declared_sends_lists_each_send_with_its_working_and_canceled_rows():
+    p = post_run_proof(ProofInputs(start=START, end=CANCELED_S1, declared_sends=(sent(),)))
+    assert p.verdict == PROVEN_DECLARED and p.declared[0].key == "s1" and p.sends == (sent(),)
+    (s,) = p.counts["sends"]
+    assert (s["flow_id"], s["step_id"], s["working"], s["canceled"], s["left_working"]) == (
+        "flow.paper.send.spy-limit", "s05", "s1", "s1", False)
+    assert p.counts["rows"]["canceled orders"] == {"start": 0, "end": 1, "new": 1, "expected": 1, "verdict": "ok"}
+    assert send_lines(p.counts) == ["send flow.paper.send.spy-limit s05 at 2026-11-10T14:02:11-05:00: Working row "
+                                    "s1, Canceled row s1"]
+    assert proof_result(p).passed and proof_result(p).evidence["sends"] == send_lines(p.counts)
+
+
+def test_a_declared_send_left_working_is_never_proven_whatever_cancel_all_says():
+    for cancel in ("not_needed", "done"):
+        p = post_run_proof(ProofInputs(START, WORKING_S1, cancel_all=cancel, declared_sends=(sent(),)))
+        assert (p.verdict, p.reason) == (UNPROVEN, "cancel_all_failed") and not p.proven
+        assert p.counts["rows"]["working orders"]["verdict"] == "not canceled"
+        assert send_lines(p.counts)[0].endswith("still Working, no Canceled row")
+    r = proof_result(post_run_proof(ProofInputs(START, WORKING_S1, declared_sends=(sent(),))))
+    assert r.run_reason == "unproven_proof" and r.evidence["blocked_reason"] == "cancel_all_failed"
+
+
+def test_a_declared_send_with_no_canceled_row_is_unproven_monitor_unreadable():
+    p = post_run_proof(ProofInputs(START, START, declared_sends=(sent(),)))
+    assert (p.verdict, p.reason) == (UNPROVEN, "monitor_unreadable")
+    assert p.counts["rows"]["canceled orders"]["verdict"] == "missing"
+    assert send_lines(p.counts) == ["send flow.paper.send.spy-limit s05 at 2026-11-10T14:02:11-05:00: Working row "
+                                    "s1, no Canceled row"]
+    both = OrderBook(canceled=(OrderRow("s1", "canceled", "CANCELED"),), net_liq=2500.0)
+    two = post_run_proof(ProofInputs(START, both, declared_sends=(sent(), sent("s2", "s09"))))
+    assert two.reason == "monitor_unreadable" and [s["canceled"] for s in two.counts["sends"]] == ["s1", None]
+
+
+def test_a_filled_declared_send_or_an_undeclared_row_beside_sends_is_orders_sent():
+    filled = OrderBook(filled=(OrderRow("s1", "filled", "FILLED"),), net_liq=2500.0)
+    assert post_run_proof(ProofInputs(START, filled, declared_sends=(sent(),))).verdict == ORDERS_SENT
+    extra = OrderBook(canceled=(OrderRow("s1", "canceled", "CANCELED"), OrderRow("x9", "canceled", "REJECTED")),
+                      net_liq=2500.0)
+    p = post_run_proof(ProofInputs(START, extra, declared_sends=(sent(),)))
+    assert p.verdict == ORDERS_SENT and [r.key for r in p.undeclared] == ["x9"] and p.counts["declared"] == ["s1"]
 
 
 def test_proof_no_session_established_needs_no_token():
@@ -314,7 +389,12 @@ def test_proof_unproven_reasons(inputs, reason):
     assert (p.verdict, p.reason) == (UNPROVEN, reason)
     r = proof_result(p)
     assert r.run_status == "complete_with_env_errors" and r.run_reason == "unproven_proof"
-    assert r.has("block_login") and r.alert == alerts.unproven_proof()
+    assert r.has("block_login") and r.evidence["blocked_reason"] == UNPROVEN_BLOCK[reason]
+    if reason in ("recovery_login_failed", "cancel_all_failed"):        # handed to a human: the login owner too
+        assert r.alert == alerts.unproven_proof().plus(paged=("login_owner",))
+        assert r.evidence["instruction"] == CANCEL_BY_HAND and CANCEL_BY_HAND in r.detail
+    else:
+        assert r.alert == alerts.unproven_proof() and r.detail == p.line and "instruction" not in r.evidence
 
 
 def test_unproven_keeps_an_aborted_safety_run_and_twice_disables_the_rig():
@@ -335,7 +415,13 @@ def test_kill_switch_sequence_then_proven_no_orders_sent():
     rep = _ks(rig, clock, rig.read_orders())
     assert rep.proof.verdict == PROVEN_NONE and rep.proof_effect.passed
     assert [s for s, _ in rep.steps] == ["deny_all", "kill_tree", "recovery_login", "proof", "revert_snapshot"]
-    assert rig.gw.deny_all and "cancel_all" not in rig.calls
+    assert "cancel_all" not in rig.calls
+    # the hook per phase (gateway.HOOK_STATES): deny-all, the recovery-only arm for the login, disarmed at the end
+    assert [c for c in rig.calls if c.startswith("set_hook_state")] == [
+        "set_hook_state:False:True", "set_hook_state:True:False:recovery_only", "set_hook_state:False:False"]
+    assert rig.calls.index("set_hook_state:True:False:recovery_only") < rig.calls.index("login") \
+        < rig.calls.index("revert_snapshot") < rig.calls.index("set_hook_state:False:False")
+    assert not (rig.gw.armed or rig.gw.deny_all or rig.recovery_only)
 
 
 def test_kill_switch_cancels_a_sent_order_and_the_proof_names_the_row():
@@ -369,6 +455,324 @@ def test_kill_switch_proof_monitor_unreadable():
     rig = SimulatedRig(SimScenario(monitor_unreadable=True), clock=clock)
     rep = _ks(rig, clock, rig.read_orders())
     assert rep.proof.reason == "monitor_unreadable"
+
+
+class StuckRig(SimulatedRig):
+    """A rig whose `Cancel All` is located and clicked but leaves the rows `stuck` keys in Working (6.6 Cancel All
+    failure: rows remain after 60 seconds)."""
+
+    def __init__(self, *a, stuck: frozenset[str] = frozenset(), **kw):
+        super().__init__(*a, **kw)
+        self.stuck = stuck
+
+    def cancel_all(self) -> CancelAllResult:
+        self._log("cancel_all")
+        keep = tuple(r for r in self.book.working if r.key in self.stuck)
+        moved = tuple(replace(r, grid="canceled", status="CANCELED") for r in self.book.working if r not in keep)
+        self.book = replace(self.book, working=keep, canceled=self.book.canceled + moved)
+        return CancelAllResult(True, True)
+
+
+def _with_send(rig: SimulatedRig, key: str = "s1") -> None:
+    rig.book = replace(rig.book, working=rig.book.working + (OrderRow(key, "working", "WORKING", "SPY", 1.0),))
+
+
+def test_kill_switch_cancels_declared_sends_and_proves_only_declared_sends():
+    clock = ManualClock()
+    rig = SimulatedRig(clock=clock)
+    start = rig.read_orders()
+    _with_send(rig)
+    rep = execute_kill_switch(rig, kill_switch("file_flag", gate="running"), clock=clock, allowlist=ALLOW, start=start,
+                              fixture_account=EMPTY, declared_sends=(sent(),))
+    assert "cancel_all" in rig.calls and rep.proof.cancel_all == "done"
+    assert rep.proof.verdict == PROVEN_DECLARED and rep.proof.counts["sends"][0]["canceled"] == "s1"
+    assert rep.proof_effect.passed
+
+
+def test_a_declared_row_cancel_all_leaves_working_is_unproven_cancel_all_failed_and_pages_the_login_owner():
+    clock = ManualClock()
+    rig = StuckRig(clock=clock, stuck=frozenset({"s1"}))
+    start = rig.read_orders()
+    _with_send(rig)
+    t0 = clock.monotonic()
+    rep = execute_kill_switch(rig, kill_switch("file_flag", gate="running"), clock=clock, allowlist=ALLOW, start=start,
+                              fixture_account=EMPTY, declared_sends=(sent(),))
+    assert clock.monotonic() - t0 >= 60.0 and rig.calls.count("cancel_all") == 1          # re-read for 60 s
+    assert (rep.proof.verdict, rep.proof.reason, rep.proof.cancel_all) == (UNPROVEN, "cancel_all_failed", "failed")
+    e = rep.proof_effect
+    assert e.run is None                                                                 # stays aborted_safety
+    assert e.alert == alerts.safety_abort().plus(paged=("login_owner",))                # the safety page re-sent
+    assert e.has("block_login") and e.evidence["blocked_reason"] == "cancel_all_failed"
+    assert e.evidence["account"] == "account D-xxxxxxxx (allowlist entry 2) on rig rig-01"
+    assert e.evidence["instruction"] == CANCEL_BY_HAND and CANCEL_BY_HAND in e.detail and EMPTY not in e.detail
+
+
+def test_cancel_all_rereads_until_no_new_row_of_any_kind_remains():
+    clock = ManualClock()
+
+    class SlowRig(SimulatedRig):
+        """Cancel All clicks at once; Working clears on the third read after it."""
+        reads = 0
+
+        def cancel_all(self) -> CancelAllResult:
+            self._log("cancel_all")
+            return CancelAllResult(True, True)
+
+        def read_orders(self) -> OrderBook:
+            self.reads += 1
+            if self.reads == 3:
+                self.book = replace(self.book, working=(), canceled=tuple(
+                    replace(r, grid="canceled", status="CANCELED") for r in self.book.working))
+            return self.book if self.reads != 2 else replace(self.book, readable=False)
+
+    rig = SlowRig(clock=clock)
+    start = OrderBook(net_liq=2500.0)
+    _with_send(rig)
+    cancel, end, found = cancel_new_working(rig, start, rig.book, clock=clock)
+    assert cancel == "done" and rig.reads == 3 and not end.working and end.readable     # an unreadable read is no "clear"
+    assert found is not None and [r.key for r in found.working] == ["s1"]               # the read that found the row
+    assert cancel_new_working(rig, start, OrderBook(net_liq=2500.0), clock=clock)[0] == "not_needed"
+
+
+class BlurAfterCancel(SimulatedRig):
+    """A rig whose Monitor reads go bad once Cancel All is clicked (a confirmation popup over the grid): unreadable,
+    or with `disagree` readable with no Working row but disagreeing with Copy All."""
+
+    def __init__(self, *a, disagree: bool = False, **kw):
+        super().__init__(*a, **kw)
+        self.disagree, self.blurred = disagree, False
+
+    def cancel_all(self) -> CancelAllResult:
+        self.blurred = True
+        return super().cancel_all() if not self.disagree else CancelAllResult(True, True)
+
+    def read_orders(self) -> MonitorBook:
+        book = super().read_orders()
+        if not self.blurred:
+            return book
+        return replace(book, working=(), copy_all_agrees=False) if self.disagree else replace(book, readable=False)
+
+
+@pytest.mark.parametrize("disagree", [False, True])
+def test_a_clean_read_that_found_an_undeclared_row_is_orders_sent_though_every_reread_after_cancel_all_is_bad(
+        disagree):
+    """killswitch:0: the clean read that triggered Cancel All is kept (`ProofInputs.found`), so re-reads that are
+    unreadable, or readable but disagree with Copy All, for 60 s give ORDERS SENT with Cancel All failed and the
+    login-owner hand-over, not UNPROVEN monitor_unreadable."""
+    clock = ManualClock()
+    rig = BlurAfterCancel(clock=clock, disagree=disagree)
+    start = rig.read_orders()
+    rig._send()
+    rep = _ks(rig, clock, start)
+    assert rig.calls.count("cancel_all") <= 1 and rep.proof.cancel_all == "failed"
+    assert rep.proof.line == "ORDERS SENT: undeclared rows (sim-order-1); Cancel All failed"
+    e = rep.proof_effect
+    assert e.incident == "S1" and e.run_reason == "undeclared_order_row" and "login_owner" in e.alert.paged
+    assert e.evidence["blocked_reason"] == "incident" and e.evidence["instruction"] == CANCEL_BY_HAND
+
+
+def test_the_recovery_proof_after_a_killed_tree_keeps_the_clean_read_that_found_the_row():
+    """killswitch:0 on machine._recovery_proof: a result that killed the tree (a deferred assertion past five minutes)
+    with an order out; every re-read after Cancel All is unreadable, so the run is ORDERS SENT, not UNPROVEN."""
+    from sentinel.orchestrator.identity import deferral_unreadable
+    from sentinel.orchestrator.machine import Orchestrator
+    from sentinel.orchestrator.simrig import MemorySink, default_context
+
+    clock = ManualClock()
+    rig = BlurAfterCancel(clock=clock)
+
+    def work(o):
+        rig._send()
+        o.apply(deferral_unreadable(deferred_s=400.0))
+
+    rep = Orchestrator(rig, default_context(), MemorySink(["c1"]), clock=clock).run(work)
+    assert rep.proof.line == "ORDERS SENT: undeclared rows (sim-order-1); Cancel All failed"
+    assert (rep.verdict.status, rep.verdict.reason) == ("aborted_safety", "undeclared_order_row")
+
+
+def test_an_order_found_at_teardown_stays_orders_sent_when_the_recovery_login_then_fails():
+    """killswitch:1: the teardown read is clean and finds an order; the kill switch sequence's recovery login fails.
+    The run's proof (the 8.3 row, the report) stays ORDERS SENT with Cancel All failed, and the one page blocks the
+    login for `incident` with the hand-over; the sequence's own UNPROVEN line is kept beside it."""
+    from sentinel.orchestrator.machine import Orchestrator
+    from sentinel.orchestrator.simrig import MemorySink, default_context
+
+    clock = ManualClock()
+    rig = SimulatedRig(SimScenario(recovery_login_fails=1), clock=clock)
+
+    def work(o):
+        o.sink.record("c1", "passed")
+        rig._send()
+
+    rep = Orchestrator(rig, default_context(), MemorySink(["c1", "c2"]), clock=clock).run(work)
+    assert rep.proof.line == "ORDERS SENT: undeclared rows (sim-order-1); Cancel All failed"
+    assert (rep.proof.verdict_code, rep.proof.cancel_all_code) == ("orders_sent", "performed_unverified")
+    assert rep.proof.counts["undeclared"] == ["sim-order-1"]
+    (page,) = [r for r in rep.results if r.alert is not None]
+    assert page.evidence["verdict"] == rep.proof.line and page.evidence["undeclared"] == ["sim-order-1"]
+    assert page.evidence["blocked_reason"] == "incident" and page.evidence["instruction"] == CANCEL_BY_HAND
+    assert page.evidence["kill_switch_proof"] == "UNPROVEN: recovery_login_failed" == rep.kill_switch.proof.line
+    assert page.evidence["teardown_undeclared"] == ["sim-order-1"] and not page.findings
+    assert (rep.verdict.status, rep.verdict.reason) == ("aborted_safety", "undeclared_order_row")
+
+
+LIVE = SelectorRead("12345678SCHW", crop_sha256="crop-live")
+
+
+def test_a_live_account_at_the_recovery_login_is_live_identity_s1_and_the_proof_session_unavailable():
+    """killswitch:3: the file-flag kill switch's recovery login reads a live-format id. The sequence reports the 6.4
+    result (aborted_safety live_identity, S1, the login blocked for live_identity, the selector crop) for the caller to
+    apply, reads nothing more through that session, and the proof is UNPROVEN session_unavailable (SD-64) with no
+    cancel-by-hand hand-over through it."""
+    clock = ManualClock()
+    rig = SimulatedRig(SimScenario(selector_reads=[LIVE]), clock=clock)
+    rep = _ks(rig, clock, rig.read_orders())
+    i = rep.identity
+    assert i is not None and (i.run_status, i.run_reason, i.incident) == ("aborted_safety", "live_identity", "S1")
+    assert i.has("block_login") and i.evidence["crop"] == "crop-live"
+    assert (rep.proof.verdict, rep.proof.reason) == (UNPROVEN, "session_unavailable")
+    assert rig.calls.count("read_orders") == 1                                           # the start read only
+    e = rep.proof_effect
+    assert e.evidence["blocked_reason"] == "live_identity" and "instruction" not in e.evidence
+    assert "login_owner" not in e.alert.paged
+
+
+def test_a_foreign_paper_id_at_the_recovery_login_is_paper_mode_mismatch_and_recovery_login_failed():
+    """killswitch:3: any other text that is not an allowlist entry is the S2 mismatch; the proof stays UNPROVEN
+    recovery_login_failed with the hand-over."""
+    clock = ManualClock()
+    rig = SimulatedRig(SimScenario(selector_reads=[SelectorRead("D-99999999")]), clock=clock)
+    rep = _ks(rig, clock, rig.read_orders())
+    assert (rep.identity.run_reason, rep.identity.incident) == ("paper_mode_mismatch", "S2")
+    assert not rep.identity.has("block_login")
+    assert (rep.proof.reason, rep.proof_effect.evidence["blocked_reason"]) == ("recovery_login_failed",) * 2
+    assert rep.proof_effect.evidence["instruction"] == CANCEL_BY_HAND
+    clean_rig = SimulatedRig(clock=clock)
+    assert _ks(clean_rig, clock, clean_rig.read_orders()).identity is None
+    from sentinel.orchestrator.killswitch import RecoveryLogin
+    assert RecoveryLogin(True) and not RecoveryLogin(False, rep.identity)             # truthy as the old bool was
+
+
+def test_the_orchestrator_applies_a_live_identity_its_kill_switch_recovery_login_saw():
+    """killswitch:3 through the Orchestrator: S1, the login blocked for live_identity on every result that blocks."""
+    from sentinel.orchestrator.machine import Orchestrator
+    from sentinel.orchestrator.simrig import MemorySink, default_context
+    from sentinel.store.safety import blocked_reason_for
+
+    clock = ManualClock()
+    rig = SimulatedRig(clock=clock)
+    flag, _ = rig.kill_channels()
+
+    def work(o):
+        rig.s.selector_reads.append(LIVE)                     # the next read is the recovery login's
+        flag.post(KillRequest("rig-01", "cli", "oncall", "stop", "t"))
+        assert o.step_boundary() is o.stop is not None
+
+    rep = Orchestrator(rig, default_context(), MemorySink(["c1"]), clock=clock).run(work)
+    assert (rep.verdict.status, rep.verdict.reason) == ("aborted_safety", "kill_switch")      # the first abort stands
+    live = [r for r in rep.results if r.run_reason == "live_identity"]
+    assert len(live) == 1 and live[0].incident == "S1"
+    assert {blocked_reason_for(r) for r in rep.results if r.has("block_login")} == {"live_identity"}
+    assert rep.proof.line == "UNPROVEN: session_unavailable"
+
+
+def test_the_proof_takes_orders_sent_from_a_clean_found_read_and_names_that_read():
+    """killswitch:0: `found` only ever adds undeclared rows, and only from a clean read; its sha is the end read the
+    proof compared when the last read was not clean."""
+    row = OrderRow("x1", "working", "WORKING")
+    found = OrderBook(working=(row,), net_liq=2500.0)
+    p = post_run_proof(ProofInputs(START, replace(found, readable=False), cancel_all="failed", found=found))
+    assert p.line == "ORDERS SENT: undeclared rows (x1); Cancel All failed" and p.end_sha256 == book_sha256(found)
+    dirty = post_run_proof(ProofInputs(START, None, cancel_all="failed", found=replace(found, copy_all_agrees=False)))
+    assert (dirty.verdict, dirty.reason) == (UNPROVEN, "monitor_unreadable")
+    canceled = OrderBook(canceled=(replace(row, grid="canceled", status="CANCELED"),), net_liq=2500.0)
+    both = post_run_proof(ProofInputs(START, canceled, cancel_all="done", found=found))
+    assert both.line == "ORDERS SENT: undeclared rows (x1); Cancel All verified"     # one row, by its key
+    vanished = post_run_proof(ProofInputs(START, START, cancel_all="done", found=found))
+    assert vanished.verdict == ORDERS_SENT and [r.key for r in vanished.undeclared] == ["x1"]
+
+
+def test_a_failed_recovery_login_pages_the_login_owner_and_blocks_with_its_reason():
+    clock = ManualClock()
+    rig = SimulatedRig(SimScenario(recovery_login_fails=1), clock=clock)
+    rig.login()
+    rep = _ks(rig, clock, rig.read_orders())
+    e = rep.proof_effect
+    assert (rep.proof.verdict, rep.proof.reason) == (UNPROVEN, "recovery_login_failed")
+    assert "login_owner" in e.alert.paged and e.alert.rule == "safety:aborted_safety"
+    assert e.evidence["blocked_reason"] == "recovery_login_failed" and e.has("block_login")
+    assert e.evidence["working_orders_screenshot"] is None and "no Working Orders read" in e.detail
+    assert e.detail.startswith("UNPROVEN: recovery_login_failed; account D-xxxxxxxx (allowlist entry 2) on rig rig-01")
+
+
+def test_the_hand_over_page_carries_the_working_orders_screenshot_of_the_last_read():
+    shot = MonitorBook(working=(OrderRow("s1", "working", "WORKING"),), net_liq=2500.0, buying_power=5000.0,
+                       screenshot_sha256="sha-wo")
+    p = post_run_proof(ProofInputs(START, shot, cancel_all="failed", declared_sends=(sent(),)))
+    r = proof_result(p, account=account_ref(ALLOW, GOLDEN), screenshot_sha256=shot.screenshot_sha256)
+    assert r.evidence["working_orders_screenshot"] == "sha-wo" and "Working Orders screenshot sha-wo" in r.detail
+    assert r.alert == alerts.unproven_proof().plus(paged=("login_owner",))              # the run was not aborted
+    assert account_ref(ALLOW, GOLDEN) == "account D-xxxxxxxx (allowlist entry 1) on rig rig-01"
+    assert account_ref(ALLOW, "D-1") == account_ref(ALLOW, None) == "the fixture account on rig rig-01"
+    assert masked_account("D-20481133") == "D-xxxxxxxx" and masked_account("1234") == "xxxx"
+
+
+def test_orders_sent_with_cancel_all_failed_keeps_its_line_and_carries_the_hand_over():
+    end = OrderBook(working=(OrderRow("x1", "working", "WORKING"),), net_liq=2500.0)
+    p = post_run_proof(ProofInputs(START, end, cancel_all="failed"))
+    r = proof_result(p, account="account D-xxxxxxxx (allowlist entry 2) on rig rig-01")
+    assert r.detail == p.line and r.evidence["instruction"] == CANCEL_BY_HAND
+    assert r.evidence["blocked_reason"] == "incident" and "login_owner" in r.alert.paged
+    verified = proof_result(post_run_proof(ProofInputs(START, end, cancel_all="done")))
+    assert "instruction" not in verified.evidence and verified.evidence["blocked_reason"] == "incident"
+
+
+def test_after_live_identity_no_recovery_login_is_made_and_the_proof_is_session_unavailable():
+    clock = ManualClock()
+    rig = SimulatedRig(clock=clock)
+    decision = kill_switch("live_identity", gate="paper_mode_asserted")
+    assert not decision.has("recovery_login") and decision.evidence["blocked_reason"] == "live_identity"   # SD-64
+    rep = execute_kill_switch(rig, decision, clock=clock, allowlist=ALLOW, start=rig.read_orders(),
+                              fixture_account=EMPTY)
+    assert "login" not in rig.calls and "launch" not in rig.calls
+    assert [s for s, _ in rep.steps] == ["deny_all", "kill_tree", "proof", "revert_snapshot"]
+    assert (rep.proof.verdict, rep.proof.reason) == (UNPROVEN, "session_unavailable")
+    e = rep.proof_effect
+    assert e.run is None and e.has("block_login") and e.evidence["blocked_reason"] == "live_identity"
+    assert "login_owner" not in e.alert.paged                                            # not a hand-over case
+    kicked = proof_result(post_run_proof(ProofInputs(START, None, session="kicked", kicked_login_ok=False)))
+    assert kicked.evidence["blocked_reason"] == "session_unavailable"
+
+
+def test_buying_power_is_a_proof_line_and_an_unexplained_drift_is_monitor_unreadable():
+    start = MonitorBook(net_liq=2500.0, buying_power=5000.0)
+    p = post_run_proof(ProofInputs(start, replace(start, buying_power=5000.25)))
+    assert p.verdict == PROVEN_NONE
+    assert p.counts["rows"]["buying power"] == {"start": 5000.0, "end": 5000.25, "drift": 0.25, "verdict": "ok"}
+    drift = post_run_proof(ProofInputs(start, replace(start, buying_power=4000.0)))
+    assert (drift.verdict, drift.reason) == (UNPROVEN, "monitor_unreadable")
+    assert drift.counts["rows"]["buying power"]["verdict"] == "drift"
+    assert "buying power" not in post_run_proof(ProofInputs(START, START)).counts["rows"]   # a read without it
+
+
+def test_the_config_invalid_run_level_proof_is_written_and_read_back(tmp_path):
+    row = config_invalid_proof("run-cfg", produced_at="2026-11-10T15:00:00Z")
+    assert (row.shard_id, row.login_alias, row.verdict, row.reason, row.cancel_all) == (
+        None, None, "proven_no_session", None, "not_needed")
+    assert (row.gateway_events, row.gateway_drops, row.send_policy_ref) == (0, 0, "OPEN")
+    with Store(tmp_path / "s.db") as store:
+        store.begin_run(RunPlan("run-cfg", "pr", "cfg", "0" * 64, "0" * 64, "h", "AUTH", 2700, ()))
+        store.write_proof(row)                                                          # SD-61: shard_id NULL
+        (back,) = store.post_run_proofs("run-cfg")
+    assert (back.shard_id, back.verdict, back.counts["rows"]) == (None, "proven_no_session", {})
+    leaked = config_invalid_proof("run-cfg", produced_at="2026-11-10T15:00:00Z", gateway=GatewayLog(tokens_issued=1))
+    assert leaked.verdict == "unproven" and leaked.reason == "snapshot_missing"
+
+
+def test_every_blocked_reason_the_proof_names_is_an_8_3_logins_value():
+    check = re.search(r"blocked_reason\s+TEXT CHECK \(blocked_reason IN \(([^)]*)\)\)", SCHEMA.read_text(), re.S)
+    allowed = set(re.findall(r"'([a-z_]+)'", check.group(1)))
+    assert set(UNPROVEN_BLOCK.values()) | {"incident", "live_identity"} <= allowed
 
 
 # -- 6.8 Explorer boundary ------------------------------------------------------------------------------

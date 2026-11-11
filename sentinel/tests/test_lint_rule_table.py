@@ -40,8 +40,12 @@ def test_every_section_4_rule_has_a_row():
 
 def test_new_rows_are_pending_until_a_module_checks_them():
     report = lint(EXAMPLE, today=TODAY)
+    implemented = {i for m in R.check_modules() for i in m.RULE_IDS}
     for rid in NEW_ROWS:
-        assert report.skipped[rid].startswith("pending:"), rid
+        if rid in implemented:
+            assert rid not in report.skipped, rid
+        else:
+            assert report.skipped[rid].startswith("pending:"), rid
     assert all(report.skipped[f"L-OUT-0{i}"].startswith("record rule") for i in range(1, 8))
     assert all(report.skipped[f"L-DEC-0{i}"].startswith("record rule") for i in range(1, 9))
 

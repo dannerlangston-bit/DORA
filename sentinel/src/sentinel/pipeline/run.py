@@ -3,12 +3,19 @@
 `run_pipeline(config_dir, scenario, out_dir, today=...)` follows the PR run of 1.7 and the
 checkpoint sequence of 5.17 with the rig replaced by `sim`:
 
-1. T+0:00. The config the run pins (the given directory plus the PR's manifest and build records,
-   4.3) is linted; any error is preflight item G1 (12.7): the shard's Orchestrator stops at
-   `provisioned` and the run ends `aborted_harness (reason: config_invalid)` with the abort block in
-   the PR comment. The build pair is read from the candidate's build record.
-2. T+0:01 to 0:02. The manifest for the candidate is loaded (or not: the two no-manifest cases),
-   the changed paths go through the static impact step and `scope.compute_scope` plans the run.
+1. T+0:00. Run creation checks the candidate's build pair (4.2, `lint.rules.check_pair`): a refused pair
+   raises `PairRefused` and no run row is written. The config the run pins (the given directory plus the
+   PR's manifest and build records, 4.3) goes through the run-start lint (`lint.runstart.lint_at_run_start`,
+   4.1): an error is preflight item G1 (12.7): the shard's Orchestrator stops at `provisioned`, the run ends
+   `aborted_harness (reason: config_invalid)` with the abort block in the PR comment and the run-level proof
+   of SD-61. An expired mask, floor exception or invariant exception is not an error there: it stops applying,
+   run health lists it (`health.expired`) and the run writes its `mask_expired`, `floor_exception_expired` or
+   `invariant_exception_expired` finding; masks expiring within seven days go to the summary (`expiring`, 3.8).
+2. T+0:01 to 0:02. The manifest for the candidate is linted on its own (`lint_manifest`): one with an error
+   is treated as missing and its lint lines go to the summary (`manifest_lint`, 4.3). The manifest is loaded
+   (or not: the two no-manifest cases), the changed paths go through the static impact step and
+   `scope.compute_scope` plans the run; a `ScopeConfigError` aborts `config_invalid` with the rule ids its
+   message names (SD-01).
 3. Before any threshold is used (3.9, 1.6 Calibration run) an A/A calibration of the base build is
    run with `diff.calibration` over every planned checkpoint: five captures in one session and one
    in a fresh session; the same A/A pairs drive the invariant enablement test of 2.7.
@@ -22,36 +29,87 @@ checkpoint sequence of 5.17 with the rig replaced by `sim`:
    (`report.cluster.cluster_members`, 9.7); one simulated Reviewer call per cluster that needs one
    (task A for declared surfaces, task B descriptions for `collateral`; never for invariants or
    assertions, never for a member that inherited a decision), up to the PR cap of 60 calls.
+   Before the diff, Capture's redaction stage (`capture.redact_pair`, 3.6, 6.10) redacts the pair with the
+   config's `redaction/anchors.yaml` and the fixture's account ids, the simulated OCR reading what synth drew: a
+   redaction landmark found on one side only is `landmark_missing (redaction_landmark:<id>)` with nothing stored;
+   otherwise the redacted pair is diffed with its boxes (`diff_pair(redactions=)`), stored and sent, a stray id
+   is a `redaction_miss` finding, and every artifact carries the run's redaction version.
 7. Everything goes through `store.Store` (single writer) and `store.ArtifactStore` (content
-   addressed, redaction header set: synthetic screens carry no account data), each shard's post-run
-   proof included (one 8.3 `post_run_proofs` row per shard, keyed by the rig's login alias). The coverage
-   matrix (`coverage.build_matrix`) and the Reporter's PR comment, commit status and static HTML report
-   are rendered from what the store returns: the proof line, what Cancel All did and the blocked login's
-   readable label (`orchestration.login_label`, never the vault alias) come from the stored proofs.
+   addressed, under the run's redaction header, with the plaintext scanner of 6.9), each shard's post-run
+   proof included (one 8.3 `post_run_proofs` row per shard, keyed by the rig's login alias). The teardown
+   summary (8.3 `runs.summary_json`: the coverage matrix of `coverage.build_matrix`, run health, the abort
+   block, the manifest's lint, the expiring masks and the alerts) is written with `Store.end_run(summary=)`,
+   and the Reporter's PR comment, commit status and static HTML report are rendered from the finished run read
+   back (`report.ReportInputs.from_store`): the proof line, what Cancel All did and the blocked login's
+   readable label (`orchestration.login_label`, never the vault alias) come from the stored proofs. Each results
+   batch is checked for a secret's plaintext before it is uploaded (`secret_scan.check_upload`), and the teardown
+   scan (`scan_run`) reads every row and file the run wrote; a hit, or a scan that cannot run, is `aborted_harness
+   (secret_leaked | secret_scan_unavailable)` with the report withheld. One `egress.EgressGate` per run, over
+   `policy/egress_allowlist.yaml`, carries every outbound call of the live Reviewer (`live_factory`, 6.10).
 
 `run_nightly` is the canary pass of a Nightly run (10.3): `canary.generate` mutates approved
 captures of the base build, every mutant goes through the same `evaluate` path as a PR checkpoint
 with `synthetic: true`, behavioral canaries run their canary flow on the simulated app, and
 `canary.score` gives the result rows, the detector state, the synthetic `harness_error` rows and
-the morning banner.
+the morning banner. Its safety pass (`safety_pass`, 6.5, 6.8, 10.3) then runs the attestation, identity, proof and
+secret-scan canaries, the denied-action test and the fire drill (`orchestrator.drill.run_drill` with `SimDrillPort`)
+on the shard's rig; their `canary_results` rows are written, every result goes through `Orchestrator.apply` (a drill
+that placed an order stops the shard through the kill switch, `aborted_safety (drill_order_placed)`), a blind one's
+result is persisted (`apply_safety_actions`), its banner and detector state join the run's (summary `safety`, which
+later PR runs in the store read), and the day's egress rows are reconciled against the allowlist (`egress.reconcile`).
 
 The Orchestrator (5.2): every shard goes through `orchestrator.Orchestrator` on a simulated rig
 (`pipeline.orchestration`): provisioned, launched, authenticated, the paper-mode assertion against
 the example allowlist, settings attestation, workspace, fixture verification and the canary flow, then
-`running`, where the Executor (`_ShardWork`) re-reads the build id before each flow, writes a heartbeat
-at every step, sends each input-bearing flow step through the gateway (`Rig.send_input`, the drop
-ledger of 5.4.8), runs the Watchdog's hang detector, and captures the checkpoints of every shard in
-`running` in plan order; then each shard's teardown and post-run proof. A control result that stops
+`running`, where the Executor (`_ShardWork`) re-reads the build id before each unit of work, then calls
+`Orchestrator.flow_boundary` (the kill channels and trip-wires, the Watchdog, free space, the 11.2 wall budget
+of the shard, the rate caps, the spend ceiling, the model re-check, the paper-mode assertion of 6.4 and the
+proactive relaunch), writes a heartbeat at every step and calls `step_boundary` before every flow step and
+every sweep or split step after its ladder's first (the trip-wires, the flow's budget, the assertion before an
+order-stage step or on the two-minute timer), sends each input-bearing flow step through the gateway
+(`Rig.send_input`, the drop ledger of 5.4.8), runs the Watchdog's hang detector (an app failure relaunches
+through `Orchestrator.relaunch("app_failure")`, every gate again, and writes a `relaunch` step event), and captures
+the checkpoints of every shard in `running` in plan order, each stamped with the session's paper-asserted stamp
+(`paper_stamp`; none means `aborted_safety (paper_mode_mismatch)` through the kill switch, and a stamp
+`may_release` refuses keeps the frame from the Reviewer); then each shard's teardown and post-run proof. The
+session safety state goes to the rig (`safety_listener`), and every record is written under its session's L-OUT-06
+context (`Store.set_session_context`). A control result that stops
 a shard gives its unreached checkpoints the Orchestrator's exact outcome (1.10); the run outcome is the
 worst of the shards' (8.2). The A/A calibration runs once a shard reaches `running`, so a run whose
-shards all stop at a gate captures nothing. Every gateway drop or refusal is a `step_events` row in the store with
-its `gateway_event` (8.3 `gate_decision`, `gate_reason`, `gate_class`), and the Safety row counts those rows. Every
+shards all stop at a gate captures nothing. Every gateway decision of a shard (the Executor's flow input, the
+LOGIN flow's typing and Cancel All, through the rig's `on_input`) is a `step_events` row from the shard's drop-log
+drainer (`gateway.drainer.Drainer`, 8.3 `gate_decision`, `gate_reason`, `gate_class`, `token_id`; dropped and
+refused rows also in its `gateway_drops.jsonl` journal), written with `Store.write_events` before any other step
+row of the shard so the two seq writers never collide; the Safety row counts the dropped and refused rows. A drop
+also goes to the `DropLedger` with the step and the shard's budgets: a blocked step ends its flow (the rest
+`not_run (reason: step_failed:<step>)`), a dead hook host restarts on its own budget with a relaunch, an attempted
+send is `aborted_safety`. The default order chords come from `gateway/default_order_hotkeys.yaml`. Every
 control result's 9.10 route goes to `alerts.json`; the shards, their gates and proofs (`Proof.line`, 6.6), the
 gateway events and the actions the Orchestrator does not perform itself go to `orchestrator.json`.
 
-The Oracle (2.8, `pipeline.assertions`): every flow checkpoint that declares assertions is evaluated
-on both builds; the candidate's verdict feeds `classify.Facts` (3.11 G and H) and the failed
-assertion's raw values of both builds go to `Finding.evidence.raw_values` and the finding text.
+The Executor (5.4.3, 5.5, 2.4, 2.6.1, 4.7, 10.1, 10.2): each unit of work runs through `executor.flow.run_unit` on
+the shard's simulated rig (`pipeline.simports`): a flow as its 4.7 document, a census visit, sweep step or split
+step as `executor.flow.census_unit` (`reset_input_state`, the 2.4 preconditions, the surface's path, the checkpoint).
+Input steps go through `executor.emitter.emit` (stages 1 to 8) with `executor.primitives.Planner` and the locator
+ladder (`executor.locator.Ladder` over the simulated desk); the step boundary is `UnitHooks.before_step`, an app
+failure seen inside a step ends the unit through `after_step`; the heartbeat is the shard's
+`executor.heartbeat.HeartbeatPolicy` (the Orchestrator's gates write through it too) and the app's age its
+`AppLife` (`app_uptime_s`, `app_restart_count` on every capture and step row); exceptions are the 10.1 rows of
+`executor.failures.guard` with the shard's `FailureLedger` (an artifact write that failed twice ends the run
+`aborted_harness (artifact_persist_failed)` at teardown); three env_error census visits in one workspace mark its
+remaining visits (`workspace:<id>`). Every step is one 8.3 step outcome row with its action and the ladder's rung;
+the emitter's own action rows keep their rung, point, label and crop while the gateway decision is the drainer's
+row (`ExecContext.audit`), so the run's drop count counts each decision once. The LOGIN secret is a leased
+`secret` step (`executor.secret.run_secret_step` over `simports.SimVault`); every lease's value joins the teardown
+plaintext scan and is then released (6.9).
+
+The Oracle (2.8, `pipeline.assertions`): every flow checkpoint that declares assertions or rule regions, and
+every census, sweep or split checkpoint whose regions file has rule regions (SD-29, `oracle.checks_for`), is
+evaluated on both builds; the candidate's verdict feeds `classify.Facts` (3.11 G and H), the failed
+assertion's raw values of both builds go to `Finding.evidence.raw_values` and the finding text, its signature
+region is the region the result names (`AssertionResult.region`), and every read is stored
+(`Store.write_extractions`, SD-09). The Invariant Checker gets the checkpoint's rule regions
+(`oracle.invariant_rule_regions`, 2.7).
 
 Choices (reported):
 
@@ -65,68 +123,129 @@ Choices (reported):
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
-from collections import abc
+from types import SimpleNamespace
 import hashlib
+import itertools
 import json
 import math
+from collections import abc
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import cv2
 import numpy as np
 
 from .. import canary as cn
 from .. import invariants as inv
-from ..classify import (REVIEWER_ROWS, Classified, Condition, DecisionMatch, Facts, HarnessFailure, Review, classify)
+from ..classify import REVIEWER_ROWS, Classified, Condition, Facts, HarnessFailure, Review, classify
 from ..coverage import Profile, build_matrix
 from ..diff import load_params
 from ..diff.calibration import CalibrationFile, Capture as CalCapture, calibrate_checkpoint
-from ..diff.engine import (DiffContext, DiffResult, compare_fingerprints, diff_pair, fingerprint_id,
+from ..diff.engine import (DiffContext, DiffResult, diff_pair, fingerprint_id,
                            global_shift_prepass)
+from ..capture import (RedactionContext, RedactionError, RedactionList, RedactionResult, Sweep, SyntheticOcr,
+                       redact_pair, redaction_version)
+from ..capture.capture import (ForeignWindowLog, TargetWindow, capture_meta, choose_target, foreign_window_event,
+                               masked_live_median, masked_live_offsets, modal_blocking, occluded, occlusion,
+                               occlusion_grid, pid_tree, put_capture, select_windows)
+from ..capture.sweep import SizeLadder, compare_minimums, minimums_summary, size_step_event
+from ..orchestrator.version_read import DEFAULT_TITLE_REGEX
+from ..orchestrator import fixture_checks
+from .. import branches as branches_mod
+from ..effective import checker_config, effective_registry as config_registry, workspace_theme
+from ..orchestrator.popups import error_title_patterns
+from ..store.lifecycle import expire_due, expiring_within, export_decisions, first_seen, suspect_decisions, verify_fixes
+from ..store.mirror import apply_renames, load_config_mirror
+from ..store.store import Roster
+from ..evaluation import (b_input_reason, declares_new_surface, flake_event, recapture_plan, rerun_stability,
+                          settle_base, settle_spec_for, take_recaptures)
+from ..review_queue import global_shift_stop, order as review_order
+from ..orchestrator.popups import (BuildCounts, PopupContext, PopupSentinel, dismiss_action, popup_event,
+                                   popup_rate_findings)
+from .orchestration import popup_catalog
+from ..login_history import login_history
+from .. import churn
+from ..canonical import calibration_key
+from ..fingerprint import (build_fingerprint, cheap_reread, g5, harness_block, midrun_fingerprint_change,
+                           mismatch_note, os_fields, pair_check, rig_spec_check)
+from ..records import Fingerprint
 from ..diff.phash import phash
-from ..diff.regions import RegionsFile, effective_registry, park_rect
-from ..diff.settle import Recapture, RerunBudget, SettleResult, diff_stability, settle
-from ..lint import lint
-from ..records import PERSONAS, CheckpointOutcome, Decision, Finding, RunOutcome, Signature, StepOutcome
-from ..report import ReportContext, build_report, render_pr_comment, render_run_report
+from ..egress import EgressAllowlist, EgressGate, reconcile
+from ..synth import THEME
+from ..diff.regions import Rect as RedactRect, RegionsFile, effective_registry, locate, park_rect
+from ..diff.settle import RerunBudget, SettleResult, Stability, settle
+from ..lint.repo import Repo
+from ..lint.rules import EXPIRY_KINDS, ExpiredRecord, Violation, check_pair
+from ..lint.runstart import expiring_soon, lint_at_run_start, lint_manifest
+from ..records import (FINDING_CATEGORIES, PERSONAS, CheckpointOutcome, Decision, EgressRow, Finding, RunOutcome,
+                       Signature, StepEvent, StepOutcome)
+from ..report import ReportContext, ReportInputs, render_report_markdown, write_run_report
 from ..report.cluster import Member, cluster_members
 from ..report.model import proof_severity, worst_proof
 from ..scope import (DependencyIndex, Manifest, PlannedCheckpoint, Rig, ScopeConfigError, ScopePlan, classes_in,
                      compute_scope)
 from ..store import ArtifactStore, Store
 from ..store.artifacts import ManifestHeader, Redaction, StoredArtifact
+from ..required_fields import WATCHDOG_EVENT
+from ..store.checks import FAILED_REASON as CHECK_FAILED, end_taxonomy_check_failed, post_run_check
+from ..store.safety import (AppliedSafety, activity_quarantined, apply_safety_actions, open_quarantines,
+                            quarantined_flow, refuse_blocked)
+from ..store.secret_scan import FileTail, SecretScanner, check_upload, scan_run
 from ..store.store import PostRunProof, RunPlan, ScopeEntry, ShardPlan
 from ..taxonomy import checkpoint_parts, load
 from ..oracle.assertions import AssertionResult, step_assertions
+from ..oracle.extraction_log import to_rows
+from ..oracle.region_rules import invariant_rule_regions
 from ..oracle.tables import OracleConfigError
-from ..orchestrator.budgets import SESSION_RELEASE_WAIT_S
+from ..gateway.drainer import JOURNAL_NAME, DrainContext, Drainer, TokenNote, wall_from
+from ..gateway.segment import record_for
+from ..orchestrator.boundary import BoundaryObservations
+from ..orchestrator.budgets import RateCounters, WallBudget
 from ..orchestrator.clock import ManualClock
-from ..orchestrator.gates import check_authenticated, check_build_unchanged, check_launched
-from ..orchestrator.gateway import VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB, Action, DropLedger, drain, refusal
-from ..orchestrator.identity import judge_identity
-from ..orchestrator.killswitch import proof_line
+from ..orchestrator.degraded import ModelAvailability, SpendTracker
+from ..orchestrator.gates import check_build_unchanged
+from ..orchestrator.gateway import Action, DropLedger
+from ..orchestrator.identity import account_id_sha256
+from ..orchestrator.killflag import main as stop_main
+from ..orchestrator.killswitch import TripWires, config_invalid_proof, kill_switch, proof_line
+from ..orchestrator import safety_canaries as sc_mod
+from ..orchestrator.drill import DrillPreconditions, DrillResult, SimDrillPort, run_drill
+from ..orchestrator.explorer import load_deny_list
+from ..orchestrator.ports import SessionSafety
 from ..orchestrator.machine import Orchestrator, RunContext, RunReport
-from ..orchestrator.results import ControlResult, Outcome, RunVerdict, worse
+from ..orchestrator.results import ControlResult, Outcome, RunVerdict, SubsetOutcome, step_failed, worse
 from ..orchestrator.rig import CrashSignal
-from ..orchestrator.simrig import CONFIRM_POINT, DELETE_POINT, SimScenario, SimulatedRig, default_context
-from ..orchestrator.watchdog import (HANG_FLOOR_S, Heartbeat, HeartbeatUnwritable, HeartbeatWriter, app_failure,
-                                     edt_frozen, heartbeat_failed)
+from ..orchestrator.simrig import SimScenario, SimulatedRig, default_context
+from ..orchestrator.watchdog import HANG_FLOOR_S, HeartbeatWriter, app_failure
 from .assertions import FlowOracle, OracleCheck
 from .config import SentinelConfig, as_dict, materialize, parse_time, tree_sha256
 from ..reviewer.adapter import ModelReviewer, ReviewerUnavailable
 from ..reviewer.config import ReviewerConfig
 from ..reviewer.job import ReviewerJob
 from .live import CollectingReviewer, ItemBuilder
-from .orchestration import RigScript, ShardSink, alert_entry, login_alias, login_label, persisted_actions, shard_setup
+from .orchestration import (RigScript, ShardSink, alert_entry, login_alias, login_label, order_hotkeys,
+                            persisted_actions, shard_setup)
 from .reviewer import ReviewerAdapter, ReviewRequest, SimulatedReviewer, change_types, to_review, validate
 from .sim import Capture, SimApp, SimBuild, observe
+from .simports import (APP_PID, APPLIED, FOREIGN_IMAGE, LAUNCHER_PID, VIRTUAL_SCREEN, SimDesk, SimLadder,
+                       SimUnitPorts, SimVault, applied as _applied, fixture_values, sim_point_owners, sim_processes,
+                       sim_windows, step_action)
+from ..executor.emitter import ExecContext
+from ..executor.failures import FailureLedger, faults_from
+from ..executor.flow import Captured, Unit, UnitHooks, UnitResult, WorkspaceStreak, census_unit, run_unit
+from ..executor.heartbeat import AppLife, HeartbeatPolicy
+from ..executor.locator import Branches, LadderContext, RescueCap, WindowCapture
+from ..executor.primitives import Planner
 
 DEFAULT_TODAY = date(2026, 11, 10)
+SAFETY_ACTIONS = ("block_login", "disable_rig", "quarantine_flow", "quarantine_order_stage_flows",
+                  "quarantine_all_flows", "withhold_report")     # what store.safety persists (6.4 to 6.12)
+PROFILE = "margin"                       # the one entitlement profile of the example's login (2.12, coverage)
 RIGS = ("rig-01", "rig-02", "rig-03", "rig-04")
-REDACTION = Redaction("redaction-v4-sim")
 PR_REVIEWER_CAP = 60                     # 3.15 per-run call cap of a PR run
 GATES_S, TEARDOWN_S = 9 * 60, 6 * 60     # 1.7: gates T+0:03 to 0:09; re-runs, teardown and report
 LISTED = ("invariant_violation", "assertion_failed", "collateral", "needs_human", "intended", "landmark_missing",
@@ -181,6 +300,29 @@ class Evaluated:
     settle_ms: int | None = None
     oracle: OracleCheck | None = None              # the candidate's assertion results (flow checkpoints)
     oracle_base: OracleCheck | None = None         # the same assertions on the base build
+    paper: dict[str, str] | None = None            # the 6.4 paper-asserted stamp taken at capture time
+    released: bool = True                          # the stamp was current at capture (Orchestrator.may_release)
+    shard_id: str | None = None                    # the shard that captured it, and its session's index there
+    session: int = -1
+    rig_id: str | None = None                      # the rig that captured both sides (one rig per shard)
+    redaction: RedactionResult | None = None       # the redaction stage's result (3.6); None: not redacted
+    app_uptime_s: int | None = None                # 10.2: the app's age when the checkpoint was captured
+    app_restart_count: int | None = None
+    window: Any = None                             # the target window Capture chose (3.4 rule 3), for CaptureMeta
+    flake: list = field(default_factory=list)      # the settled re-captures of an unstable re-run (3.10 step 5)
+
+    @property
+    def storable(self) -> bool:
+        """False when the redaction stage refused the pair (6.10): nothing of it is stored or sent."""
+        return self.redaction is None or self.redaction.terminal is None
+
+    def images(self) -> tuple[np.ndarray | None, np.ndarray]:
+        """(base, candidate) as stored and sent: the redacted pair when the stage ran (3.6), else the screens. A
+        checkpoint redacted without a base frame (a side that did not settle) has no base image (8.4, 9.2)."""
+        r = self.redaction
+        if r is not None and r.terminal is None and r.candidate is not None:
+            return r.base, r.candidate
+        return (self.base.screen.image if self.base else None), self.cand.screen.image
 
     @property
     def category(self) -> str:
@@ -305,15 +447,70 @@ class _Run:
         self.params = load_params()
         epoch = str(((cfg.fixture.get("epoch") or {}).get("epoch_id")) or "epoch-unknown")
         self.fp_match, self.fp_id = _fingerprint(epoch)
+        self.fp_base_id = self.fp_id
+        self.cal_key: str | None = None                  # 4.12 calibration key of the run's fingerprint (7.13)
+        self.fp_ids: dict[str, str] = {}                 # shard -> its candidate fingerprint_id (4.12)
+        self.effective = config_registry(cfg, now)        # the registry as it applies at run start (4.5, 4.7, 2.7)
+        self.checkers: dict[str, inv.CheckerConfig] = {}  # theme -> the Invariant Checker's run-wide settings
+        self.cp_rules: dict[str, inv.SurfaceRules] = {}
         self.epoch = epoch
         self.calibration: CalibrationFile | None = None
         self.rules: dict[str, inv.SurfaceRules] = {}
         self.disabled: dict[str, list[str]] = {}
         self.registries: dict[str, RegionsFile] = {}
         self.expiry_notices: list = []
+        self.expired_exceptions: list[tuple[str, inv.InvariantException]] = []
         self.budget: RerunBudget | None = None
         self.entries = frozenset(e.entry_id for e in manifest.entries) if manifest else frozenset()
         self.tickets = frozenset(t for e in manifest.entries for t in e.tickets) if manifest else frozenset()
+        # 3.6, 6.10: the redaction list and the sweep's literal ids (the fixture's accounts) and display name (the
+        # vault's login record); one version per run. Without the list or the name, RedactionError.
+        anchors = cfg.root / "redaction" / "anchors.yaml"
+        if not anchors.is_file():                         # 6.10 stage 1 is never empty (the lint refuses it first)
+            raise RedactionError("redaction/anchors.yaml is missing: Capture's stage-1 redaction list is required")
+        self.anchors = RedactionList.load(anchors, cfg.root)
+        ids = tuple(str(a["account_id"]) for a in cfg.fixture.get("accounts") or () if a.get("account_id"))
+        self.sweep = Sweep.for_login(ids, login_display_name(str(cfg.fixture.get("rig", "rig-01"))))
+        self.red_header = Redaction(redaction_version(self.anchors, self.sweep))
+        self.redaction_counts = {"base": 0, "candidate": 0}
+        self.pair_id: str | None = None                  # 8.3 build_pairs.pair_id, set before begin_run
+        self._outcomes = itertools.count(1)
+
+    def next_outcome_id(self) -> str:
+        """The next `oc-<run_id>-<seq>` (4.13 outcome_id)."""
+        return f"oc-{self.run_id}-{next(self._outcomes):06d}"
+
+    # -- the redaction stage of Capture (3.6, 5.7, 6.10) ----------------------------------------------
+    def redact(self, cp: PlannedCheckpoint, base: Capture | None, cand: Capture, base_img: np.ndarray | None,
+               cand_img: np.ndarray, *, count: bool = True) -> RedactionResult:
+        """Redact one checkpoint's pair in memory before anything is diffed or stored (`capture.redact_pair`): the
+        simulated OCR reads what synth drew on each side; a capture without a base frame is redacted against itself
+        and its result has no base image, so nothing of the candidate is ever stored or sent as the base (8.4, 9.2)."""
+        alone = base is None or base_img is None
+        b_cap, b_img = (cand, cand_img) if alone else (base, base_img)
+        ocr = {"base": SyntheticOcr.from_screen(b_cap.screen), "candidate": SyntheticOcr.from_screen(cand.screen)}
+        res = redact_pair(b_img, cand_img, self.anchors, ocr, THEME["bg"], sweep=self.sweep,
+                          context=RedactionContext(self.run_id, cp.checkpoint_id, cp.tier), params=self.params)
+        if res.terminal is None and count:
+            for side in ("candidate",) if alone else ("base", "candidate"):
+                self.redaction_counts[side] += int(res.counts.get(side, 0))
+        return dataclasses.replace(res, base=None) if alone else res
+
+    def redaction_canary(self, cp: PlannedCheckpoint, base: Capture, m: cn.Mutant) -> bool:
+        """M19 (12.5, 6.10): the mutant leaves a synthetic account id unredacted in the candidate frame; the redaction
+        stage must find it and mask it. The simulated OCR reads the planted footprint as a nine-digit id (the live
+        id pattern of 3.6, whatever digits the generator drew), and the hit is the footprint masked by a
+        `redaction_miss` box."""
+        if m.image is None or m.footprint is None:
+            return False
+        fx, fy, fw, fh = m.footprint
+        h, w = m.image.shape[:2]
+        ocr = {"base": SyntheticOcr.from_screen(base.screen),
+               "candidate": SyntheticOcr([("123456789", RedactRect(fx, fy, fw, fh))], (w, h))}
+        res = redact_pair(base.screen.image, m.image, self.anchors, ocr, THEME["bg"], sweep=self.sweep,
+                          context=RedactionContext(self.run_id, cp.checkpoint_id, cp.tier), params=self.params)
+        return res.terminal is None and res.masked(RedactRect(fx, fy, fw, fh)) and \
+            any(f.kind == "redaction_miss" for f in res.findings)
 
     # -- registry and rules ----------------------------------------------------------------
     def registry(self, cp: PlannedCheckpoint, base: Capture) -> RegionsFile:
@@ -326,10 +523,33 @@ class _Run:
         return self.registries[cp.checkpoint_id]
 
     def surface_rules(self, cp: PlannedCheckpoint) -> inv.SurfaceRules:
-        key = f"{cp.surface_id}|{cp.data_mode}"
-        if key not in self.rules:
-            self.rules[key] = self.cfg.rules(cp.surface_id, cp.data_mode)
-        return self.rules[key]
+        """The checkpoint's invariant inputs from the effective registry (its overrides, the exceptions in force at
+        run start), with the A/A enablement of its surface and data mode applied (2.7)."""
+        if cp.checkpoint_id not in self.cp_rules:
+            rules = self.effective.surface_rules(cp)
+            calibrated = self.rules.get(f"{cp.surface_id}|{cp.data_mode}")
+            if calibrated is not None:                    # the surface's A/A enablement test (2.7)
+                rules = dataclasses.replace(rules, calibration_pending=calibrated.calibration_pending)
+            self.cp_rules[cp.checkpoint_id] = rules
+        return self.cp_rules[cp.checkpoint_id]
+
+    def checker(self, cp: PlannedCheckpoint) -> inv.CheckerConfig:
+        """The Invariant Checker's settings for the checkpoint's workspace theme (`effective.checker_config`: the
+        pinned palette, INV-15, and the popup catalog's error title patterns, INV-14)."""
+        theme = workspace_theme(self.cfg, cp.workspace_id)
+        if theme not in self.checkers:
+            cat = popup_catalog(self.cfg)
+            self.checkers[theme] = checker_config(self.cfg, theme, error_title_patterns(cat) if cat else ())
+        return self.checkers[theme]
+
+    def live_rules(self, surface_id: str, data_mode: str) -> inv.SurfaceRules:
+        """The surface's invariant inputs as they apply at run start: an invariant exception expired by then is
+        dropped (L-SRF-11, `invariants.active_exceptions`); the run-start lint lists it as an expired record."""
+        rules, expired = inv.active_exceptions(self.cfg.rules(surface_id, data_mode),
+                                               self.now.astimezone(timezone.utc).isoformat())
+        self.expired_exceptions += [(surface_id, e) for e in expired
+                                    if (surface_id, e) not in self.expired_exceptions]
+        return rules
 
     def capture(self, cp: PlannedCheckpoint, side: str, tick: int = 0) -> Capture:
         app = self.base_app if side == "base" else self.cand_app
@@ -338,24 +558,25 @@ class _Run:
     # -- 3.9 A/A calibration and the 2.7 enablement test -------------------------------------
     def calibrate(self, planned: Sequence[PlannedCheckpoint], out_dir: Path) -> None:
         """The Calibration run of 1.6 on the base build, before any threshold is used."""
-        cal = CalibrationFile.load(out_dir / "calibration", self.fp_id) or CalibrationFile(self.fp_id, f"cal-{self.run_id}")
+        key = self.cal_key or self.fp_id                # 7.13: floors are keyed by the calibration key (4.12)
+        cal = CalibrationFile.load(out_dir / "calibration", key) or CalibrationFile(key, f"cal-{self.run_id}")
         pairs: dict[str, list[inv.AAPair]] = {}
         for cp in planned:
             caps = [self.capture(cp, "base", tick=10 + k) for k in range(6)]
             reg = self.registry(cp, caps[0])
             if cp.checkpoint_id not in cal.checkpoints:     # a fingerprint is calibrated once (3.9, 7.13)
-                key = (self.fp_id, self.base_app.build, cp.checkpoint_id, cp.data_mode, _registry_key(reg))
-                if key not in _CALIBRATIONS:
-                    _CALIBRATIONS[key] = calibrate_checkpoint(
+                ck = (key, self.base_app.build, cp.checkpoint_id, cp.data_mode, _registry_key(reg))
+                if ck not in _CALIBRATIONS:
+                    _CALIBRATIONS[ck] = calibrate_checkpoint(
                         [CalCapture(c.screen.image, time_to_settle_ms=3 * 250) for c in caps], reg,
                         data_mode=cp.data_mode, system_masks=[park_rect(_park(caps[0]))], now=self.now,
                         params=self.params)
-                cal.checkpoints[cp.checkpoint_id] = _CALIBRATIONS[key]
+                cal.checkpoints[cp.checkpoint_id] = _CALIBRATIONS[ck]
             pairs.setdefault(f"{cp.surface_id}|{cp.data_mode}", []).append(
                 inv.AAPair(cp.data_mode, caps[0].models, caps[5].models))
         for key, ps in sorted(pairs.items()):
             surface, mode = key.split("|")
-            rules = self.cfg.rules(surface, mode)
+            rules = self.live_rules(surface, mode)
             statuses = inv.enablement(ps, rules)
             self.rules[key] = inv.with_enablement(rules, statuses)
             off = [i for i, s in statuses.items() if s != inv.ENABLED]
@@ -417,39 +638,62 @@ def _located(reg: RegionsFile, res: DiffResult | None, side: int) -> dict[str, t
     return {lm.id: lm.expected for lm in reg.landmarks if lm.expected is not None}
 
 
-def _event_id(run: _Run, cp: PlannedCheckpoint) -> str:
-    """The Watchdog event id a harness fault at this checkpoint carries (4.13)."""
-    return "wd-" + hashlib.sha256(f"{run.run_id}|{cp.checkpoint_id}".encode()).hexdigest()[:8]
+def _event_id(run: _Run, cp: PlannedCheckpoint | None) -> str:
+    """The Watchdog event id a harness fault at this checkpoint (or at the run's post-run check) carries (4.13)."""
+    where = cp.checkpoint_id if cp is not None else "post_run_check"
+    return "wd-" + hashlib.sha256(f"{run.run_id}|{where}".encode()).hexdigest()[:8]
 
 
 def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Capture, *, x: str,
              primitive: str | None, entry_ref: str | None, recapture: Callable[[], Capture],
              recapturable: bool = True, store: Store | None = None, synthetic: bool = False,
-             absent_reason: str | None = None, injected: bool = False, oracle: FlowOracle | None = None) -> Evaluated:
+             absent_reason: str | None = None, injected: bool = False, oracle: FlowOracle | None = None,
+             rescued: bool = False, base_recapture: Callable[[], Capture] | None = None) -> Evaluated:
     """5.17 from capture to classification for one checkpoint; PR checkpoints and canary mutants alike.
     An `injected` candidate (a canary mutant, 10.3 Injection) is already a settled capture: the settle
     loop, a capture-time gate, does not run on it. With `oracle`, a flow checkpoint's assertions are
     evaluated on both builds (module docstring)."""
     reg = run.registry(cp, base if base is not None else cand)
     rules = run.surface_rules(cp)
+    placed = locate(reg, {lm.id: lm.expected for lm in reg.landmarks if lm.expected is not None})
+    if rule_rects := invariant_rule_regions(reg, placed):     # 2.7: INV-03 and INV-04 read the rule regions
+        rules = dataclasses.replace(rules, rule_regions=rule_rects)
     park = _park(cand)
-    spec = SimApp.settle_spec(reg, park)
+    # 3.5: the checkpoint's settle parameters; the sim's renders hold no registry PNG, so surface templates are left out
+    spec = settle_spec_for(run.cfg, cp, regfile=reg, park=park, template=lambda i, p: None, params=run.params)
     fkw: dict[str, Any] = dict(manifest=x, primitive=primitive, manifest_entry_ref=entry_ref,
-                               manifest_entries=run.entries, manifest_tickets=run.tickets)
+                               manifest_entries=run.entries, manifest_tickets=run.tickets, build_pair_id=run.pair_id,
+                               rescued=rescued)
     s_c = settle(cand.frames, spec, run.params) if not injected else _as_settled(cand)
-    s_b = settle(base.frames, spec, run.params) if base is not None else None
+    # 3.11 row 9, SD-07: a base that does not settle is re-captured once; only a second failure leaves B absent
+    bc = settle_base(lambda: base.frames, spec, run.params, recapturable=recapturable) if base is not None else None
+    s_b = bc.result if bc is not None else None
     res, comparison = None, None
     recaps = 0
+    flake: list[Capture] = []
+    red: RedactionResult | None = None                  # 3.6: only redacted images are diffed or stored
     if not s_c.settled:
+        red = run.redact(cp, None, cand, None, s_c.last_frame if s_c.last_frame is not None else cand.screen.image)
         facts = Facts(not_settled=Condition(s_c.reason, side="candidate", detail=s_c.detail), **fkw)
-    elif base is None or (s_b is not None and not s_b.settled):
-        facts = Facts(base="absent", base_reason=absent_reason or "base_not_settled", **fkw)
-        comparison = inv.compare(None, cand.models, rules)
+    elif base is None or (bc is not None and not bc.settled):
+        red = run.redact(cp, None, cand, None, s_c.capture)
+        new_surface = declares_new_surface(run.manifest, cp.surface_id)
+        if bc is not None:                               # 3.11 input B from the base side's capture attempts
+            facts = Facts(**b_input_reason(bc.evidence(), new_surface=new_surface).facts, **fkw)
+        else:
+            facts = Facts(base="absent", base_reason=absent_reason or ("new_surface" if new_surface
+                                                                        else "base_not_settled"), **fkw)
+        comparison = inv.compare(None, cand.models, rules, config=run.checker(cp))
+    elif (red := run.redact(cp, base, cand, s_b.capture, s_c.capture)).terminal is not None:
+        t = red.terminal                                # a redaction landmark on one side only: nothing is stored
+        facts = Facts(landmark=Condition(t.reason, side=t.side, detail=t.detail), **fkw)
     else:
-        res = diff_pair(s_b.capture, s_c.capture, reg, calibration=run.calibration, system_masks=[park_rect(park)],
+        boxes = red.boxes
+        res = diff_pair(red.base, red.candidate, reg, calibration=run.calibration, redactions=boxes,
+                        system_masks=[park_rect(park)],
                         context=DiffContext(run.run_id, cp.checkpoint_id, cp.tier, synthetic=synthetic),
                         params=run.params)
-        comparison = inv.compare(base.models, cand.models, rules)
+        comparison = inv.compare(base.models, cand.models, rules, config=run.checker(cp))
         if res.terminal is not None:
             t = res.terminal
             if t.outcome == "landmark_missing":
@@ -459,15 +703,18 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
         else:
             inv_ids, inv_stab, inv_cause = (), None, None
             stab, cause = None, None
-            budget_ok = run.budget.take() if (run.budget and (comparison.fired or res.level == "above")
-                                              and recapturable) else True
+            # 3.10: the re-capture plan takes the run budget's unit itself (one per checkpoint that re-runs)
+            trigger = "invariant" if comparison.fired else "diff" if res.level == "above" else None
+            plan = recapture_plan(trigger, data_mode=cp.data_mode, recapturable=recapturable, budget=run.budget,
+                                  params=run.params) if trigger is not None else None
             if comparison.fired:
-                if not recapturable or not budget_ok:
-                    p = inv.confirm(comparison, None, cause="not_recapturable" if not recapturable else "budget")
+                if plan.unknown_cause is not None:
+                    p = inv.confirm(comparison, None, cause=plan.unknown_cause)
                 else:
                     again = recapture()
                     recaps = 1
-                    p = inv.confirm(comparison, inv.check_capture(again.models, rules, reference=base.models[0]))
+                    p = inv.confirm(comparison, inv.check_capture(again.models, rules, reference=base.models[0],
+                                                                  config=run.checker(cp)))
                 inv_ids = tuple(r.violation.invariant_id for r in (p.confirmed or p.unconfirmed))
                 inv_stab, inv_cause = p.stability, p.stability_cause
             if res.level == "above":
@@ -475,18 +722,20 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
                     stab, cause = inv_stab, inv_cause
                 else:
                     def above(a: np.ndarray, b: np.ndarray) -> bool:
-                        return diff_pair(a, b, reg, calibration=run.calibration, system_masks=[park_rect(park)],
+                        return diff_pair(a, b, reg, calibration=run.calibration, redactions=boxes,
+                                         system_masks=[park_rect(park)],
                                          context=DiffContext(run.run_id, cp.checkpoint_id, cp.tier, synthetic=synthetic),
                                          params=run.params).level == "above"
-                    if recapturable and budget_ok:
-                        again = [recapture(), recapture()]
-                        recaps = 2
-                        st = diff_stability(s_c.capture, [Recapture(True, a.screen.image) for a in again], above,
-                                            params=run.params)
-                    else:
-                        st = diff_stability(s_c.capture, [], above, recapturable=recapturable, budget_ok=budget_ok,
-                                            params=run.params)
+                    taken = take_recaptures(plan.candidate, recapture, spec, frames=lambda c: c.frames,
+                                            params=run.params) if plan.candidate else ()
+                    base_taken = take_recaptures(plan.base, base_recapture, spec, frames=lambda c: c.frames,
+                                                 params=run.params) if plan.base and base_recapture else ()
+                    recaps = len(taken)
+                    st = rerun_stability(plan, red.candidate, taken, above, base_first=red.base,
+                                         base_taken=base_taken, params=run.params)
                     stab, cause = st.stability, st.cause
+                    if st.stability == "unstable":        # 3.10 step 5: the re-captures are kept for the flake row
+                        flake = [t.source for t in taken if t.recapture.settled]
             fix = None
             if res.threshold_source == "uncalibrated":
                 fix = "no calibrated floor for this fingerprint (3.9); threshold 0"
@@ -494,12 +743,14 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
                           fix_list_item=fix, invariant_ids=inv_ids, invariant_stability=inv_stab,
                           invariant_stability_cause=inv_cause, bounds_unreadable=comparison.unreadable, **fkw)
     checks: tuple[OracleCheck | None, OracleCheck | None] = (None, None)
-    if oracle is not None and cp.test_kind == "flow" and s_c.settled and facts.landmark is None and facts.harness is None:
+    if oracle is not None and s_c.settled and facts.landmark is None and facts.harness is None:
+        def side_check(capture: Capture, side: str, located: Mapping[str, tuple[int, int]]) -> OracleCheck | None:
+            if cp.test_kind == "flow":
+                return oracle.check(cp.flow_id or "", cp.step_id or "", cp.data_mode, capture, reg, located, side)
+            return oracle.check_census(cp.checkpoint_id, cp.data_mode, capture, reg, located, side)   # SD-29
         try:
-            c_chk = oracle.check(cp.flow_id or "", cp.step_id or "", cp.data_mode, cand, reg, _located(reg, res, 1),
-                                 "candidate")
-            b_chk = oracle.check(cp.flow_id or "", cp.step_id or "", cp.data_mode, base, reg, _located(reg, res, 0),
-                                 "base") if base is not None and c_chk is not None else None
+            c_chk = side_check(cand, "candidate", _located(reg, res, 1))
+            b_chk = side_check(base, "base", _located(reg, res, 0)) if base is not None and c_chk is not None else None
         except OracleConfigError:              # a flow the lint accepted that the Oracle cannot evaluate: harness
             c_chk = b_chk = None
             facts = dataclasses.replace(facts, harness=HarnessFailure("exception:OracleConfigError", _event_id(run, cp)))
@@ -508,7 +759,8 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
             checks = (c_chk, b_chk)
     classified = classify(facts)
     ev = Evaluated(cp, base, cand, reg, facts, classified, res, comparison, recaptures=recaps,
-                   settle_ms=s_c.time_to_settle_ms, oracle=checks[0], oracle_base=checks[1])
+                   settle_ms=s_c.time_to_settle_ms, oracle=checks[0], oracle_base=checks[1], redaction=red)
+    ev.flake = flake
     ev.facts_category = classified.outcome
     cand_lm = {k: m[1].pos for k, m in (res.landmarks.items() if res else []) if m[1].found}
     h, w = cand.screen.image.shape[:2]
@@ -521,7 +773,8 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
             region, box = "_window", (0, 0, w, h)
         if region is not None and box is not None:
             ev.region = region
-            ev.phash = phash(_crop(cand.screen.image, _clip(box, w, h)))
+            if ev.storable:                    # 3.6: hash the redacted crop, as stored; a refused pair, nothing
+                ev.phash = phash(_crop(ev.images()[1], _clip(box, w, h)))
             ev.crop = _clip(box, w, h, 24)
     if comparison is not None and comparison.fired:
         u = inv.Rect.union(r.violation.crop for r in comparison.reported)
@@ -531,11 +784,10 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
     if store is not None and not synthetic and ev.phash and ev.region:
         look = store.lookup_decisions(Signature(cp.checkpoint_id, ev.region, ev.phash, ev.category),
                                       at=run.now.isoformat(), run_id=run.run_id, manifest_entries=run.entries,
-                                      manifest_tickets=run.tickets)
+                                      manifest_tickets=run.tickets, candidate_build=run.cand_app.build.build_id)
         ev.related = [{"decision_id": m.decision.decision_id, "hamming": m.distance} for m in look.related]
         if look.applicable and not look.frozen:      # a frozen signature inherits nothing (9.7)
-            facts = dataclasses.replace(facts, decisions=tuple(DecisionMatch(m.decision, m.distance)
-                                                               for m in look.applicable))
+            facts = dataclasses.replace(facts, decisions=tuple(look.applicable))     # with each one's build pair
             ev.facts, ev.classified = facts, classify(facts)
             if look.conflict:
                 ev.conflicts = [{"decision_id": m.decision.decision_id, "verdict": m.decision.verdict}
@@ -553,7 +805,9 @@ def _asserted_region(ev: Evaluated, cand_lm: Mapping[str, tuple[int, int]]) -> t
         return None
     fields = [e.field for e in failed[0].operands.values()]
     moved = {m.region_id for m in (ev.diff.regions if ev.diff is not None else ()) if m.above_threshold}
-    rid = next((f for f in fields if f in moved), fields[-1] if fields else None)
+    # the result names the region it read (a rule region's own check, AssertionResult.region); else the operand the
+    # diff saw move, else the last operand
+    rid = failed[0].region or next((f for f in fields if f in moved), fields[-1] if fields else None)
     try:
         r = ev.registry.region(rid) if rid else None
     except KeyError:
@@ -562,6 +816,36 @@ def _asserted_region(ev: Evaluated, cand_lm: Mapping[str, tuple[int, int]]) -> t
         return None
     lx, ly = cand_lm[r.landmark]
     return r.id, (r.rect.x + lx, r.rect.y + ly, r.rect.w, r.rect.h)
+
+
+def _masked_pct(ev: Evaluated) -> float | None:
+    """8.3 `outcomes.masked_pct`: the share of the candidate capture under masks and redaction boxes, in percent (3.8),
+    from the effective registry's mask regions at their landmarks and the redaction stage's boxes; overlaps counted
+    once."""
+    h, w = ev.cand.screen.image.shape[:2]
+    cover = np.zeros((h, w), dtype=bool)
+    placed = locate(ev.registry, {lm.id: lm.expected for lm in ev.registry.landmarks if lm.expected is not None})
+    rects = [placed[r.id] for r in ev.registry.regions if r.type == "mask" and r.id in placed]
+    rects += [b.rect for b in (ev.redaction.boxes if ev.redaction is not None else ())]
+    for r in rects:
+        x0, y0, x1, y1 = max(0, r.x), max(0, r.y), min(w, r.x + r.w), min(h, r.y + r.h)
+        if x1 > x0 and y1 > y0:
+            cover[y0:y1, x0:x1] = True
+    return round(100.0 * float(cover.mean()), 3)
+
+
+def repair_record(o: CheckpointOutcome, errors: list[str]) -> CheckpointOutcome:
+    """The one repair of a record the 4.13 required-fields table refuses (L-OUT-02): fields the record itself implies,
+    the assertion ids of an `assertion:<id>` reason; anything else stays as it was."""
+    if o.outcome == "assertion_failed" and not o.assertion_ids and (o.reason or "").startswith("assertion:"):
+        return dataclasses.replace(o, assertion_ids=[str(o.reason).split(":", 1)[1]])
+    return o
+
+
+def _category(ev: Evaluated) -> str | None:
+    """The finding's 9.7 category: the computed category when it is one of the finding categories (4.13); none for an
+    outcome outside them, such as a redaction landmark's `landmark_missing`."""
+    return ev.category if ev.category in FINDING_CATEGORIES else None
 
 
 def _as_settled(cap: Capture) -> SettleResult:
@@ -717,8 +1001,8 @@ def _overlay(img: np.ndarray, rects: Iterable[inv.Rect]) -> np.ndarray:
 class _Writer:
     """Turns evaluated checkpoints into the records of 4.13 and their artifacts (8.4)."""
 
-    def __init__(self, run: _Run, arts: ArtifactStore, today: date, clock: str):
-        self.run, self.arts, self.today, self.clock = run, arts, today, clock
+    def __init__(self, run: _Run, arts: ArtifactStore, today: date, clock: str, store: Store | None = None):
+        self.run, self.arts, self.today, self.clock, self.store = run, arts, today, clock, store
         tag = run.run_id.split("-pr-")[-1].replace("-", "") if "-pr-" in run.run_id else \
             hashlib.sha256(run.run_id.encode()).hexdigest()[:6]
         self.tag, self.n = tag, 0
@@ -726,14 +1010,15 @@ class _Writer:
     def _put(self, img: np.ndarray, name: str, kind: str, cid: str, side: str | None, tag: str = "") -> StoredArtifact:
         path = f"{self.run.run_id}/{cid}/{tag + '/' if tag else ''}{name}.png"
         return self.arts.put(_png(img), name=path, kind=kind, media_type="image/png",
-                             redaction=REDACTION, checkpoint_id=cid, side=side,
+                             redaction=self.run.red_header, checkpoint_id=cid, side=side,
                              captured_at=_ts(self.today, self.clock))
 
     def artifacts(self, ev: Evaluated, tag: str = "") -> tuple[dict, list[StoredArtifact]]:
         cid = ev.cp.checkpoint_id
         stored: list[StoredArtifact] = []
-        cimg = ev.cand.screen.image
-        bimg = ev.base.screen.image if ev.base else None
+        if not ev.storable:                       # 3.6: a redaction landmark missing on one side stores nothing
+            return {}, stored
+        bimg, cimg = ev.images()
         listed = ev.classified.outcome in LISTED or ev.classified.decision_ref is not None
         box = ev.crop if listed else (0, 0, cimg.shape[1], cimg.shape[0])
         if ev.comparison is not None and ev.comparison.fired:
@@ -763,10 +1048,78 @@ class _Writer:
             out["heatmap"] = hmap.sha256
         return out, stored
 
+    def captures(self, ev: Evaluated) -> list[StoredArtifact]:
+        """Each side's redacted capture with its `CaptureMeta` (3.3, 5.7, 8.4; `capture.put_capture`): the target
+        window's class, redacted title and bounds, the fingerprint, the app's age, the settle time and the redaction
+        applied; a masked_live checkpoint also stores the later frames of its median (7.9: the frames at
+        `masked_live_offsets` after the settle frame, each redacted, whose per-pixel median is the stored capture)."""
+        if not ev.storable or ev.window is None:
+            return []
+        cp, run = ev.cp, self.run
+        out: list[StoredArtifact] = []
+        boxes = ev.redaction.boxes if ev.redaction is not None else ()
+        for side, img in zip(("base", "candidate"), ev.images()):
+            if img is None:
+                continue
+            png = _png(img)
+            meta = capture_meta(sha256=hashlib.sha256(png).hexdigest(), run_id=run.run_id,
+                                checkpoint_id=cp.checkpoint_id, side=side, window=ev.window,
+                                captured_at=_ts(self.today, self.clock, 600), sweep=run.sweep, dpi=96, scale_percent=100,
+                                dpi_awareness="PER_MONITOR_AWARE_V2",
+                                fingerprint_id=run.fp_ids.get(ev.shard_id or "", run.fp_id),
+                                app_uptime_s=ev.app_uptime_s, app_restart_count=ev.app_restart_count, mode="scripted",
+                                action_path=f"{cp.flow_id}/{cp.step_id}" if cp.flow_id else cp.checkpoint_id,
+                                settle_ms=ev.settle_ms, redaction_version=run.red_header.version,
+                                redaction_boxes=len(boxes))
+            out += put_capture(self.arts, png, run.red_header,
+                               name=f"{run.run_id}/{cp.checkpoint_id}/capture-{side}.png", meta=meta)
+        if cp.data_mode == "masked_live":
+            out += self._masked_live(ev)
+        return out
+
+    def flake_capture(self, ev: Evaluated, cap: Capture, k: int) -> str:
+        """One capture of an unstable re-run, redacted and stored (3.10 step 5: both or all are kept); its sha256."""
+        red = self.run.redact(ev.cp, None, cap, None, cap.screen.image, count=False)
+        img = red.candidate if red.terminal is None and red.candidate is not None else ev.images()[1]
+        return self.arts.put(_png(img), name=f"{self.run.run_id}/{ev.cp.checkpoint_id}/rerun-{k}.png", kind="capture",
+                             media_type="image/png", redaction=self.run.red_header, checkpoint_id=ev.cp.checkpoint_id,
+                             side="candidate", captured_at=_ts(self.today, self.clock, 600)).sha256
+
+    def _masked_live(self, ev: Evaluated) -> list[StoredArtifact]:
+        """The masked_live frames of the candidate (7.9): the settled triple and the later frames of the live
+        values, redacted; their median equals the settled frame outside masks, redactions and the parking point,
+        which `masked_live_median` checks; the later frames are stored next to the capture."""
+        cp, run = ev.cp, self.run
+        offsets = masked_live_offsets(run.params)
+        _, settled = ev.images()
+        h, w = settled.shape[:2]
+        ignore = np.zeros((h, w), dtype=bool)
+        placed = locate(ev.registry, {lm.id: lm.expected for lm in ev.registry.landmarks if lm.expected is not None})
+        rects = [placed[r.id] for r in ev.registry.regions if r.type == "mask" and r.id in placed]
+        rects += [b.rect for b in (ev.redaction.boxes if ev.redaction is not None else ())]
+        px, py = _park(ev.cand)
+        rects.append(RedactRect(px - 8, py - 8, 16, 16))
+        for r in rects:
+            ignore[max(0, r.y):max(0, r.y + r.h), max(0, r.x):max(0, r.x + r.w)] = True
+        triple = sum(1 for o in offsets if o < 3 * 250)
+        later = []
+        for k in range(len(offsets) - triple):
+            cap = run.capture(cp, "candidate", tick=20 + k)
+            red = run.redact(cp, None, cap, None, cap.screen.image, count=False)
+            later.append(red.candidate if red.terminal is None and red.candidate is not None else settled)
+        frames = [settled] * triple + [f if f.shape == settled.shape else settled for f in later]
+        ml = masked_live_median(frames, offsets, ignore=ignore)
+        return [self.arts.put(_png(f), name=f"{run.run_id}/{cp.checkpoint_id}/masked-live-{t}ms.png", kind="capture",
+                              media_type="image/png", redaction=run.red_header, checkpoint_id=cp.checkpoint_id,
+                              side="candidate", captured_at=_ts(self.today, self.clock, 600))
+                for t, f in zip(ml.times_ms[triple:], ml.frames[triple:])]
+
     def records(self, ev: Evaluated, *, synthetic: bool = False, data_mode: str | None = None, tag: str = ""
                 ) -> tuple[CheckpointOutcome, list[Finding], list[StoredArtifact]]:
         cp, c = ev.cp, ev.classified
         arts, stored = self.artifacts(ev, tag)
+        if not synthetic:
+            stored += self.captures(ev)
         diff = None
         if ev.diff is not None and ev.diff.terminal is None:
             diff = ev.diff.summary
@@ -777,8 +1130,14 @@ class _Writer:
             test_kind=cp.test_kind, tier=cp.tier, flow_id=cp.flow_id, step_id=cp.step_id,
             size_step=dict(cp.size_step) if cp.size_step else None, diff=diff, artifacts=arts,
             recaptures=ev.recaptures, synthetic=synthetic, flow_class=_flow_class(self.run.cfg, cp),
-            fingerprint_id=self.run.fp_id, data_epoch_id=self.run.epoch,
-            captured_at=_ts(self.today, self.clock, 600), recorded_at=_ts(self.today, self.clock, 900), **rec_kw)
+            fingerprint_id=self.run.fp_ids.get(ev.shard_id or "", self.run.fp_id), data_epoch_id=self.run.epoch,
+            paper_assertion=ev.paper,
+            captured_at=_ts(self.today, self.clock, 600), recorded_at=_ts(self.today, self.clock, 900),
+            outcome_id=self.run.next_outcome_id(), pair_id=self.run.pair_id, profile_id=PROFILE,
+            diff_pixels=sum(m.changed_px for m in ev.diff.regions) if diff is not None else None,
+            masked_pct=_masked_pct(ev), settle_ms=ev.settle_ms, cand_rig_id=ev.rig_id,
+            base_rig_id=ev.rig_id if ev.base is not None else None, app_uptime_s=ev.app_uptime_s,
+            app_restart_count=ev.app_restart_count, **rec_kw)
         findings: list[Finding] = []
         if synthetic:
             return o, findings, stored
@@ -817,14 +1176,19 @@ class _Writer:
             if kind not in load().finding_kinds:
                 kind = "collateral"
             findings.append(Finding(
-                finding_id=fid, run_id=self.run.run_id, kind=kind, description=desc, first_seen_run_id=self.run.run_id,
+                finding_id=fid, run_id=self.run.run_id, kind=kind, description=desc,
+                first_seen_run_id=self.run.run_id,
                 checkpoint_id=cp.checkpoint_id, tier=cp.tier, region_id=ev.region, primitive=c.primitive,
-                manifest_entry_ref=c.manifest_entry_ref, phash=ev.phash, category=ev.category, evidence=evidence,
+                manifest_entry_ref=c.manifest_entry_ref, phash=ev.phash, category=_category(ev), evidence=evidence,
                 severity=sev, side=c.side, step_id=cp.step_id, decision_ref=c.decision_ref,
                 created_at=_ts(self.today, self.clock, 900)))
         if ev.diff is not None:
             for f in ev.diff.findings:
                 findings.append(dataclasses.replace(f, created_at=_ts(self.today, self.clock, 900), tier=cp.tier))
+        for f in ev.redaction.findings if ev.redaction is not None else ():     # 3.6: never the primary finding
+            findings.append(dataclasses.replace(f, created_at=_ts(self.today, self.clock, 900)))
+        if self.store is not None:                      # 9.2 novelty: the run that first showed the signature
+            findings = [dataclasses.replace(f, first_seen_run_id=first_seen(self.store, f)) for f in findings]
         return o, findings, stored
 
 
@@ -833,14 +1197,16 @@ class _Writer:
 
 
 def coverage_summary(cfg: SentinelConfig, plan: ScopePlan, outcomes: Sequence[CheckpointOutcome], run_id: str) -> dict:
-    """The PR run's coverage summary the Reporter reads (`report.model` docstring, 2.12)."""
-    matrix = build_matrix(run_id, cfg.registry, [Profile("margin", cfg.entitlements)], {"margin": list(outcomes)},
+    """The PR run's coverage summary the Reporter reads (`report.model` docstring, 2.12): the per-tier counts, the
+    scope facts, the full matrix (`cells`, one `coverage.Cell.to_row` per surface x persona x entitlement profile,
+    synthetic rows included) and its dimensions (`matrix`), which 1.4 G2 checks."""
+    matrix = build_matrix(run_id, cfg.registry, [Profile(PROFILE, cfg.entitlements)], {PROFILE: list(outcomes)},
                           plan.cuts, PERSONAS)
     tiers: dict[int, dict] = {}
     for s in cfg.registry:
         t = tiers.setdefault(s.tier, {"registered": 0, "in_scope": 0, "covered": 0, "not_compared": {}, "not_run": {}})
         t["registered"] += 1
-        cells = [matrix.cell(s.id, p, "margin") for p in PERSONAS]
+        cells = [matrix.cell(s.id, p, PROFILE) for p in PERSONAS]
         scoped = any(o.surface_id == s.id for o in outcomes) or any(
             c.surface_id == s.id and c.reason != "scope" for c in plan.cuts)
         if not scoped:
@@ -852,7 +1218,7 @@ def coverage_summary(cfg: SentinelConfig, plan: ScopePlan, outcomes: Sequence[Ch
             continue
         reasons = [c.reason for c in cells if c.state == "not_run" and c.reason and c.reason != "scope"]
         blocked = [r for r in reasons if r.startswith("blocked:")]
-        if blocked:
+        if blocked:                 # 2.12: every blocking outcome alike is not compared and leaves the percent
             k = blocked[0].split(":", 1)[1]
             t["not_compared"][k] = t["not_compared"].get(k, 0) + 1
         elif reasons:
@@ -864,19 +1230,41 @@ def coverage_summary(cfg: SentinelConfig, plan: ScopePlan, outcomes: Sequence[Ch
     static_added = len(impact.static_surfaces - impact.map_expanded - plan.declared) if impact else 0
     smoke = cfg.registry.smoke_subset()
     smoke_cps = sum(1 for cp in plan.planned if cp.surface_id in smoke and cp.test_kind == "census")
-    cells = [{"surface": c.surface_id, "persona": c.persona, "state": c.state, "worst": c.worst, "n": c.count,
-              "reason": c.reason} for c in matrix.cells.values()
-             if not (c.state == "not_run" and c.reason == "scope" and c.persona not in
-                     {o.persona for o in outcomes})]
     return {"tiers": tiers,
             "scope": {"declared_surfaces": len(plan.declared), "edges": edges, "primitives": touched,
                       "static_impact_added": static_added, "smoke_census": smoke_cps,
                       "send_policy": cfg.send_policy, "order_surfaces_entitlement": 0},
-            "cells": cells}
+            "cells": matrix.to_rows(),
+            "matrix": {"surfaces": len(matrix.rows), "personas": len(matrix.personas), "profiles": len(matrix.profiles)}}
 
 
 # ------------------------------------------------------------------------------------------------
 # The store: identity rows
+
+
+class RigsRefused(ValueError):
+    """No rig may take the run (6.4, 6.6, 6.12: `store.safety.refuse_blocked` for every rig): it is never created."""
+
+    def __init__(self, blocked: Sequence[Any]):
+        self.blocked = list(blocked)
+        super().__init__("no rig may take the run: " + "; ".join(b.detail for b in self.blocked))
+
+
+def available(store: Store, cfg: SentinelConfig, rigs: Sequence[str]) -> tuple[list[str], frozenset[str]]:
+    """Before `begin_run` (6.4, 6.6, 6.12): the rigs a run may use, those `refuse_blocked` passes and no `rig`
+    quarantine names (their work goes to the other rigs), and the flows the open safety quarantines cut
+    (`quarantined_flow`: a flow target, or every order-stage flow; never a `canary` flow), which scope cuts
+    `not_run (reason: quarantine)`. Raises `RigsRefused` when no rig is left."""
+    qs = open_quarantines(store)
+    refused = [b for b in (refuse_blocked(store, r) for r in rigs) if b is not None]
+    held = {q.target for q in qs if q.target_kind == "rig"}
+    ok = [r for r in rigs if r not in {b.rig_id for b in refused} and r not in held]
+    if not ok:
+        raise RigsRefused(refused)
+    flows = frozenset(f.flow_id for f in cfg.flows if quarantined_flow(
+        qs, flow_id=f.flow_id, flow_class=f.flow_class, rig_id="",
+        order_stage=any(s.get("order_stage") is True for s in cfg.flow_docs.get(f.flow_id, {}).get("steps") or ())))
+    return ok, flows
 
 
 def _register(store: Store, cfg: SentinelConfig, builds: Iterable[str]) -> None:
@@ -894,15 +1282,29 @@ def _register(store: Store, cfg: SentinelConfig, builds: Iterable[str]) -> None:
                              branch=b.get("branch"), first_seen_at=str(b.get("built_at")) if b.get("built_at") else None)
 
 
+def _register_pair(store: Store, cfg: SentinelConfig, candidate: str, base: str, kind: str = "pr") -> int | None:
+    """The run's 8.3 `build_pairs` row (`Store.register_pair`), registered before `begin_run` so the run row and every
+    outcome carry its id; None when either build has no record in the checkout (nothing to register)."""
+    if candidate not in cfg.builds or base not in cfg.builds:
+        return None
+    merge_base = (cfg.builds[candidate].get("build") or {}).get("merge_base_sha")
+    return store.register_pair(candidate, base, kind, merge_base_commit=str(merge_base) if merge_base else None)
+
+
 def _run_plan(run_id: str, run_type: str, cfg_root: Path, scope: Sequence[ScopeEntry], shards: Sequence[ShardPlan],
-              started: str, manifest_text: str | None, pr: int | None, author: str | None) -> RunPlan:
+              started: str, manifest_text: str | None, pr: int | None, author: str | None,
+              pair_id: int | None = None, flow_docs: Mapping[str, Mapping[str, Any]] | None = None) -> RunPlan:
+    """The run row's plan (8.3), with each flow's step ids (`step_failed:<step>` names one, L-OUT-02)."""
     sha = tree_sha256(cfg_root)
+    steps = {f: [str(st.get("id")) for blk in ("preconditions", "steps", "normalize", "teardown")
+                 for st in d.get(blk) or ()] for f, d in (flow_docs or {}).items()}
     return RunPlan(run_id=run_id, run_type=run_type, config_commit=sha[:12], config_tarball_sha256=sha,
                    snapshot_set_sha256=hashlib.sha256(",".join(RIGS).encode()).hexdigest(),
                    harness_sha="sentinel-core-0.1.0-sim", authorization_ref="AUTH-SIM-2026-11",
                    budget_sec=2700 if run_type == "pr" else 4 * 3600, scope=tuple(scope), shards=tuple(shards),
                    manifest_sha256=hashlib.sha256(manifest_text.encode()).hexdigest() if manifest_text else None,
-                   pr_ref=f"PR {pr}" if pr else None, pr_author=author, started_at=started)
+                   pr_ref=f"PR {pr}" if pr else None, pr_author=author, started_at=started, pair_id=pair_id,
+                   flow_steps=steps or None)
 
 
 def _status_json(status) -> dict:
@@ -914,11 +1316,123 @@ def _status_json(status) -> dict:
 # The Orchestrator and the Executor (5.2, 5.4, 10.2): one shard through the gate machine
 
 
-FLOW_INPUT_STEPS = ("click_named", "press", "type_fixture")
-NAMED_KEYS = {"enter": VK_RETURN, "return": VK_RETURN, "space": VK_SPACE, "tab": VK_TAB, "escape": VK_ESCAPE}
-GUARDED_KEYS = ("enter", "return", "space")
+SIDED = ("not_settled", "landmark_missing")     # 4.13: outcomes that name the side the Executor ran
 MAX_WAIT_S = 15.0                        # 3.5: the settle loop's maximum wait, the hang detector's max_wait_s
 STEP_S = 2.0                             # simulated seconds per Executor step (heartbeats, token expiry)
+
+
+ENTER_TARGET = "dialog.order-confirmation.send-button"   # the dialog's default button, where a scripted Enter lands
+
+
+def scripted_flow(doc: Mapping[str, Any], flow_id: str, script: RigScript) -> Mapping[str, Any]:
+    """The flow document the Executor runs (and the run plan lists): the scenario's scripted Enter
+    (`RigScript.enter_after`) is a `press: enter` step inserted after the step it names, targeting the open dialog's
+    default button (`ENTER_TARGET`), as a flow that declared it would run it (5.4.3 stage 2, 5.4.7)."""
+    if script.enter_after is None or script.enter_after[0] != flow_id:
+        return doc
+    after = script.enter_after[1]
+    steps: list[Any] = []
+    for step in doc.get("steps") or ():
+        steps.append(step)
+        if str(step.get("id")) == after:
+            steps.append({"id": f"{after}+enter", "type": "press", "key": "enter", "target": ENTER_TARGET})
+    return {**doc, "steps": steps}
+
+
+class _LiveTeardown(dict):
+    """A flow document whose teardown is read when it runs (`run_unit` reads `doc.get("teardown")` then): a
+    `close_dialog` or `clear_ticket` whose dialog is not open has nothing to close, so it runs as the target-less
+    teardown action (`SimUnitPorts.teardown_action`, no input) instead of a click the ladder cannot place (2.6.1)."""
+
+    def __init__(self, doc: Mapping[str, Any], rig: SimulatedRig):
+        super().__init__(doc)
+        self.rig = rig
+
+    def get(self, key: str, default: Any = None) -> Any:
+        value = super().get(key, default)
+        if key != "teardown" or self.rig.dialog_open:
+            return value
+        return [{k: v for k, v in st.items() if k != "target"}
+                if st.get("action") in ("close_dialog", "clear_ticket") and st.get("target") else st
+                for st in value or ()]
+
+
+def _spec_step(spec: Any) -> str | None:
+    """The step a finding spec of the emitter names in its JSON detail (`locator_failure`), if any."""
+    try:
+        detail = json.loads(spec.detail or "")
+    except (TypeError, ValueError):
+        return None
+    return str(detail["step_id"]) if isinstance(detail, dict) and detail.get("step_id") else None
+
+
+def _churn_rows(today: date, cfg: SentinelConfig, planned: Sequence[PlannedCheckpoint], at: str) -> list[list[str]]:
+    """Run health's churn lines (4.9, 7.9): the checkpoints today's `reapprove` events mark for re-approval and the
+    reseed tasks of the calendar."""
+    rows = []
+    marked = churn.reapprove(today, cfg.fixture, planned, cfg)
+    if marked:
+        rows.append(["Churn re-approval", "; ".join(f"{cid} ({why})" for cid, why in sorted(marked.items()))])
+    soon = today + timedelta(days=7)                # the owner's heads-up: reseeds due within a week
+    tasks = [t for t in churn.reseed_tasks(cfg.fixture, opened_at=at) if today <= date.fromisoformat(
+        t.ref.rsplit("/", 1)[-1]) <= soon]
+    if tasks:
+        rows.append(["Reseed tasks", "; ".join(f"{t.ref}: {t.detail}" for t in tasks)])
+    return rows
+
+
+def _decision_rows(store: Store, verified: Any, at: str) -> list[list[str]]:
+    """Run health's decision lines (9.5, 9.9): fixes whose signature returned, suspect decisions, decisions
+    expiring within seven days, open proposals and tickets the poller could not find."""
+    rows = []
+    if verified.reopened:
+        rows.append(["Fixes reopened", "; ".join(f"{r.decision_id} (reopened {r.reopen_count}x"
+                                                 + (", suspect)" if r.suspect else ")") for r in verified.reopened)])
+    suspect = suspect_decisions(store)
+    if suspect:
+        rows.append(["Suspect decisions", "; ".join(d.decision_id for d in suspect)])
+    soon = expiring_within(store, at)
+    if soon:
+        rows.append(["Decisions expiring within 7 days", "; ".join(f"{d.decision_id} ({d.action})" for d in soon)])
+    proposals = store.query("SELECT proposal_id, action FROM proposals WHERE state = 'proposed' ORDER BY proposal_id")
+    if proposals:
+        rows.append(["Open proposals", "; ".join(f"{p['proposal_id']} ({p['action']})" for p in proposals)])
+    missing = store.query("SELECT natural_key, evidence_json FROM findings WHERE evidence_json LIKE '%triage_note%'")
+    if missing:                                        # 9.9: the poller's 404 note on the decision's finding
+        rows.append(["Tickets not found", "; ".join(f"{d['natural_key']}: {json.loads(d['evidence_json'])['triage_note']}"
+                                                    for d in missing)])
+    return rows
+
+
+class _UnreviewedReviewer:
+    """The Reviewer while DR-07 is undecided or no model is pinned (11.8, 10.7): every call is unavailable, so the
+    items it would review take R from the failed verdict (3.11 row 23) and the report says unreviewed."""
+
+    model_id = "none"
+    prompt_hash = "none"
+
+    def review(self, request: Any) -> Any:
+        raise _Unreviewed()
+
+
+class _Unreviewed(ReviewerUnavailable):
+    """No Reviewer for the run (DR-07, 10.7): R is `unavailable` with cause `reviewer_disabled`."""
+
+    def __init__(self) -> None:
+        RuntimeError.__init__(self, "unavailable: reviewer_disabled")
+        self.verdict = SimpleNamespace(state="unavailable", cause="reviewer_disabled")
+
+    def review(self, threshold: float = 0.0) -> Review:
+        return Review("unavailable", cause="reviewer_disabled")
+
+
+def _branches_doc(cfg: SentinelConfig) -> dict:
+    """The parsed `phase0/branches.yaml` (4.16), or nothing when the config has none (every branch undecided)."""
+    path = cfg.root / "phase0" / "branches.yaml"
+    if not path.is_file():
+        return {}
+    import yaml
+    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
 def _units(cps: Sequence[PlannedCheckpoint]) -> list[list[PlannedCheckpoint]]:
@@ -953,6 +1467,41 @@ class _Shard:
     ctx: RunContext
     order_stage: bool = False
     noted: set[int] = field(default_factory=set)
+    seen: int = 0                                          # Orchestrator results already noted
+    sessions: list[list[str]] = field(default_factory=list)   # each session's paper-mode assertion times (6.4)
+    session_open: bool = False
+    events: list[StepEvent] = field(default_factory=list)  # the shard's step events for `Store.write_events`
+    seq: Iterator[int] = field(default_factory=lambda: itertools.count(1))   # the shard's step_events seq (8.3)
+    drainer: Drainer | None = None                         # every gateway decision as a step event (5.4.8)
+    last_flow: str | None = None                           # the flow that ran last (a quarantine's target)
+    policy: Any = None                                     # executor.heartbeat.HeartbeatPolicy (10.2)
+    life: AppLife = field(default_factory=AppLife)         # the app's uptime and restart count (10.2)
+    exec: Any = None                                       # executor.emitter.ExecContext
+    ports: Any = None                                      # pipeline.simports.SimUnitPorts
+    ladder: Any = None                                     # pipeline.simports.SimLadder
+    failures: FailureLedger = field(default_factory=FailureLedger)   # 8.9 run taint
+    streak: WorkspaceStreak = field(default_factory=WorkspaceStreak)  # 2.4 census workspace rule
+    emitting: bool = False                                 # the emitter is sending: the rig's observer holds off
+    interrupt: ControlResult | None = None                 # an app failure seen inside a step (`_after_step`)
+    unit: Any = None                                       # the unit in progress
+    fp: dict[str, Fingerprint] | None = None               # the shard's 4.12 fingerprints by side (7.4)
+    popups: Any = None                                     # orchestrator.popups.PopupSentinel (7.8)
+    proactive: bool = False                                # POP-11 asked for a proactive relaunch (7.8, 10.2)
+    close_after: list[int] = field(default_factory=list)   # app error dialogs closed after their capture (4.10)
+    host: tuple[str, str | None] | None = None             # the sweep host the shard ran last (2.5.1)
+    rest: list[PlannedCheckpoint] = field(default_factory=list)   # the unit's later checkpoints outside it
+
+    def assertion(self, stamp: dict[str, str] | None) -> None:
+        """The Orchestrator pushed a new session safety state (its `safety_listener`): a stamp is a passing paper-mode
+        assertion of the current session, none the session's end (6.4, L-OUT-06)."""
+        if stamp is None:
+            self.session_open = False
+            return
+        if not self.session_open:
+            self.sessions.append([])
+            self.session_open = True
+        if stamp["asserted_at"] not in self.sessions[-1]:
+            self.sessions[-1].append(stamp["asserted_at"])
 
 
 class _ShardWork:
@@ -975,6 +1524,22 @@ class _ShardWork:
         self.reports: list[tuple[_Shard, RunReport]] = []
         self.calibrated = False
         self.frozen: set[str] = set()
+        self.store_refusals: list[dict] = []                 # L-OUT-02 refusals the repair did not fix
+        self.applied: dict[int, AppliedSafety] = {}          # what store.safety persisted, by control result
+        self.pending: list[tuple[_Shard, ControlResult, str | None]] = []   # results noted before the run row
+        self.desk = SimDesk(cfg.surfaces)                    # the simulated screen the locator ladder reads (5.5)
+        self.values = fixture_values(cfg.fixture, list(cfg.flow_docs.values()))   # the Planner's typed values
+        self.branches_doc = _branches_doc(cfg)
+        self.rescue_cap = RescueCap()                        # 5.5: rescued steps per run
+        self.faults = faults_from(self.script.faults) if self.script.faults else None
+        self.vault = SimVault(unreachable=self.script.vault_unreachable)   # 6.9: secrets leased at typing time
+        self.sides: dict[str, str] = {}                      # the side the Executor ran for a step-decided outcome
+        self.agent_allowed = True                            # DR-07 branch A with a pinned model (5.5)
+        self.foreign_log = ForeignWindowLog()                # 5.7: one alert per run per foreign image name
+        self.ladders: dict[tuple[str, str, str], SizeLadder] = {}   # (surface, host, side) -> its 2.5.1 ladder
+        self.health_rows: list[list[str]] = []               # run-health rows the wiring adds (report.model)
+        self.catalog = popup_catalog(cfg)                    # 4.10: the popup sentinel's catalog
+        self.shown: set[tuple[str, str]] = set()             # the scenario's popups already on screen
 
     # -- the shards -------------------------------------------------------------------------------------
     def run_shards(self, specs: Sequence[tuple[str, int, str, list[PlannedCheckpoint]]]) -> None:
@@ -996,13 +1561,41 @@ class _ShardWork:
         sc = self.scenario
         clock = ManualClock(start=self.run.now.astimezone(timezone.utc), mono=1000.0 + 10_000 * shard_no)
         ctx, sim = shard_setup(self.cfg, run_id=sc.run_id, run_type="pr", shard_id=shard_id, shard_no=shard_no,
-                               build_id=sc.candidate.build_id, workspace_id=cps[0].workspace_id, script=self.script)
+                               build_id=sc.candidate.build_id,
+                               workspace_id=(cps or self.planned)[0].workspace_id, script=self.script,
+                               rig_id=rig_id, kill_root=self.out / "rigs", today=self.today,
+                               history=login_history(self.store, login_alias(rig_id)))     # 6.3, 6.4, 9.10
+        sim.vault = self.vault                          # the LOGIN secret is a leased secret step (6.9)
         rig = SimulatedRig(sim, clock=clock)
         sink = ShardSink([cp.checkpoint_id for cp in cps])
         hb = HeartbeatWriter(self.out / "heartbeat" / f"shard-{shard_no}.json", clock)
-        orch = Orchestrator(rig, ctx, sink, clock=clock, ledger=self.ledger, heartbeat=hb,
-                            watchdog_status=lambda: (1.0, True))
-        st = _Shard(shard_id, rig_id, list(cps), orch, rig, sink, clock, ctx)
+        life = AppLife()
+        policy = HeartbeatPolicy(hb, clock, run_id=sc.run_id, shard=shard_no, life=life)
+        holder: list[_Shard] = []
+
+        def listener(s: SessionSafety) -> None:
+            """The slow half reads the session safety state (6.2, SD-57); each change is also a session boundary or
+            a passing paper-mode assertion for the store's L-OUT-06 context."""
+            rig.set_session_safety(s)
+            if holder:
+                holder[0].assertion(holder[0].orch.paper_stamp())
+
+        hooks = {"provisioned": lambda o: self._fp_provisioned(holder[0]),
+                 "settings_attested": lambda o: self._fp_build(holder[0]),
+                 "relaunched": lambda o: self._fp_relaunched(holder[0])}
+        rig.g5 = lambda: self._g5(holder[0])
+        orch = self.orchestrator(rig, ctx, sink, clock, hb, sim, listener, policy=policy, life=life, hooks=hooks)
+        st = _Shard(shard_id, rig_id, list(cps), orch, rig, sink, clock, ctx, policy=policy, life=life)
+        st.drainer = Drainer(DrainContext(sc.run_id, shard_id, "candidate", mode="scripted"),
+                             journal=self.out / "journal" / sc.run_id / f"shard-{shard_no}" / JOURNAL_NAME,
+                             next_seq=lambda: next(st.seq), wall_at=wall_from(clock))
+        rig.on_input = lambda action, res: self._drain(st, action, res)
+        self._executor(st)
+        st.popups = PopupSentinel(self.catalog) if self.catalog is not None else None
+        holder.append(st)
+        _, hotkeys_error = order_hotkeys(self.cfg)
+        if hotkeys_error is not None:                   # 5.4.7: fails the shard closed at settings_attested
+            orch.apply(hotkeys_error.result)
         entered: list[bool] = []
 
         def work(o: Orchestrator) -> None:
@@ -1029,12 +1622,186 @@ class _ShardWork:
                       for r in report.results],
             "unreached_filled": sorted(sink.filled)})
 
+    def orchestrator(self, rig: SimulatedRig, ctx: RunContext, sink: Any, clock: ManualClock,
+                     hb: HeartbeatWriter | None, sim: SimScenario,
+                     listener: Callable[[SessionSafety], None], *, policy: HeartbeatPolicy | None = None,
+                     life: AppLife | None = None, hooks: Mapping[str, Any] | None = None) -> Orchestrator:
+        """One shard's Orchestrator (5.2) with the run's budgets: the 11.2 wall budget from the shard's start, the
+        spend ceiling, the model availability of preflight N2 and N5 (10.7), the login's 6.4 rate counters (no
+        store helper seeds them yet: a fresh login) and the session safety listener (`rig.set_session_safety`)."""
+        fails = sim.preflight_failures
+        return Orchestrator(rig, ctx, sink, clock=clock, ledger=self.ledger, heartbeat=hb,
+                            wall=WallBudget.for_run(ctx.run_type, clock.monotonic()), spend=SpendTracker(),
+                            model=ModelAvailability.from_preflight("N2" not in fails, "N5" not in fails),
+                            counters=RateCounters(), safety_listener=listener, heartbeat_policy=policy, life=life,
+                            gate_hooks=hooks)
+
+    # -- the 4.12 fingerprint of each shard (3.3, 7.4, 12.7 G5) -------------------------------------------------
+    def _harness(self, st: _Shard) -> dict:
+        """The fingerprint's `harness` field (7.4, 8.5) of this run: the simulated harness, OCR and capture, the
+        run's redaction version, the config commit and tarball hash and the allowlist's hash."""
+        sha = tree_sha256(self.cfg.root)
+        return harness_block(version="sentinel-core-0.1.0-sim", ocr_engine="sim-ocr-1", ocr_model="synth-drawn-text",
+                             capture_lib="sim-capture-1", redaction_version=self.run.red_header.version,
+                             region_registry_version=sha[:12], config_commit=sha[:12],
+                             config_tarball_sha256="sha256:" + sha, allowlist_sha256="sha256:" + st.ctx.allowlist.sha256,
+                             diff_params=self.run.params)
+
+    def _g5(self, st: _Shard) -> str:
+        """12.7 G5 at `provisioned`: the halves' OS-class fields compared (`fingerprint.g5`). Both halves run on the
+        shard's one rig back to back (7.4): the second half's OS fields are the rig's, read once for both. An
+        unreadable read is the `provisioned` hook's outcome, not G5's."""
+        fields = os_fields(st.rig.read_os(), self._harness(st))
+        return "pass" if isinstance(fields, ControlResult) else g5(fields, fields)
+
+    def _fp_provisioned(self, st: _Shard) -> ControlResult | None:
+        """At `provisioned`: the OS fields (`fingerprint.os_fields`), or `env_error (fingerprint_unreadable:<field>)`."""
+        r = os_fields(st.rig.read_os(), self._harness(st))
+        return r if isinstance(r, ControlResult) else None
+
+    def _fp_build(self, st: _Shard) -> ControlResult | None:
+        """After `settings_attested` (7.4): both halves' fingerprints from the rig's reads (the base half on the same
+        rig, its app fields with the scenario's `base_fingerprint`), stored once per shard and side
+        (`Store.write_fingerprint`); the rig specification (`rig_spec_check`, L-FPR-02) and the pair check before
+        the second half's first capture (`pair_check`, L-FPR-03, L-FPR-05). The shard's captures and outcomes carry
+        the candidate's `fingerprint_id`; the run's floors are keyed by its calibration key."""
+        sc, rig = self.scenario, st.rig
+        if st.fp is not None:                 # a relaunch passes attestation again: the `relaunched` hook re-checks
+            return None
+        harness = self._harness(st)
+        os_r, app_r = rig.read_os(), rig.read_app()
+        fixture_acct = st.ctx.fixture_account
+        common = dict(data_epoch={"epoch_id": self.run.epoch, "data_mode": "backend_fixture"},
+                      account={"account_id_sha256": account_id_sha256(fixture_acct),
+                               "login_sha256": account_id_sha256(login_alias(st.rig_id)), "role": "empty"},
+                      read_at=st.clock.now().isoformat())
+        cand = build_fingerprint(os_r, app_r, sc.run_id, st.shard_id, "candidate", st.rig_id, harness, **common)
+        if isinstance(cand, ControlResult):
+            return cand
+        base_app = dataclasses.replace(app_r, build_id_title=sc.base.build_id, build_id_about=sc.base.build_id,
+                                       **dict(self.script.base_fingerprint))
+        base = build_fingerprint(os_r, base_app, sc.run_id, st.shard_id, "base", st.rig_id, harness, **common)
+        if isinstance(base, ControlResult):
+            return base
+        self.store.write_fingerprint(cand)
+        self.store.write_fingerprint(base)
+        st.fp = {"candidate": cand, "base": base}
+        self.run.fp_ids[st.shard_id] = cand.fingerprint_id
+        if self.run.cal_key is None:
+            self.run.fp_id, self.run.fp_base_id = cand.fingerprint_id, base.fingerprint_id
+            self.run.cal_key = calibration_key(cand.match)
+        r = rig_spec_check(cand, rig_kind="vm", display_config=self._display_config(st),
+                           allowlist_sha256=harness["allowlist_sha256"])
+        return r or pair_check(cand, base)
+
+    def _display_config(self, st: _Shard) -> Mapping[str, Any] | None:
+        """The shard's workspace display configuration (`configs/allowed.yaml` entry it names, 7.1)."""
+        ws = st.cps[0].workspace_id if st.cps else None
+        entry = next((d.data for d in self.cfg.repo.of("workspace") if (d.data or {}).get("id") == ws), {}) or {}
+        want = entry.get("display_config") or {}
+        allowed = next((d.data for d in self.cfg.repo.docs.values() if isinstance(d.data, dict)
+                        and isinstance(d.data.get("configs"), list)), {}) or {}
+        return next((c for c in allowed.get("configs") or () if all(c.get(k) == v for k, v in want.items())), None)
+
+    def _fp_relaunched(self, st: _Shard) -> ControlResult | None:
+        """After every relaunch (7.4): the fingerprint rebuilt from fresh reads against the session's start
+        (`midrun_fingerprint_change`) and the base half (`pair_check`)."""
+        if st.fp is None:
+            return None
+        sc, rig = self.scenario, st.rig
+        start = st.fp["candidate"]
+        new = build_fingerprint(rig.read_os(), rig.read_app(), sc.run_id, st.shard_id, "candidate", st.rig_id,
+                                start.match["harness"], data_epoch=start.match["data_epoch"],
+                                account=start.record["account"], read_at=st.clock.now().isoformat())
+        if isinstance(new, ControlResult):
+            return new
+        return midrun_fingerprint_change(start, new) or pair_check(new, st.fp["base"])
+
+    def _fp_boundary(self, st: _Shard) -> ControlResult | None:
+        """At every flow boundary: the cheap fields re-read against the session's start fingerprint (3.3, 7.4)."""
+        if st.fp is None:
+            return None
+        return midrun_fingerprint_change(st.fp["candidate"], cheap_reread(st.rig.read_os(), st.rig.read_title_build_id()))
+
+    def _executor(self, st: _Shard) -> None:
+        """The shard's Executor (5.4.3, 5.5, 10.2): its `ExecContext` (the run's drop ledger, the shard's budgets, the
+        heartbeat policy, the app's age, the drainer as the audit sink, the shard's step-event seq), the simulated
+        rig's ports and the locator ladder over the desk."""
+        sc, rig = self.scenario, st.rig
+        st.exec = ExecContext(sc.run_id, st.shard_id, st.clock, ledger=self.ledger, budgets=st.orch.budgets,
+                              side="candidate", agent_available=st.orch.model.agent_available and self.agent_allowed,
+                              dr07_branch_b=Branches.from_doc(self.branches_doc).computer_use == "B",
+                              heartbeat=st.policy, life=st.life, audit=st.drainer, resolve_target=self.desk.target,
+                              next_seq=lambda: next(st.seq))
+        lctx = LadderContext("", "", self.rescue_cap, retry=lambda: WindowCapture.from_frame(self.desk.frame(rig)),
+                             flag=rig.poll_flag, templates=self.desk.templates,
+                             agent_available=st.orch.model.agent_available)
+        st.ladder = SimLadder(self.desk, rig, lctx, dict(self.script.locator_miss), branches=self.branches_doc)
+        st.ports = SimUnitPorts(rig, self.desk, orch=st.orch, capture=lambda step, rescued: self._capture_step(
+            st, step, rescued), hold_observer=lambda on: setattr(st, "emitting", on),
+            precondition_fail=dict(self.script.precondition_fail), wait_timeout=self.script.wait_timeout,
+            postcondition_fail=self.script.postcondition_fail)
+        st.ports.ladder = st.ladder
+
+    def persist(self, st: _Shard, r: ControlResult, flow_id: str | None) -> None:
+        """6.4 to 6.12: persist what a safety control result decided (`store.safety.apply_safety_actions`: the login
+        block, the rig disable, the quarantines, the incident); a result noted before the run row exists waits
+        (`apply_pending`)."""
+        if not (r.incident or any(r.has(a) for a in SAFETY_ACTIONS)):
+            return
+        if not self.store.query("SELECT 1 FROM runs WHERE run_id = ?", (self.scenario.run_id,)):
+            self.pending.append((st, r, flow_id))
+            return
+        rr = r if flow_id is not None or not r.has("quarantine_flow") else \
+            dataclasses.replace(r, actions=tuple(a for a in r.actions if a != "quarantine_flow"))
+        self.applied[id(r)] = apply_safety_actions(self.store, rr, run_id=self.scenario.run_id, rig_id=st.rig_id,
+                                                   login_alias=login_alias(st.rig_id), flow_id=flow_id)
+
+    def apply_pending(self) -> None:
+        """Persist the safety results noted before the run row was written (the Nightly's gate results)."""
+        pending, self.pending = self.pending, []
+        for st, r, flow_id in pending:
+            self.persist(st, r, flow_id)
+
+    def incident(self, r: ControlResult) -> str | None:
+        """The incident id `apply_safety_actions` opened (or joined) for `r` (6.12), as text."""
+        a = self.applied.get(id(r))
+        return str(a.incident_id) if a is not None and a.incident_id is not None else None
+
+    def _note_new(self, st: _Shard, checkpoint: PlannedCheckpoint | None = None, flow_id: str | None = None) -> None:
+        """Note every result the shard's Orchestrator recorded since the last call (a boundary, a relaunch)."""
+        results = st.orch.results
+        for r in results[st.seen:]:
+            self._note(st, r, checkpoint, flow_id)
+        st.seen = len(results)
+
+    def _event(self, st: _Shard, action: str, **fields: Any) -> StepEvent:
+        """One `step_events` row of the shard (8.3), numbered from the shard's seq (`write_events`)."""
+        e = StepEvent(run_id=self.scenario.run_id, shard_id=st.shard_id, side="candidate", seq=next(st.seq),
+                      source="orchestrator", wall_at=st.clock.now().isoformat(),
+                      mono_ms=int(st.clock.monotonic() * 1000), mode="system", action=action, **fields)
+        st.events.append(e)
+        return e
+
     def _note(self, st: _Shard, r: ControlResult, checkpoint: PlannedCheckpoint | None = None,
               flow_id: str | None = None) -> None:
-        """Record a control result once: its 9.10 route, the actions to persist and its findings."""
+        """Record a control result once: its 9.10 route, the actions to persist, its findings and, for a relaunch,
+        its run-health step event (10.2)."""
         if id(r) in st.noted:
             return
         st.noted.add(id(r))
+        fields = (r.evidence or {}).get("fields") if r.control in ("fingerprint_pair", "fingerprint_reread") else None
+        note = mismatch_note(fields) if fields else None
+        if note:                                         # L-FPR-05: the morning report's sentence
+            row = ["Fingerprint", f"{note} (differing: {', '.join(fields)})"]
+            if row not in self.health_rows:
+                self.health_rows.append(row)
+        self.persist(st, r, flow_id or st.last_flow)
+        if r.control == "relaunch":
+            ev = r.evidence or {}
+            self._event(st, "relaunch", reason=f"cause {ev.get('cause')}; budget {ev.get('budget') or 'none'}; "
+                                               f"flows since launch {ev.get('flows_since_launch')}",
+                        app_restart_count=sum(1 for e in st.events if e.action == "relaunch") + 1)
         sc = self.scenario
         a = alert_entry(sc.run_id, st.shard_id, r)
         if a is not None:
@@ -1072,6 +1839,11 @@ class _ShardWork:
             return [cp for cp in rest if cp in todo]
         if selector == "first_unreached":
             return todo[:1]
+        if fixture_checks.handles(selector):      # account_state, account_state:golden, order_bearing, symbol:<id>
+            return fixture_checks.select_subset(selector, todo, self.cfg)
+        if selector.startswith("workspace:"):     # 2.4: the shard's remaining census visits in that workspace
+            ws = selector.split(":", 1)[1]
+            return [cp for cp in todo if cp.test_kind == "census" and cp.workspace_id == ws]
         return []        # account_state, probe:<Pn>, explorer_stage, drill, ...: no checkpoint of a PR shard's scope
 
     def _subsets(self, st: _Shard, r: ControlResult, current: PlannedCheckpoint | None = None,
@@ -1097,172 +1869,509 @@ class _ShardWork:
             orch = st.orch
             if orch.stop is not None or not [cp for cp in unit if cp in self._todo(st)]:
                 continue
-            r = orch.apply(check_build_unchanged(st.rig.read_title_build_id(), st.ctx.expected_build))
+            title = st.rig.read_title_build_id()          # 7.3: the About read stands in when the title misses
+            r = orch.apply(check_build_unchanged(title, st.ctx.expected_build,
+                                                 about_build_id=st.rig.read_about_build_id() if title is None else None,
+                                                 launcher_log_sha256=st.rig.launcher_log_sha256()))
             self._note(st, r)
             if not r.passed:
                 continue
-            if unit[0].test_kind == "flow":
-                self._flow(st, unit)
-            else:
-                for i, cp in enumerate(unit):
-                    self._heartbeat(st, None, None, cp)
-                    if not self._capture(st, cp, unit[i + 1:]) or orch.stop is not None:
-                        break
+            flow_id = unit[0].flow_id if unit[0].test_kind == "flow" else None
+            if st.proactive and orch.stop is None:      # POP-11: the relaunch its memory warning asked for
+                st.proactive = False
+                orch.relaunch("proactive")
+                self._note_new(st)
+                if orch.stop is not None:
+                    continue
+            fp = self._fp_boundary(st)                  # 3.3, 7.4: the cheap fields at every flow boundary
+            if fp is not None:
+                self._note(st, orch.apply(fp))
+                continue
+            orch.flow_boundary(BoundaryObservations(order_dialog_visible=st.rig.dialog_open), flow_id=flow_id,
+                               p50_s=None)          # 5.2, 6.4, 6.6, 10.2, 11.2; no measured p50 yet: 5 minutes
+            self._note_new(st, flow_id=flow_id)
+            if orch.stop is not None:
+                continue
+            self._run_unit(st, unit)
+        for st in self._running:                        # 8.9: a persist that failed twice taints the run
+            r = st.failures.at_teardown(st.orch.stop.run if st.orch.stop is not None else None)
+            if r is not None:
+                self._note(st, st.orch.apply(r))
 
-    def _heartbeat(self, st: _Shard, flow_id: str | None, step_id: str | None, cp: PlannedCheckpoint | None) -> None:
-        """10.2: a heartbeat at every step start; a write failing twice ends the run (watchdog.heartbeat_failed)."""
-        st.clock.advance(STEP_S)
-        hb = st.orch.heartbeat
-        if hb is None:
+    def _run_unit(self, st: _Shard, unit: Sequence[PlannedCheckpoint]) -> None:
+        """One unit through the Executor (`executor.flow.run_unit`, module docstring): a flow as its 4.7 document, a
+        census visit, sweep step or split step as a census visit (`census_unit`: `reset_input_state`, the 2.4
+        preconditions, the surface's path, the checkpoint), each step input through the emitter, the planner and the
+        locator ladder on the shard's simulated rig (`pipeline.simports`)."""
+        first = unit[0]
+        todo = [cp for cp in unit if cp in self._todo(st)]
+        if first.test_kind == "flow":
+            doc = scripted_flow(self.cfg.flow_docs.get(first.flow_id or "", {}), first.flow_id or "", self.script)
+            self._execute(st, Unit("flow", first.flow_id or "", doc, tuple(cp.checkpoint_id for cp in todo),
+                                   first.workspace_id), todo, ())
             return
-        try:
-            hb.write(Heartbeat(self.scenario.run_id, st.ctx.shard, st.ctx.attempt, "running", st.clock.now().isoformat(),
-                               st.clock.monotonic(), flow_id=flow_id, step_id=step_id,
-                               checkpoint_id=cp.checkpoint_id if cp else None, max_wait_s=MAX_WAIT_S))
-        except HeartbeatUnwritable as e:
-            self._note(st, st.orch.apply(heartbeat_failed(e)))
-
-    def _flow(self, st: _Shard, unit: Sequence[PlannedCheckpoint]) -> None:
-        """One flow: its steps in order, input steps through the gateway, its checkpoints captured, then its
-        teardown input (5.4.3, 4.7). Preconditions and normalize steps send no input here."""
-        flow_id = unit[0].flow_id or ""
-        doc = self.cfg.flow_docs.get(flow_id, {})
-        want = {cp.step_id: cp for cp in unit}
-        cps = list(unit)
-        for step in doc.get("steps") or ():
+        if first.test_kind in ("sweep", "split"):
+            host = (first.surface_id, _host(first))
+            if st.host is not None and st.host != host:     # 2.5.1: the next host starts from a clean slate
+                ok = st.ports.reset_input_state() and st.ports.reload_workspace()
+                st.events.append(st.exec.event("reset_input_state", None, reason="next sweep host: reset_input_state "
+                                               "and the tier C workspace reload (2.5.1)"
+                                               + ("" if ok else "; the reset or the reload failed")))
+            st.host = host
+        started = False
+        for i, cp in enumerate(unit):
             if st.orch.stop is not None:
                 return
-            sid = str(step.get("id"))
-            cp = want.get(sid) if step.get("type") == "checkpoint" else None
-            self._heartbeat(st, flow_id, sid, cp)
-            if cp is not None:
-                if cp in self._todo(st) and not self._capture(st, cp, cps[cps.index(cp) + 1:]):
-                    return
-            elif step.get("type") in FLOW_INPUT_STEPS and not self._input(st, flow_id, step, doc):
-                return
-            if self.script.enter_after == (flow_id, sid):     # the scenario's scripted Enter on the open dialog
-                if not self._send(st, Action("press", keys=(VK_RETURN,), declared_guarded=True,
-                                             flow_class=str(doc.get("class", "standard"))),
-                                  flow_id, f"{sid}+enter"):
-                    return
-        for step in doc.get("teardown") or ():
-            if st.orch.stop is not None:
-                return
-            self._heartbeat(st, flow_id, str(step.get("id")), None)
-            if step.get("action") == "close_dialog" and st.rig.dialog_open:
-                # the Order Confirmation's dismiss allowlist (6.2): Delete closes the dialog, Send never
-                self._send(st, Action("click", point=DELETE_POINT, resolved_name="Delete", under_point_text="Delete",
-                                      teardown_action="close_dialog", flow_class=str(doc.get("class"))),
-                           flow_id, str(step.get("id")))
-                st.order_stage = st.rig.dialog_open
+            if cp not in self._todo(st):
+                continue
+            if started and not self._ladder_boundary(st, cp):
+                return                  # the unreached steps take the stop's outcome at `_finish` (1.10, 6.6)
+            started = True
+            path = list((self.cfg.surfaces.get(cp.surface_id) or {}).get("path") or ())
+            self._execute(st, census_unit(cp.checkpoint_id, [s for s in path if s.get("type") == "wait_for"],
+                                          workspace_id=cp.workspace_id), [cp], unit[i + 1:])
 
-    def _label(self, target: str) -> str:
-        """A step target's control text from the Surface Registry (`<surface>.<control id>`)."""
-        for sid in sorted(self.cfg.surfaces, key=len, reverse=True):
-            if target.startswith(sid + "."):
-                cid = target[len(sid) + 1:]
-                for c in self.cfg.surfaces[sid].get("controls") or ():
-                    if str(c.get("id")) == cid:
-                        return str(c.get("ocr_text") or cid)
-                return cid
-        return target
+    def _ladder_boundary(self, st: _Shard, cp: PlannedCheckpoint) -> bool:
+        """The Orchestrator's `step_boundary` before a sweep or split step after its ladder's first (the unit's
+        `flow_boundary` covers the first): each ladder size is a step (2.5.1), and the kill channels and trip-wires are
+        evaluated at every step boundary (6.6 Triggers). False when the shard stopped."""
+        st.orch.step_boundary(BoundaryObservations(order_dialog_visible=st.rig.dialog_open,
+                                                   tripwires=TripWires(dialog_owned=st.exec.order_stage)))
+        self._note_new(st, checkpoint=cp)
+        return st.orch.stop is None
 
-    def _input(self, st: _Shard, flow_id: str, step: Mapping[str, Any], doc: Mapping[str, Any]) -> bool:
-        """One input-bearing flow step as the gateway's `Action` (5.4.3 stages 1 to 3 resolved here)."""
-        kind, cls = step.get("type"), str(doc.get("class", "standard"))
-        if kind == "click_named":
-            label = self._label(str(step.get("target", "")))
-            stage = step.get("order_stage") is True
-            ok = self._send(st, Action("click", point=CONFIRM_POINT if label.casefold() == "confirm and send" else (40, 40),
-                                       resolved_name=label, under_point_text=label, order_stage_step=stage,
-                                       flow_class=cls), flow_id, str(step.get("id")))
-            st.order_stage = st.order_stage or (stage and st.rig.dialog_open)
-            return ok
-        key = str(step.get("key") if kind == "press" else step.get("commit") or "").casefold()
-        if key not in NAMED_KEYS:
-            return True
-        return self._send(st, Action(kind if kind == "press" else "type_fixture", keys=(NAMED_KEYS[key],),
-                                     declared_guarded=key in GUARDED_KEYS, flow_class=cls), flow_id, str(step.get("id")))
+    def _execute(self, st: _Shard, u: Unit, cps: Sequence[PlannedCheckpoint], rest: Sequence[PlannedCheckpoint]) -> None:
+        """Run one unit and take what it decided (`_absorb`)."""
+        st.rest = list(rest)
+        st.unit = u
+        doc = u.doc
+        planner = Planner(self.values, "scripted", flow_class=str(doc.get("class", "standard")),
+                          account_role=doc.get("account_role"))
+        st.ladder.ctx = dataclasses.replace(st.ladder.ctx, flow_class=str(doc.get("class", "standard")),
+                                            flow_agent_fallback=str(doc.get("agent_fallback", "allowed")),
+                                            agent_available=st.orch.model.agent_available)
+        st.exec.agent_available = st.orch.model.agent_available
+        if u.kind == "flow":
+            st.last_flow = u.unit_id
+        hooks = UnitHooks(before_step=lambda step: self._before_step(st, u, step),
+                          after_step=lambda step: self._after_step(st))
+        live = dataclasses.replace(u, doc=_LiveTeardown(u.doc, st.rig))
+        r = run_unit(live, st.ports, st.ladder, planner, st.exec, hooks=hooks, failures=st.failures, faults=self.faults,
+                     streak=st.streak if u.kind == "census" and cps and cps[0].test_kind == "census" else None)
+        self._absorb(st, u, r, cps)
 
-    def _send(self, st: _Shard, action: Action, flow_id: str, step_id: str) -> bool:
-        """`Rig.send_input` and the drop ledger of 5.4.8: a refusal or a hook drop is a step event, and the
-        ledger's result may end the flow or the run (an attempted send is `aborted_safety`)."""
-        res = st.rig.send_input(action)
-        drops = [refusal(res.refused)] if res.refused is not None else []
-        drops += [drain(d, e) for e, d in zip(res.events, res.decisions) if not d.allowed]
-        for drop in drops:
-            r = st.orch.apply(self.ledger.record(drop, unit=flow_id, order_stage=st.order_stage))
-            self._note(st, r, flow_id=flow_id)
-            self.steps.append((StepOutcome(self.scenario.run_id, flow_id, step_id, r.step or "blocked_by_gateway",
-                                           shard_id=st.shard_id, gateway_event={"decision": drop.decision,
-                                                                                "reason": drop.reason,
-                                                                                "class": drop.gate_class},
-                                           recorded_at=_ts(self.today, self.scenario.clock, 600)), st.shard_id))
-        return not drops and st.orch.stop is None
+    def _before_step(self, st: _Shard, u: Unit, step: Mapping[str, Any]) -> ControlResult | None:
+        """`UnitHooks.before_step`: the step's simulated time, and for a flow step the Orchestrator's `step_boundary`
+        (5.2: the trip-wires, the flow's own budget, the paper-mode assertion when due, 6.4) and the symbol-change
+        count of the 6.4 rate caps. A result that stopped the run, or the flow budget's `end_flow`, ends the unit;
+        it was applied already, so it comes back marked (`APPLIED`)."""
+        st.clock.advance(STEP_S)
+        sid, kind = str(step.get("id")), str(step.get("type"))
+        st.ladder.ctx = dataclasses.replace(st.ladder.ctx, step_id=sid, step_type=kind, teardown=False)
+        ends = self._sweep(st, sid, u.unit_id if u.kind == "flow" else None, at_capture=False,
+                           census=u.kind == "census", order_stage=step.get("order_stage") is True)
+        if ends is not None:
+            return _applied(ends)
+        if kind not in ("checkpoint", "wait_for", "assert", "precondition") and st.popups is not None:
+            fg = st.popups.foreground(st.rig.foreground_window(), (APP_PID,), self._popup_ctx(st, sid, None))
+            if fg is not None:                          # 7.8 hardening: a foreign foreground; the batch is not sent
+                fg = st.orch.apply(fg)
+                self._note(st, fg, flow_id=u.unit_id if u.kind == "flow" else None)
+                # the step fails unsent: the checkpoint it led to takes the occlusion, the rest of the flow step_failed
+                subsets = tuple(SubsetOutcome(sel, o) for sel, o in (("in_progress", fg.checkpoint),
+                                                                     ("rest_of_flow", step_failed(sid))) if o)
+                return _applied(dataclasses.replace(fg, outcomes=subsets,
+                                                    actions=tuple(dict.fromkeys(fg.actions + ("end_flow",)))))
+        if u.kind != "flow":
+            return None
+        cp = next((c for c in self.planned if c.checkpoint_id == step.get("checkpoint_id")), None) \
+            if kind == "checkpoint" else None
+        r = st.orch.step_boundary(BoundaryObservations(order_dialog_visible=st.rig.dialog_open,
+                                                       tripwires=TripWires(dialog_owned=st.exec.order_stage)),
+                                  order_stage_step=step.get("order_stage") is True)
+        self._note_new(st, checkpoint=cp, flow_id=u.unit_id)
+        if st.orch.stop is not None:
+            return _applied(st.orch.stop)
+        if r is not None and r.has("end_flow"):
+            return _applied(r)
+        if kind == "type_fixture" and str(step.get("value_ref") or "").startswith("fixture.symbols."):
+            st.orch.counters.symbol_change(st.clock.now())     # 6.4 rate caps: a symbol-box change
+        return None
 
-    def _capture(self, st: _Shard, cp: PlannedCheckpoint, rest: Sequence[PlannedCheckpoint]) -> bool:
-        """Capture and evaluate one checkpoint; False when the unit ends here (an app failure, 10.2)."""
+    def _after_step(self, st: _Shard) -> ControlResult | None:
+        """`UnitHooks.after_step`: the Watchdog's app failure seen during the step (`_freeze`) ends the unit with the
+        tree gone (its checkpoints were decided there)."""
+        r, st.interrupt = st.interrupt, None
+        return r
+
+    def _absorb(self, st: _Shard, u: Unit, r: UnitResult, cps: Sequence[PlannedCheckpoint]) -> None:
+        """What one unit decided, into the shard (module docstring): its step events (the emitter's action rows keep
+        their rung, point, label and crop while the gateway decision is the drainer's row, 5.4.8, so the run's drop
+        count counts each decision once), a flow's step outcome rows with their 8.3 action, the unit's findings,
+        its consequences through `Orchestrator.apply` (a hook host death relaunches through every gate, 5.4.2) and
+        the outcomes its steps decided."""
+        by = {cp.checkpoint_id: cp for cp in cps}
+        for e in r.events:
+            if e.action != "gateway_decision" and (e.gate_decision != "none" or e.step_outcome is not None):
+                e = dataclasses.replace(e, gate_decision="none", gate_reason=None, gate_class=None, step_outcome=None)
+            elif e.step_outcome is not None:
+                e = dataclasses.replace(e, step_outcome=None)
+            st.events.append(e)
+        flow_id = u.unit_id if u.kind == "flow" else None
+        steps = {str(x.get("id")): x for blk in ("steps", "normalize", "teardown") for x in u.doc.get(blk) or ()}
+        for sr in r.steps + r.teardown:
+            so = sr.to_step_outcome(self.scenario.run_id, u.unit_id, shard_id=st.shard_id, side="candidate",
+                                    mode="scripted")
+            gw = dict(sr.gateway_event or {})
+            self.steps.append((dataclasses.replace(
+                so, action=step_action(steps.get(sr.step_id, {}), sr.status, sr.gateway_event), gateway_event=None,
+                reason=so.reason or gw.get("reason"), recorded_at=_ts(self.today, self.scenario.clock, 600)),
+                st.shard_id))
+        flow_steps = list(u.doc.get("steps") or ())
+        ids = [str(x.get("id")) for x in flow_steps]
+        for spec in r.findings:                         # locator_failure, gateway_integrity (5.5, 5.4.3 stage 7)
+            n = len(self.findings) + 1
+            sid = _spec_step(spec) or r.ended_by
+            start = ids.index(sid) if sid in ids else len(ids)      # the checkpoint the step led to, if any
+            led = next((str(x.get("checkpoint_id")) for x in flow_steps[start:] if x.get("type") == "checkpoint"
+                        and str(x.get("checkpoint_id")) in by), None)
+            self.findings.append(spec.to_finding(f"fnd-{self.scenario.run_id}-exe-{n:03d}", self.scenario.run_id,
+                                                 created_at=_ts(self.today, self.scenario.clock, 900),
+                                                 checkpoint_id=led, step_id=sid))
+        for c in r.consequences:
+            if c.control.startswith(APPLIED):
+                continue
+            c = st.orch.apply(c)
+            self._note(st, c, flow_id=flow_id)
+            self._subsets(st, c)
+            if st.orch.stop is None and (c.has("relaunch") or c.has("kill_tree")):
+                st.exec.order_stage = False  # 5.4.2: the hook host restarts; the app relaunches through every gate
+                st.orch.relaunch("hook_host")
+                self._note_new(st)
+        st.seen = len(st.orch.results)
+        failed = next((sr for sr in r.steps if sr.led_to is not None and not sr.passed), None)
+        for cid, o in r.outcomes.items():
+            if cid in by and cid not in st.sink.done:
+                if o.outcome in SIDED and not o.detail and failed is not None and failed.led_to == o:
+                    # 4.13: the anchor or landmark, and the wait used, from the step that decided it
+                    kind = str(steps.get(failed.step_id, {}).get("type"))
+                    o = dataclasses.replace(o, detail=f"wait_for {failed.step_id}: {o.reason} after "
+                                            f"{steps.get(failed.step_id, {}).get('timeout_ms', 5000)} ms"
+                                            if kind == "wait_for" else f"{kind} {failed.step_id}: {failed.detail}")
+                self.bare[cid] = (by[cid], o)
+                self.sides[cid] = r.side
+                st.sink.done.add(cid)
+
+    def _drain(self, st: _Shard, action: Action, res: Any) -> None:
+        """Every decision of one `send_input` as the shard's step-event rows (5.4.8, 6.2 Audit trail), the LOGIN
+        flow's typing and Cancel All's click included (the rig's `on_input`): a stage 4 refusal (`Drainer.refused`),
+        and each event's ring record (`segment.record_for`; the simulated rig has no shared segment) with the token
+        it consumed, under the drainer's context (the flow step `_send` names, none for the rig's own input)."""
+        d = st.drainer
+        if d is None or st.emitting:         # the Executor's emitter feeds the drainer itself (ExecContext.audit)
+            return
+        flow_id, step_id = d.ctx.flow_id, d.ctx.step_id
+        now_ns = int(st.clock.monotonic() * 1e9)
+        if res.refused is not None:
+            keys = None
+            if action.keys:
+                keys = "key_down:" + ("<redacted>" if action.kind == "secret"
+                                      else "+".join(f"0x{vk:02X}" for vk in action.keys))
+            st.events.append(d.refused(res.refused, mono_ns=now_ns, point=action.point, keys=keys,
+                                       target_text=action.resolved_name))
+            return
+        records = []
+        for e, dec in zip(res.events, res.decisions):
+            if dec.token_id is not None:
+                d.note_token(TokenNote(dec.token_id, "scripted", flow_id, step_id, target_text=action.resolved_name))
+            rec = record_for(e, dec, now_ns, secret=action.kind == "secret")
+            if rec is not None:
+                records.append(rec)
+        st.events += d.drain(records)
+
+    def _capture_step(self, st: _Shard, step: Mapping[str, Any], rescued: bool) -> Captured:
+        """`SimUnitPorts.capture`: the checkpoint the step names, through `_capture`; its candidate capture's sha256,
+        or the outcome the capture decided (an app failure)."""
+        cid = str(step.get("checkpoint_id"))
+        cp = next(c for c in st.cps if c.checkpoint_id == cid)
+        if self.faults is not None:                      # 8.4: the capture's artifact write (FaultInjector)
+            self.faults.check("artifact_put", cid)
+        unit = list(st.unit.checkpoints) if st.unit is not None else [cid]
+        rest = [c for c in st.cps if c.checkpoint_id in unit[unit.index(cid) + 1:]] if cid in unit else []
+        ev = self._capture(st, cp, rest + list(st.rest), rescued=rescued)
+        if cid in self.bare and cid in st.sink.done and ev is None:
+            return Captured(outcome=self.bare[cid][1])
+        if ev is None:
+            return Captured()
+        return Captured(hashlib.sha256(np.ascontiguousarray(ev.cand.screen.image).tobytes()).hexdigest())
+
+    def _capture(self, st: _Shard, cp: PlannedCheckpoint, rest: Sequence[PlannedCheckpoint], *,
+                 rescued: bool = False) -> Evaluated | None:
+        """Capture and evaluate one checkpoint; None when nothing was evaluated (an app failure, 10.2, or no
+        paper-mode stamp, 6.4)."""
         cid = cp.checkpoint_id
         if self.script.freeze_at == cid and cid not in self.frozen:
-            return self._freeze(st, cp, rest)
+            self._freeze(st, cp, rest)
+            return None
+        if self.script.stop_at == cid and cid not in self.frozen:      # an operator stops the rig (6.6)
+            self.frozen.add(cid)
+            stop_main([st.rig_id, "--root", str(self.out / "rigs"), "--by", "asmith",
+                       "--reason", "an unexpected dialog on the rig's console"], clock=st.clock)
+        stamp = st.orch.paper_stamp()                    # 6.4: taken at capture time, for every record
+        if stamp is None:                                # L-OUT-06: no assertion in this session; nothing captured
+            self._note(st, st.orch.apply(kill_switch("paper_mode_mismatch", gate="running",
+                                                     running_flow=cp.flow_id)), checkpoint=cp, flow_id=cp.flow_id)
+            st.seen = len(st.orch.results)
+            return None
+        if self._sweep(st, cp.step_id or "visit", cp.flow_id, at_capture=True, census=cp.test_kind == "census",
+                       checkpoint_id=cid) is not None or cid in st.sink.done:
+            return None
+        window = self._window(st, cp, rest)
+        if window is None:
+            return None
         live = cp.data_mode == "masked_live"
         base_cap = self.run.capture(cp, "base", tick=1 if live else 0)
         cand_cap = self.run.capture(cp, "candidate", tick=2 if live else 0)
+        if cp.test_kind == "sweep" and self._size_step(st, cp, base_cap, cand_cap, rest):
+            return None
         att = self.plan.attribution.get(cp.surface_id)
-        ticks = iter(range(3, 9))
+        ticks, bticks = iter(range(3, 9)), iter(range(9, 15))
         ev = evaluate(self.run, cp, base_cap, cand_cap, x=self.plan.x_input(cp.surface_id),
+                      base_recapture=lambda: self.run.capture(cp, "base", tick=next(bticks)),
                       primitive=att.primitive if att else None, entry_ref=att.entry_id if att else None,
                       recapture=lambda: self.run.capture(cp, "candidate", tick=next(ticks)),
-                      recapturable=_recapturable(self.cfg, cp), store=self.store, oracle=self.oracle)
+                      recapturable=_recapturable(self.cfg, cp), store=self.store, oracle=self.oracle, rescued=rescued)
+        ev.paper, ev.released = stamp, st.orch.may_release(stamp)
+        ev.shard_id, ev.session, ev.rig_id = st.shard_id, len(st.sessions) - 1, st.rig_id
+        ev.app_uptime_s, ev.app_restart_count = st.life.tags(st.clock.monotonic())     # 10.2
+        ev.window = window
+        for hwnd in st.close_after:                     # 4.10: an app error dialog is captured first, then closed
+            st.rig.close_window(hwnd)
+        st.close_after.clear()
         self.evals.append(ev)
         st.sink.done.add(cid)
+        return ev
+
+    def _popup_ctx(self, st: _Shard, step_id: str | None, flow_id: str | None, *, at_capture: bool = False,
+                   census: bool = False, order_stage: bool = False) -> PopupContext:
+        return PopupContext(phase="running", gate="running", flow_id=flow_id, step_id=step_id,
+                            order_stage=order_stage or st.exec.order_stage, at_capture=at_capture, census=census,
+                            agent_enabled=False, relaunched=st.life.restarts > 0, relogin_budget=st.orch.relogin,
+                            build_id=self.scenario.candidate.build_id)
+
+    def _sweep(self, st: _Shard, step_id: str, flow_id: str | None, *, at_capture: bool, census: bool = False,
+               order_stage: bool = False, checkpoint_id: str | None = None) -> ControlResult | None:
+        """The popup sentinel before a step or a capture (4.10, 7.8; `PopupSentinel.sweep` over the rig's windows, the
+        main frame and an order dialog the flow opened expected): every new hit is a `popup` step event; a dismiss key
+        goes through the gateway, an unknown or error window gets WM_CLOSE (an error dialog after its capture), a
+        wait polls its timeout (`wait_over`), POP-11 asks for the proactive relaunch at the next flow boundary; each
+        decision goes through `Orchestrator.apply`. The result that ends the unit, or None."""
+        if st.popups is None:
+            return None
+        for at, title in self.script.popups:            # the scenario's windows appear here
+            if at == step_id and (at, title) not in self.shown:
+                self.shown.add((at, title))
+                st.rig.extra_windows.append(title)
+        rig, sc = st.rig, self.scenario
+        ctx = self._popup_ctx(st, step_id, flow_id, at_capture=at_capture, census=census, order_stage=order_stage)
+        expected = {1} | ({rig._dialog_hwnd} if rig.dialog_open and st.exec.order_stage else set())
+        ends: ControlResult | None = None
+        for hit in st.popups.sweep(rig.enumerate_windows(), ctx, expected_hwnds=expected):
+            ev = hit.result.evidence or {}
+            if hit.new:
+                st.events.append(popup_event(hit, run_id=sc.run_id, shard_id=st.shard_id, side="candidate",
+                                             seq=next(st.seq), wall_at=st.clock.now().isoformat(),
+                                             mono_ms=int(st.clock.monotonic() * 1000), flow_id=flow_id,
+                                             step_id=step_id, checkpoint_id=checkpoint_id))
+                if (ev.get("input") or {}).get("key") and hit.entry is not None:
+                    rig.send_input(dismiss_action(hit.entry))
+                if ev.get("close") in ("wm_close", "agent_dismiss"):
+                    if ev.get("capture_first") and at_capture:
+                        st.close_after.append(hit.window.hwnd)
+                    else:
+                        rig.close_window(hit.window.hwnd)
+                if ev.get("proactive_relaunch"):
+                    st.proactive = True
+            r: ControlResult | None = hit.result
+            if hit.new and ev.get("wait_timeout_ms"):  # 4.10 wait: poll the window until its timeout
+                st.clock.advance(float(ev["wait_timeout_ms"]) / 1000.0)
+                r = st.popups.wait_over(hit, ctx, cleared=hit.window.hwnd not in {w.hwnd for w in
+                                                                                  rig.enumerate_windows()})
+            if r is None or (r.passed and not r.outcomes and r.run is None):
+                continue
+            r = st.orch.apply(r)
+            cp = next((c for c in st.cps if c.checkpoint_id == checkpoint_id), None)
+            self._note(st, r, checkpoint=cp, flow_id=flow_id)
+            if checkpoint_id is not None and r.checkpoint is not None and cp is not None:
+                o = r.checkpoint
+                if o.outcome in SIDED and not o.detail:   # 4.13: name the window still present at max wait
+                    o = dataclasses.replace(o, detail=f"window {hit.window.title!r} present at max wait")
+                self._decide(st, cp, o, "candidate" if o.outcome in SIDED else None)
+            unit = st.unit
+            later = [c for c in st.cps if unit is not None and c.checkpoint_id in unit.checkpoints]
+            self._subsets(st, r, cp, later)
+            st.seen = len(st.orch.results)
+            if ends is None and (r.run is not None or r.has("end_flow") or r.has("teardown") or r.outcomes
+                                 or r.step == "failed"):
+                ends = r
+        return ends
+
+    def popup_findings(self) -> list[Finding]:
+        """7.8 policy 3: `popup_rate_increase` for each catalog popup whose hits per run rose on the candidate build
+        against the base (`popup_rate_findings`; the base half of the pair ran no popup sweep in the simulation)."""
+        events = [e for st, _ in self.reports for e in st.events]
+        sc = self.scenario
+        history = [BuildCounts(sc.base.build_id, 1, {}),
+                   BuildCounts.from_events(sc.candidate.build_id, events, side="candidate", runs=1)]
+        return [spec.to_finding(f"fnd-{sc.run_id}-pop-{i:03d}", sc.run_id, created_at=_ts(self.today, sc.clock, 900))
+                for i, spec in enumerate(popup_rate_findings(history), 1)]
+
+    def _decide(self, st: _Shard, cp: PlannedCheckpoint, o: Outcome, side: str | None = None) -> None:
+        """A checkpoint outcome Capture decided before any evaluation (3.4, 2.5.1)."""
+        self.bare[cp.checkpoint_id] = (cp, o)
+        if side is not None:
+            self.sides[cp.checkpoint_id] = side
+        st.sink.done.add(cp.checkpoint_id)
+
+    def _target_window(self, cp: PlannedCheckpoint) -> TargetWindow:
+        """The checkpoint's `target_window` (4.7): the flow step's, else the surface's, else the main window."""
+        tw = (self.cfg.flow_step(cp.flow_id, cp.step_id or "").get("target_window") if cp.flow_id else None) or \
+            (self.cfg.surfaces.get(cp.surface_id) or {}).get("target_window") or {"kind": "main"}
+        return TargetWindow.from_dict(tw)
+
+    def _window(self, st: _Shard, cp: PlannedCheckpoint, rest: Sequence[PlannedCheckpoint]):
+        """Capture's window rules before the settle loop (3.4 rules 1, 3 and 4; 5.7), on the rig's windows: the PID
+        tree's `SunAwt*` windows, the checkpoint's target window (`not_comparable (window_mismatch)` when it is not
+        on screen), the 8 x 8 occlusion grid over it (`env_error (reason: occluded)` with a `foreign_window` event,
+        one alert and one `hardening` finding per foreign image name) and a modal over a main-window target
+        (`not_settled (reason: unexpected_window:<title>)`). The target window, or None when one decided."""
+        cid, sc = cp.checkpoint_id, self.scenario
+        tw = self._target_window(cp)
+        hide = (tw.title_regex if tw.kind != "main" else DEFAULT_TITLE_REGEX) if cid in self.script.window_missing \
+            else None
+        foreign = cid in self.script.occluded
+        pids = pid_tree([LAUNCHER_PID, APP_PID], sim_processes())
+        sel = select_windows(sim_windows(st.rig, foreign=foreign, hide=hide), pids, VIRTUAL_SCREEN)
+        choice = choose_target(sel.kept, tw, virtual_screen=VIRTUAL_SCREEN, main_title_regex=DEFAULT_TITLE_REGEX,
+                               side="candidate")
+        if choice.terminal is not None:
+            t = choice.terminal
+            self._decide(st, cp, Outcome(t.outcome, t.reason, None, t.detail), t.side)
+            return None
+        occ = occlusion(sim_point_owners(occlusion_grid(choice.window.rect), foreign=foreign), pids)
+        if occ is not None:
+            r = st.orch.apply(occluded(occ, image_name=FOREIGN_IMAGE, log=self.foreign_log, gate="running"))
+            up, restarts = st.life.tags(st.clock.monotonic())
+            st.events.append(foreign_window_event(
+                occ, run_id=sc.run_id, shard_id=st.shard_id, side="candidate", seq=next(st.seq),
+                wall_at=st.clock.now().isoformat(), mono_ms=int(st.clock.monotonic() * 1000), checkpoint_id=cid,
+                flow_id=cp.flow_id, step_id=cp.step_id, app_uptime_s=up, app_restart_count=restarts))
+            self._note(st, r, checkpoint=cp, flow_id=cp.flow_id)
+            self._subsets(st, r, cp, rest)
+            st.seen = len(st.orch.results)
+            return None
+        main = next((w for w in sel.kept if w.cls == "SunAwtFrame"), None)
+        modal = modal_blocking(sel.kept, main_hwnd=main.hwnd, target_hwnd=choice.window.hwnd) \
+            if main is not None and tw.kind == "main" else None
+        if modal is not None:
+            self._decide(st, cp, Outcome("not_settled", f"unexpected_window:{modal}", None,
+                                         f"modal {modal!r} over the main window at max wait"), "candidate")
+            return None
+        return choice.window
+
+    def _size_step(self, st: _Shard, cp: PlannedCheckpoint, base: Capture, cand: Capture,
+                   rest: Sequence[PlannedCheckpoint]) -> bool:
+        """2.5.1 for one sweep step on both builds (`capture.sweep.SizeLadder` per surface, host and side): the size
+        each build's gadget took (a gadget's minimum clamps it, `size_clamped`), one retry when it was not reached,
+        a `size_step` event per side; a step not reached after its retry is `assertion_failed (assertion:
+        size_reached)` with the rest of its ladder `not_run (reason: step_failed:<step>)`. True when it decided."""
+        cid, host, sc = cp.checkpoint_id, _host(cp) or "", self.scenario
+        failed = None
+        for side, cap in (("base", base), ("candidate", cand)):
+            lad = self.ladders.setdefault((cp.surface_id, host, side), SizeLadder(cp.surface_id, host, side))
+            if lad.blocked() is not None:
+                continue
+            h, w = cap.screen.image.shape[:2]
+            first = (int(w), int(h))
+            r = lad.measure(cid, first, first if lad.needs_retry(cid, first) else None)   # the sim's re-set is exact
+            up, restarts = st.life.tags(st.clock.monotonic())
+            st.events.append(size_step_event(r, checkpoint_id=cid, run_id=sc.run_id, shard_id=st.shard_id, side=side,
+                                             seq=next(st.seq), wall_at=st.clock.now().isoformat(),
+                                             mono_ms=int(st.clock.monotonic() * 1000), app_uptime_s=up,
+                                             app_restart_count=restarts))
+            failed = failed or (r if r.checkpoint is not None else None)
+        if failed is None:
+            return False
+        self._decide(st, cp, dataclasses.replace(failed.checkpoint), failed.side)
+        for later in rest:
+            if later.test_kind == "sweep" and later.surface_id == cp.surface_id and _host(later) == host \
+                    and later in self._todo(st):
+                self._decide(st, later, failed.rest_of_ladder)
         return True
 
-    def _freeze(self, st: _Shard, cp: PlannedCheckpoint, rest: Sequence[PlannedCheckpoint]) -> bool:
-        """The app's EDT freezes while `cp` is captured: the screenshot-staleness detector fires after
-        max(2 x max wait, 60 s), `app_failure` decides, and the Executor kills, relaunches and logs in again
-        before the next unit (10.2 sampling 5, F62)."""
+    def sweep_minimums(self) -> tuple[list[dict], list[Finding]]:
+        """2.5.1: the run's achieved minimum per gadget and host on the candidate (stored with the run), and a
+        `window_geometry_changed` finding where a build moved it by more than 4 px."""
+        cand = [lad for (s, h, side), lad in sorted(self.ladders.items()) if side == "candidate"]
+        findings = []
+        for lad in cand:
+            base = self.ladders.get((lad.surface_id, lad.host, "base"))
+            bm, cm = (base.minimum() if base else None), lad.minimum()
+            spec = compare_minimums(bm, cm) if bm is not None and cm is not None else None
+            if spec is not None:
+                n = len(findings) + 1
+                findings.append(spec.to_finding(f"fnd-{self.scenario.run_id}-min-{n:03d}", self.scenario.run_id,
+                                                created_at=_ts(self.today, self.scenario.clock, 900)))
+        return minimums_summary(cand), findings
+
+    def _freeze(self, st: _Shard, cp: PlannedCheckpoint, rest: Sequence[PlannedCheckpoint]) -> None:
+        """The app's EDT freezes while `cp` is captured: the Watchdog's screenshot-staleness detector, read over the
+        heartbeat as the policy wrote it (`HeartbeatPolicy.hang_detected`), fires after max(2 x max wait, 60 s),
+        `app_failure` decides, and the Executor kills, relaunches and logs in again before the next unit (10.2
+        sampling 5, F62). The unit ends there with the tree gone (`_after_step`)."""
         self.frozen.add(cp.checkpoint_id)
+        pol = st.policy
+        pol.expect_screen_change()
+        pol.step_start(cp.flow_id, cp.step_id or "visit", checkpoint_id=cp.checkpoint_id, max_wait_s=MAX_WAIT_S)
         since = st.clock.monotonic()
         st.clock.advance(max(2 * MAX_WAIT_S, HANG_FLOOR_S))
-        if not edt_frozen(now=st.clock.monotonic(), expect_change_since=since, last_hash_change=since - STEP_S,
-                          max_wait_s=MAX_WAIT_S, anti_anchor=False, capture_suspended=False):
+        if not pol.hang_detected(now=st.clock.monotonic(), last_hash_change=since - STEP_S, anti_anchor=False):
             raise RuntimeError("the hang detector did not fire on a frozen screen")
         r = st.orch.apply(app_failure(CrashSignal("hang", "screenshot_staleness"), st.orch.budgets, phase="running"))
         self._note(st, r, checkpoint=cp, flow_id=cp.flow_id)
         self._subsets(st, r, cp, rest)
+        st.seen = len(st.orch.results)
+        st.interrupt = ControlResult(APPLIED + "app_failure", False, "running", actions=("end_flow", "kill_tree"),
+                                     detail="the app failed during the step; its checkpoints were decided")
         if st.orch.stop is not None:
-            return False
-        if r.has("kill_tree"):
+            return
+        st.exec.order_stage = False
+        if r.has("relaunch"):        # 7.7, 10.2: kill, reset input, session release wait, every gate again
+            st.orch.relaunch("app_failure")
+            self._note_new(st)
+        elif r.has("kill_tree"):
             st.rig.kill_process_tree()
-            st.order_stage = False
-        if r.has("wait_session_release"):
-            st.clock.sleep(SESSION_RELEASE_WAIT_S)
-        if r.has("relaunch"):
-            self._relaunch(st)
-        return False
-
-    def _relaunch(self, st: _Shard) -> None:
-        """Re-enter at `launched` after an app failure (10.2): launch, log in, assert paper mode again."""
-        orch, ctx, rig = st.orch, st.ctx, st.rig
-        for check in (lambda: check_launched(rig.launch(), expected_build=ctx.expected_build, first_launch=False,
-                                             budgets=orch.budgets),
-                      lambda: check_authenticated(rig.login()),
-                      lambda: judge_identity([rig.read_account_selector()], ctx.allowlist)):
-            r = orch.apply(check())
-            self._note(st, r)
-            if not r.passed or orch.stop is not None:
-                return
 
     # -- after every shard ----------------------------------------------------------------------------
     def bare_outcome(self, cp: PlannedCheckpoint, o: Outcome) -> CheckpointOutcome:
+        """The record of an outcome a control result decided (1.10): a `harness_error` names the Watchdog event of
+        the control that decided it (4.13), an `assertion_failed` its assertion id."""
         sc = self.scenario
+        detail = o.detail
+        if o.outcome == "harness_error" and not WATCHDOG_EVENT.search(detail or ""):
+            detail = f"watchdog_event: {_event_id(self.run, cp)}" + (f"; {detail}" if detail else "")
         return CheckpointOutcome(
-            run_id=sc.run_id, checkpoint_id=cp.checkpoint_id, outcome=o.outcome, reason=o.reason, detail=o.detail,
-            gate=o.gate, workspace_id=cp.workspace_id, persona=cp.persona, data_mode=cp.data_mode,
+            run_id=sc.run_id, checkpoint_id=cp.checkpoint_id, outcome=o.outcome, reason=o.reason, detail=detail,
+            gate=o.gate, side=self.sides.get(cp.checkpoint_id) if o.outcome in SIDED else None,
+            workspace_id=cp.workspace_id, persona=cp.persona, data_mode=cp.data_mode,
             surface_id=cp.surface_id, test_kind=cp.test_kind, tier=cp.tier, flow_id=cp.flow_id, step_id=cp.step_id,
             size_step=dict(cp.size_step) if cp.size_step else None, flow_class=_flow_class(self.cfg, cp),
-            fingerprint_id=self.run.fp_id, data_epoch_id=self.run.epoch, recorded_at=_ts(self.today, sc.clock, 900))
+            fingerprint_id=self.run.fp_ids.get(next((s.shard_id for s, _ in self.reports if cp in s.cps), ""),
+                                               self.run.fp_id),
+            data_epoch_id=self.run.epoch, recorded_at=_ts(self.today, sc.clock, 900),
+            assertion_ids=[o.reason.split(":", 1)[1]] if o.outcome == "assertion_failed" and (o.reason or "")
+            .startswith("assertion:") else None, outcome_id=self.run.next_outcome_id(), pair_id=self.run.pair_id,
+            profile_id=PROFILE)
 
     def stop(self) -> tuple[_Shard, ControlResult] | None:
         """The shard and result that ended the run (an `aborted_*` run outcome), if one did."""
@@ -1278,6 +2387,17 @@ class _ShardWork:
             v = worse(v, rep.verdict)
         return v or RunVerdict("complete")
 
+    def leased_secrets(self) -> dict[str, str]:
+        """6.9 Plaintext scan at teardown: the value under every secret step's vault lease (the LOGIN flows'), by
+        lease; each lease is released once read (`VaultPort.release`, "at teardown")."""
+        out: dict[str, str] = {}
+        for st, _ in self.reports:
+            for lease in st.rig.leases:
+                out[f"{lease.alias}#{lease.lease_id}"] = self.vault.secret(lease)
+                self.vault.release(lease)
+            st.rig.leases.clear()
+        return out
+
     def write_proofs(self) -> None:
         """One 8.3 `post_run_proofs` row per shard proof (6.6), through the store, keyed by the shard's login alias;
         `proofs` reads them back for the report. A shard's gateway drops are its step events the hook dropped or the
@@ -1286,8 +2406,7 @@ class _ShardWork:
         for st, rep in self.reports:
             p, log = rep.proof, st.rig.gateway_log()
             pm = [r for r in rep.results if r.control == "paper_mode"]
-            drops = sum(1 for s, sid in self.steps
-                        if sid == st.shard_id and (s.gateway_event or {}).get("decision") in ("dropped", "refused"))
+            drops = sum(1 for e in st.events if e.gate_decision in ("dropped", "refused"))
             self.store.write_proof(PostRunProof(
                 shard_id=st.shard_id, run_id=sc.run_id, login_alias=login_alias(st.rig_id), verdict=p.verdict_code,
                 reason=p.reason, send_policy_ref=self.cfg.send_policy_ref, counts=p.counts,
@@ -1333,12 +2452,72 @@ class _ShardWork:
                 "gateway_drops": self.store.gateway_drops(self.scenario.run_id), "cancel_all": cancel,
                 "proof": proof, "login": logins[0] if len(logins) == 1 else logins}
 
-    def write(self, extra: Mapping[str, Any] | None = None) -> None:
-        """`alerts.json` and `orchestrator.json` in the scenario output (appended to by every run there)."""
-        _append_json(self.out / "alerts.json", self.alerts)
-        _append_json(self.out / "orchestrator.json", [{
+    def write_record(self, o: CheckpointOutcome, **kw: Any) -> CheckpointOutcome:
+        """One checkpoint's batch under L-OUT-02 (`Store.write_checkpoint_or_repair`, 4.13): a record the
+        required-fields table refuses gets one repair (`repair_record`); one still refused is written `harness_error
+        (reason: store_write_failed)` with the Watchdog event logged here (`store_refusals`)."""
+        def refused(rec: CheckpointOutcome, errors: list[str]) -> str:
+            event = "wd-" + hashlib.sha256(f"{rec.run_id}|{rec.checkpoint_id}|store".encode()).hexdigest()[:8]
+            self.store_refusals.append({"watchdog_event": event, "checkpoint_id": rec.checkpoint_id,
+                                        "refused": list(errors)})
+            return event
+        return self.store.write_checkpoint_or_repair(o, repair=repair_record, on_refused=refused, **kw)
+
+    def write_events(self) -> None:
+        """Every shard's step events (relaunches, gateway decisions) through `Store.write_events`, before any other
+        step row of the shard: those take MAX(seq) + 1, so the two writers never collide (8.3)."""
+        for st, _ in self.reports:
+            if st.events:
+                self.store.write_events(st.events)
+
+    def session_context(self, ev: Evaluated) -> None:
+        """`Store.set_session_context` for the session that captured `ev` (6.4, L-OUT-06): the allowlisted accounts
+        and every paper-mode assertion of that session, so its stamped record is checked against them."""
+        st = next((s for s, _ in self.reports if s.shard_id == ev.shard_id), None)
+        if st is None or ev.paper is None or not 0 <= ev.session < len(st.sessions):
+            return
+        self.store.set_session_context(st.shard_id, {account_id_sha256(a) for a in st.ctx.allowlist.entries},
+                                       st.sessions[ev.session])
+
+    def entries(self) -> tuple[list[dict], dict]:
+        """What `write` appends: this run's `alerts.json` entries and its `orchestrator.json` entry."""
+        return list(self.alerts), {
             "run_id": self.scenario.run_id, "shards": self.summaries, "persisted_actions": self.actions,
-            "gateway_events": [s.to_dict() for s, _ in self.steps], **dict(extra or {})}])
+            "gateway_events": [e.to_dict() for st, _ in self.reports for e in st.events
+                               if e.gate_decision in ("dropped", "refused")],
+            "store_refusals": self.store_refusals}
+
+    def write(self) -> None:
+        """`alerts.json` and `orchestrator.json` in the scenario output (appended to by every run there)."""
+        alerts, entry = self.entries()
+        _append_json(self.out / "alerts.json", alerts)
+        _append_json(self.out / "orchestrator.json", [entry])
+
+
+def _ledger_size(out: Path) -> int:
+    """Where this run's lines begin in the output's results.jsonl, the store's ledger every run there appends to."""
+    p = out / "results.jsonl"
+    return p.stat().st_size if p.exists() else 0
+
+
+def _teardown_scan(store: Store, arts: ArtifactStore, out: Path, run_id: str, secrets: Mapping[str, str],
+                   ledger_at: int, leak: ControlResult | None = None, files: Sequence[Path] = (),
+                   texts: Mapping[str, Any] | None = None) -> ControlResult | None:
+    """The 6.9 teardown plaintext scan before a run reaches `reported` (`secret_scan.scan_run`): the run's rows (its
+    summary among them, so it is written first), its artifact set, its journal, `files`, the results.jsonl lines it
+    appended (from `ledger_at`, secret_scan choice 1) and `texts`, what it will publish but has not written yet,
+    each JSON-encoded. Returns the run's secret result: `leak`, the first upload the mid-run check stopped, else the
+    scan's hit (or `secret_scan_unavailable`), else None. Either hit moves the set to `artifacts/quarantine/<run_id>`
+    (6.9, 8.4): a stopped upload never reached the set, so the scan alone would not."""
+    reports: list[Path | FileTail] = [p for p in (out / "journal" / run_id, *files) if p.exists()]
+    if (out / "results.jsonl").exists():
+        reports.append(FileTail(out / "results.jsonl", ledger_at))
+    quarantine = out / "artifacts" / "quarantine"
+    scan = scan_run(store, arts, reports, secrets, run_id=run_id, quarantine_root=quarantine,
+                    texts={k: json.dumps(v, sort_keys=True, default=str).encode() for k, v in (texts or {}).items()})
+    if leak is not None and scan.passed:
+        arts.quarantine(run_id, quarantine, store=store)
+    return leak or (None if scan.passed else scan)
 
 
 class _EvalIndex(abc.Mapping):
@@ -1366,22 +2545,91 @@ def _append_json(path: Path, entries: Sequence[Any]) -> None:
 # run_pipeline
 
 
+class PairRefused(ValueError):
+    """Run creation refused the build pair (4.2 L-BLD-04, L-BLD-05; `lint.rules.check_pair`): the run is never
+    queued, no run row is written, and the requester gets the rule ids (`rule_ids`) and the violations."""
+
+    def __init__(self, violations: Sequence[Violation]):
+        self.violations = list(violations)
+        self.rule_ids = sorted({v.rule for v in self.violations})
+        super().__init__("build pair refused at run creation: " + "; ".join(v.line() for v in self.violations))
+
+
+def pair_violations(repo: Repo, candidate: str, run_type: str = "pr") -> list[Violation]:
+    """4.2 at run creation: `lint.rules.check_pair` on the candidate's build pair (its `builds/<id>.yaml` record),
+    against the build records of the checkout. A candidate whose record carries no pair, or a pair of another run
+    type, is not checked here."""
+    docs = {str(d.data["build"]["build_id"]): d.data for d in repo.of("build")
+            if isinstance(d.data, dict) and isinstance(d.data.get("build"), dict) and d.data["build"].get("build_id")}
+    pair = (docs.get(candidate) or {}).get("build_pair")
+    if not isinstance(pair, dict) or pair.get("run_type", run_type) != run_type:
+        return []
+    return check_pair(pair, {b: d["build"] for b, d in docs.items()}, file=f"builds/{candidate}.yaml")
+
+
+def _expired_findings(run_id: str, expired: Sequence[ExpiredRecord], notices: Sequence[Any],
+                      exceptions: Sequence[tuple[str, inv.InvariantException]], at: str) -> list[Finding]:
+    """One finding per record that stopped applying at run start (4.1, 4.8 L-MSK-02, L-RGN-05, L-SRF-11): the
+    run-start lint's expired records, plus any the run itself dropped (`effective_registry`, `active_exceptions`)
+    that the lint's day did not reach, each once by (kind, record id)."""
+    rows: dict[tuple[str, str], tuple[str, str]] = {}
+    for e in expired:
+        rows.setdefault((e.kind, e.record_id), (e.scope, f"{e.file}, {e.rule}, expired {e.expires_at}, owner "
+                                                         f"{e.owner or 'unknown'}"))
+    for n in notices:
+        rows.setdefault((n.kind, n.record_id), (n.region_id, f"region {n.region_id}"))
+    for surface, x in exceptions:
+        rows.setdefault(("invariant_exception_expired", x.invariant_id),
+                        (surface, f"surface {surface}, expired {x.expires_at}, owner {x.owner or 'unknown'}"))
+    return [Finding(f"fnd-{run_id}-expired-{i:03d}", run_id, kind,
+                    f"{EXPIRY_KINDS[kind]}: {rid} ({where}); it stopped applying at run start", run_id, created_at=at,
+                    evidence={"raw_values": {"record_id": rid, "scope": scope,
+                                             "run_health": f"{EXPIRY_KINDS[kind]}: {rid}"}})
+            for i, ((kind, rid), (scope, where)) in enumerate(sorted(rows.items()), 1)]
+
+
+def _render(store: Store, run_id: str, mdict: dict | None, ctx: ReportContext, out: Path) -> tuple[str, dict]:
+    """The finished run read back from the store (`report.ReportInputs`: its records, its summary JSON and the Safety
+    rows; 9.2 renders from the summary written at teardown, 8.7) into `pr-comment.md`, `commit-status.json` and
+    `report.html`; returns the comment and the commit status."""
+    rep = ReportInputs.from_store(store, run_id).build(mdict, ctx)
+    comment = render_report_markdown(rep)
+    status = _status_json(rep.status)
+    (out / "pr-comment.md").write_text(comment, encoding="utf-8")
+    (out / "commit-status.json").write_text(json.dumps(status, indent=2) + "\n")
+    write_run_report(rep, out / "report.html", objects_dir=out / "artifacts" / "runs" / run_id / "objects", embed=True)
+    return comment, status
+
+
 def _abort_config(store: Store, scenario: Scenario, cfg_root: Path, errors: list[str], rule_ids: list[str],
-                  out_dir: Path, today: date, started: str) -> RunResult:
+                  out_dir: Path, today: date, started: str, *, expiring: Sequence[str] = ()) -> RunResult:
     """1.7 T+0:00 and preflight G1 (12.7): config lint failed, so the shard's Orchestrator fails G1 at
-    `provisioned` and the run ends `aborted_harness (reason: config_invalid)` before any product action."""
+    `provisioned` and the run ends `aborted_harness (reason: config_invalid)` before any product action. No shard
+    started, so the run's one post-run proof is the run-level row of SD-61 (`killswitch.config_invalid_proof`)."""
     store.begin_run(_run_plan(scenario.run_id, scenario.run_type, cfg_root, (), (), started, None, scenario.pr,
                               scenario.author))
     sink = ShardSink(())                                 # 1.10: none was scoped yet
     clock = ManualClock(start=parse_time(started).astimezone(timezone.utc))
     ctx = default_context(scenario.run_id, scenario.run_type, expected_build=scenario.candidate.build_id)
-    report = Orchestrator(SimulatedRig(SimScenario(preflight_failures={"G1": None}), clock=clock), ctx, sink,
-                          clock=clock).run()
+    rig = SimulatedRig(SimScenario(preflight_failures={"G1": None}), clock=clock)
+    report = Orchestrator(rig, ctx, sink, clock=clock).run()
+    store.write_proof(config_invalid_proof(scenario.run_id, produced_at=clock.now().isoformat(),
+                                           gateway=rig.gateway_log()))
     store.fill_unreached(scenario.run_id, "harness_error", "config_invalid")
+    alerts = [a for r in report.results if (a := alert_entry(scenario.run_id, ctx.shard_id, r)) is not None]
+    abort = {"rule_ids": rule_ids, "not_requeued": "the same config would fail again; fix it first"}
+    health = {"wall_clock": _mmss(60), "budget": "45:00", "shards": 1,
+              "safety": {"attestation": "not reached", "paper_mode_asserted": 0, "gateway_drops": 0,
+                         "cancel_all": "not needed", "proof": report.proof.line},
+              "integrations": {"pr_comment": {"state": "posted", "time": "(simulated: written to pr-comment.md)"},
+                               "jira_queued": 0, "slack": {"queued": 0}}}
+    summary: dict[str, Any] = {"coverage": {}, "health": health, "abort": abort, "alerts": alerts,
+                               "lint_errors": list(errors)}
+    if expiring:
+        summary["expiring"] = list(expiring)
     run = store.end_run(RunOutcome(scenario.run_id, scenario.run_type, report.verdict.status, report.last_gate,
                                    reason=report.verdict.reason, started_at=started,
-                                   ended_at=_ts(today, scenario.clock, 60)))
-    alerts = [a for r in report.results if (a := alert_entry(scenario.run_id, ctx.shard_id, r)) is not None]
+                                   ended_at=_ts(today, scenario.clock, 60)), summary=summary)
     _append_json(out_dir / "alerts.json", alerts)
     shard = {"shard_id": ctx.shard_id, "rig": "none (stopped at provisioned)", "verdict": report.verdict.status,
              "reason": report.verdict.reason, "last_gate": report.last_gate, "proof": report.proof.line,
@@ -1390,73 +2638,108 @@ def _abort_config(store: Store, scenario: Scenario, cfg_root: Path, errors: list
     _append_json(out_dir / "orchestrator.json", [{"run_id": scenario.run_id, "shards": [shard], "persisted_actions": [],
                                                   "gateway_events": [], "lint_errors": errors}])
     ctx_r = ReportContext(pr=scenario.pr or 0, candidate_build=scenario.candidate.build_id,
-                          base_build=scenario.base.build_id,
-                          abort={"rule_ids": rule_ids,
-                                 "not_requeued": "the same config would fail again; fix it first"})
-    health = {"wall_clock": _mmss(60), "budget": "45:00", "shards": 1,
-              "safety": {"attestation": "not reached", "paper_mode_asserted": 0, "gateway_drops": 0,
-                         "cancel_all": "not needed", "proof": report.proof.line},
-              "integrations": {"pr_comment": {"state": "posted", "time": "(simulated: written to pr-comment.md)"},
-                               "jira_queued": 0, "slack": {"queued": 0}}}
-    comment = render_pr_comment(run, [], [], [], {}, health, None, ctx_r)
-    rep = build_report(run, [], [], [], {}, health, None, ctx_r)
-    (out_dir / "pr-comment.md").write_text(comment, encoding="utf-8")
-    (out_dir / "commit-status.json").write_text(json.dumps(_status_json(rep.status), indent=2) + "\n")
-    render_run_report(run, [], [], [], {}, health, None, ctx_r, out_dir / "report.html")
+                          base_build=scenario.base.build_id)
+    comment, status = _render(store, scenario.run_id, None, ctx_r, out_dir)
     return RunResult(scenario.run_id, scenario.run_type, run.status, run.reason, out_dir, comment=comment,
-                     commit_status=_status_json(rep.status), lint_errors=errors, alerts=alerts, shards=[shard],
+                     commit_status=status, lint_errors=errors, alerts=alerts, shards=[shard],
                      proof=report.proof.line)
 
 
+@dataclass(frozen=True)
+class RunStart:
+    """What the run-start lint of 4.1 left for the run (`lint.runstart`): the errors that abort it, the records that
+    stopped applying, the masks expiring within seven days, and the manifest's own lint (4.3)."""
+
+    errors: list[Violation]
+    expired: list[ExpiredRecord]
+    expiring: list[str]
+    manifest_lint: list[str]
+    manifest_ok: bool
+
+
+def run_start(repo: Repo, candidate: str, today: date) -> RunStart:
+    """4.1 and 4.3 at run start: `lint_at_run_start` (an error is `config_invalid`; an expired mask, floor exception
+    or invariant exception only stops applying), `expiring_soon` for the owner warning (3.8), and `lint_manifest` on
+    the candidate's manifest (any error: the manifest is treated as missing, its lines go to the PR comment)."""
+    report, expired = lint_at_run_start(repo, phase=1, today=today)
+    rel = f"manifests/{candidate}.yaml"
+    found = lint_manifest(repo, rel, candidate=candidate, phase=1, today=today) if rel in repo.docs else []
+    bad = any(v.severity == "error" for v in found)
+    return RunStart(report.errors, expired, [w.line() for w in expiring_soon(repo, today)],
+                    [v.line() for v in found] if bad else [], not bad)
+
+
 def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path, today: date = DEFAULT_TODAY,
-                 reviewer: ReviewerAdapter | None = None, live: ReviewerJob | None = None) -> RunResult:
+                 reviewer: ReviewerAdapter | None = None, live: ReviewerJob | None = None,
+                 live_factory: Callable[[EgressGate], ReviewerJob] | None = None) -> RunResult:
     """One simulated PR run from webhook to PR comment (module docstring). The Reviewer is `reviewer`, else
-    with `live` (a `reviewer.ReviewerJob`, `pipeline.live.live_job`) the real adapter `ModelReviewer`, else
+    with `live` (a `reviewer.ReviewerJob`, `pipeline.live.live_job`; or `live_factory`, which builds it over the
+    run's `egress.EgressGate`, 6.10) the real adapter `ModelReviewer`, else
     the offline `SimulatedReviewer`. Writes into `out_dir`:
-    `config/<run_id>/`, `sentinel.db` (shared by every run of the directory), `artifacts/`,
+    `config/<run_id>/`, `sentinel.db` (shared by every run of the directory), `artifacts/runs/<run_id>/` (8.4),
     `calibration/`, `heartbeat/`, `pr-comment.md`, `commit-status.json`, `report.html`,
-    `reviewer-calls.json`, and appends to `alerts.json` and `orchestrator.json`."""
+    `reviewer-calls.json`, and appends to `alerts.json` and `orchestrator.json`. Raises `PairRefused`, before
+    anything is written to the store, when run creation refuses the candidate's build pair (4.2)."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     started = _ts(today, scenario.clock)
     now = parse_time(started)
     cfg_root = materialize(config_dir, scenario.overlay, out / "config" / scenario.run_id)
-    report_lint = lint(cfg_root, phase=1, today=today)
-    with Store(out / "sentinel.db") as store:
-        if report_lint.errors:
-            errs = [v.line() for v in report_lint.errors]
-            rules = sorted({v.rule for v in report_lint.errors})
-            return _abort_config(store, scenario, cfg_root, errs, rules, out, today, started)
+    repo = Repo.load(cfg_root)
+    refused = pair_violations(repo, scenario.candidate.build_id)
+    if refused:                                      # 4.2: the run is never created
+        raise PairRefused(refused)
+    start = run_start(repo, scenario.candidate.build_id, today)
+    with Store(out / "sentinel.db", strict_records=True) as store:      # L-OUT-02: every record is complete
+        ledger_at = _ledger_size(out)                                   # 6.9: this run's results.jsonl lines
+        oncall = repo.one("oncall")
+        if oncall is not None and isinstance(oncall.data, dict):        # L-DEC-01: who may decide (ops/oncall.yaml)
+            store.set_roster(Roster.from_oncall(oncall.data))
+        if start.errors:
+            errs = [v.line() for v in start.errors]
+            rules = sorted({v.rule for v in start.errors})
+            return _abort_config(store, scenario, cfg_root, errs, rules, out, today, started, expiring=start.expiring)
         cfg = SentinelConfig.load(cfg_root)
         try:
             oracle = FlowOracle.load(cfg, now)
         except OracleConfigError as exc:
             return _abort_config(store, scenario, cfg_root, [str(exc)], [], out, today, started)
+        try:                                             # 11.8: every Phase 0 branch, its default while undecided
+            phase0 = branches_mod.load(cfg.root / branches_mod.BRANCHES_PATH)
+        except branches_mod.BranchesError as exc:
+            return _abort_config(store, scenario, cfg_root, [str(exc)], ["L-XREF-15"], out, today, started)
         cand_doc = cfg.builds.get(scenario.candidate.build_id, {})
         pair = cand_doc.get("build_pair") or {}
         base_id = pair.get("base", scenario.base.build_id)
-        mdoc = cfg.manifests.get(scenario.candidate.build_id)
+        mdoc = cfg.manifests.get(scenario.candidate.build_id) if start.manifest_ok else None
         manifest = Manifest.from_dict(mdoc) if mdoc else None
         dep_index = DependencyIndex.from_depends_on(scenario.depends_on) if scenario.depends_on is not None else None
+        _register(store, cfg, [base_id, scenario.candidate.build_id])
+        rigs, held_flows = available(store, cfg, RIGS)       # 6.4, 6.6, 6.12: blocked rigs and quarantined flows
         try:
             plan = compute_scope("pr", manifest, cfg.dep_map, cfg.registry, dep_index, classes_in(scenario.changed_paths),
                                  run_id=scenario.run_id, workspaces=cfg.workspaces, flows=cfg.flows,
-                                 entitlements=cfg.entitlements, quarantine=cfg.quarantine,
-                                 rigs=[Rig(r, "fp") for r in RIGS], candidate_build_id=scenario.candidate.build_id)
-        except ScopeConfigError as exc:
-            return _abort_config(store, scenario, cfg_root, [str(exc)], ["L-SRF-10"], out, today, started)
+                                 entitlements=cfg.entitlements, quarantine=cfg.quarantine | held_flows,
+                                 rigs=[Rig(r, "fp") for r in rigs], candidate_build_id=scenario.candidate.build_id)
+        except ScopeConfigError as exc:              # an input the lint should have refused: its own rule (SD-01)
+            return _abort_config(store, scenario, cfg_root, [str(exc)], list(exc.rule_ids), out, today, started,
+                                 expiring=start.expiring)
         planned = list(plan.planned)
+        skipped = churn.skip_outcomes(today, cfg.fixture, planned, cfg)      # 4.9: the day's churn calendar
+        churn_rows = _churn_rows(today, cfg, planned, started)
         rig_of = {cp.checkpoint_id: it.rigs[0] for it in plan.items for cp in it.checkpoints}
-        run = _Run(cfg, scenario.run_id, "pr", scenario.base, scenario.candidate, now, manifest, plan, plan.x_input)
+        try:
+            run = _Run(cfg, scenario.run_id, "pr", scenario.base, scenario.candidate, now, manifest, plan,
+                       plan.x_input)
+        except RedactionError as exc:               # 6.10: no capture without the whole redaction stage
+            return _abort_config(store, scenario, cfg_root, [str(exc)], [], out, today, started)
         run.budget = RerunBudget(len(planned), run.params)
-        # 3.3: fingerprint equality on every field but build id, before any capture
-        mismatch = compare_fingerprints({"match": dict(run.fp_match, build_id=base_id)},
-                                        {"match": dict(run.fp_match, build_id=scenario.candidate.build_id)})
-        assert mismatch is None
         # -- T+0:00 to 0:02: the run row, its scope and shards (1.7)
-        arts = ArtifactStore(out / "artifacts", f"runs/{scenario.run_id}")
-        writer = _Writer(run, arts, today, scenario.clock)
-        _register(store, cfg, [base_id, scenario.candidate.build_id])
+        secrets = run_secrets(RIGS)                       # 6.9: the plaintexts the run's logins used, by reference
+        scanner = SecretScanner(secrets)
+        arts = ArtifactStore.at(out / "artifacts", f"runs/{scenario.run_id}", scanner=scanner)   # 8.4: its own dir
+        leak: ControlResult | None = None                 # the first results batch the upload check stopped
+        writer = _Writer(run, arts, today, scenario.clock, store)
         used = sorted({rig_of[cp.checkpoint_id] for cp in planned})
         shard_of = {r: f"{scenario.run_id}/{i}" for i, r in enumerate(used, 1)}
         scope_entries = [ScopeEntry(cp.checkpoint_id, cp.workspace_id, cp.persona, cp.tier, cp.data_mode,
@@ -1469,60 +2752,110 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         shards = [ShardPlan(shard_of[r], r, scope_count=sum(1 for cp in planned if rig_of[cp.checkpoint_id] == r))
                   for r in used]
         mtext = (cfg.root / "manifests" / f"{scenario.candidate.build_id}.yaml")
+        pair_id = _register_pair(store, cfg, scenario.candidate.build_id, base_id)    # 3.1, 8.3: before the run row
+        run.pair_id = str(pair_id) if pair_id is not None else None
         store.begin_run(_run_plan(scenario.run_id, "pr", cfg.root, scope_entries, shards, started,
-                                  mtext.read_text() if mtext.exists() else None, scenario.pr, scenario.author))
+                                  mtext.read_text() if mtext.exists() else None, scenario.pr, scenario.author, pair_id,
+                                  {f: scripted_flow(d, f, scenario.rig) for f, d in cfg.flow_docs.items()}))
+        commit = tree_sha256(cfg.root)[:12]               # 8.3, 8.5: renames and the config commit's registry mirror
+        renames = repo.one("renames")
+        apply_renames(store, renames.data if renames is not None else None, commit)
+        redaction = repo.one("redaction")
+        load_config_mirror(store, commit, cfg.regions, cfg.masks, redaction.data if redaction is not None else None)
         work = _ShardWork(run, cfg, scenario, out, oracle, store, planned, plan, today)
         rev = reviewer or SimulatedReviewer()
-        items = ItemBuilder(scenario.run_id, arts, REDACTION, _EvalIndex(work), manifest=manifest, epoch=run.epoch,
-                            flow_docs=cfg.flow_docs, pad=(live.config if live else ReviewerConfig()).crop.pad_px)
+        gate = egress_gate(cfg.root, store, scenario.run_id)   # 6.10: one gate per run for every outbound call
+        if live is None and live_factory is not None:
+            live = live_factory(gate)
+        items = ItemBuilder(scenario.run_id, arts, run.red_header, _EvalIndex(work), manifest=manifest, epoch=run.epoch,
+                            flow_docs=cfg.flow_docs, pad=(live.config if live else ReviewerConfig()).crop.pad_px,
+                            sweep=run.sweep)
         if reviewer is None and live is not None:          # 3.12: the real Reviewer; crops from the artifact store
             rev = ModelReviewer(live, items)
-        if isinstance(rev, CollectingReviewer):
-            rev.item_for = items
+        if not phase0.models().reviewer_enabled:          # DR-07 undecided or no pinned model: unreviewed (10.7)
+            rev = _UnreviewedReviewer()
+        work.agent_allowed = phase0.models().agent_rung_allowed
+        if isinstance(rev, CollectingReviewer):            # `sentinel review`: its live items go through `gate`
+            rev.item_for, rev.live = items, live
         # -- 5.2: every shard through the Orchestrator; 5.17 per checkpoint inside `running`
-        work.run_shards([(shard_of[r], i, r, [cp for cp in planned if rig_of[cp.checkpoint_id] == r])
+        work.run_shards([(shard_of[r], i, r, [cp for cp in planned if rig_of[cp.checkpoint_id] == r
+                                              and cp.checkpoint_id not in skipped])
                          for i, r in enumerate(used, 1)])
+        work.write_events()                    # first: the shard's seq is then the store's MAX(seq) for later rows
         evals = work.evals
         shift = global_shift_prepass([ev.diff.signal for ev in evals if ev.diff is not None and ev.diff.signal is not None],
                                      params=run.params)
-        if shift.raised:                       # 3.7 granularity 0: one needs_human (global_shift) cluster
-            for ev in evals:
-                if ev.cp.checkpoint_id in shift.collapse:
-                    ev.facts = dataclasses.replace(ev.facts, global_shift=True)
-                    ev.classified = classify(ev.facts)
-            gf = shift.finding(scenario.run_id)
-            if gf is not None:
-                store.write_finding(dataclasses.replace(gf, created_at=started))
-        calls = _review_pass(run, evals, rev, scenario.reviewer_cap)
-        for f in plan.findings:
-            store.write_finding(dataclasses.replace(f, created_at=started))
-        for n in run.expiry_notices:
-            store.write_finding(Finding(f"fnd-{scenario.run_id}-expiry-{n.record_id}", scenario.run_id, n.kind,
-                                        f"{n.kind}: {n.record_id} on {n.region_id} stopped applying at run start",
-                                        scenario.run_id, created_at=started))
+        # 3.7 granularity 0: one needs_human (global_shift) cluster, and no Reviewer call for the run
+        stop = global_shift_stop(shift, {ev.cp.checkpoint_id: ev.facts for ev in evals})
+        for ev in evals:
+            if ev.cp.checkpoint_id in stop.facts:
+                ev.facts, ev.classified = stop.facts[ev.cp.checkpoint_id], stop.classified[ev.cp.checkpoint_id]
+        gf = shift.finding(scenario.run_id)
+        if gf is not None:
+            store.write_finding(dataclasses.replace(gf, created_at=started))
+        calls = [] if stop.stopped else _review_pass(run, evals, rev, scenario.reviewer_cap, gate)
+        for f in list(plan.findings) + work.sweep_minimums()[1] + work.popup_findings():
+            store.write_finding(dataclasses.replace(f, created_at=f.created_at or started))
+        for f in _expired_findings(scenario.run_id, start.expired, run.expiry_notices, run.expired_exceptions,
+                                   started):
+            store.write_finding(f)
+        def uploads(payload: Any, where: str, cp: PlannedCheckpoint | None = None, shard: str | None = None) -> bool:
+            """6.9: each results batch is scanned before it is uploaded, and from the first hit on no batch is (a leak
+            mid-run stops uploads at once): False when this one is withheld, and then the checkpoint `cp` it was for
+            is written only as the leak's unreached outcome, `harness_error (secret_leaked)`, with no findings,
+            artifacts or steps; the batch stays with the run for the human scan."""
+            nonlocal leak
+            if leak is None:
+                leak = check_upload(scanner, json.dumps(payload, sort_keys=True, default=str).encode(),
+                                    location=f"results batch {where}")
+            if leak is None:
+                return True
+            if cp is not None:
+                assert leak.unreached is not None                # check_upload's leak result names its outcome
+                work.write_record(work.bare_outcome(cp, leak.unreached), shard_id=shard)
+            return False
+
         for ev in evals:
             o, fs, stored = writer.records(ev)
-            steps = []
-            if ev.cp.test_kind == "flow":
-                steps = [StepOutcome(scenario.run_id, ev.cp.flow_id or "", ev.cp.step_id or "", "passed",
-                                     locator_rung="image", duration_ms=ev.settle_ms or 750,
-                                     recorded_at=_ts(today, scenario.clock, 600))]
-            store.write_checkpoint(o, findings=fs, artifacts=stored, shard_id=shard_of[rig_of[ev.cp.checkpoint_id]],
-                                   steps=steps)
+            shard = shard_of[rig_of[ev.cp.checkpoint_id]]
+            work.session_context(ev)                     # L-OUT-06: the stamp is one of its session's assertions
+            reads = [to_rows(chk.verdict.results, run_id=scenario.run_id, checkpoint_id=ev.cp.checkpoint_id, side=side,
+                             read_at=run.now) for side, chk in (("candidate", ev.oracle), ("base", ev.oracle_base))
+                     if chk is not None]                                            # SD-09: every extraction
+            if not uploads([o.to_dict(), [f.to_dict() for f in fs], reads], ev.cp.checkpoint_id, ev.cp, shard):
+                continue
+            work.write_record(o, findings=fs, artifacts=stored, shard_id=shard)
+            if ev.flake:                                 # 3.10 step 5: the unstable re-run's captures, redacted
+                shas = [writer.flake_capture(ev, c, k) for k, c in enumerate([ev.cand] + list(ev.flake))]
+                fe = flake_event(Stability("unstable", recaptures=len(ev.flake)), shas, region_id=ev.region)
+                if fe is not None:
+                    store.write_flake_event(scenario.run_id, ev.cp.checkpoint_id, created_at=started, **fe)
+            for rows in reads:
+                store.write_extractions(rows)
         by_cp = {}
         for f in work.findings:
             by_cp.setdefault(f.checkpoint_id, []).append(f)
         for cid, (cp, oc) in sorted(work.bare.items()):
-            store.write_checkpoint(work.bare_outcome(cp, oc), findings=by_cp.pop(cid, []),
-                                   shard_id=shard_of[rig_of[cid]])
-        for fs in by_cp.values():
-            for f in fs:
+            rec, fs = work.bare_outcome(cp, oc), by_cp.pop(cid, [])
+            if uploads([rec.to_dict(), [f.to_dict() for f in fs]], cid, cp, shard_of[rig_of[cid]]):
+                work.write_record(rec, findings=fs, shard_id=shard_of[rig_of[cid]])
+        for f in [f for fs in by_cp.values() for f in fs]:
+            if uploads(f.to_dict(), f"finding {f.finding_id}"):
                 store.write_finding(f)
         for s, sid in work.steps:                         # each with its gateway_event (8.3 gate_* columns)
-            store.write_steps([s], shard_id=sid, side="candidate")
+            if uploads(s.to_dict(), f"step {s.flow_id}/{s.step_id}"):
+                store.write_steps([s], shard_id=sid, side="candidate")
+        for cid, o in sorted(skipped.items()):         # 4.9: not_run (scope) with the churn event in detail
+            cp = planned_for(cfg, cid)
+            rec = dataclasses.replace(work.bare_outcome(cp, o), recorded_at=started)
+            if uploads(rec.to_dict(), cid, cp):
+                work.write_record(rec)
         for c in plan.cuts:
             if c.checkpoint is not None:
-                store.write_checkpoint(dataclasses.replace(c.outcome(scenario.run_id), recorded_at=started))
+                rec = dataclasses.replace(c.outcome(scenario.run_id), recorded_at=started,
+                                          outcome_id=run.next_outcome_id(), pair_id=run.pair_id, profile_id=PROFILE)
+                if uploads(rec.to_dict(), c.checkpoint.checkpoint_id, c.checkpoint):
+                    work.write_record(rec)
         verdict = work.verdict()
         stop = work.stop()
         reported = {st.shard_id: rep for st, rep in work.reports}
@@ -1530,7 +2863,8 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         for sp in shards:
             v = reported[sp.shard_id].verdict
             store.end_shard(sp.shard_id, v.status, v.reason)
-            store.mark_shard_imported(sp.shard_id)
+            if leak is None:                              # 6.9: a shard whose uploads stopped is not imported
+                store.mark_shard_imported(sp.shard_id)
         arts.write_manifest(ManifestHeader(config_commit=tree_sha256(cfg.root)[:12], harness_commit="sentinel-core-0.1.0",
                                            run_id=scenario.run_id, created_at=started))
         wall = GATES_S + max(sum(it.rig_cost_s for it in plan.items if r in it.rigs) for r in used) + \
@@ -1539,16 +2873,88 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         if status == "complete" and store.complete_blockers(scenario.run_id):
             status, reason = "complete_with_env_errors", None
         last_gate = stop[1].gate if stop is not None and stop[1].gate else "reported"
-        runrec = store.end_run(RunOutcome(scenario.run_id, "pr", status, last_gate, reason=reason, started_at=started,
-                                          ended_at=_ts(today, scenario.clock, int(wall))))
         abort = {}
-        if stop is not None and runrec.status == "aborted_safety":
+        if stop is not None and status == "aborted_safety":
             st, r = stop
             stopped = [s.rig_id for s, rep in work.reports if rep.verdict.status == "aborted_safety"]
-            abort = {"trigger": r.run_reason, "gate": r.gate, "proof": work.proof(), "incident": r.incident or "unknown",
+            abort = {"trigger": r.run_reason, "gate": r.gate, "proof": work.proof(),
+                     "incident": work.incident(r) or r.incident or "unknown",   # the 6.12 incident row's id
                      "rig": stopped or [st.rig_id]}                    # every rig the abort disabled (6.6 step 6)
-        result = _report(store, cfg, plan, run, scenario, runrec, manifest, mdoc, out, today, wall, len(work.reports),
-                         safety=work.safety(), abort=abort)
+        (out / "reviewer-calls.json").write_text(json.dumps(calls, indent=1, sort_keys=True, default=str) + "\n")
+        minimums, _ = work.sweep_minimums()
+        work.health_rows += [["Phase 0 branches", line] for line in phase0.run_health_lines(today)]
+        stage1 = sorted({line for st, _ in work.reports for line in st.orch.stage1_steps})
+        health_rows = list(work.health_rows) + churn_rows + ([["Fixture Stage 1", "; ".join(stage1)]] if stage1 else [])
+
+        def full_summary() -> dict[str, Any]:
+            """The run's summary with its 2.5.1 minimums and run-health rows (9.2)."""
+            s = _summary(store, cfg, plan, run, scenario, wall, len(work.reports), safety=work.safety(), abort=abort,
+                         start=start, alerts=work.alerts)
+            if minimums:                                # 2.5.1: stored with the run, the report's minimum line
+                s["sweep_minimums"] = minimums
+            if health_rows:
+                s["health_rows"] = list(health_rows)
+            return s
+
+        summary = full_summary()
+        store.update_summary(scenario.run_id, summary)      # 6.9: a row of this run, and a ledger line, for the scan
+        ctx = _report_context(scenario, cfg.root)
+        secrets.update(work.leased_secrets())         # every secret step's lease, read under it, then released
+        # 6.9 teardown: the plaintext scan of everything the run wrote or will publish, before anything is reported
+        secret = _teardown_scan(store, arts, out, scenario.run_id, secrets, ledger_at, leak,
+                                [out / "reviewer-calls.json"],
+                                {"report inputs": [dataclasses.asdict(ctx), as_dict(mdoc) if mdoc else None],
+                                 "alerts.json and orchestrator.json": work.entries()})
+        if secret is not None:
+            v = worse(RunVerdict(status, reason), secret.run)
+            status, reason, last_gate = v.status, v.reason, secret.gate or "teardown"
+            work.alerts += [a for a in [alert_entry(scenario.run_id, None, secret)] if a is not None]
+            abort = {"trigger": secret.run_reason, "gate": last_gate, "not_requeued": "the report is withheld until "
+                     "a human scans the run and rotates the credential (6.9)"}
+            summary = full_summary()
+            summary["secret_scan"] = {"result": secret.run_reason, "detail": secret.detail, "report_withheld": True}
+        dims = summary["coverage"]["matrix"]          # 1.4 G2 and L-OUT-07 on the stored rows, before anything reports
+        failures = post_run_check(store, scenario.run_id, dims["surfaces"], dims["personas"], dims["profiles"],
+                                  cells=summary["coverage"]["cells"])
+        checked = worse(RunVerdict("aborted_harness", CHECK_FAILED), RunVerdict(status, reason)) if failures else None
+        if checked is not None and checked.status == "aborted_harness":
+            store.update_summary(scenario.run_id, summary)
+            runrec = end_taxonomy_check_failed(store, scenario.run_id, failures, last_gate=last_gate,
+                                               watchdog_event_id=_event_id(run, None), ended_at=_ts(today, scenario.clock,
+                                                                                                   int(wall)))
+        elif checked is not None:          # 8.2: a safety abort stays the run's outcome; the failed check withholds
+            store.fill_unreached(scenario.run_id, "env_error", reason, gate=last_gate,      # 1.10, as the abort's own
+                                 detail=f"watchdog_event: {_event_id(run, None)}; post-run check failed: {failures[0]}")
+            runrec = store.end_run(RunOutcome(scenario.run_id, "pr", status, last_gate, reason=reason,
+                                              started_at=started, ended_at=_ts(today, scenario.clock, int(wall))),
+                                   summary={**summary, "post_run_check": {"failures": list(failures),
+                                                                          "report_withheld": True}})
+        else:
+            runrec = store.end_run(RunOutcome(scenario.run_id, "pr", status, last_gate, reason=reason,
+                                              started_at=started, ended_at=_ts(today, scenario.clock, int(wall))),
+                                   summary=summary)
+        verified = verify_fixes(store, scenario.run_id, candidate_build=scenario.candidate.build_id, at=started)
+        for re_ in verified.reopened:                    # 9.9: each reopen's outbox job payload, as its artifact
+            arts.put(re_.payload, name=f"{scenario.run_id}/outbox/{re_.decision_id}.json", kind="request",
+                     media_type="application/json")
+        rows = _decision_rows(store, verified, started)
+        if rows:
+            summary.setdefault("health_rows", []).extend(rows)
+            store.update_summary(scenario.run_id, summary)
+        held = activity_quarantined(open_quarantines(store), "report_publication")      # 6.9: no report publishes
+        if secret is not None:
+            result = _withheld(store, plan, scenario, runrec, out, str(secret.detail or secret.run_reason))
+        elif held is not None:
+            result = _withheld(store, plan, scenario, runrec, out, f"report publication quarantined ({held.reason})")
+        else:
+            result = _report(store, plan, scenario, runrec, mdoc, out, ctx)
+            late = _teardown_scan(store, arts, out, scenario.run_id, secrets, ledger_at,
+                                  files=[out / n for n in ("report.html", "pr-comment.md", "commit-status.json")])
+            if late is not None:       # 6.9: text only the rendered report holds (rows of other runs); not published
+                work.alerts += [a for a in [alert_entry(scenario.run_id, None, late)] if a is not None]
+                store.update_summary(scenario.run_id, {"secret_scan": {"result": late.run_reason, "detail": late.detail,
+                                                                       "report_withheld": True}})
+                result = _withheld(store, plan, scenario, runrec, out, str(late.detail or late.run_reason))
         result.reviewer_calls = calls
         n_pairs = sum(1 for ev in evals if ev.diff is not None and ev.diff.signal is not None)
         result.notes.append(
@@ -1564,12 +2970,13 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
             summary["proof"] = lines[summary["shard_id"]]
         result.alerts, result.shards, result.proof = work.alerts, work.summaries, work.proof()
         work.write()
-        (out / "reviewer-calls.json").write_text(json.dumps(calls, indent=1, sort_keys=True, default=str) + "\n")
         return result
 
 
-def _review_pass(run: _Run, evals: list[Evaluated], rev: ReviewerAdapter, cap: int) -> list[dict]:
-    """5.11, 9.7: one Reviewer call per report cluster that needs one, in cluster order, up to `cap`."""
+def _review_pass(run: _Run, evals: list[Evaluated], rev: ReviewerAdapter, cap: int,
+                 gate: EgressGate | None = None) -> list[dict]:
+    """5.11, 9.7: one Reviewer call per report cluster that needs one, in cluster order, up to `cap`; each call's
+    egress rows name the item's checkpoint and the run's redaction version (`gate.context`, 6.10)."""
     members = []
     by_id: dict[str, Evaluated] = {}
     for ev in evals:
@@ -1580,11 +2987,11 @@ def _review_pass(run: _Run, evals: list[Evaluated], rev: ReviewerAdapter, cap: i
                                 persona=ev.cp.persona, data_mode=ev.cp.data_mode, tier=ev.cp.tier,
                                 diff=ev.diff.summary if ev.diff and ev.diff.terminal is None else None, **c.fields())
         f = Finding("pre", run.run_id, "collateral", "", run.run_id, checkpoint_id=ev.cp.checkpoint_id,
-                    region_id=ev.region, phash=ev.phash, category=ev.category)
+                    region_id=ev.region, phash=ev.phash, category=_category(ev))
         members.append(Member(rec, f, ev.category, 0, ev.region, c.decision_ref))
         by_id[ev.cp.checkpoint_id] = ev
     calls: list[dict] = []
-    for cl in cluster_members(members):
+    for cl in review_order(cluster_members(members)):     # 3.15: lowest tier, then area, then checkpoint id
         evs = [by_id[m.checkpoint_id] for m in cl.unsuppressed]
         if not evs:
             continue
@@ -1594,6 +3001,13 @@ def _review_pass(run: _Run, evals: list[Evaluated], rev: ReviewerAdapter, cap: i
         elif all(ev.classified.outcome == "collateral" for ev in evs):
             task = "describe_collateral"
         else:
+            continue
+        held = [ev for ev in evs if not ev.released]     # 6.4: no frame without a current paper-asserted stamp
+        if task == "manifest_match":
+            for ev in held:
+                _with_review(ev, Review("unavailable", cause="paper_assertion_not_current"))
+        evs = [ev for ev in evs if ev.released]
+        if not evs:
             continue
         if len(calls) >= cap:
             if task == "manifest_match":
@@ -1623,11 +3037,13 @@ def _review_pass(run: _Run, evals: list[Evaluated], rev: ReviewerAdapter, cap: i
             edge={"primitive": att.primitive, "entry_id": att.entry_id} if att and task == "describe_collateral" else None,
             sizes=sizes, ladder=any(d.kind == "order_strip" for d in rep.cand.screen.components))
         try:
-            answer = rev.review(req)
-            problems = validate(answer, req)
-            if problems:                  # 3.13: re-sent once, then unavailable (row 23)
+            with gate.context(checkpoint_id=req.checkpoint_ids[0], redaction_version=run.red_header.version) \
+                    if gate is not None else contextlib.nullcontext():
                 answer = rev.review(req)
                 problems = validate(answer, req)
+                if problems:              # 3.13: re-sent once, then unavailable (row 23)
+                    answer = rev.review(req)
+                    problems = validate(answer, req)
         except ReviewerUnavailable as exc:       # the live adapter gave up on the item (3.11 row 23)
             for ev in evs:
                 _with_review(ev, exc.review())
@@ -1653,41 +3069,180 @@ def _area(ev: Evaluated) -> tuple:
     return (int(step.get("w", 0)) * int(step.get("h", 0)), int(step.get("w", 0)))
 
 
-def _report(store: Store, cfg: SentinelConfig, plan: ScopePlan, run: _Run, scenario: Scenario, runrec: RunOutcome,
-            manifest: Manifest | None, mdoc: dict | None, out: Path, today: date, wall: float, shards: int, *,
-            safety: dict, abort: dict) -> RunResult:
-    """Read the run back from the store and render the PR comment, commit status and report (9.2, 9.5).
+def _summary(store: Store, cfg: SentinelConfig, plan: ScopePlan, run: _Run, scenario: Scenario, wall: float,
+             shards: int, *, safety: dict, abort: dict, start: RunStart, alerts: Sequence[dict]) -> dict:
+    """The teardown summary of 8.3 `runs.summary_json` the Reporter reads (`report.model` docstring): the coverage
+    matrix, run health (with the records that expired at run start), the abort block facts, the manifest's lint
+    lines when it was treated as missing (4.3), the seven-day mask warnings (3.8) and the run's 9.10 alerts.
     `safety` is run health's safety row from the shards' control results; `abort` the abort block's facts."""
     outcomes = store.outcomes(scenario.run_id)
-    findings = store.findings(scenario.run_id)
-    steps = store.step_outcomes(scenario.run_id)
-    ids = sorted({o.decision_ref for o in outcomes if o.decision_ref} | {f.decision_ref for f in findings if f.decision_ref})
-    decisions = [d for d in (store.get_decision(i) for i in ids) if d is not None]
-    coverage = coverage_summary(cfg, plan, outcomes, scenario.run_id)
-    health = {
+    health: dict[str, Any] = {
         "wall_clock": _mmss(wall), "budget": "45:00", "shards": shards,
-        "fingerprint": {"candidate": run.fp_id[7:13], "base": run.fp_id[7:13]},
+        "fingerprint": {"candidate": run.fp_id[7:13], "base": run.fp_base_id[7:13]},
         "reviewer": {"cost_usd": 0.0},
         "safety": safety,
         "integrations": {"pr_comment": {"state": "posted", "time": "(simulated: written to pr-comment.md)"},
                          "jira_queued": 0, "slack": {"queued": 0}},
     }
+    expired = [f.evidence["raw_values"]["run_health"] for f in store.findings(scenario.run_id)
+               if f.kind in EXPIRY_KINDS]
+    if expired:
+        health["expired"] = expired
+    health["redaction"] = dict(run.redaction_counts)    # 3.6: the run's redaction boxes per side
     if scenario.canary:
         health["canary"] = dict(scenario.canary)
-    ctx = ReportContext(pr=scenario.pr or 0, candidate_build=scenario.candidate.build_id,
-                        base_build=scenario.base.build_id, detector_banner=scenario.detector_banner,
-                        history=scenario.history, abort=abort,
-                        provenance={"harness_commit": "sentinel-core-0.1.0 (simulated run)",
-                                    "config_commit": tree_sha256(cfg.root)[:12],
-                                    "vm_image_id": "none: synthetic screens from sentinel.synth"})
-    mdict = as_dict(mdoc) if mdoc else None
-    comment = render_pr_comment(runrec, outcomes, findings, decisions, coverage, health, mdict, ctx, steps=steps)
-    (out / "pr-comment.md").write_text(comment, encoding="utf-8")
-    rep = build_report(runrec, outcomes, findings, decisions, coverage, health, mdict, ctx, steps)
-    status = _status_json(rep.status)
+    out: dict[str, Any] = {"coverage": coverage_summary(cfg, plan, outcomes, scenario.run_id), "health": health,
+                           "alerts": list(alerts)}
+    if abort:
+        out["abort"] = abort
+    nightly = last_nightly_safety(store)            # 10.3: the last Nightly's safety banner and canary rows
+    if nightly:
+        out["safety"] = nightly
+    if start.manifest_lint:
+        out["manifest_lint"] = list(start.manifest_lint)
+    if start.expiring:
+        out["expiring"] = list(start.expiring)
+    return out
+
+
+def egress_allowlist(cfg_root: Path) -> EgressAllowlist:
+    """The signed allowlist `policy/egress_allowlist.yaml` (6.10); without the file the empty allowlist, under which
+    every host is refused (L-XREF-19 choice 1, `egress` choice 5): a missing allowlist never opens the gate."""
+    path = cfg_root / "policy" / "egress_allowlist.yaml"
+    return EgressAllowlist.load(path) if path.is_file() else EgressAllowlist.empty()
+
+
+def egress_gate(cfg_root: Path, store: Store, run_id: str) -> EgressGate:
+    """The run's egress gate over the signed allowlist (`egress_allowlist`, 6.10): every outbound call of the run,
+    the live Reviewer's included, goes through it."""
+    return EgressGate(egress_allowlist(cfg_root), store, run_id=run_id)
+
+
+def nightly_reconcile(store: Store, cfg_root: Path, now: datetime) -> ControlResult:
+    """The Nightly egress reconciliation (6.10): the last day's `egress_log` rows against the signed allowlist (the
+    empty one without the file) and the rigs' firewall logs; the simulated rig keeps no firewall log, so only rows to
+    an unapproved host can trip it. Each run the reconciliation names is re-marked `aborted_harness
+    (egress_unlogged)` by its caller (none here)."""
+    since = (now - timedelta(days=1)).astimezone(timezone.utc).isoformat()
+    names = {f.name for f in dataclasses.fields(EgressRow)}
+    rows = [EgressRow(**{k: r[k] for k in r.keys() if k in names})
+            for r in store.query("SELECT * FROM egress_log WHERE sent_at >= ?", (since,))]
+    return reconcile(rows, egress_allowlist(cfg_root), ()).control()
+
+
+@dataclass(frozen=True)
+class SafetyPass:
+    """What the Nightly's safety pass did (6.5, 6.8, 10.3): each safety canary and the denied-action test, the fire
+    drill, their `canary_results` rows, the results to persist, and the banner and detector state they give."""
+
+    canaries: tuple[sc_mod.SafetyCanaryResult, ...]
+    drill: DrillResult
+    rows: tuple[Any, ...]
+
+    @property
+    def results(self) -> tuple[ControlResult, ...]:
+        return tuple(c.result for c in self.canaries) + (self.drill.result,)
+
+    @property
+    def state(self) -> str:
+        return sc_mod.detector_state(self.canaries)
+
+    @property
+    def banner(self) -> str | None:
+        return sc_mod.banner(self.canaries)
+
+
+def _scan_dir(workdir: Path, marker: str) -> list[Path]:
+    """The secret-scan canary's adapter: the files under `workdir` where the 6.9 plaintext scanner finds `marker`."""
+    scanner = SecretScanner({"canary.marker": marker})
+    try:
+        return sorted(p for p in workdir.rglob("*") if p.is_file() and scanner.scan_file(p, str(p)))
+    finally:
+        scanner.zero()
+
+
+def safety_pass(cfg: SentinelConfig, orch: Orchestrator, rig: SimulatedRig, ctx: RunContext, ledger: DropLedger,
+                workdir: Path) -> SafetyPass:
+    """The Nightly's safety pass inside `running` (10.3, 6.5, 6.8): the attestation, identity, proof and secret-scan
+    canaries (each planted input through the real checker), the denied-action test over the config's Explorer deny
+    list (every probe through the gateway), then the fire drill (`run_drill` with `SimDrillPort` on the shard's rig and
+    its kill channel), last because its item 5 runs the kill switch sequence. The drill's preconditions come from the
+    session: A1 to A9 passed (`a3_a9`), a liveness probe the hook dropped a second ago (the simulated hook answers
+    every probe), the signed injector (the simulation has no binary to check)."""
+    entries, registry = load_deny_list(cfg.root)
+    canaries = (sc_mod.attestation_canary(ctx.profile), sc_mod.identity_canary(ctx.allowlist),
+                sc_mod.proof_canary(orch.start_book), sc_mod.secret_scan_canary(_scan_dir, workdir),
+                sc_mod.denied_action_test(rig, entries, deny_controls=registry.deny_controls))
+    chords = ctx.default_hotkeys().chords
+    drill = run_drill(rig, ledger, orch.clock, chords, orch.start_book or rig.read_orders(), rig.flag_channel,
+                      port=SimDrillPort(rig), preconditions=DrillPreconditions(
+                          orch.safety.attestation_stage == "a3_a9", 1.0, True),
+                      allowlist=ctx.allowlist, rig_id=rig.s.rig_id, fixture_account=ctx.fixture_account)
+    return SafetyPass(canaries, drill, tuple(c.row for c in canaries) + tuple(sc_mod.drill_rows(drill, chords)))
+
+
+SIM_SECRET = SimVault.SECRET                      # the stand-in plaintext of every simulated login's password (6.9)
+
+
+SIM_DISPLAY_NAME = "Wren Halvorsen-Tate"     # the stand-in display name of every simulated test login (6.10)
+
+
+def login_display_name(rig: str) -> str | None:
+    """The display name of the rig's test login, from the vault's record of its `login_ref` (6.10 stage 2: the
+    sweep looks for it always; `capture.redaction` choice 9). Here one stand-in name that the synthetic screens
+    never draw, so a sweep hit on it can only come from a frame that shows the account holder's name."""
+    return SIM_DISPLAY_NAME
+
+
+def run_secrets(rigs: Iterable[str]) -> dict[str, str]:
+    """The plaintext of each secret the run's logins used, by vault reference (6.9 Plaintext scan): on the rig the
+    Orchestrator's locked buffer; here one stand-in value the simulated LOGIN flow never types (its keys are
+    stand-ins too), so a hit can only come from a value written where it must not be."""
+    return {f"{login_alias(r)}#password": SIM_SECRET for r in rigs}
+
+
+def _withheld(store: Store, plan: ScopePlan, scenario: Scenario, runrec: RunOutcome, out: Path, why: str) -> RunResult:
+    """6.9: a leaked secret (or a scan that could not run, or a quarantined report publication) withholds the report:
+    no PR comment and no report page are published; the commit status says Sentinel did not report."""
+    status = {"context": "sentinel/pr-run", "state": "error", "mode": "informational", "target_url": None,
+              "description": f"Sentinel did not report: {runrec.status} ({runrec.reason}); the report is withheld"}
     (out / "commit-status.json").write_text(json.dumps(status, indent=2) + "\n")
-    render_run_report(runrec, outcomes, findings, decisions, coverage, health, mdict, ctx, out / "report.html",
-                      steps=steps, objects_dir=out / "artifacts" / "objects", embed=True)
+    for name in ("pr-comment.md", "report.html"):
+        (out / name).unlink(missing_ok=True)
+    return RunResult(scenario.run_id, "pr", runrec.status, runrec.reason, out, store.outcomes(scenario.run_id),
+                     store.findings(scenario.run_id), [], "", status, plan, None,
+                     notes=[f"report withheld: {why}"])
+
+
+def last_nightly_safety(store: Store) -> dict | None:
+    """The `safety` block of the last finished Nightly run in the store (10.3): its safety canary banner and its run
+    id, whose `canary_results` rows the PR report's Safety section prints; None before any Nightly."""
+    rows = store.query("SELECT summary_json FROM runs WHERE run_type = 'nightly' AND lifecycle = 'finished' "
+                       "ORDER BY finished_at DESC, run_id DESC LIMIT 1")
+    if not rows:
+        return None
+    s = json.loads(rows[0]["summary_json"] or "{}").get("safety")
+    return {"banner": s.get("banner"), "nightly_run_id": s.get("nightly_run_id")} if isinstance(s, dict) else None
+
+
+def _report_context(scenario: Scenario, cfg_root: Path) -> ReportContext:
+    """The run-level facts the report prints that no record holds (9.2, 9.5)."""
+    return ReportContext(pr=scenario.pr or 0, candidate_build=scenario.candidate.build_id,
+                         base_build=scenario.base.build_id, detector_banner=scenario.detector_banner,
+                         history=scenario.history,
+                         provenance={"harness_commit": "sentinel-core-0.1.0 (simulated run)",
+                                     "config_commit": tree_sha256(cfg_root)[:12],
+                                     "vm_image_id": "none: synthetic screens from sentinel.synth"})
+
+
+def _report(store: Store, plan: ScopePlan, scenario: Scenario, runrec: RunOutcome, mdoc: dict | None,
+            out: Path, ctx: ReportContext) -> RunResult:
+    """Read the finished run back from the store and render the PR comment, commit status and report (9.2, 9.5)."""
+    mdict = as_dict(mdoc) if mdoc else None
+    comment, status = _render(store, scenario.run_id, mdict, ctx, out)
+    outcomes, findings = store.outcomes(scenario.run_id), store.findings(scenario.run_id)
+    ids = sorted({o.decision_ref for o in outcomes if o.decision_ref} | {f.decision_ref for f in findings if f.decision_ref})
+    decisions = [d for d in (store.get_decision(i) for i in ids) if d is not None]
     return RunResult(scenario.run_id, "pr", runrec.status, runrec.reason, out, outcomes, findings, decisions, comment,
                      status, plan, mdict)
 
@@ -1736,7 +3291,7 @@ class NightlyScenario:
     history_nights: int = 14
 
 
-SIMULATED_MUTANTS = ("M01", "M02", "M03", "M04", "M05", "M06", "M08", "M09", "M12", "M14", "M18", "M20", "M22",
+SIMULATED_MUTANTS = ("M01", "M02", "M03", "M04", "M05", "M06", "M08", "M09", "M12", "M14", "M18", "M19", "M20", "M22",
                      "M24", "M25", "M26", "M27", "M28", "M29", "M30")
 NOT_SIMULATED = {
     "M07": "color_swap expects INV-15; the registry declares no signed P/L column and palette for the synthetic app",
@@ -1744,10 +3299,11 @@ NOT_SIMULATED = {
     "M11": "clipped_label (ellipsis) needs OCR of the pixels, as M10",
     "M13": "missing_row expects an Oracle assertion (R08); the simulated Oracle reads what synth drew, not a mutant's "
            "pixels, so the Nightly pass runs without it",
-    "M15": "placeholder lands on a rule region asserted by the Oracle, which reads drawn text, not a mutant's pixels",
+    "M15": "placeholder expects INV-08, which reads the surface's value regions; the example registry declares none "
+           "for the Position Statement, and the Nightly pass runs without the Oracle that asserts the census rule "
+           "region in PR runs (SD-29)",
     "M16": "font_height needs OCR cap heights from the pixels",
     "M17": "scrollbar needs a template match of the drawn thumb",
-    "M19": "redaction is proven by the redaction stage and the egress log, which the simulation has no rig for",
     "M21": "global_shift is judged by the run-level pre-pass over at least 20 pairs of one run",
     "M23": "global_shift, as M21",
     "M31": "misaligned_column expects INV-12; the registry declares no grid columns for the synthetic app",
@@ -1768,7 +3324,7 @@ def planned_for(cfg: SentinelConfig, cid: str) -> PlannedCheckpoint:
         return PlannedCheckpoint(cid, surface, "flow", int(step.get("tier", tier)), flow["workspace"], flow["persona"],
                                  str(step.get("data_mode", flow.get("data_mode", mode))), flow_id=q[0], step_id=q[1])
     if kind == "sweep":
-        w, h = q[1].split("x")
+        w, h = q[1].removesuffix("-asc").split("x")          # SD-04: a Ladder F ascending step ends in -asc
         return PlannedCheckpoint(cid, surface, "sweep", tier, "ws.tier-c.sweep-harness", s["personas"][0], mode,
                                  size_step=(("host", q[0]), ("w", int(w)), ("h", int(h))))
     ws = next(w for w in cfg.workspaces if w.id == q[0])
@@ -1839,8 +3395,9 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
     started = _ts(today, scenario.clock)
     now = parse_time(started)
     cfg_root = materialize(config_dir, scenario.overlay, out / "config" / scenario.run_id)
-    lrep = lint(cfg_root, phase=1, today=today)
-    with Store(out / "sentinel.db") as store:
+    lrep, expired = lint_at_run_start(cfg_root, phase=1, today=today)
+    with Store(out / "sentinel.db") as store:    # not strict: canary.score's synthetic harness rows lack a Watchdog id
+        ledger_at = _ledger_size(out)                                   # 6.9: this run's results.jsonl lines
         if lrep.errors:
             sc = Scenario(scenario.name, scenario.run_id, scenario.build, scenario.build, run_type="nightly",
                           clock=scenario.clock)
@@ -1850,8 +3407,15 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         assert cfg.catalog is not None
         wanted = set(scenario.mutants or SIMULATED_MUTANTS)
         entries = [e for e in cfg.catalog.entries if e.mutant_id in wanted]
-        run = _Run(cfg, scenario.run_id, "nightly", scenario.build, scenario.build, now, None, None,
-                   lambda s: "undeclared")
+        try:
+            run = _Run(cfg, scenario.run_id, "nightly", scenario.build, scenario.build, now, None, None,
+                       lambda s: "undeclared")
+        except RedactionError as exc:               # 6.10: no capture without the whole redaction stage
+            sc = Scenario(scenario.name, scenario.run_id, scenario.build, scenario.build, run_type="nightly",
+                          clock=scenario.clock)
+            return _abort_config(store, sc, cfg_root, [str(exc)], [], out, today, started)
+        secrets = run_secrets([str(cfg.fixture.get("rig", "rig-01"))])     # 6.9: the plaintexts the login used
+        scanner = SecretScanner(secrets)
         bound = sorted({e.checkpoint_id for e in entries} | {str(e.params.get("donor_checkpoint")) for e in entries
                                                               if e.params.get("donor_checkpoint")})
         cps = {cid: planned_for(cfg, cid) for cid in bound}
@@ -1862,9 +3426,10 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         ctx, sim = shard_setup(cfg, run_id=scenario.run_id, run_type="nightly", shard_id=f"{scenario.run_id}/1",
                                shard_no=1, build_id=scenario.build.build_id, workspace_id="ws.tier-a.swing-trader",
                                script=RigScript())
-        orch = Orchestrator(SimulatedRig(sim, clock=clock), ctx, ShardSink(()),
-                            clock=clock, heartbeat=HeartbeatWriter(out / "heartbeat" / f"{scenario.run_id}.json", clock),
-                            watchdog_status=lambda: (1.0, True))
+        nrig = SimulatedRig(sim, clock=clock)
+        orch = work.orchestrator(nrig, ctx, ShardSink(()), clock,
+                                 HeartbeatWriter(out / "heartbeat" / f"{scenario.run_id}.json", clock), sim,
+                                 nrig.set_session_safety)
         done: dict[str, Any] = {}
 
         def canary_pass(_: Orchestrator) -> None:
@@ -1881,7 +3446,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
             gen = cn.generate(entries, {cid: c.screen.image for cid, c in approved.items()}, boxes)
             results: list[cn.MutantResult] = []
             produced: dict[str, CheckpointOutcome] = {}
-            writer = _Writer(run, ArtifactStore(out / "artifacts", f"runs/{scenario.run_id}"), today, scenario.clock)
+            writer = _Writer(run, ArtifactStore.at(out / "artifacts", f"runs/{scenario.run_id}", scanner=scanner),
+                             today, scenario.clock)
             rows_meta = []
             arts_by_sha: dict[str, StoredArtifact] = {}
             for m in gen.mutants:
@@ -1907,12 +3473,17 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                 if ev.classified.outcome in ("identical", "noise"):
                     masks = [f"mask {r.mask_ref} (region {r.id})" for r in ev.registry.regions if r.type == "mask"]
                     absorbed = ", ".join(masks) if masks else None
-                results.append(cn.MutantResult(m, rec, absorbed_by=absorbed, step_status=step_status))
+                hit = run.redaction_canary(cp, base_cap, m) if m.defect_class == "redaction" else None
+                results.append(cn.MutantResult(m, rec, absorbed_by=absorbed, step_status=step_status,
+                                               redaction_hit=hit))
                 produced[m.key] = rec
                 rows_meta.append((m, ev))
             report = cn.score(results, history=history or {}, since=f"{today.isoformat()} {scenario.clock[:5]} ET",
                               context=cn.RowContext(scenario.run_id, "ws.tier-a.swing-trader", "swing_trader", "frozen"))
             done.update(report=report, rows_meta=rows_meta, produced=produced, writer=writer, arts_by_sha=arts_by_sha)
+            done["safety"] = safety_pass(cfg, orch, nrig, ctx, work.ledger, out / "safety-canaries" / scenario.run_id)
+            for res in done["safety"].results:      # 6.5, 1.10: a drill that placed an order stops the shard through
+                orch.apply(res)                     # the kill switch, `aborted_safety (drill_order_placed)`
 
         shard = orch.run(canary_pass)
         st = _Shard(ctx.shard_id, cfg.fixture.get("rig", "rig-01"), [], orch, orch.rig, orch.sink, clock, ctx)
@@ -1923,6 +3494,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         work.summaries.append({"shard_id": ctx.shard_id, "rig": st.rig_id, "verdict": shard.verdict.status,
                                "reason": shard.verdict.reason, "last_gate": shard.last_gate,
                                "proof": shard.proof.line,
+                               "kill_switch": [name for name, _ in shard.kill_switch.steps] if shard.kill_switch
+                               else None,
                                "gates": [{"control": r.control, "gate": r.gate, "passed": r.passed, "detail": r.detail}
                                          for r in shard.results]})
         work.write()
@@ -1943,6 +3516,13 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                                                flow_class=_flow_class(cfg, cp)) for cp in cps.values()],
                                    config_commit=tree_sha256(cfg.root)[:12])
         store.begin_run(_run_plan(scenario.run_id, "nightly", cfg.root, (), shard_plan, started, None, None, None))
+        expired_findings = _expired_findings(scenario.run_id, expired, run.expiry_notices, run.expired_exceptions,
+                                             started)
+        for f in expired_findings:
+            store.write_finding(f)
+        work.apply_pending()             # the gate and safety-pass results noted before the run row existed
+        safety = done["safety"]                      # 6.5, 6.8, 10.3: the drill and the safety canaries' rows
+        store.write_canary_results(scenario.run_id, safety.rows, created_at=_ts(today, scenario.clock, 1800))
         written: set[str] = set()
         for row in report.outcome_rows:
             if row.checkpoint_id in written:
@@ -1960,35 +3540,75 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                     evidence={"raw_values": {"state": r.state, "money_cell": str(r.money_cell)}},
                     created_at=_ts(today, scenario.clock, 1800)))
         _end_nightly_shard(store, work, st, shard)
-        runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", shard.verdict.status, "reported",
-                                          reason=shard.verdict.reason, started_at=started,
-                                          ended_at=_ts(today, scenario.clock, 2 * 3600)))
         money = [r for r in report.results if r.money_cell and r.state != "generation_failed"]
         other = [r for r in report.results if not r.money_cell and r.state != "generation_failed"]
         canary_health = {"money_detected": sum(r.state == "detected" for r in money), "money_total": len(money),
                          "other_detected": sum(r.state == "detected" for r in other), "other_total": len(other),
                          "detector_state": report.state, "date": today.isoformat(),
                          "since": f"{today.isoformat()} {scenario.clock[:5]} ET"}
+        health = {"wall_clock": "2:41:00", "budget": "4:00:00", "shards": 1, "canary": canary_health,
+                  "fingerprint": {"candidate": run.fp_id[7:13], "base": run.fp_id[7:13]},
+                  "integrations": {"pr_comment": {"state": "unposted", "time": "n/a (Nightly run)"}, "jira_queued":
+                                   1 if report.state != "ok" else 0, "slack": {"queued": 0}}}
+        if expired_findings:
+            health["expired"] = [f.evidence["raw_values"]["run_health"] for f in expired_findings]
+        expiry = expire_due(store, started)               # 9.6, 9.7: the Nightly ends what is due
+        soon = expiring_within(store, started)
+        if expiry.expired or soon:
+            health["decisions"] = {"expired": [e.decision_id for e in expiry.expired],
+                                   "expiring_7d": [d.decision_id for d in soon]}
+        export_decisions(store, out / "decisions")       # 4.14: the nightly export for review in git
+        egress = nightly_reconcile(store, cfg.root, now)          # 6.10: the day's egress rows against the allowlist
+        work._note(st, egress)
+        health["egress"] = {"verdict": "ok" if egress.passed else egress.incident, "detail": egress.detail}
+        summary = {"coverage": {}, "health": health, "alerts": work.alerts,
+                   "detector_state": "detector_blind" if "detector_blind" in (report.state, safety.state)
+                   else report.state,
+                   "safety": {"banner": safety.banner, "nightly_run_id": scenario.run_id, "detector_state": safety.state}}
+        store.update_summary(scenario.run_id, summary)      # 6.9: a row of this run, and a ledger line, for the scan
         body = {"run_id": scenario.run_id, "detector_state": report.state, "banner": report.banner,
+                "safety": {"detector_state": safety.state, "banner": safety.banner,
+                           "rows": [r.mutant_id for r in safety.rows], "drill": safety.drill.result.detail},
                 "catalog_version": cfg.catalog.version, "simulated": sorted(wanted),
                 "not_simulated": {k: v for k, v in NOT_SIMULATED.items() if k not in wanted},
                 "results": [r.to_dict() for r in report.results],
                 "class_rates": report.class_rates, "class_floors": report.class_floors}
-        (out / f"canary-results-{scenario.run_id}.json").write_text(json.dumps(body, indent=1, sort_keys=True) + "\n")
-        writer.arts.put(json.dumps(body, sort_keys=True).encode(), name=f"{scenario.run_id}/canary-results.json",
-                        kind="canary_results", media_type="application/json")
+        results = json.dumps(body, sort_keys=True).encode()
+        leak = check_upload(scanner, results, location="canary results")   # 6.9: a text artifact before upload
+        if leak is None:
+            writer.arts.put(results, name=f"{scenario.run_id}/canary-results.json", kind="canary_results",
+                            media_type="application/json")
         writer.arts.write_manifest(ManifestHeader(config_commit=tree_sha256(cfg.root)[:12],
                                                   harness_commit="sentinel-core-0.1.0", run_id=scenario.run_id,
                                                   created_at=started))
         ctx = ReportContext(pr=0, candidate_build=scenario.build.build_id, base_build=scenario.build.build_id,
                             detector_banner=report.banner)
-        health = {"wall_clock": "2:41:00", "budget": "4:00:00", "shards": 1, "canary": canary_health,
-                  "fingerprint": {"candidate": run.fp_id[7:13], "base": run.fp_id[7:13]},
-                  "integrations": {"pr_comment": {"state": "unposted", "time": "n/a (Nightly run)"}, "jira_queued":
-                                   1 if report.state != "ok" else 0, "slack": {"queued": 0}}}
+        # 6.9 teardown: the plaintext scan of the Nightly run, as of a PR run, before it reaches `reported`
+        secret = _teardown_scan(store, writer.arts, out, scenario.run_id, secrets, ledger_at, leak,
+                                texts={"nightly report inputs": dataclasses.asdict(ctx),
+                                       "alerts.json and orchestrator.json": work.entries()})
+        status, reason, last_gate = shard.verdict.status, shard.verdict.reason, "reported"
+        if secret is not None:
+            v = worse(RunVerdict(status, reason), secret.run)
+            status, reason, last_gate = v.status, v.reason, secret.gate or "teardown"
+            work.alerts += [a for a in [alert_entry(scenario.run_id, None, secret)] if a is not None]
+            summary["alerts"] = work.alerts
+            summary["secret_scan"] = {"result": secret.run_reason, "detail": secret.detail, "report_withheld": True}
+        runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", status, last_gate, reason=reason,
+                                          started_at=started, ended_at=_ts(today, scenario.clock, 2 * 3600)),
+                               summary=summary)
         outcomes = store.outcomes(scenario.run_id)
-        render_run_report(runrec, outcomes, store.findings(scenario.run_id), [], {}, health, None, ctx,
-                          out / f"nightly-report-{scenario.run_id}.html")
+        if secret is None:                                # 6.9: a hit withholds the Nightly's report and results
+            published = [out / f"canary-results-{scenario.run_id}.json", out / f"nightly-report-{scenario.run_id}.html"]
+            published[0].write_text(json.dumps(body, indent=1, sort_keys=True) + "\n")
+            write_run_report(ReportInputs.from_store(store, scenario.run_id).build(None, ctx), published[1])
+            late = _teardown_scan(store, writer.arts, out, scenario.run_id, secrets, ledger_at, files=published)
+            if late is not None:
+                for f in published:
+                    f.unlink(missing_ok=True)
+                work.alerts += [a for a in [alert_entry(scenario.run_id, None, late)] if a is not None]
+                store.update_summary(scenario.run_id, {"secret_scan": {"result": late.run_reason, "detail": late.detail,
+                                                                       "report_withheld": True}})
         res = RunResult(scenario.run_id, "nightly", runrec.status, runrec.reason, out, outcomes,
                         store.findings(scenario.run_id), alerts=work.alerts, shards=work.summaries,
                         proof=shard.proof.line)

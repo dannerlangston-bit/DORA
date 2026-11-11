@@ -1,8 +1,9 @@
-"""`sentinel lint <config-dir> [--phase 0|1]` (4.1, 4.15).
+"""`sentinel lint <config-dir> [--phase 0|1]` (4.1, 4.15), and `sentinel lint --code` (5.4.1, 5.4.9, 6.2).
 
 Prints one line per violation, `L-XXX-nn severity file: [location: ]message`, or with `--json` the
 JSON line of 4.15 (`rule`, `severity`, `file`, `path`, `message`); a count goes to stderr. Returns 1
-when any `error` was found, 0 otherwise, 2 on a usage error or a missing directory.
+when any `error` was found, 0 otherwise, 2 on a usage error or a missing directory. With `--code` the arguments go
+to `sentinel.lint.code.main`, the gateway single-entry-point lint over the harness source (1 on any violation).
 """
 from __future__ import annotations
 
@@ -31,6 +32,9 @@ def main(argv: list[str] | None = None) -> int:
     args_in = list(sys.argv[1:] if argv is None else argv)
     if args_in[:1] == ["lint"]:
         args_in = args_in[1:]
+    if "--code" in args_in:
+        from .code import main as code_main
+        return code_main(args_in)
     try:
         args = _parser().parse_args(args_in)
     except SystemExit as exc:

@@ -2,6 +2,8 @@
 
 Subcommands:
   sentinel lint <config-dir> [--phase N] [--today YYYY-MM-DD] [--json] [--show-skipped]
+  sentinel lint --code [ROOT] [--drill-allowlist FILE] [--json]
+                                              the gateway single-entry-point lint over ROOT/src (5.4.1, 5.4.9, 6.2)
   sentinel schemas [--check] [--out DIR]      write or check the generated JSON Schemas (L-XREF-09)
   sentinel taxonomy --check                   check config/taxonomy.yaml against the spec (L-XREF-08)
   sentinel demo <scenario|all> [--out DIR] [--today YYYY-MM-DD] [--reviewer simulated|live]
@@ -9,8 +11,14 @@ Subcommands:
   sentinel run <config-dir> --scenario NAME [--out DIR] [--today YYYY-MM-DD] [--reviewer simulated|live]
                                               the same simulated run on another sentinel-config checkout
   sentinel review [--live] <scenario> [--out DIR] [--today YYYY-MM-DD] [--config DIR]
-                                              the Reviewer items of a simulated PR run; with --live they go to
-                                              the real Reviewer (reviewer.review_live; ANTHROPIC_API_KEY needed)
+                                              the Reviewer items of a simulated PR run; with --live they also go
+                                              to the real Reviewer, from inside the run and through its egress
+                                              gate (pipeline.live; ANTHROPIC_API_KEY needed)
+  sentinel stop <rig> [--reason TEXT] [--by NAME] [--root DIR]
+                                              trip the kill switch on a rig: write its file flag (6.6); --root for
+                                              simulated rigs (orchestrator.killflag)
+  sentinel reenable --db PATH {login|rig|quarantine|proof|incident} ...
+                                              the human safety actions of 6.6 and 6.12 (sentinel.reenable)
 """
 from __future__ import annotations
 
@@ -68,16 +76,16 @@ def _run(argv: list[str]) -> int:
 
 def _review(argv: list[str]) -> int:
     """`sentinel review [--live] <scenario>`: run the scenario's PR run with the offline Reviewer, keep every
-    Reviewer item (3.12, with its 1:1 crops) and list them; with `--live`, review them with the real Reviewer
-    through `reviewer.review_live`, which calls the network only with `allow_network=True` and a key."""
+    Reviewer item (3.12, with its 1:1 crops) and list them; with `--live` (and a key), each item is also reviewed by
+    the real Reviewer inside the run, through the run's egress gate (6.10: allowlisted and logged to egress_log)."""
     import json
     from dataclasses import asdict
     from datetime import date
 
     from .demo import DEFAULT_TODAY, EXAMPLE, PR_SCENARIOS
-    from .pipeline.live import CollectingReviewer, load_reviewer_config
+    from .pipeline.live import CollectingReviewer, live_job, load_reviewer_config
     from .pipeline.run import run_pipeline
-    from .reviewer import NetworkNotAllowed, review_live
+    from .reviewer import NetworkNotAllowed
 
     p = argparse.ArgumentParser(prog="sentinel review", description=_review.__doc__)
     p.add_argument("scenario", choices=sorted(PR_SCENARIOS))
@@ -89,19 +97,26 @@ def _review(argv: list[str]) -> int:
     a = p.parse_args(argv)
     settings = load_reviewer_config(a.reviewer_config)
     out = Path(a.out) / f"review-{a.scenario}"
+    factory, refused = None, None
+    if a.live:
+        try:
+            live_job(config=settings)                   # the key and environment checks; this job sends nothing
+        except NetworkNotAllowed as exc:
+            refused = exc
+        else:
+            factory = lambda gate: live_job(config=settings, gate=gate)     # noqa: E731 - the run's gated job
     rev = CollectingReviewer()
-    run_pipeline(a.config, PR_SCENARIOS[a.scenario](a.today), out, a.today, reviewer=rev)
+    run_pipeline(a.config, PR_SCENARIOS[a.scenario](a.today), out, a.today, reviewer=rev, live_factory=factory)
     listing = [{"queue_key": i.queue_key, "task": i.task, "checkpoints": list(i.checkpoint_ids), "region": i.region,
                 "crop_sizes": i.crop_sizes()} for i in rev.items]
     (out / "review-items.json").write_text(json.dumps(listing, indent=1) + "\n")
     print(f"{len(rev.items)} Reviewer item(s) -> {out / 'review-items.json'}")
     if not a.live:
         return 0
-    try:
-        verdicts = review_live(rev.items, allow_network=True, config=settings)
-    except NetworkNotAllowed as exc:
-        print(f"sentinel review --live: {exc}", file=sys.stderr)
+    if refused is not None:
+        print(f"sentinel review --live: {refused}", file=sys.stderr)
         return 2
+    verdicts = rev.verdicts
     (out / "review-live.json").write_text(json.dumps({k: asdict(v) for k, v in verdicts.items()}, indent=1,
                                                      default=str) + "\n")
     for k, v in verdicts.items():
@@ -130,6 +145,12 @@ def main(argv: list[str] | None = None) -> int:
         return _run(rest)
     if cmd == "review":
         return _review(rest)
+    if cmd == "stop":
+        from .orchestrator.killflag import main as stop_main
+        return stop_main(rest)
+    if cmd == "reenable":
+        from .reenable import main as reenable_main
+        return reenable_main(rest)
     print(f"unknown command {cmd!r}\n{__doc__}", file=sys.stderr)
     return 2
 

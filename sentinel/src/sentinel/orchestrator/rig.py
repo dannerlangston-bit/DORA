@@ -6,15 +6,27 @@ Each method names the spec section that requires it and returns a plain observat
 over those observations is made by the platform-independent code of this package, never by the rig.
 
 The observation types are frozen dataclasses so a gate check is a pure function of what the rig saw.
+
+The input side holds the gateway's state for the Orchestrator: the hook's phase (`set_hook_state`, and
+`set_hook_phase` over `gateway.HOOK_STATES`, 6.6), the session's safety state the slow half reads
+(`set_session_safety`, 5.4.3 stage 4, SD-57), the gated branch's declared sends (`declared_sends`, 6.7) and the
+Window Watcher's trip-wires (`window_tripwires`, 6.6). The kill switch's two human channels (`kill_channels`), the
+Watchdog's reverse heartbeat (`watchdog_status`) and free space (`free_bytes`) are what the Orchestrator reads at
+its boundaries (5.2, 10.2).
 """
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from .gateway import Action, Chord, InputEvent, SlowDecision
+from .gateway import HOOK_STATES, Action, Chord, InputEvent, SlowDecision
+
+if TYPE_CHECKING:                      # ports and killswitch import this module; only the types are needed here
+    from ..records import DeclaredSend
+    from .killswitch import TripWires
+    from .ports import KillChannel, SessionSafety
 
 
 # -- observations -----------------------------------------------------------------------------------------
@@ -60,6 +72,8 @@ class LaunchObservation:
     windows: tuple[WindowInfo, ...] = ()
     processes: tuple[str, ...] = ()
     screenshot_sha256: str | None = None
+    jab_properties_present: bool | None = None   # 7.5: .accessibility.properties in the profile (Branch A); None unread
+    jab_query_answers: bool | None = None        # 7.5: one JAB query answered (Branch A); None unread
 
 
 @dataclass(frozen=True)
@@ -329,8 +343,38 @@ class Rig(ABC):
         injects raw events from another origin instead (the fire drill injector, 6.5)."""
 
     @abstractmethod
-    def set_hook_state(self, *, armed: bool, deny_all: bool) -> None:
-        """Write `armed` and `deny_all` in the shared header (5.4.2); the kill switch's first step (6.6)."""
+    def set_hook_state(self, *, armed: bool, deny_all: bool, recovery_only: bool = False) -> None:
+        """Write `armed` and `deny_all` in the shared header (5.4.2); the kill switch's first step (6.6).
+        `recovery_only` is the recovery arm of 6.6 step 5: the slow half then tokens only what
+        `gateway.recovery_admits` (the scripted login and the recovery teardown actions); every other write
+        clears it."""
+
+    def set_hook_phase(self, phase: str) -> None:
+        """Put the hook in one phase of `gateway.HOOK_STATES` (`running`, `kill_switch`, `recovery`, `between_runs`;
+        gateway.py choice 12); `recovery` also sets the recovery-only arm."""
+        armed, deny_all = HOOK_STATES[phase]
+        self.set_hook_state(armed=armed, deny_all=deny_all, recovery_only=phase == "recovery")
+
+    @abstractmethod
+    def set_session_safety(self, safety: SessionSafety) -> None:
+        """The session's safety state the slow half reads from now on (attestation stage, last paper-mode assertion,
+        session kicked; 5.4.3 stage 4, 6.3, 6.4, SD-57): the Orchestrator's `safety_listener`."""
+
+    @abstractmethod
+    def reset_input_state(self) -> bool:
+        """`reset_input_state` through a fresh gateway instance: release tokens for Shift, Ctrl, Alt, Win and every
+        mouse button, nothing of the dead tree's input left pending (5.4.10, 7.7, 10.2 step 4); True when done. The
+        relaunch runs it right after `kill_process_tree`."""
+
+    @abstractmethod
+    def declared_sends(self) -> tuple[DeclaredSend, ...]:
+        """The gated branch's declared sends of this run, as its `SendGate` recorded them (6.7); () while the send
+        policy is disabled. The post-run proof lists them and the trip-wires do not count their Working rows."""
+
+    @abstractmethod
+    def window_tripwires(self) -> TripWires:
+        """The Window Watcher's trip-wires at a fresh poll (5.4.6, 6.6 Triggers): an `order_event` window, and how
+        long the oldest Order Confirmation dialog has been visible (`order_event_window`, `dialog_open_s`)."""
 
     @abstractmethod
     def load_order_chords(self, chords: Sequence[Chord]) -> None:
@@ -346,9 +390,13 @@ class Rig(ABC):
         """Locate and click `Cancel All` in Working Orders through the `cancel_all` teardown action (6.6)."""
 
     @abstractmethod
+    def locate_cancel_all(self) -> bool:
+        """`Cancel All` in Working Orders located by template, never clicked (6.5 item 5, 6.6)."""
+
+    @abstractmethod
     def read_orders(self) -> OrderBook:
-        """Read Working, Filled and Canceled Orders, Position Statement and Net Liq; grid OCR cross-checked
-        with Copy All (6.6, 7.6)."""
+        """Read Working, Filled and Canceled Orders, Position Statement, Net Liq and buying power; grid OCR
+        cross-checked with Copy All (`orderbook.build_order_book`; 6.6, 7.6)."""
 
     @abstractmethod
     def kill_process_tree(self) -> bool:
@@ -362,3 +410,19 @@ class Rig(ABC):
     @abstractmethod
     def revert_snapshot(self) -> None:
         """Revert the rig to its golden snapshot (6.6 step 6, 7.2)."""
+
+    # the rig host (5.14, 6.6, 10.2)
+    @abstractmethod
+    def kill_channels(self) -> tuple[KillChannel, KillChannel]:
+        """The kill switch's human channels on this rig (6.6 Triggers): the file flag (`killflag.FLAG_PATH`) and the
+        named pipe (`killflag.PIPE_NAME`), polled at every step and flow boundary and proven by preflight H5."""
+
+    @abstractmethod
+    def watchdog_status(self) -> tuple[float, bool]:
+        """The Watchdog's reverse heartbeat `watchdog.json`: its age in seconds and whether the Watchdog PID is alive
+        (10.2, 5.14), read at every gate and flow boundary."""
+
+    @abstractmethod
+    def free_bytes(self) -> int:
+        """Free bytes on the rig's artifact volume, the Watchdog's free-space result (10.2), read at every flow
+        boundary."""

@@ -8,7 +8,8 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from sentinel.orchestrator import alerts
-from sentinel.orchestrator.budgets import ReloginBudget, ShardBudgets, run_budget, session_kicked
+from sentinel.orchestrator.budgets import (RATE_CAPS, REPORT_MARGIN_S, WALL_BUDGET_S, RateCounters, ReloginBudget,
+                                           ShardBudgets, run_budget, session_kicked, wall_budget_s)
 from sentinel.orchestrator.clock import ManualClock
 from sentinel.orchestrator.degraded import (ModelAvailability, NetworkPause, SpendTracker, agent_only_step,
                                             locator_failed, model_preflight, rig_lost, rig_silent, verdict_outcome)
@@ -196,6 +197,27 @@ def test_run_budgets_wall_clock_rate_cap_superseded():
     rc = run_budget(now_s=1, wall_budget_s=2700, report_margin_s=300, counters={"orders_staged_per_hour": 60})
     assert rc.run_reason == "rate_cap" and "system_owner" in rc.alert.notified
     assert run_budget(now_s=1, wall_budget_s=2700, report_margin_s=300, superseded=True).run_reason == "superseded"
+
+
+def test_rate_counters_count_rolling_hours_and_days_and_caps_can_be_replaced():
+    now = datetime(2026, 11, 9, 19, 0, tzinfo=timezone.utc)
+    c = RateCounters()
+    for minutes in (5, 59, 61, 23 * 60, 25 * 60):
+        c.order_staged(now - timedelta(minutes=minutes))
+    c.symbol_change(now)
+    c.login(now - timedelta(hours=2))
+    assert c.counts(now) == {"logins_per_day": 1, "symbol_changes_per_hour": 1, "orders_staged_per_hour": 2,
+                             "orders_staged_per_day": 4}
+    assert c.counts(now - timedelta(hours=3))["logins_per_day"] == 0        # an event after `now` is not counted
+    tight = {**RATE_CAPS, "orders_staged_per_day": 4}
+    assert run_budget(now_s=1, wall_budget_s=2700, report_margin_s=600, counters=c.counts(now)) is None
+    hit = run_budget(now_s=1, wall_budget_s=2700, report_margin_s=600, counters=c.counts(now), caps=tight)
+    assert hit.run_reason == "rate_cap" and "orders_staged_per_day 4 of 4" in hit.detail
+    assert REPORT_MARGIN_S == 600 and WALL_BUDGET_S["merge"] == 3 * 3600
+    assert wall_budget_s("nightly") == 4 * 3600
+    assert wall_budget_s("calibration", started_at=now, ends_at=now + timedelta(hours=2)) == 7200
+    with pytest.raises(ValueError):
+        wall_budget_s("calibration", started_at=now, ends_at=now)
 
 
 # -- 10.7 degraded modes ----------------------------------------------------------------------------------

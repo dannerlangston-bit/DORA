@@ -1,0 +1,20 @@
+# The on-call roster (4.16, 6.12, 9.12): who owns what, the weekly rotations and the logins that may decide
+# findings (L-MSK-01, L-DEC-01, L-DEC-06). Placeholder names until the team fills them in.
+schema_version: 1
+roles:
+  - {role: system_owner, person: asmith, deputy: bkhan}
+  - {role: accountable_owner, person: cliu, deputy: asmith}
+  - {role: risk_owner, person: dmora, deputy: cliu}
+  - {role: security_contact, person: security-contact, deputy: esato}
+  - {role: explorer_owner, person: fgupta, deputy: asmith}
+  - {role: accounts_owner, person: asmith, deputy: fgupta}
+  - {role: release_manager, person: glee, deputy: cliu}
+  - {role: registry_owner, person: hnovak, deputy: glee}
+flow_owners:
+  - {tier: 1, person: tos-trade-ui, deputy: pchen}
+  - {tier: 2, person: tos-trade-ui, deputy: pchen}
+  - {tier: 3, person: tos-shell-ui, deputy: jdoe}
+rotations:
+  - {rotation: triage, person: triage.lead, from: 2026-11-09, to: 2026-11-15}
+  - {rotation: harness_oncall, person: bkhan, from: 2026-11-09, to: 2026-11-15}
+triage_roster: [triage.lead, pchen, asmith]

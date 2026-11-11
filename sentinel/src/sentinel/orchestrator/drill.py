@@ -26,17 +26,61 @@ the first names the reason and the rest go in `detail`. The gateway attempts are
 the ladder cell of item 2 (deny geometry outside an order-stage step), and for item 4 `shift_click_dialog` on
 the ticket's Buy button and `deny_profile` on the ladder cell, because the deny profile runs before the flag
 re-check in stage 4 of 5.4.3 (the hook drops both raw attempts `shift_click_dialog`).
+
+`run_drill` drives the drill on a `Rig` and scores it with `score_drill`. What it needs beyond the `Rig` is the
+`DrillPort` (build the drill ticket, locate the drill's targets, the `close_dialog` and `clear_ticket`
+teardown actions with the `absent` assertion); `SimDrillPort` implements it over `SimulatedRig`, the Windows track
+over the drill flow's scripted steps. Item 5 writes the kill flag through a `ports.KillChannel`, then runs the 6.6
+sequence itself with the hook in each phase of `gateway.HOOK_STATES` (deny-all, the tree killed, the recovery login
+with A1 and A2 in the recovery-only arm, the Working read, `Cancel All` located by `Rig.locate_cancel_all` without a
+click, the proof, the revert, then `between_runs`) and times each part with the clock from the moment the flag was
+written.
+
+Choices for `run_drill` (reported):
+- The preconditions are checked first, with the drill ticket built on the way (the fourth precondition is
+  that it is on the EMPTY account); a failed one stops the drill before anything is injected, and the Oracle
+  reads the Monitor at once (a new row in any of the three grids is the S1 case).
+- Item 1 runs on the first ticket; item 2 needs no ticket and runs after item 1's teardown; the ticket is then
+  rebuilt for items 3 and 4 ("the drill ticket keeps the flag set") and item 5 writes the flag while it is up.
+  An item that cannot run (a target not located, the dialog not open, the ticket not rebuilt) is recorded in
+  `could_not_run` and the drill goes on with the next item, so one renamed control does not hide the others.
+- A raw attempt injects the activating event only (key down or button down) with origin `drill`; the hook's
+  drop of it, drained in the drill's declared raw phase, is the record. A gateway attempt is refused in the
+  slow half; anything else the slow half lets through is recorded as the hook decided it, so it is never in
+  the declared set. Every drop and refusal goes to the run's `DropLedger` as exempt (drill tag, 5.4.8).
+- Item 5's `Cancel All` counts as located when the recovery read showed no new row and the rig located it,
+  or when a new row made the recovery flow click it and the re-read came back clean. The rig counts as
+  reverted when `revert_snapshot` returned without an exception. The final Oracle read is item 5's recovery
+  read (taken before the revert), and the clean read that made `Cancel All` click counts too (the larger
+  new-row count wins), so re-reads that go unreadable after the click never hide a sent order: with no usable
+  read the new-row count is 0 and item 5 fails, so the drill is never PROVEN without it.
+- Item 5's `deny_all` is measured when it is seen in effect, not when it is written: right after the deny-all write
+  one drill-tagged raw key down of an inert key (`DENY_ALL_PROBE_VK`) goes to the hook, which must drop it
+  `deny_all`; any other decision leaves `deny_all_s` None, so item 5 fails "hook not in deny-all" (6.5 Failure
+  handling). That drop is drained in the drill's raw phase and recorded in the ledger as exempt (5.4.8).
+- `run_drill` executes the drill's own steps only; the actions of the result (block the login, quarantine,
+  the kill switch after a new row) are the caller's, as for every control result.
+- A selector text that is not an allowlist entry at item 5's recovery login is the 6.4 mismatch (killswitch choice
+  18): item 5 fails (the recovery login failed A1), and the drill's one result also carries the mismatch's run
+  outcome (`aborted_safety` with `live_identity` or `paper_mode_mismatch`), unreached outcome, incident, actions
+  (the login blocked for `live_identity`), safety page and selector crop, so persisting that result applies both.
 """
 from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from typing import Protocol, runtime_checkable
 
-from . import alerts
-from .gateway import Chord
-from .killswitch import PROVEN_NONE
+from . import alerts, killflag
+from .clock import Clock
+from .gateway import VK_ESCAPE, VK_F24, VK_RETURN, VK_SPACE, Action, Chord, DropLedger, InputEvent, drain, refusal
+from .identity import Allowlist
+from .killswitch import GRIDS, PROVEN_NONE, ProofInputs, cancel_new_working, post_run_proof, recovery_login
+from .ports import KillChannel
 from .results import ControlResult, Outcome, safety_abort_outcome
+from .rig import EmitResult, OrderBook, Rig
+from .simrig import CONFIRM_POINT, DELETE_POINT, SimulatedRig
 
 PROBE_MAX_AGE_S = 5.0
 DENY_ALL_WITHIN_S = 0.5
@@ -116,14 +160,16 @@ class DrillObservation:
     could_not_run: Mapping[int, str] = field(default_factory=dict)   # item -> what was not located or did not open
     dialog_open_after_keys: bool = True         # item 1: the dialog still open by title after the keys
     absent_passed: bool = True                  # item 1: close_dialog, clear_ticket and the absent assertion
+    identity: ControlResult | None = None       # item 5: the 6.4 mismatch its recovery login saw (killswitch choice 18)
 
 
 @dataclass(frozen=True)
 class DrillResult:
-    """The drill's `ControlResult` and the failed items in order."""
+    """The drill's `ControlResult`, the failed items in order and, from `run_drill`, what it observed."""
 
     result: ControlResult
     failed: tuple[str, ...] = ()
+    observation: DrillObservation | None = None
 
 
 def score_drill(obs: DrillObservation, chords: Sequence[Chord]) -> DrillResult:
@@ -173,8 +219,272 @@ def score_drill(obs: DrillObservation, chords: Sequence[Chord]) -> DrillResult:
         acts.append("maintenance_task")
     if 1 in obs.could_not_run:
         notes.append("the Order Confirmation dialog did not open: also an A9 failure")
-    return DrillResult(ControlResult(
+    result = ControlResult(
         "fire_drill", False, "running", checkpoint=Outcome("harness_error", f"drill_failed:{failed[0]}",
                                                            detail="; ".join(notes) or None),
         alert=alerts.drill_failure(), actions=tuple(acts), incident="S2",
-        detail="fire drill failed: " + ", ".join(failed) + "; the Nightly run stays complete"), tuple(failed))
+        detail="fire drill failed: " + ", ".join(failed) + "; the Nightly run stays complete")
+    i = obs.identity
+    if i is not None:                                    # a 6.4 mismatch at item 5's recovery login (docstring)
+        ev = dict(i.evidence) | ({"blocked_reason": "live_identity"} if i.run_reason == "live_identity" else {})
+        result = replace(result, run=i.run, unreached=i.unreached, alert=alerts.safety_abort(), incident=i.incident,
+                         actions=tuple(dict.fromkeys(result.actions + i.actions)), evidence=ev,
+                         detail=f"fire drill failed: {', '.join(failed)}; item 5's recovery login saw {i.run_reason}")
+    return DrillResult(result, tuple(failed))
+
+
+# -- driving the drill on a rig (6.5) -----------------------------------------------------------------------
+DRILL_UNIT = "flow.fire-drill"          # the drill flow's unit in the DropLedger (its drops are exempt, 5.4.8)
+DENY_ALL_PROBE_VK = VK_F24             # item 5's inert raw key: the hook in deny-all drops it `deny_all` (6.5)
+DRILL_TARGETS = ("confirm_and_send", "delete", "ladder_buy_cell", "ticket_buy_button")
+DIALOG_TITLE = "Order Confirmation"
+CTRL = frozenset({"ctrl"})
+SHIFT = frozenset({"shift"})
+
+
+@runtime_checkable
+class DrillPort(Protocol):
+    """What the drill needs from the rig beyond `Rig` (6.5); module docstring."""
+
+    def build_drill_ticket(self) -> str | None:
+        """Build the drill ticket (1 share, far-from-market DAY limit, EMPTY account) through the drill flow's
+        scripted steps; the role of the account it is on (`empty`), or None when it could not be built."""
+
+    def locate(self, target: str) -> tuple[int, int] | None:
+        """The point of one of `DRILL_TARGETS` on the current screen, or None when it is not located."""
+
+    def clear_drill_ticket(self) -> bool:
+        """The `close_dialog` and `clear_ticket` teardown actions, then the `absent` assertion on the dialog
+        title and the ticket: True when both are absent."""
+
+
+@dataclass(frozen=True)
+class DrillPreconditions:
+    """The preconditions of 6.5 that come from the session rather than the drill's own steps."""
+
+    attestation_passed: bool                 # A1 to A9 passed in this session
+    probe_dropped_age_s: float | None        # seconds since the hook dropped the liveness probe; None: passed through
+    injector_signed: bool                    # the drill injector is the signed binary the lint allowlists
+
+
+class SimDrillPort:
+    """`DrillPort` over `SimulatedRig`: the drill ticket is the simulated docked ticket (`ticket_visible`), the
+    targets are the simulated app's fixed points (`unlocated` names targets to report as not located, as after a
+    rename in a new build)."""
+
+    POINTS = {"confirm_and_send": CONFIRM_POINT, "delete": DELETE_POINT, "ladder_buy_cell": (300, 700),
+              "ticket_buy_button": (50, 50)}
+
+    def __init__(self, rig: SimulatedRig, *, unlocated: frozenset[str] = frozenset(), ticket_builds: bool = True):
+        self.rig = rig
+        self.unlocated = unlocated
+        self.ticket_builds = ticket_builds
+
+    def build_drill_ticket(self) -> str | None:
+        if not (self.rig.app_running and self.ticket_builds):
+            return None
+        self.rig.ticket_visible = True
+        return next((a.role for a in self.rig.s.accounts if a.account_id == self.rig.selected), None)
+
+    def locate(self, target: str) -> tuple[int, int] | None:
+        if target not in DRILL_TARGETS:
+            raise ValueError(f"drill target {target!r}; one of {DRILL_TARGETS}")
+        return None if target in self.unlocated or not self.rig.app_running else self.POINTS[target]
+
+    def clear_drill_ticket(self) -> bool:
+        self.rig.send_input(Action("press", keys=(VK_ESCAPE,), flow_class="canary", teardown_action="close_dialog"))
+        self.rig.ticket_visible = False                  # the simulated app clears the ticket on clear_ticket
+        self.rig.send_input(Action("press", keys=(VK_ESCAPE,), flow_class="canary", teardown_action="clear_ticket"))
+        return not (self.rig.dialog_open or self.rig.ticket_visible)
+
+
+class _Drive:
+    """One drill on one rig: the records it collected and the items that could not run."""
+
+    def __init__(self, rig: Rig, port: DrillPort, ledger: DropLedger):
+        self.rig, self.port, self.ledger = rig, port, ledger
+        self.records: list[DrillRecord] = []
+        self.could_not_run: dict[int, str] = {}
+        self.identity: ControlResult | None = None       # the 6.4 mismatch item 5's recovery login saw
+
+    def dialog_up(self) -> bool:
+        return any(w.title.startswith(DIALOG_TITLE) for w in self.rig.enumerate_windows())
+
+    def _hook_records(self, item: int, attempt: str, r: EmitResult) -> None:
+        for d, e in zip(r.decisions, r.events):
+            if not d.allowed:
+                drop = drain(d, e, drill_phase=True)
+                self.ledger.record(drop, unit=DRILL_UNIT, exempt=True)
+                self.records.append(DrillRecord(item, attempt, "dropped", drop.reason))
+
+    def attempt(self, item: int, action: Action, raw: InputEvent) -> None:
+        """One item attempted twice: through the gateway (refused in the slow half) and by the drill injector
+        (dropped by the hook)."""
+        r = self.rig.send_input(action)
+        if r.refused is not None:
+            self.ledger.record(refusal(r.refused), unit=DRILL_UNIT, exempt=True)
+            self.records.append(DrillRecord(item, "gateway", "refused", r.refused.reason or ""))
+        else:
+            self._hook_records(item, "gateway", r)
+        self._hook_records(item, "raw", self.rig.send_input(action, events=(raw,)))
+
+    def located(self, item: int, target: str, what: str) -> tuple[int, int] | None:
+        p = self.port.locate(target)
+        if p is None:
+            self.could_not_run.setdefault(item, f"{what} not located")
+        return p
+
+    def deny_all_holds(self) -> bool:
+        """Item 5's "hook in deny-all" (6.5): one drill-tagged raw key down of an inert key, injected after the deny-all
+        write, which the hook must drop `deny_all`. Its drop goes to the ledger as exempt (5.4.8), never into the
+        items 1 to 4 set."""
+        raw = InputEvent("key_down", vk=DENY_ALL_PROBE_VK, origin="drill")
+        r = self.rig.send_input(Action("press", keys=(DENY_ALL_PROBE_VK,), flow_class="canary"), events=(raw,))
+        for d, e in zip(r.decisions, r.events):
+            if not d.allowed:
+                self.ledger.record(drain(d, e, drill_phase=True), unit=DRILL_UNIT, exempt=True)
+        return bool(r.decisions) and all(not d.allowed and d.reason == "deny_all" for d in r.decisions)
+
+
+def _new_rows(start: OrderBook, end: OrderBook | None) -> int:
+    """New Working, Filled and Canceled rows against the run-start snapshot (6.5); 0 without a readable read."""
+    if end is None or not end.readable:
+        return 0
+    return sum(1 for g in GRIDS for r in end.rows(g) if r.key not in {s.key for s in start.rows(g)})
+
+
+def _item1(d: _Drive) -> tuple[bool, bool]:
+    """Enter, Space and Ctrl+Enter on the open Order Confirmation dialog; (dialog open after the keys, the
+    Delete, close_dialog, clear_ticket and absent steps passed)."""
+    p = d.located(1, "confirm_and_send", "Confirm and Send")
+    if p is None:
+        return True, d.port.clear_drill_ticket()
+    r = d.rig.send_input(Action("click", point=p, resolved_name="Confirm and Send", under_point_text="Confirm and Send",
+                                order_stage_step=True, flow_class="canary"))
+    if r.refused is not None or not d.dialog_up():
+        d.could_not_run[1] = "the Order Confirmation dialog did not open after Confirm and Send"
+        return True, d.port.clear_drill_ticket()
+    for vk, mods in ((VK_RETURN, frozenset()), (VK_SPACE, frozenset()), (VK_RETURN, CTRL)):
+        d.attempt(1, Action("key_chord" if mods else "press", keys=(vk,), mods=mods, declared_guarded=True,
+                            flow_class="canary"), InputEvent("key_down", vk=vk, mods=mods, origin="drill"))
+    still_open = d.dialog_up()
+    delete = d.located(1, "delete", "the dialog allowlist label Delete")
+    if delete is not None:
+        d.rig.send_input(Action("click", point=delete, resolved_name="Delete", under_point_text="Delete",
+                                flow_class="canary"))
+    absent = d.port.clear_drill_ticket() and not d.dialog_up()
+    return still_open, absent and delete is not None
+
+
+def _item2(d: _Drive) -> None:
+    """The Auto Send ladder click: a ladder Buy cell on the fixture Active Trader panel."""
+    p = d.located(2, "ladder_buy_cell", "the Active Trader panel or a ladder cell")
+    if p is not None:
+        d.attempt(2, Action("click", point=p, resolved_name="Buy", under_point_text="Buy",
+                            target_kind="ladder_order_cell", flow_class="canary"),
+                  InputEvent("button_down", *p, button="left", origin="drill"))
+
+
+def _item3(d: _Drive, chords: Sequence[Chord]) -> None:
+    """Every default order chord while the drill ticket keeps the flag set."""
+    for c in chords:
+        d.attempt(3, Action("key_chord", keys=(c.vk,), mods=c.mods, flow_class="canary"),
+                  InputEvent("key_down", vk=c.vk, mods=c.mods, origin="drill"))
+
+
+def _item4(d: _Drive) -> None:
+    """Shift+click on the ticket's Buy button and on a ladder cell."""
+    buy = d.located(4, "ticket_buy_button", "the ticket's Buy button")
+    cell = d.located(4, "ladder_buy_cell", "a ladder cell")
+    for p, kind in ((buy, None), (cell, "ladder_order_cell")):
+        if p is not None:
+            d.attempt(4, Action("click", point=p, resolved_name="Buy", under_point_text="Buy", mods=SHIFT,
+                                target_kind=kind, flow_class="canary"),
+                      InputEvent("button_down", *p, button="left", mods=SHIFT, origin="drill"))
+
+
+def _item5(d: _Drive, *, clock: Clock, kill_channel: KillChannel, rig_id: str, start: OrderBook,
+           allowlist: Allowlist, fixture_account: str | None) -> tuple[Item5, tuple[OrderBook | None, ...]]:
+    """The kill switch end to end (6.5 item 5, 6.6): the file flag written mid-ticket, then the sequence, timed.
+    Returns item 5's measurements and its Monitor reads: the last one, and the clean read that made `Cancel All`
+    click (killswitch choice 4), so a row either showed counts. A human stop request pending on the channel is never
+    overwritten, consumed or acknowledged: item 5 does not run and the request stays for the Orchestrator (killflag
+    choice 5)."""
+    t0 = clock.monotonic()
+    human = killflag.poll(kill_channel)
+    mine = killflag.drill_request(rig_id, clock.now().isoformat())
+    if human is None:
+        try:
+            kill_channel.post(mine)
+        except FileExistsError:                      # the flag holds a request that is not ours (killflag choice 5)
+            human = killflag.poll(kill_channel)
+    req = kill_channel.poll() if human is None else None
+    if req is not None and req != mine and not killflag.is_probe(req):     # a human request came first: leave it
+        human = req
+        kill_channel.acknowledge(mine)
+    if human is not None or req is None:
+        d.could_not_run[5] = ("the kill flag did not arrive on the channel" if human is None else
+                              f"a stop request is pending ({human.requested_by} via {human.channel}: {human.reason}); "
+                              "it is left for the kill switch")
+        d.port.clear_drill_ticket()
+        return Item5(None, None, False, False, None, False), ()
+    d.rig.set_hook_phase("kill_switch")
+    deny_all_s = clock.monotonic() - t0 if d.deny_all_holds() else None      # seen in effect, not just written
+    tree_gone_s = clock.monotonic() - t0 if d.rig.kill_process_tree() else None
+    d.rig.reset_input_state()
+    d.rig.set_hook_phase("recovery")                 # the recovery-only arm, as in the sequence itself (6.6 step 5)
+    login = recovery_login(d.rig, allowlist, clock, fixture_account)
+    login_ok = login.ok
+    d.identity = login.identity
+    end: OrderBook | None = None
+    found: OrderBook | None = None
+    cancel, located = "not_needed", False
+    if login_ok:
+        cancel, end, found = cancel_new_working(d.rig, start, d.rig.read_orders(), clock=clock)
+        located = cancel == "done" or (cancel == "not_needed" and d.rig.locate_cancel_all())
+    proof = post_run_proof(ProofInputs(start=start, end=end, recovery_login_ok=login_ok, cancel_all=cancel, found=found))
+    try:
+        d.rig.revert_snapshot()
+        reverted = True
+    except Exception:            # noqa: BLE001 - any revert failure is "rig not reverted" (6.5 item 5), never a crash
+        reverted = False
+    d.rig.set_hook_phase("between_runs")
+    kill_channel.acknowledge(mine)                   # only our own request (killflag choice 4)
+    return Item5(deny_all_s, tree_gone_s, login_ok, located, proof.verdict, reverted), (end, found)
+
+
+def run_drill(rig: Rig, ledger: DropLedger, clock: Clock, chords: Sequence[Chord], start_book: OrderBook,
+              kill_channel: KillChannel, *, port: DrillPort, preconditions: DrillPreconditions, allowlist: Allowlist,
+              rig_id: str, fixture_account: str | None = None) -> DrillResult:
+    """Run the Nightly fire drill on `rig` and score it (6.5): preconditions, items 1 to 5, the Oracle read
+    against `start_book` (the run-start snapshot). `chords` are the default order chords of item 3, already
+    loaded into the hook at `settings_attested`; the result carries the observation for the canary rows."""
+    d = _Drive(rig, port, ledger)
+    role = port.build_drill_ticket()
+    pre = preconditions
+    if (pre.probe_dropped_age_s is None or pre.probe_dropped_age_s > PROBE_MAX_AGE_S or not pre.attestation_passed
+            or not pre.injector_signed or role != "empty"):
+        port.clear_drill_ticket()
+        obs = DrillObservation(pre.attestation_passed, pre.probe_dropped_age_s, pre.injector_signed, role == "empty",
+                               (), Item5(None, None, False, False, None, False),
+                               new_order_rows=_new_rows(start_book, rig.read_orders()))
+        return _with(score_drill(obs, chords), obs)
+    still_open, absent = _item1(d)
+    _item2(d)
+    if port.build_drill_ticket() is None:
+        for item in (3, 4):
+            d.could_not_run.setdefault(item, "the drill ticket could not be rebuilt")
+    else:
+        _item3(d, chords)
+        _item4(d)
+    item5, reads = _item5(d, clock=clock, kill_channel=kill_channel, rig_id=rig_id, start=start_book,
+                          allowlist=allowlist, fixture_account=fixture_account)
+    obs = DrillObservation(True, pre.probe_dropped_age_s, True, True, tuple(d.records), item5,
+                           new_order_rows=max((_new_rows(start_book, b) for b in reads), default=0),
+                           could_not_run=dict(d.could_not_run),
+                           dialog_open_after_keys=still_open, absent_passed=absent, identity=d.identity)
+    return _with(score_drill(obs, chords), obs)
+
+
+def _with(r: DrillResult, obs: DrillObservation) -> DrillResult:
+    return DrillResult(r.result, r.failed, obs)

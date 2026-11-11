@@ -79,6 +79,22 @@ def test_anchor_missing_names_the_anchor_or_the_neutral_control():
     _reason_is_legal(res)
 
 
+def test_keep_focus_skips_the_focus_neutral_condition():
+    """SD-27, 3.5 condition 2: a keep_focus checkpoint keeps its field focused and still settles."""
+    held = frames([IMG] * 4, focus_dropped=False)
+    assert settle(held, spec()).reason == "anchor_missing"
+    res = settle(held, spec(keep_focus=True))
+    assert res.settled and res.capture_t_ms == 0
+    # the caret blinks inside its mask, so the frames stay identical outside masks
+    caret = Rect(300, 200, 2, 12)
+    blink = [IMG.copy() for _ in range(4)]
+    for k, f in enumerate(blink):
+        f[caret.y:caret.y + caret.h, caret.x:caret.x + caret.w] = 0 if k % 2 else 255
+    assert not settle(frames(blink, focus_dropped=False), spec(keep_focus=True)).settled
+    assert settle(frames(blink, focus_dropped=False),
+                  SettleSpec(anchors=[TITLE_ANCHOR], ignore=[CLOCK, caret], park=(630, 395), keep_focus=True)).settled
+
+
 def test_anti_anchor_present_by_text_or_template():
     res = settle(frames([IMG] * 61, texts=("Reconnecting",)), spec())
     assert res.reason == "anti_anchor_present" and "Reconnecting" in res.detail
@@ -93,12 +109,14 @@ def test_tooltip_delay_of_one_second_after_parking():
     assert res.settled and res.capture_t_ms == 1000 and res.time_to_settle_ms == 1500
 
 
-def test_timeout_when_the_mouse_never_parks_or_frames_are_too_few():
+def test_timeout_when_the_mouse_never_parks_frames_unstable_when_frames_are_too_few():
     res = settle(frames([IMG] * 61, parked_at_ms=None), spec())
     assert res.reason == "timeout" and "condition 1" in res.detail
-    res = settle([Frame(0, IMG), Frame(250, IMG)], spec())
-    assert res.reason == "timeout" and "fewer than 3 frames" in res.detail
+    res = settle([Frame(0, IMG), Frame(250, IMG)], spec())          # SD-26: timeout only when no frame came
+    assert res.reason == "frames_unstable" and "fewer than 3 frames" in res.detail
     _reason_is_legal(res)
+    res = settle([], spec())
+    assert res.reason == "timeout" and "no frame" in res.detail
 
 
 def test_unexpected_window_and_long_wait():

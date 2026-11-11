@@ -138,13 +138,14 @@ def test_s04_fixed_in_build_must_name_a_newer_build(store):
     facts = dict(channel="branch", pipeline_artifact_url="https://ci/1", installer_sha256="9" * 64)
     store.register_build("branch-1998.3.0-7be42d0", source_commit="7be42d0",
                          first_seen_at="2026-11-09T10:00:00+00:00", **facts)
+    record(store, "dec-000001", "confirm_bug", "confirmed_bug", build_id="branch-1998.3.0-7be42d0")
     with pytest.raises(REFUSED):
-        record(store, "dec-000001", "fixed_in_build", "confirmed_bug", build_id="branch-1998.3.0-7be42d0",
-               fixed_in_build_id="branch-1998.3.0-7be42d0")
+        record(store, "dec-000002", "fixed_in_build", "confirmed_bug", build_id="branch-1998.3.0-7be42d0",
+               fixed_in_build_id="branch-1998.3.0-7be42d0", supersedes="dec-000001")
     store.register_build("branch-1998.3.1-8aa0b11", source_commit="8aa0b11",
                          first_seen_at="2026-11-10T10:00:00+00:00", **facts)
     d = record(store, "dec-000002", "fixed_in_build", "confirmed_bug", build_id="branch-1998.3.0-7be42d0",
-               fixed_in_build_id="branch-1998.3.1-8aa0b11")
+               fixed_in_build_id="branch-1998.3.1-8aa0b11", supersedes="dec-000001")
     assert d.action == "fixed_in_build"
 
 
@@ -212,6 +213,38 @@ def test_mark_intended_scope_by_manifest_entry_and_build_pair(tmp_path):
         assert s.lookup_decisions(sig, run_id="run-02").inherited.decision_id == "dec-000001"
         assert s.lookup_decisions(sig, run_id="run-03").inherited is None
         assert s.lookup_decisions(sig, run_id="run-03", manifest_entries=["tos-48120-1"]).inherited is not None
+
+
+def test_registered_build_pairs_scope_mark_intended(tmp_path):
+    # 08-build-pairs, 8.3 build_pairs and runs.pair_id, 9.7: two PR runs on the same registered pair, no manifest
+    # tickets: the second inherits the first's mark_intended, through the store and through classify (input M with
+    # Facts.build_pair_id); a run on another pair does not. The lookup returns classify's one DecisionMatch type.
+    from sentinel.classify import DecisionMatch, Facts, classify
+    facts = dict(channel="branch", pipeline_artifact_url="u")
+    with Store(tmp_path / "run.db") as s:
+        for b in ("cand", "base", "other"):
+            s.register_build(b, source_commit=b, installer_sha256=b * 4, **facts)
+        pair = s.register_pair("cand", "base", "pr", merge_base_commit="4f1c9a2")
+        assert s.register_pair("cand", "base", "pr", merge_base_commit="4f1c9a2") == pair       # one pair, reused
+        other = s.register_pair("other", "base", "pr")
+        assert s.register_pair("base", "base", "aa") not in (pair, other)                     # aa: equal builds
+        with pytest.raises(REFUSED):
+            s.register_pair("base", "base", "pr")
+        with pytest.raises(REFUSED):
+            s.register_pair("cand", "nope", "pr")
+        s.begin_run(plan(pair_id=pair))
+        record(s, "dec-000001", "mark_intended", "intended", ticket="TOS-48120")
+        s.begin_run(plan(run_id="run-02", pair_id=pair))
+        s.begin_run(plan(run_id="run-03", pair_id=other))
+        sig = Signature(SWEEP, REGION, ph(), "collateral")
+        same = s.lookup_decisions(sig, run_id="run-02")
+        assert same.inherited.decision_id == "dec-000001" and same.inherited.build_pair_id == str(pair)
+        m = same.matches[0]
+        assert isinstance(m, DecisionMatch) and m.build_pair_id == str(pair) and m.distance == m.hamming == 0
+        assert s.lookup_decisions(sig, run_id="run-03").inherited is None
+        above = dict(diff="above", stability="stable", manifest="undeclared")
+        assert classify(Facts(**above, decisions=same.matches, build_pair_id=str(pair))).outcome == "intended"
+        assert classify(Facts(**above, decisions=same.matches, build_pair_id=str(other))).outcome == "collateral"
 
 
 def test_waiver_is_not_ticket_scoped(store):
@@ -414,8 +447,9 @@ def test_s21_identity_field_redaction_box_over_a_money_cell():
     # S-21, 4.8 mask budget: "any money_cell region 0 percent"; identity_field exempts the panel share only.
     repo = Repo.load(EXAMPLE)
     red = repo.docs["redaction/anchors.yaml"].data
-    box = next(r for r in red["regions"] if r["id"] == "rgn.redact.ps-account-number")
-    box["rect"] = {"dx": 0, "dy": 44, "w": 60, "h": 120}           # exactly over rgn.ps.qty
+    # SD-28: the Position Statement's qty column is no money cell, so the box goes over the confirmation's qty
+    box = next(r for r in red["regions"] if r["id"] == "rgn.redact.confirm-account-number")
+    box["rect"] = {"dx": 90, "dy": 48, "w": 48, "h": 20}            # exactly over rgn.confirm.qty
     assert "L-MSK-03" in lint_repo(repo, today=TODAY).rules()
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from sentinel.orchestrator.budgets import ShardBudgets
+from sentinel.orchestrator.budgets import SESSION_RELEASE_WAIT_S, ShardBudgets, session_kicked
 from sentinel.orchestrator.clock import ManualClock
 from sentinel.orchestrator.degraded import SpendTracker
 from sentinel.orchestrator.gateway import Action, refusal
@@ -18,6 +18,14 @@ from sentinel.orchestrator.watchdog import HeartbeatWriter, app_failure, hook_ho
 SCOPE = ["census/trade.order-entry.stock/ws.tier-a.active-trader",
          "flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07",
          "sweep/charts.flexible-grid.active-trader-cell/flexgrid/480x360"]
+# the simulated rig's log of each gateway.HOOK_STATES phase
+DENY_ALL, RECOVERY, BETWEEN_RUNS = "set_hook_state:False:True", "set_hook_state:True:False:recovery_only", \
+    "set_hook_state:False:False"
+
+
+def disarmed(rig: SimulatedRig) -> bool:
+    """The hook ends the run between runs: not armed, no deny-all, no recovery arm (gateway.py choice 12)."""
+    return not rig.gw.armed and not rig.gw.deny_all and not rig.recovery_only and rig.calls[-1] == BETWEEN_RUNS
 
 
 def run(scenario: SimScenario | None = None, work=None, **kw):
@@ -94,12 +102,69 @@ def test_session_kicked_waits_and_logs_in_once_more_for_the_proof():
     assert rig.calls.count("login") == 3 and report.gate("teardown").has("block_login")
 
 
+def test_a_session_kicked_mid_run_waits_logs_in_once_more_and_proves_normally():
+    seen = {}
+
+    def work(orch: Orchestrator) -> None:
+        orch.sink.record(SCOPE[0], "identical")
+        seen["t0"], seen["calls"] = orch.clock.monotonic(), len(orch.rig.calls)
+        orch.apply(session_kicked())                              # POP-04 during a flow
+    report, rig, sink, orch = run(work=work)
+    assert orch.session == "kicked" and orch.safety.session_kicked
+    assert report.verdict.status == "complete_with_env_errors" and report.proof.verdict == PROVEN_NONE
+    assert {sink.outcomes[c][:3] for c in SCOPE[1:]} == {("env_error", "session_kicked", "authenticated")}
+    after = rig.calls[seen["calls"]:]
+    assert after[:5] == ["kill_process_tree", "reset_input_state", RECOVERY, "launch", "login"]
+    assert "teardown" not in after and disarmed(rig)
+    assert orch.clock.monotonic() - seen["t0"] >= SESSION_RELEASE_WAIT_S
+    report, rig, _, _ = run(SimScenario(recovery_login_fails=2), work=work)
+    assert (report.proof.verdict, report.proof.reason) == (UNPROVEN, "session_unavailable")
+    assert rig.calls.count("login") == 3 and report.gate("teardown").has("block_login")
+
+
+def test_a_live_id_at_the_kicked_sessions_proof_login_is_live_identity_with_no_second_login():
+    """session:0: the kicked session's proof login reads a live-format id. The 6.4 result is applied (aborted_safety
+    live_identity, S1, the login blocked for live_identity), no further login is made on that login, and the proof is
+    UNPROVEN session_unavailable (SD-64)."""
+    def work(orch: Orchestrator) -> None:
+        orch.sink.record(SCOPE[0], "identical")
+        orch.apply(session_kicked())                              # POP-04 mid-run
+    reads = [SelectorRead(EMPTY, crop_sha256="c0"), SelectorRead("12345678SCHW", crop_sha256="c1")]
+    report, rig, sink, _ = run(SimScenario(selector_reads=reads), work=work)
+    assert (report.verdict.status, report.verdict.reason) == ("aborted_safety", "live_identity")
+    assert rig.calls.count("login") == 2 and "read_orders" not in rig.calls[rig.calls.index("kill_process_tree"):]
+    assert report.proof.line == "UNPROVEN: session_unavailable"
+    (live,) = [r for r in report.results if r.run_reason == "live_identity"]
+    assert live.incident == "S1" and live.has("block_login") and live.evidence["crop"] == "c1"
+    assert report.gate("teardown").evidence["blocked_reason"] == "live_identity"
+    assert {sink.outcomes[c][:3] for c in SCOPE[1:]} == {("env_error", "live_identity", "paper_mode_asserted")}
+    # the same read after a result that killed the tree (one attempt, no kicked session)
+    def blind_work(orch: Orchestrator) -> None:
+        orch.sink.record(SCOPE[0], "identical")
+        orch.rig.s.selector_reads[:] = [SelectorRead(None, landmark_found=False)] * 2 + [SelectorRead("12345678SCHW")]
+        orch.flow_boundary()
+    report, rig, _, _ = run(work=blind_work)
+    assert (report.verdict.status, report.verdict.reason) == ("aborted_safety", "live_identity")
+    assert report.proof.line == "UNPROVEN: session_unavailable" and rig.calls.count("login") == 2
+
+
+def test_an_unreadable_read_after_a2_selects_the_account_takes_the_identity_unreadable_path():
+    blind = SelectorRead(None, landmark_found=False)
+    golden = SelectorRead(GOLDEN, crop_sha256="crop-a1")
+    report, rig, sink, _ = run(SimScenario(selected=GOLDEN, selector_reads=[golden, blind, blind]))
+    assert filled(sink) == {("env_error", "identity_unreadable", "paper_mode_asserted")}
+    assert report.verdict.status == "complete_with_env_errors" and "set_hook_state:True:True" in rig.calls
+    report, _, _, _ = run(SimScenario(selected=GOLDEN, selector_reads=[golden, blind]), work=all_work)
+    assert report.verdict.status == "complete"                   # the second read 1 s later is readable
+
+
 def test_live_identity_runs_the_kill_switch_and_stays_aborted_safety():
     report, rig, sink, _ = run(SimScenario(selector_reads=[SelectorRead("12345678SCHW")]))
     assert (report.verdict.status, report.verdict.reason) == ("aborted_safety", "live_identity")
     assert filled(sink) == {("env_error", "live_identity", "paper_mode_asserted")}
-    assert report.kill_switch is not None and rig.gw.deny_all and "kill_process_tree" in rig.calls
-    assert report.proof.verdict == UNPROVEN and report.proof.reason == "snapshot_missing"
+    assert report.kill_switch is not None and rig.calls.index(DENY_ALL) < rig.calls.index("kill_process_tree")
+    assert report.proof.verdict == UNPROVEN and report.proof.reason == "session_unavailable"   # SD-64: no recovery login
+    assert rig.calls.count("login") == 1 and RECOVERY not in rig.calls and disarmed(rig)
 
 
 def test_paper_mode_mismatch_and_unreadable_identity():
@@ -170,7 +235,9 @@ def test_attempted_send_in_running_aborts_through_the_kill_switch():
     assert (report.verdict.status, report.verdict.reason) == ("aborted_safety", "attempted_send")
     assert sink.outcomes[SCOPE[0]][0] == "identical"
     assert {sink.outcomes[c][:3] for c in SCOPE[1:]} == {("env_error", "attempted_send", "running")}
-    assert report.proof.verdict == PROVEN_NONE and rig.sent_orders == 0 and rig.gw.deny_all
+    assert report.proof.verdict == PROVEN_NONE and rig.sent_orders == 0
+    assert rig.calls.index(DENY_ALL) < rig.calls.index("kill_process_tree") < rig.calls.index(RECOVERY) \
+        < rig.calls.index("revert_snapshot") and disarmed(rig)
 
 
 def test_an_order_that_got_out_is_found_by_the_proof():

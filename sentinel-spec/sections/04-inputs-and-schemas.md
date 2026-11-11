@@ -1728,7 +1728,7 @@ The per-file rules above catch local errors. The cross-file rules below run afte
 | Rule | Check | Severity |
 |---|---|---|
 | L-XREF-01 | every surface in the registry is reached by at least one census workspace or one flow checkpoint; otherwise the coverage matrix will show it as `not_run` forever | warn |
-| L-XREF-02 | every tier-1 surface has at least one flow with an `assert` step or `expect` entries and a regions file with at least one `money_cell` region, of type `diff` or `freeze` (L-RGN-04) | error |
+| L-XREF-02 | every tier-1 surface has at least one flow with an `assert` step or `expect` entries; a tier-1 surface whose regions show an order panel (`order_confirmation` or `order_ticket`, SD-28) also has a regions file with at least one `money_cell` region of type `diff` or `freeze` (L-RGN-04) | error |
 | L-XREF-03 | every `masked_live` checkpoint has a `rule` or `mask` region; every `frozen` checkpoint has no `must_change_within_s` rule | error |
 | L-XREF-04 | every `checkpoint_id` referenced by a regions file, the mutant catalog or a calibration file exists in a flow or census definition, or in `flows/RENAMES.yaml` as retired; `"*"` on an `aa_control` mutant entry stands for every bound checkpoint and is accepted (L-MUT-01) | error |
 | L-XREF-05 | every critical checkpoint has its behavioral mutants in `canaries/mutants.yaml` (L-MUT-03), and every tier-1 checkpoint a calibration entry for the canonical calibration key (4.12); missing calibration is `warn` until the first Calibration run, then `error` | warn, then error |

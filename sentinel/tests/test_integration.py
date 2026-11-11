@@ -3,6 +3,7 @@ scenarios that exercise them end to end (sentinel.pipeline, sentinel.demo). No t
 from __future__ import annotations
 
 import json
+import re
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -25,6 +26,7 @@ from sentinel.pipeline.sim import SimApp, SimBuild
 from sentinel.records import CheckpointOutcome
 from sentinel.reviewer import ModelResponse, ReviewerConfig, ReviewerJob, TransportError, Usage
 from sentinel.store import Store
+from sentinel.store import safety as S
 from sentinel.taxonomy import load
 
 S03 = f"flow/trade.order-entry.stock/{STOCK_FLOW}/s03"
@@ -89,7 +91,11 @@ def test_every_example_flow_checkpoint_passes_its_assertions_on_the_base_build(c
         for st in cfg.flow_docs[flow]["steps"]:
             if st.get("type") == "checkpoint" and st.get("expect"):
                 chk = _check(cfg, SimBuild("b"), st["id"], flow)
-                assert [r.status for r in chk.verdict.results] == ["passed"] * len(st["expect"]), (flow, st["id"])
+                # the step's `expect` assertions, then the checkpoint's rule regions (2.8.2, SD-29)
+                ids = [r.assertion_id for r in chk.verdict.results]
+                assert ids[:len(st["expect"])] == [a["id"] for a in st["expect"]], (flow, st["id"])
+                assert all(i.startswith("rule.") for i in ids[len(st["expect"]):]), (flow, st["id"])
+                assert [r.status for r in chk.verdict.results] == ["passed"] * len(ids), (flow, st["id"])
 
 
 def test_the_oracle_reads_what_synth_drew_and_catches_a_transposed_cost(cfg):
@@ -145,9 +151,10 @@ def test_a_shard_context_from_the_config_passes_every_gate_on_the_simulated_rig(
                                                                       sink.done.add(S07)))
     assert report.verdict.status == "complete" and report.proof.line == "PROVEN: no orders sent"
     assert seen == ["b-1"]                      # the build re-read sees the build the launched gate accepted
-    assert [r.gate for r in report.results][:8] == ["provisioned", "launched", "authenticated", "paper_mode_asserted",
-                                                    "settings_attested", "workspace_loaded", "fixture_verified",
-                                                    "canary_flow_passed"]
+    # fixture_verified is stage 2 of 7.6 (fixture_checks.check_stage2): its connectivity check has its own gate
+    gates = [g for g in dict.fromkeys(r.gate for r in report.results) if g != "connectivity"]
+    assert gates[:8] == ["provisioned", "launched", "authenticated", "paper_mode_asserted", "settings_attested",
+                         "workspace_loaded", "fixture_verified", "canary_flow_passed"]
 
 
 def test_the_shard_sink_holds_only_its_own_unreached_checkpoints():
@@ -162,11 +169,15 @@ def test_clean_runs_pass_every_gate_page_nobody_and_prove_no_orders_sent(runs):
     assert alerts(out) == [] and r.proof == "PROVEN: no orders sent"
     (run,) = orchestrator(out)
     assert {s["verdict"] for s in run["shards"]} == {"complete"} and len(run["shards"]) == len(r.shards) == 4
-    assert all([g["control"] for g in s["gates"]][:8] == ["preflight", "launch", "login", "paper_mode", "attestation",
-                                                          "workspace", "fixture", "canary_flow"] for s in run["shards"])
+    stage2 = {"ondemand", "delay_badge", "connectivity", "alerts", "prices", "pinned_quote", "symbol_precheck"}
+    assert all([c for c in dict.fromkeys(g["control"] for g in s["gates"]) if c not in stage2][:8] == [
+        "preflight", "launch", "login", "paper_mode", "attestation", "workspace", "fixture", "canary_flow"]
+        for s in run["shards"])
     assert all(any(g["control"] == "build_reread" for g in s["gates"]) for s in run["shards"])
     assert (out / "heartbeat" / "shard-1.json").exists()
-    assert "paper mode asserted 4 times" in (out / "pr-comment.md").read_text()
+    # once at each shard's gate and again before every unit of work (6.4 Schedule, flow_boundary)
+    asserted = sum(1 for s in run["shards"] for g in s["gates"] if g["control"] == "paper_mode" and g["passed"])
+    assert asserted > 4 and f"paper mode asserted {asserted} times" in (out / "pr-comment.md").read_text()
 
 
 # -- the five scenarios -------------------------------------------------------------------------------------
@@ -207,7 +218,12 @@ def test_paper_mode_mismatch_aborts_safety_before_any_capture(runs):
     text = (out / "pr-comment.md").read_text()
     assert "**Abort**" in text and "Trigger: live_identity" in text and "Gate: paper_mode_asserted" in text
     assert "No run starts on rigs rig-01, rig-02, rig-03 and rig-04 until the incident closes." in text
-    assert "Incident: S1" in text and "**Unexpected (" not in text and r.commit_status["state"] == "error"
+    # the abort block names the S1 incident row store.safety opened (6.12), the status line too
+    with Store(out / "sentinel.db") as store:
+        ids = {str(i.incident_id) for i in S.incidents(store, run_id=r.run_id) if i.severity == "S1"}
+    assert ids and re.search(r"Incident: (\d+)", text).group(1) in ids
+    assert "**Unexpected (" not in text and r.commit_status["state"] == "error"
+    assert r.commit_status["description"].startswith("aborted_safety: incident ")
     s1 = [a for a in alerts(out) if a["incident"] == "S1"]
     assert s1 and all(a["priority"] == "P1" and a["rule"] == "safety:aborted_safety" and "harness_on_call" in a["paged"]
                       for a in s1)
@@ -224,23 +240,32 @@ def test_attempted_send_is_dropped_by_the_gateway_and_proven_harmless(runs):
     assert (by[S07].outcome, by[S07].reason, by[S07].gate) == ("env_error", "attempted_send", "running")
     assert by[S03].outcome == by[S06].outcome == "identical"           # captured before the abort
     (blocked,) = [s for s in steps if s.status == "blocked_by_gateway"]
-    assert (blocked.flow_id, blocked.step_id) == (STOCK_FLOW, "open-confirm+enter")
-    # the gateway event goes through the store (8.3 step_events gate_decision, gate_reason, gate_class)
-    assert blocked.gateway_event == {"decision": "refused", "reason": "guarded_key_refused", "class": "safety"}
+    assert (blocked.flow_id, blocked.step_id, blocked.reason) == (STOCK_FLOW, "open-confirm+enter",
+                                                                  "guarded_key_refused")
+    # every gateway decision is a step event the shard's drainer wrote (5.4.8, 8.3 gate_decision, gate_reason,
+    # gate_class): the emitted events of the flow's input, then the stage 4 refusal, journaled
     with Store(out / "sentinel.db") as store:
-        rows = store.conn.execute("SELECT gate_decision, gate_reason, gate_class FROM step_events WHERE run_id = ? "
-                                  "AND gate_decision <> 'none'", (r.run_id,)).fetchall()
-        assert [tuple(x) for x in rows] == [("refused", "guarded_key_refused", "safety")]
-        assert store.gateway_drops(r.run_id) == 1
+        rows = store.conn.execute("SELECT gate_decision, gate_reason, gate_class, source, step_id FROM step_events "
+                                  "WHERE run_id = ? AND gate_decision IN ('dropped', 'refused')", (r.run_id,)).fetchall()
+        assert [tuple(x) for x in rows] == [("refused", "guarded_key_refused", "safety", "orchestrator",
+                                             "open-confirm+enter")]
+        emitted = store.conn.execute("SELECT count(*) FROM step_events WHERE run_id = ? AND gate_decision = 'emitted' "
+                                     "AND token_id IS NOT NULL", (r.run_id,)).fetchone()[0]
+        assert emitted > 0 and store.gateway_drops(r.run_id) == 1
+    (journal,) = (out / "journal" / r.run_id).rglob("gateway_drops.jsonl")
+    assert json.loads(journal.read_text().splitlines()[0])["gate_reason"] == "guarded_key_refused"
     (run,) = orchestrator(out)
     (event,) = run["gateway_events"]                 # orchestrator.json keeps its copy
-    assert event["gateway_event"] == blocked.gateway_event
+    assert (event["gate_decision"], event["gate_reason"], event["gate_class"]) == ("refused", "guarded_key_refused",
+                                                                                   "safety")
     shard = next(s for s in run["shards"] if s["verdict"] == "aborted_safety")
     assert shard["proof"] == "PROVEN: no orders sent" and "recovery_login" in shard["kill_switch"]
     assert [a for a in run["persisted_actions"] if a["action"] == "quarantine_flow"][0]["flow_id"] == STOCK_FLOW
     text = (out / "pr-comment.md").read_text()
     assert "Trigger: attempted_send" in text and "Post-run proof: PROVEN: no orders sent" in text
-    assert "gateway 1 drop, Cancel All not needed, proof PROVEN: no orders sent |" in text
+    # the run's stored proofs give the Safety row each shard's buying power line (6.6 step 5, 9.4)
+    assert ("gateway 1 drop, Cancel All not needed, proof PROVEN: no orders sent; shard run-2026-11-10-pr-4853-01/1: "
+            "buying power 2,500.00 to 2,500.00, drift 0.00, ok;") in text
     summary = (out / "summary.txt").read_text()
     assert "WORKAROUND" not in text + summary and "proof PROVEN: no orders sent" in summary
     assert "reason code\n  (guarded_key_refused)" in summary and "run health counts it as 1 gateway drop" in summary
@@ -273,8 +298,9 @@ def test_an_order_that_got_out_is_orders_sent_and_the_run_stays_aborted_safety(t
     assert (run.status, run.reason, run.last_gate) == ("aborted_safety", "undeclared_order_row", "teardown")
     text = (tmp_path / "pr-comment.md").read_text()
     assert "Trigger: undeclared_order_row" in text and f"Post-run proof: {line}" in text
-    assert "An order reached the account: login " in text and "Incident: S1" in text
-    assert f"Cancel All verified, proof {line}; an order reached the account" in text
+    assert "An order reached the account: login " in text and re.search(r"Incident: \d+", text)
+    safety_row = next(row for row in text.splitlines() if row.startswith("| Safety |"))
+    assert f"Cancel All verified, proof {line}; shard " in safety_row and "; an order reached the account" in safety_row
     assert "UNPROVEN" not in text and r.commit_status["state"] == "error"
     *_, page = [a for a in alerts(tmp_path) if a["run_reason"] == "undeclared_order_row"]   # the kill switch's proof
     assert page["incident"] == "S1" and "login_owner" in page["paged"] and page["detail"] == line
@@ -296,8 +322,16 @@ def test_app_crash_fails_app_alive_skips_the_ladder_and_resumes_after_a_relaunch
     assert crash.checkpoint_id == FREEZE_AT and crash.tier == 1
     shard = next(s for s in orchestrator(out)[0]["shards"] if FREEZE_AT in json.dumps(s) or s["rig"] == "rig-04")
     controls = [g["control"] for g in shard["gates"]]
-    assert controls.count("launch") == 2 and controls.count("login") == 2 and controls.count("paper_mode") == 2
+    # Orchestrator.relaunch("app_failure"): every gate again (launch, login, paper mode, attestation, ...); paper mode
+    # is also asserted before every unit of work (6.4)
+    assert controls.count("launch") == 2 and controls.count("login") == 2 and controls.count("attestation") == 2
+    assert controls.count("relaunch") == 1 and controls.count("canary_flow") == 2
     assert "watchdog" in controls and shard["verdict"] == "complete"
+    with Store(out / "sentinel.db") as store:                      # the relaunch is a run-health step event (10.2)
+        (ev,) = store.query("SELECT reason, app_restart_count, source, mode FROM step_events WHERE run_id = ? AND "
+                            "action = 'relaunch'", (r.run_id,))
+    assert ev["reason"].startswith("cause app_failure; budget app_relaunch") and ev["app_restart_count"] == 1
+    assert (ev["source"], ev["mode"]) == ("orchestrator", "system")
     resumed = [o for o in outs if o.test_kind == "census" and o.checkpoint_id.startswith("census/trade.")]
     assert resumed and {o.outcome for o in resumed} == {"identical"}     # the units after the ladder ran
     assert r.status == "complete" and r.commit_status["state"] == "failure"
@@ -309,14 +343,16 @@ def test_app_crash_fails_app_alive_skips_the_ladder_and_resumes_after_a_relaunch
 def test_config_invalid_aborts_harness_at_preflight_g1(runs):
     out, (r,) = runs("config-invalid")
     assert (r.status, r.reason) == ("aborted_harness", "config_invalid")
-    assert any("L-MSK-02" in e for e in r.lint_errors) and r.proof == "PROVEN: no session established"
+    assert any("L-RGN-03" in e for e in r.lint_errors) and r.proof == "PROVEN: no session established"
     with Store(out / "sentinel.db") as store:
         run = store.run_outcome(r.run_id)
         assert (run.last_gate, store.outcomes(r.run_id)) == ("provisioned", [])
+        (proof,) = store.post_run_proofs(r.run_id)               # the run-level row of a run with no shard (SD-61)
+        assert (proof.shard_id, proof.login_alias, proof.verdict) == (None, None, "proven_no_session")
     (page,) = alerts(out)
     assert (page["rule"], page["priority"], page["paged"]) == ("aborted_harness", "P1", ["harness_on_call"])
     text = (out / "pr-comment.md").read_text()
-    assert "**Abort**" in text and "`config_invalid` (rules L-MSK-02)" in text and r.commit_status["state"] == "error"
+    assert "**Abort**" in text and "`config_invalid` (rules L-RGN-03)" in text and r.commit_status["state"] == "error"
     assert "- Not re-queued: the same config would fail again; fix it first" in text and "Re-queued once" not in text
     assert "Scope not computed: the run stopped at provisioned before it planned any checkpoint." in text
     assert "| Tier |" not in text and "| Fingerprint | not read |" in text
@@ -324,10 +360,45 @@ def test_config_invalid_aborts_harness_at_preflight_g1(runs):
     assert "PR comment posted (simulated: written to pr-comment.md)" in text and "unknown" not in text
 
 
-def test_config_invalid_runs_the_day_after_the_first_mask_expiry(runs):
-    out, (r,) = runs("config-invalid")
+def test_expired_mask_runs_the_day_after_the_first_mask_expiry_and_completes(runs):
+    """4.1, 4.8: the expired mask is an expired record at run start, not `config_invalid`; the run completes with the
+    record in run health and a `mask_expired` finding."""
+    out, (r,) = runs("expired-mask")
     day = date.fromordinal(mask_expiry(EXAMPLE).toordinal() + 1)
     assert r.run_id == f"run-{day.isoformat()}-pr-4823-01"
+    assert r.status == "complete" and not r.lint_errors
+    assert [f.kind for f in r.findings if f.kind.endswith("_expired")] == ["mask_expired"]
+    text = (out / "pr-comment.md").read_text()
+    assert "Expired records" in text and "mask expired: msk.ps.last-update-01" in text
+    assert "mask expired: msk.ps.last-update-01" in (out / "summary.txt").read_text()
+
+
+def test_operator_stop_trips_the_kill_switch_through_the_file_flag(runs):
+    """6.6 human channels: `sentinel stop` writes the rig's file flag; the next boundary's `killflag.check` trips the
+    kill switch (`aborted_safety (kill_switch)`, S2), the sequence runs and proves no order was sent, the request is
+    acknowledged, and store.safety holds the incident."""
+    out, (r,) = runs("operator-stop")
+    outs, _, _, _ = stored(out, r.run_id)
+    legal(outs)
+    assert (r.status, r.reason) == ("aborted_safety", "kill_switch") and r.proof == "PROVEN: no orders sent"
+    shard = next(s for s in orchestrator(out)[0]["shards"] if s["verdict"] == "aborted_safety")
+    ks = next(g for g in shard["gates"] if g["control"] == "kill_switch")
+    assert "file_flag" in ks["detail"] and "requested by asmith via cli" in ks["detail"]
+    assert {(o.outcome, o.reason) for o in outs if o.outcome == "env_error"} == {("env_error", "kill_switch")}
+    assert not list((out / "rigs").rglob("kill.flag"))                       # acknowledged: the flag is gone
+    with Store(out / "sentinel.db") as store:
+        assert {i.severity for i in S.incidents(store, run_id=r.run_id)} == {"S2"}
+
+
+def test_redaction_miss_masks_a_stray_account_id_and_reports_it_tier_1(runs):
+    """3.6, 6.10: an account id outside the anchors on the candidate only is masked by the redaction stage, stored as
+    a tier-1 `redaction_miss` finding (never the id itself), counted in run health, and the check still passes."""
+    out, (r,) = runs("redaction-miss")
+    (miss,) = [f for f in r.findings if f.kind == "redaction_miss"]
+    assert (miss.tier, miss.side, miss.evidence["candidate_only"]) == (1, "candidate", True)
+    text = (out / "pr-comment.md").read_text()
+    assert "redaction_miss" in text and "1 candidate only, tier 1" in text and "D-20481134" not in text
+    assert r.status == "complete" and r.commit_status["state"] == "success"
 
 
 # -- sentinel demo all: one line per scenario and out/index.html ---------------------------------------------
@@ -398,7 +469,7 @@ def test_the_live_adapter_reviews_with_crops_from_the_artifact_store(tmp_path):
         {("intended", "reviewer", "claude-opus-5-5")}
     images = [b for b in t.calls[0]["messages"][-1]["content"] if b.get("type") == "image"]
     assert len(images) == 3                                     # base, candidate and heatmap crops at 1:1
-    manifest = json.loads((tmp_path / "artifacts" / "manifest.json").read_text())
+    manifest = json.loads((tmp_path / "artifacts" / "runs" / r.run_id / "manifest.json").read_text())   # 8.4
     assert any(e["name"].endswith("/review/candidate.png") and e["kind"] == "capture"
                for e in manifest.get("entries", manifest.get("artifacts", [])))
 

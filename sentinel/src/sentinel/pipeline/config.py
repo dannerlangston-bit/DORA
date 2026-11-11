@@ -5,6 +5,12 @@ build records, copied from the branch at run creation as 4.3 says, or a simulate
 every run lints and reads exactly the tree it used; the copy stays in the output for inspection.
 `SentinelConfig.load` reads the tree with `lint.repo.Repo` (the lint's own loader) into the
 inputs scope, the Diff Engine, the Invariant Checker and the canaries take.
+
+The run-start lint (`lint.runstart.lint_at_run_start`) leaves every manifest out of the report that decides
+`config_invalid` (4.3), so a manifest the run then treats as missing may be malformed: manifests are keyed by
+their file name (`manifests/<candidate build id>.yaml`, the copy made at run creation), never by a field read from
+them. A surface's `invariant_exceptions` (4.5) reach the Invariant Checker through `rules`; the run drops the
+ones expired at run start (`invariants.active_exceptions`, L-SRF-11).
 """
 from __future__ import annotations
 
@@ -59,7 +65,7 @@ class SentinelConfig:
     flows: list[Flow]
     flow_docs: dict[str, dict]
     dep_map: DependencyMap
-    manifests: dict[str, dict]                    # candidate build id -> manifest document
+    manifests: dict[str, Any]                     # candidate build id (the file name) -> manifest document
     regions: dict[str, dict]                      # checkpoint id -> regions document
     masks: dict[str, MaskRecord]
     surfaces: dict[str, dict]                     # surface id -> registry entry document
@@ -79,7 +85,8 @@ class SentinelConfig:
         fixture = (repo.one("fixture").data if repo.one("fixture") else {}) or {}
         kinds = {a.get("kind") for a in fixture.get("accounts", [])}
         quarantine = repo.one("quarantine")
-        q = frozenset(r.get("checkpoint_id") or r.get("flow_id") for r in ((quarantine.data or {}).get("records") or [])
+        # 10.5, 4.16 quarantine_record: each record names exactly one of `checkpoint` and `flow`
+        q = frozenset(r.get("checkpoint") or r.get("flow") for r in ((quarantine.data or {}).get("records") or [])
                       ) if quarantine else frozenset()
         send = repo.one("send_policy")
         mutants = Path(root) / "canaries" / "mutants.yaml"
@@ -88,7 +95,7 @@ class SentinelConfig:
             workspaces=[Workspace.from_dict(d.data) for d in repo.of("workspace")],
             flows=[Flow.from_dict(f) for f in flows.values()], flow_docs=flows,
             dep_map=DependencyMap.from_dict(repo.one("dependency_map").data),
-            manifests={d.data["candidate"]: d.data for d in repo.of("manifest")},
+            manifests={Path(d.rel).stem: d.data for d in repo.of("manifest")},
             regions={d.data["checkpoint_id"]: d.data for d in repo.of("regions")},
             masks={d.data["mask_id"]: MaskRecord.from_dict(d.data) for d in repo.of("mask")},
             surfaces=surfaces, builds={d.data["build"]["build_id"]: d.data for d in repo.of("build")},
@@ -112,14 +119,18 @@ class SentinelConfig:
         return None
 
     def rules(self, surface_id: str, data_mode: str) -> inv.SurfaceRules:
-        """The invariant inputs a Surface Registry entry declares (4.5): its tier, required labels and
-        required controls (template plus OCR anchor)."""
+        """The invariant inputs a Surface Registry entry declares (4.5): its tier, required labels, required
+        controls (template plus OCR anchor) and its invariant exceptions (expired ones included: the run drops them
+        with `invariants.active_exceptions`)."""
         s = self.surfaces.get(surface_id, {})
         labels = tuple(inv.RequiredLabel(str(t)) for t in s.get("labels") or ())
         controls = tuple(inv.RequiredControl(str(c["id"]), ocr_text=c.get("ocr_text"))
                          for c in s.get("controls") or () if c.get("required"))
+        exceptions = tuple(inv.InvariantException(str(x["invariant_id"]), str(x.get("owner", "")),
+                                                  str(x.get("reason", "")), utc_text(x["expires_at"]))
+                           for x in s.get("invariant_exceptions") or () if isinstance(x, dict))
         return inv.SurfaceRules(surface_id, tier=int(s.get("tier", 3)), data_mode=data_mode, labels=labels,
-                                controls=controls)
+                                controls=controls, exceptions=exceptions)
 
     def control_ids(self, surface_id: str) -> dict[str, str]:
         """OCR text -> control id of the surface's registry controls (what a template match reports)."""
@@ -135,6 +146,13 @@ class SentinelConfig:
     def target_window(self, surface_id: str) -> str:
         tw = self.surfaces.get(surface_id, {}).get("target_window") or {}
         return str(tw.get("kind", "main"))
+
+
+def utc_text(value: Any) -> str:
+    """A YAML timestamp (text or datetime) as UTC ISO text, so `invariants.active_exceptions` compares like with
+    like."""
+    d = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    return (d if d.tzinfo else d.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).isoformat()
 
 
 def parse_time(text: str) -> datetime:

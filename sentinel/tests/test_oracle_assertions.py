@@ -350,6 +350,15 @@ def test_api_failures_are_env_errors_and_leave_other_assertions_in_force():
 # The wrong number, the classifier and the reporter
 
 
+def test_results_name_the_region_they_assert():
+    results = {r.assertion_id: r for r in evaluate_assertions(S07, {"ocr": GroundTruthReader(CONFIRM)}, {}, FIXTURE,
+                                                              context=STOCK)}
+    assert results["qty"].region == "rgn.confirm.qty" and results["send_label"].region == "rgn.confirm.send-button"
+    assert results["cost_math"].region is None                       # a rule names operands, not one region
+    bad = one({"id": "qty", "kind": "equals", "region": "q", "format": "int", "expected": 100}, {"q": "108"})
+    assert (bad.status, bad.region) == ("failed", "q")
+
+
 def test_wrong_number_order_confirmation_cost_is_assertion_failed():
     wrong = dict(CONFIRM, **{"rgn.confirm.cost": "15,250.00"})        # 100 x 150.25 is 15,025.00
     results = evaluate_assertions(S07, {"ocr": GroundTruthReader(wrong)}, {}, FIXTURE, context=STOCK)

@@ -52,7 +52,15 @@ The scenarios, and what each one should show:
 | `paper-mode-mismatch` | The login lands on a live-looking account. | The run stops before capturing anything, every checkpoint says why, and an S1 page goes out. |
 | `attempted-send` | A test step tries to press Enter on the Order Confirmation dialog. | The input guard blocks it, the run stops, and the proof reads "PROVEN: no orders sent". |
 | `app-crash` | The app freezes in the middle of a size sweep. | The crash recorded on that step, the rest of the sweep marked not run, and the run continuing after a relaunch. |
-| `config-invalid` | The test configuration has an expired entry. | The run refuses to start and says exactly which rule failed. |
+| `config-invalid` | The test configuration points to a mask record that does not exist. | The run refuses to start and says exactly which rule failed. |
+| `expired-mask` | The run happens the day after a mask expires. | The run still goes ahead. The report lists the expired mask, and the area it used to hide is compared again. |
+| `operator-stop` | Someone runs `sentinel stop` on a rig in the middle of a run. | The run stops on that rig, the safety sequence runs, and the proof reads "PROVEN: no orders sent". An incident is opened. |
+| `redaction-miss` | The new build shows an account number in a place the hiding rules do not cover. | The number is hidden before anything is saved, a finding says where it was, and the check still passes. |
+| `popups` | Two windows pop up while the order ticket is filled in: the Message Center, which Sentinel knows, and a window it has never seen. | The Message Center is closed with Escape and the run goes on. The unknown window is closed too, a finding names it and proposes a catalog entry, and its test flow is put on hold. |
+| `fingerprint-mismatch` | The old build was drawn by a different graphics setup, so its screens cannot be compared fairly. | Every screen says "not comparable" and names what differed. Run health says the drawing changed inside one Windows build. Nothing is reported as a change. |
+| `clamped-gadget` | The Active Trader cell will not get shorter than 400 px, on both builds, and the size test asks for smaller sizes. | The small sizes are marked as clamped, not as failures. The sizes match on both builds. Run health shows the smallest size the cell reached. |
+| `fixed-reopens` | A bug is confirmed, the ticket is marked fixed in the next build, and the next build still has the bug. | After the second run the "fixed" decisions are reopened, the ticket is sent back to open, and Run health lists the reopened fixes. |
+| `occluded-capture` | Another program's window covers the screen while two screens are captured. | Those two screens say they were covered and name the program. One alert and one finding name the program. The rest of the run is compared. |
 
 `out/index.html` repeats this list with links. Use the questions below for every scenario.
 

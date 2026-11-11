@@ -1,0 +1,55 @@
+# The Explorer deny list of 6.8 (schema in 4.16, SD-30). The system owner owns the file; a change needs the Explorer
+# owner's approval. The gateway enforces every entry by window title, by the resolved control name and under-point
+# OCR label, and by the registered controls' landmark-anchored geometry; the nightly denied-action test drives every
+# entry and every `deny: true` control of the registry and requires blocked_by_gateway for each (L-XREF-13).
+schema_version: 1
+approved_by: explorer.owner
+entries:
+  - id: chat
+    denied: Chat Rooms, Support chat, any chat or message input
+    why: Real people receive messages
+    window_title_regex: "chat|support"
+    label_regex: "chat|message"
+  - id: share
+    denied: Share and anything creating a tos.mx link
+    why: Pre-release screenshots become public
+    window_title_regex: "share|tos\\.mx"
+    label_regex: "share|tos\\.mx"
+  - id: setup
+    denied: Setup menu, Application Settings, Order Defaults
+    why: Can disarm later runs
+    window_title_regex: "setup|application settings|order defaults"
+    label_regex: "^setup$|application settings|order defaults"
+  - id: adjust-account
+    denied: Adjust Account
+    why: Destroys the fixture
+    window_title_regex: "adjust account"
+    label_regex: "adjust account"
+  - id: logout-account-switch
+    denied: Logout, account switch (the selector)
+    why: Identity drift
+    label_regex: "log ?out|log off"
+  - id: leaves-rig-or-persists
+    denied: Browser-opening controls, Help menu, Export, Print, Save or Delete workspace
+    why: Leaves the rig or changes persistent state
+    label_regex: "^help$|browser|export|print|save workspace|delete workspace"
+  - id: persistent-and-send
+    denied: MarketWatch Alerts creation, Saved Orders, Blast All, Flatten, Active Trader order columns, Confirm and Send, Send
+    why: Persistent state and send paths
+    label_regex: "alert|saved orders|blast all|flatten|confirm and send|^send$"
+  - id: send-button
+    denied: Send on the Order Confirmation dialog
+    why: Send path
+    control: dialog.order-confirmation.send-button
+  - id: flatten-button
+    denied: Flatten on the Active Trader ladder
+    why: Send path
+    control: trade.active-trader.ladder.flatten-button
+  - id: opens-ticket
+    denied: Buy and Sell menu items, BUY MKT and SELL MKT, ladder and Level II bid or ask cells, order-entry buttons
+    why: Opens or populates an order ticket
+    label_regex: "^(buy|sell)\\b|buy mkt|sell mkt"
+  - id: buy-mkt-button
+    denied: BUY MKT on the Active Trader ladder
+    why: Opens or populates an order ticket
+    control: trade.active-trader.ladder.buy-mkt-button

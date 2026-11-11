@@ -287,9 +287,13 @@ def test_rc_scope(inputs):
     chain = ids(plan, "trade.all-products.option-chain", "census")
     assert "census/trade.all-products.option-chain/ws.tier-b.power-1" in chain and len(chain) == 5
     sweep = ids(plan, CHART, "sweep")
-    assert len(sweep) == 36 + 4 + 1                              # grid, corners, corpus; the ascending pass reuses ids
+    assert len(sweep) == 36 + 4 + 1 + 6                          # grid, corners, corpus, then the ascending pass
     assert sweep[0].endswith("/960x720") and sweep[35].endswith("/320x300")
-    assert [s.rsplit("/", 1)[1] for s in sweep[36:]] == ["240x160", "240x1000", "1904x160", "1904x1000", "512x384"]
+    assert [s.rsplit("/", 1)[1] for s in sweep[36:41]] == ["240x160", "240x1000", "1904x160", "1904x1000", "512x384"]
+    # SD-04: Ladder F's ascending pass has its own `-asc` ids, planned after the descending pass in ladder order
+    assert [s.rsplit("/", 1)[1] for s in sweep[41:]] == ["320x480-asc", "400x480-asc", "480x480-asc", "640x480-asc",
+                                                          "800x480-asc", "960x480-asc"]
+    assert all(is_checkpoint_id(s) for s in sweep)
     assert [s.rsplit("/", 1)[1] for s in ids(plan, LADDER, "split")] == ["0.15", "0.30", "0.50", "0.70", "0.85"]
     assert [s.rsplit("/", 1)[1] for s in ids(plan, "analyze.risk-profile", "split")] == [
         "0.00", "0.15", "0.30", "0.50", "0.70", "0.85", "1.00"]  # collapsible

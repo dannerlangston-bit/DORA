@@ -31,7 +31,7 @@ CREATE TABLE logins (
   blocked_at TEXT,
   blocked_reason   TEXT CHECK (blocked_reason IN ('unproven_proof','identity_unreadable_twice','cancel_all_failed',
                      'recovery_login_failed','explorer_teardown_incomplete','drill_order_placed','incident','rotation',
-                     'session_unavailable','live_identity')),   -- 6.4, 6.5, 6.6, 6.8; cleared by a human
+                     'session_unavailable','live_identity','authentication_failed')),   -- 6.4 to 6.8, 7.7; a human clears it
   unblocked_by TEXT, unblocked_at TEXT,
   CHECK ((blocked_at IS NULL) OR (blocked_reason IS NOT NULL))
 );
@@ -439,7 +439,7 @@ CREATE TABLE decisions (
   revoked_at TEXT, revoked_by TEXT, revoke_reason TEXT,
   source_finding_id INTEGER REFERENCES findings(finding_id),
   bbox_q4           TEXT,                   -- x,y,w,h of the largest component quantized to 4 px: the fallback key at or below noise spread (4.14)
-  role              TEXT CHECK (role IS NULL OR role IN ('system_owner','triage_rotation','flow_owner','pr_author','jira_resolver')),   -- 9.12, L-DEC-01
+  role              TEXT CHECK (role IS NULL OR role IN ('triage_rotation','flow_owner','system_owner','release_manager','pr_author','ticket_resolver')),   -- 4.14, 9.12, L-DEC-01
   reopen_count      INTEGER NOT NULL DEFAULT 0 CHECK (reopen_count >= 0),   -- fixed_in_build signatures that returned (4.14)
   CHECK ({{decision_action_verdict}}),   -- the 4.14 and 9.6 mapping; request_mask is inert until mask_ref is set
   CHECK (action NOT IN ({{decision_actions:mark_intended,fixed_in_build}}) OR ticket_ref IS NOT NULL),   -- L-DEC-02 at write time

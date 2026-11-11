@@ -458,6 +458,16 @@ def test_fingerprints_must_match_except_build_id():
     assert "render_probe_hash" in t.detail
     assert fingerprint_id(_fp()["match"]) == fingerprint_id(_fp(build_id="other")["match"])
     assert fingerprint_id(_fp()["match"]) != fingerprint_id(_fp(data_epoch="E2")["match"])
+    assert compare_fingerprints(_fp(), _fp(render_probe_hash="E3B0C44298FC1C14")) is None     # one 64-bit value
+
+
+def test_fingerprint_with_a_null_field_is_refused_not_classified():
+    # 7.4: an unreadable field is env_error (fingerprint_unreadable:<field>) at its gate, never a mismatch
+    with pytest.raises(ValueError, match="cleartype"):
+        compare_fingerprints(_fp(cleartype=None), _fp(cleartype=None))
+    with pytest.raises(ValueError, match="gpu"):
+        compare_fingerprints(_fp(), _fp(gpu={"name": "Hyper-V Video"}))          # one side lacks the field
+    assert compare_fingerprints(_fp(build_id=None), _fp()) is None              # build_id is never compared
 
 
 # -- component boxes in window and region coordinates (choice 16, 9.7) --------------------------

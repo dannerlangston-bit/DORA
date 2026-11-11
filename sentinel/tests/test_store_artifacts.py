@@ -1,4 +1,5 @@
-"""Tests for sentinel.store.artifacts (8.4) and the store's artifact rows and retention (8.2, 8.6)."""
+"""Tests for sentinel.store.artifacts (8.4) and the store's artifact rows and retention (8.2, 8.6), the plaintext
+put hook (6.9) and quarantine (8.4, 8.9)."""
 import io
 import json
 
@@ -9,7 +10,8 @@ from sentinel.records import CheckpointOutcome, Finding
 from sentinel.store import (ArtifactCorrupt, ArtifactError, ArtifactHashMismatch, ArtifactPersistError, ArtifactStore,
                             ManifestHeader, Redaction, RedactionRefused, RunPlan, ScopeEntry, Store)
 from sentinel.store import artifacts as artifacts_mod
-from sentinel.store.artifacts import sha256_hex
+from sentinel.store.artifacts import ArtifactQuarantined, SecretLeaked, sha256_hex
+from sentinel.store.secret_scan import SecretScanner
 
 CID = "census/trade.active-trader.ladder/ws.tier-a.active-trader"
 RED = Redaction("redact-v3")
@@ -118,3 +120,77 @@ def test_store_indexes_artifacts_and_sweeps_safely(tmp_path):
         assert deleted_at[0] is not None
         ledger = [json.loads(x)["batch"] for x in (tmp_path / "db" / "results.jsonl").read_text().splitlines()]
         assert ledger[-1] == "retention"
+
+
+
+def test_sweep_never_deletes_a_quarantined_object(tmp_path):
+    """8.4 / 8.6: an object whose set was quarantined after a secret leak is evidence; the sweep skips it."""
+    arts = ArtifactStore(tmp_path / "objects-set", "runs/run-01")
+    with Store(tmp_path / "db" / "run.db") as s:
+        s.begin_run(RunPlan("run-01", "merge", "c0ffee", "a" * 64, "b" * 64, "d00d", "auth/v1.md", 2700,
+                            scope=(ScopeEntry(CID, "ws.tier-a.active-trader", "active_trader", 1, "frozen"),)))
+        cap = put_capture(arts)
+        o = CheckpointOutcome(run_id="run-01", checkpoint_id=CID, outcome="identical", workspace_id="ws.tier-a."
+                              "active-trader", persona="active_trader", data_mode="frozen",
+                              artifacts={"candidate": cap.sha256})
+        s.write_checkpoint(o, artifacts=[cap])
+        assert s.deletable(cap.sha256)
+        s.write_artifact_set(cap.sha256, "runs/run-01")
+        s.conn.execute("UPDATE artifact_sets SET quarantined_at = '2026-11-10T15:00:00Z' WHERE sha256 = ?", (cap.sha256,))
+        assert not s.deletable(cap.sha256)
+        assert s.sweep(arts, [cap.sha256], backup_ok=True).deleted == ()
+
+# -- the plaintext put hook (6.9) and quarantine (8.4, 8.9) ---------------------------------------------------------
+
+SECRET = "hunter2-Qx9!"
+
+
+def test_a_text_artifact_holding_a_secret_is_refused_before_it_is_written(tmp_path):
+    arts = ArtifactStore(tmp_path / "shard", "run-01/1", scanner=SecretScanner({"login.password": SECRET}))
+    with pytest.raises(SecretLeaked) as e:
+        arts.put(f"request: {SECRET}".encode("utf-16-le"), name="reviewer/req.json", kind="request",
+                 media_type="application/json")
+    assert e.value.refs == ("login.password",) and SECRET not in str(e.value)
+    assert not any(p.is_file() for p in arts.objects.rglob("*")) and arts.entries == []
+    assert arts.put(b"clean log\n", name="logs/a.txt", kind="log_slice", media_type="text/plain").bytes == 10
+    assert put_capture(arts).kind == "capture"                           # images go through redaction, not the scan
+
+
+def test_quarantine_moves_the_set_marks_its_rows_and_refuses_reads_and_writes(tmp_path):
+    arts = ArtifactStore(tmp_path / "artifacts" / "runs" / "run-01", "runs/run-01")
+    with Store(tmp_path / "db" / "run.db") as s:
+        s.begin_run(RunPlan("run-01", "merge", "c0ffee", "a" * 64, "b" * 64, "d00d", "auth/v1.md", 2700,
+                            scope=(ScopeEntry(CID, "ws.tier-a.active-trader", "active_trader", 1, "frozen"),)))
+        cand = put_capture(arts)
+        log = arts.put(f"pw={SECRET}".encode(), name="logs/leak.txt", kind="log_slice", media_type="text/plain")
+        arts.write_manifest(ManifestHeader(config_commit="c0ffee", harness_commit="d00d", run_id="run-01"))
+        (arts.root / "shards" / "1").mkdir(parents=True)
+        (arts.root / "shards" / "1" / "results.jsonl").write_text('{"batch": "events"}\n')
+        o = CheckpointOutcome(run_id="run-01", checkpoint_id=CID, outcome="identical", workspace_id="ws.tier-a."
+                              "active-trader", persona="active_trader", data_mode="frozen",
+                              artifacts={"candidate": cand.sha256})
+        s.write_checkpoint(o, artifacts=[cand, log])
+        for a in (cand, log):
+            s.write_artifact_set(a.sha256, "runs/run-01")
+        s.write_artifact_set(cand.sha256, "baselines/main/b1")             # another set's copy stays untouched
+        qroot = tmp_path / "artifacts" / "quarantine"
+        (qroot / "run-01").mkdir(parents=True)
+        (qroot / "run-01" / "manifest.json").write_text("{}")             # a different file already there
+        dest = arts.quarantine("run-01", qroot, store=s, at="2026-11-10T09:00:00-05:00")
+        assert dest == qroot / "run-01"
+        moved = sorted(p.relative_to(dest).as_posix() for p in dest.rglob("*") if p.is_file())
+        assert moved == sorted([f"objects/{cand.sha256[:2]}/{cand.sha256}.png",
+                                f"objects/{log.sha256[:2]}/{log.sha256}.txt",
+                                "manifest.json", "manifest.json.1", "shards/1/results.jsonl"])
+        assert [p.name for p in arts.root.rglob("*") if p.is_file()] == ["QUARANTINED.json"]
+        assert arts.quarantined["quarantined_at"] == "2026-11-10T14:00:00+00:00"
+        rows = dict(s.conn.execute("SELECT set_path || ':' || sha256, quarantined_at FROM artifact_sets").fetchall())
+        assert rows[f"runs/run-01:{cand.sha256}"] == rows[f"runs/run-01:{log.sha256}"] == "2026-11-10T14:00:00+00:00"
+        assert rows[f"baselines/main/b1:{cand.sha256}"] is None
+    with pytest.raises(ArtifactQuarantined):
+        arts.get(cand.sha256)
+    with pytest.raises(ArtifactQuarantined):
+        arts.put(b"more\n", name="logs/b.txt", kind="log_slice", media_type="text/plain")
+    with pytest.raises(ArtifactQuarantined):                             # a reopened set is still quarantined
+        ArtifactStore(arts.root, "runs/run-01").get(cand.sha256)
+    assert arts.path_of(cand.sha256) is None and not arts.unlink(cand.sha256)

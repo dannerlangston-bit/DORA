@@ -53,8 +53,9 @@ with `synthetic: true`, behavioral canaries run their canary flow on the simulat
 `canary.score` gives the result rows, the detector state, the synthetic `harness_error` rows and
 the morning banner. Its safety pass (`safety_pass`, 6.5, 6.8, 10.3) then runs the attestation, identity, proof and
 secret-scan canaries, the denied-action test and the fire drill (`orchestrator.drill.run_drill` with `SimDrillPort`)
-on the shard's rig; their `canary_results` rows are written, a blind one's result is persisted
-(`apply_safety_actions`), its banner and detector state join the run's (summary `safety`, which later PR runs in the
+on the shard's rig; their `canary_results` rows are written, every result goes through `Orchestrator.apply` (a drill
+that placed an order stops the shard through the kill switch, `aborted_safety (drill_order_placed)`), a blind one's
+result is persisted (`apply_safety_actions`), its banner and detector state join the run's (summary `safety`, which later PR runs in the
 store read), and the day's egress rows are reconciled against the allowlist (`egress.reconcile`).
 
 The Orchestrator (5.2): every shard goes through `orchestrator.Orchestrator` on a simulated rig
@@ -3411,11 +3412,9 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                                              started)
         for f in expired_findings:
             store.write_finding(f)
-        work.apply_pending()                          # the gate results noted before the run row existed
+        work.apply_pending()             # the gate and safety-pass results noted before the run row existed
         safety = done["safety"]                      # 6.5, 6.8, 10.3: the drill and the safety canaries' rows
         store.write_canary_results(scenario.run_id, safety.rows, created_at=_ts(today, scenario.clock, 1800))
-        for res in safety.results:
-            work._note(st, res)
         written: set[str] = set()
         for row in report.outcome_rows:
             if row.checkpoint_id in written:

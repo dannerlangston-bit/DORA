@@ -13,11 +13,21 @@ redaction stage passed and naming the redaction version; the refusal is `Redacti
 turns into `harness_error (reason: redaction_version_missing)`. Images are recognised by media type, by kind, by
 their leading bytes and by Pillow being able to read them, so a PNG, WebP or TIFF declared as text is still caught.
 
+Plaintext secrets (6.9, 8.4): a set opened with a `scanner` (`store.secret_scan.SecretScanner`) scans every
+non-image put before it is written; a hit raises `SecretLeaked` naming the secret references, never the value, and
+nothing is written, so a leak mid-run stops uploads at once. `quarantine(run_id, quarantine_root)` moves the set's
+files to `<quarantine_root>/<run_id>/` (the control host's `quarantine/<run_id>/`, 8.4), leaves a
+`QUARANTINED.json` marker so later puts and reads raise `ArtifactQuarantined` (the report UI says "quarantined"),
+and, given the store, sets `quarantined_at` on the set's `artifact_sets` rows.
+
 Choices where 8.4 is silent:
 - The "redaction header" is the `Redaction` value passed with the bytes, the in-process form of the
   redaction-version header of the 8.2 `PUT /v1/artifacts/{sha256}` request.
 - Text artifacts (logs, exports, ledgers, reviewer requests) are accepted without a redaction header: 8.4 sends
-  them through the post-run plaintext scan instead (6.9). Their redaction version is recorded when given.
+  them through the plaintext scan instead (6.9). Their redaction version is recorded when given.
+- Quarantine moves every file of the set (objects, manifest, ledgers under `shards/`), since a leaked secret can
+  sit in a ledger as well as in an object. A file already in the quarantine directory with the same bytes is
+  dropped; one with other bytes keeps both, the moved copy under the next free `<name>.<n>`.
 - `manifest.json` is written by `write_manifest`, not on every put, so a shard of 2,900 captures does not
   rewrite a growing file 2,900 times; the ledger of 8.2 carries the artifact rows in between. An existing
   manifest is loaded when the set is opened, so a resumed writer appends to it.
@@ -30,10 +40,16 @@ import io
 import json
 import os
 import re
+import shutil
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING, Protocol
 
 from ..records import now
+
+if TYPE_CHECKING:
+    from .store import Store
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -46,6 +62,7 @@ EXTENSIONS = {
 }
 _IMAGE_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"BM", b"II*\x00", b"MM\x00*")
 MANIFEST = "manifest.json"
+QUARANTINE_MARKER = "QUARANTINED.json"
 
 
 class ArtifactError(Exception):
@@ -78,6 +95,25 @@ class ArtifactCorrupt(ArtifactError):
 
 class ArtifactMissing(ArtifactError):
     """No object with this hash is in the set (8.6 artifact audit: missing)."""
+
+
+class ArtifactQuarantined(ArtifactError):
+    """The set was moved to quarantine by the plaintext scan (8.4, 8.9); security clears it (8.6)."""
+
+
+class SecretLeaked(ArtifactError):
+    """A text artifact holds the plaintext of a secret (6.9): nothing was written. `refs` names the secrets."""
+
+    def __init__(self, message: str, refs: tuple[str, ...]):
+        super().__init__(message)
+        self.refs = refs
+
+
+class TextScanner(Protocol):
+    """What the put hook asks of a secret scanner (`store.secret_scan.SecretScanner`)."""
+
+    def refs_in(self, data: bytes) -> tuple[str, ...]:
+        """The references of the secrets whose plaintext `data` holds, in any scanned encoding."""
 
 
 @dataclass(frozen=True)
@@ -135,10 +171,15 @@ def _read_back(path: Path) -> bytes:
     return path.read_bytes()
 
 
+def has_image_magic(head: bytes) -> bool:
+    """True when the leading bytes are those of an image or video file (PNG, JPEG, GIF, BMP, TIFF, WebP, MP4)."""
+    return (head.startswith(_IMAGE_MAGIC) or (head[:4] == b"RIFF" and head[8:12] == b"WEBP")
+            or head[4:8] == b"ftyp")
+
+
 def is_visual(data: bytes, kind: str, media_type: str) -> bool:
     """True for anything that may show the screen: image or video media type, a visual kind, or image bytes."""
-    return (media_type.startswith(("image/", "video/")) or kind in VISUAL_KINDS
-            or data.startswith(_IMAGE_MAGIC) or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+    return (media_type.startswith(("image/", "video/")) or kind in VISUAL_KINDS or has_image_magic(data[:16])
             or _dimensions(data) != (None, None))      # any other format Pillow reads is a picture too
 
 
@@ -155,12 +196,14 @@ class ArtifactStore:
     """One artifact set on disk (8.4): `<root>/objects/<aa>/<sha256>.<ext>` and `<root>/manifest.json`.
 
     `set_path` is the set's name in the 8.3 `artifacts.set_path` column (`runs/<run_id>`,
-    `baselines/<lineage>/<build_id>`, `eval/<version>`, or the shard id on the rig).
+    `baselines/<lineage>/<build_id>`, `eval/<version>`, or the shard id on the rig). `scanner` turns on the
+    plaintext check of every non-image put (6.9).
     """
 
-    def __init__(self, root: str | os.PathLike, set_path: str):
+    def __init__(self, root: str | os.PathLike, set_path: str, *, scanner: TextScanner | None = None):
         self.root = Path(root)
         self.set_path = set_path
+        self.scanner = scanner
         self.objects = self.root / "objects"
         self.objects.mkdir(parents=True, exist_ok=True)
         self._entries: dict[str, dict] = {}
@@ -168,6 +211,18 @@ class ArtifactStore:
         if mf.exists():
             for e in json.loads(mf.read_text(encoding="utf-8")).get("entries", []):
                 self._entries[e["name"]] = e
+
+    @property
+    def quarantined(self) -> dict | None:
+        """The quarantine marker (run_id, set_path, quarantined_at, moved_to), or None for a live set (8.4)."""
+        marker = self.root / QUARANTINE_MARKER
+        return json.loads(marker.read_text(encoding="utf-8")) if marker.exists() else None
+
+    def _refuse_if_quarantined(self, what: str) -> None:
+        q = self.quarantined
+        if q is not None:
+            raise ArtifactQuarantined(f"{what}: set {self.set_path} was quarantined at {q['quarantined_at']} "
+                                      "(8.4); security clears it")
 
     # -- paths -----------------------------------------------------------------------------------
     def _dir(self, sha: str) -> Path:
@@ -191,11 +246,17 @@ class ArtifactStore:
             captured_at: str | None = None) -> StoredArtifact:
         """Store `data` under its sha256 and add it to the manifest (8.4 write path).
 
-        Raises RedactionRefused, ArtifactHashMismatch or ArtifactPersistError; nothing is written on a refusal.
+        Raises RedactionRefused, SecretLeaked, ArtifactQuarantined, ArtifactHashMismatch or ArtifactPersistError;
+        nothing is written on a refusal.
         """
+        self._refuse_if_quarantined(name)
         visual = is_visual(data, kind, media_type)
         if visual and (redaction is None or not redaction.passed or not redaction.version):
             raise RedactionRefused(f"{name}: an image is stored only with a passing redaction header (8.4, 6.10)")
+        if not visual and self.scanner is not None:
+            refs = self.scanner.refs_in(data)
+            if refs:
+                raise SecretLeaked(f"{name}: holds the plaintext of {', '.join(refs)}; not stored (6.9)", refs)
         sha = sha256_hex(data)
         if expected_sha256 is not None and expected_sha256 != sha:
             raise ArtifactHashMismatch(f"{name}: bytes hash to {sha}, sender named {expected_sha256} (8.2)")
@@ -244,7 +305,8 @@ class ArtifactStore:
 
     # -- read ------------------------------------------------------------------------------------
     def get(self, sha: str) -> bytes:
-        """The bytes of `sha`, verified against the hash (ArtifactMissing, ArtifactCorrupt)."""
+        """The bytes of `sha`, verified against the hash (ArtifactMissing, ArtifactCorrupt, ArtifactQuarantined)."""
+        self._refuse_if_quarantined(sha)
         path = self.path_of(sha)
         if path is None:
             raise ArtifactMissing(sha)
@@ -268,6 +330,50 @@ class ArtifactStore:
             return False
         path.unlink()
         return True
+
+    # -- quarantine (8.4, 8.6, 8.9) -----------------------------------------------------------------
+    def quarantine(self, run_id: str, quarantine_root: str | os.PathLike, *, store: "Store | None" = None,
+                   at: str | None = None) -> Path:
+        """Move every file of this set to `<quarantine_root>/<run_id>/` after a plaintext-scan hit (8.4, 6.9).
+
+        The marker is written first, so puts and reads are refused from that moment even if the move stops half
+        way. With `store`, every `artifact_sets` row of this set not yet quarantined gets `quarantined_at` (8.4,
+        SD-82). Returns the quarantine directory; quarantining a quarantined set moves whatever is left.
+        """
+        ts = datetime.fromisoformat(at or now())
+        stamp = (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).isoformat(
+            timespec="seconds")
+        dest = Path(quarantine_root) / run_id
+        dest.mkdir(parents=True, exist_ok=True)
+        marker = self.quarantined or {"run_id": run_id, "set_path": self.set_path, "quarantined_at": stamp,
+                                      "moved_to": str(dest)}
+        tmp = self.root / f".{QUARANTINE_MARKER}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(marker, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, self.root / QUARANTINE_MARKER)
+        for src in sorted(p for p in self.root.rglob("*") if p.is_file() and p.name != QUARANTINE_MARKER):
+            target = dest / src.relative_to(self.root)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists() and target.read_bytes() == src.read_bytes():
+                src.unlink()
+                continue
+            n = 1
+            while target.exists():
+                target = target.with_name(f"{src.name}.{n}")
+                n += 1
+            shutil.move(str(src), str(target))
+        for d in sorted((p for p in self.root.rglob("*") if p.is_dir()), key=lambda p: len(p.parts), reverse=True):
+            if not any(d.iterdir()):
+                d.rmdir()
+        self._entries = {}
+        if store is not None:
+            rows = store.query("SELECT sha256 FROM artifact_sets WHERE set_path = ? AND quarantined_at IS NULL",
+                               (self.set_path,))
+            if rows:
+                with store.batch("quarantine") as b:
+                    for r in rows:
+                        b.update("artifact_sets", {"sha256": r[0], "set_path": self.set_path},
+                                 {"quarantined_at": marker["quarantined_at"]})
+        return dest
 
     # -- manifest --------------------------------------------------------------------------------
     @property

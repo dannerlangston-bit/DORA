@@ -56,12 +56,16 @@ Choices for `run_drill` (reported):
   read the new-row count is 0 and item 5 fails, so the drill is never PROVEN without it.
 - `run_drill` executes the drill's own steps only; the actions of the result (block the login, quarantine,
   the kill switch after a new row) are the caller's, as for every control result.
+- A selector text that is not an allowlist entry at item 5's recovery login is the 6.4 mismatch (killswitch choice
+  18): item 5 fails (the recovery login failed A1), and the drill's one result also carries the mismatch's run
+  outcome (`aborted_safety` with `live_identity` or `paper_mode_mismatch`), unreached outcome, incident, actions
+  (the login blocked for `live_identity`), safety page and selector crop, so persisting that result applies both.
 """
 from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
 
 from . import alerts
@@ -152,6 +156,7 @@ class DrillObservation:
     could_not_run: Mapping[int, str] = field(default_factory=dict)   # item -> what was not located or did not open
     dialog_open_after_keys: bool = True         # item 1: the dialog still open by title after the keys
     absent_passed: bool = True                  # item 1: close_dialog, clear_ticket and the absent assertion
+    identity: ControlResult | None = None       # item 5: the 6.4 mismatch its recovery login saw (killswitch choice 18)
 
 
 @dataclass(frozen=True)
@@ -210,11 +215,18 @@ def score_drill(obs: DrillObservation, chords: Sequence[Chord]) -> DrillResult:
         acts.append("maintenance_task")
     if 1 in obs.could_not_run:
         notes.append("the Order Confirmation dialog did not open: also an A9 failure")
-    return DrillResult(ControlResult(
+    result = ControlResult(
         "fire_drill", False, "running", checkpoint=Outcome("harness_error", f"drill_failed:{failed[0]}",
                                                            detail="; ".join(notes) or None),
         alert=alerts.drill_failure(), actions=tuple(acts), incident="S2",
-        detail="fire drill failed: " + ", ".join(failed) + "; the Nightly run stays complete"), tuple(failed))
+        detail="fire drill failed: " + ", ".join(failed) + "; the Nightly run stays complete")
+    i = obs.identity
+    if i is not None:                                    # a 6.4 mismatch at item 5's recovery login (docstring)
+        ev = dict(i.evidence) | ({"blocked_reason": "live_identity"} if i.run_reason == "live_identity" else {})
+        result = replace(result, run=i.run, unreached=i.unreached, alert=alerts.safety_abort(), incident=i.incident,
+                         actions=tuple(dict.fromkeys(result.actions + i.actions)), evidence=ev,
+                         detail=f"fire drill failed: {', '.join(failed)}; item 5's recovery login saw {i.run_reason}")
+    return DrillResult(result, tuple(failed))
 
 
 # -- driving the drill on a rig (6.5) -----------------------------------------------------------------------
@@ -288,6 +300,7 @@ class _Drive:
         self.rig, self.port, self.ledger = rig, port, ledger
         self.records: list[DrillRecord] = []
         self.could_not_run: dict[int, str] = {}
+        self.identity: ControlResult | None = None       # the 6.4 mismatch item 5's recovery login saw
 
     def dialog_up(self) -> bool:
         return any(w.title.startswith(DIALOG_TITLE) for w in self.rig.enumerate_windows())
@@ -391,7 +404,9 @@ def _item5(d: _Drive, *, clock: Clock, kill_channel: KillChannel, rig_id: str, s
     tree_gone_s = clock.monotonic() - t0 if d.rig.kill_process_tree() else None
     d.rig.reset_input_state()
     d.rig.set_hook_phase("recovery")                 # the recovery-only arm, as in the sequence itself (6.6 step 5)
-    login_ok = recovery_login(d.rig, allowlist, clock, fixture_account)
+    login = recovery_login(d.rig, allowlist, clock, fixture_account)
+    login_ok = login.ok
+    d.identity = login.identity
     end: OrderBook | None = None
     found: OrderBook | None = None
     cancel, located = "not_needed", False
@@ -438,7 +453,7 @@ def run_drill(rig: Rig, ledger: DropLedger, clock: Clock, chords: Sequence[Chord
     obs = DrillObservation(True, pre.probe_dropped_age_s, True, True, tuple(d.records), item5,
                            new_order_rows=max((_new_rows(start_book, b) for b in reads), default=0),
                            could_not_run=dict(d.could_not_run),
-                           dialog_open_after_keys=still_open, absent_passed=absent)
+                           dialog_open_after_keys=still_open, absent_passed=absent, identity=d.identity)
     return _with(score_drill(obs, chords), obs)
 
 

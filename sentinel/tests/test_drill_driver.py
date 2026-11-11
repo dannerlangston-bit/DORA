@@ -237,6 +237,25 @@ def test_an_order_found_by_item5s_clean_read_is_the_s1_case_though_the_rereads_g
     assert (r.result.run_status, r.result.run_reason) == ("aborted_safety", "drill_order_placed")
 
 
+def test_a_live_account_at_item5s_recovery_login_is_live_identity_s1_and_blocks_the_login():
+    """killswitch:3: item 5 fails (the recovery login failed A1), and the 6.4 live identity it saw goes on the
+    drill's result: aborted_safety live_identity, S1, the login blocked for live_identity, the rig quarantined."""
+    from sentinel.orchestrator.rig import SelectorRead
+    from sentinel.orchestrator.safety_canaries import drill_rows
+    from sentinel.store.safety import blocked_reason_for
+
+    rig = ready(SimulatedRig(SimScenario(selector_reads=[SelectorRead("12345678SCHW", crop_sha256="c-live")])))
+    r = drill(rig)
+    res = r.result
+    assert r.failed == ("item5",) and not r.observation.item5.recovery_login_ok
+    assert (res.run_status, res.run_reason, res.incident) == ("aborted_safety", "live_identity", "S1")
+    assert res.has("block_login") and blocked_reason_for(res) == "live_identity"
+    assert res.has("quarantine_all_flows") and res.checkpoint.reason == "drill_failed:item5"
+    assert res.alert == alerts.safety_abort() and res.evidence["crop"] == "c-live"
+    rows = drill_rows(r, CHORDS)
+    assert rows[4].produced_reason == "drill_failed:item5" and rows[0].state == "detected"
+
+
 def test_sim_drill_port_names_only_the_drill_targets():
     with pytest.raises(ValueError):
         SimDrillPort(SimulatedRig()).locate("send_button")

@@ -91,6 +91,13 @@ Choices (reported):
     `live_identity` the recovery arm is never entered, since no recovery login is made (SD-64). `reset_input_state`
     runs right after the kill, as before every relaunch (7.7, 10.2 step 4), so no token of the dead tree's input is
     pending when the recovery login types.
+18. The paper-mode assertion runs after every re-login (6.4 Schedule), the recovery login's included: a selector text
+    that is not an allowlist entry is the 6.4 mismatch (`RecoveryLogin.identity`), which the caller applies as at any
+    other read (S1 and the login blocked for `live_identity`; S2 for `paper_mode_mismatch`). The run keeps the abort
+    that came first (results.worse: the first wins a tie), so a kill switch whose recovery login sees a Live account
+    stays `aborted_safety (kill_switch)` with the S1 added. After `live_identity` nothing more is read through that
+    session: the proof is UNPROVEN `session_unavailable` and the login is blocked for `live_identity` (SD-64), with no
+    cancel-by-hand hand-over through it; a `paper_mode_mismatch` or unreadable selector is `recovery_login_failed`.
 """
 from __future__ import annotations
 
@@ -107,7 +114,7 @@ from .identity import READ_GAP_S, Allowlist, judge_identity
 from .orderbook import MonitorBook
 from .ports import KillRequest
 from .results import ControlResult, FindingSpec, RunVerdict, safety_abort_outcome
-from .rig import GatewayLog, OrderBook, OrderRow, Rig
+from .rig import GatewayLog, OrderBook, OrderRow, Rig, SelectorRead
 
 DIALOG_OPEN_MAX_S = 30.0
 CANCEL_REREAD_S = 60.0
@@ -509,12 +516,14 @@ def config_invalid_proof(run_id: str, *, produced_at: str, gateway: GatewayLog =
 # -- the sequence on a rig --------------------------------------------------------------------------------
 @dataclass
 class KillSwitchReport:
-    """What `execute_kill_switch` did: the decision, the proof and each step with its monotonic time."""
+    """What `execute_kill_switch` did: the decision, the proof and each step with its monotonic time, and the 6.4
+    mismatch its recovery login saw (`RecoveryLogin.identity`), which the caller applies before the proof effect."""
 
     result: ControlResult
     proof: Proof
     proof_effect: ControlResult
     steps: list[tuple[str, float]] = field(default_factory=list)
+    identity: ControlResult | None = None
 
 
 def masked_account(account_id: str) -> str:
@@ -536,29 +545,48 @@ def live_identity_blocked(decision: ControlResult, run_so_far: RunVerdict | None
     return "live_identity" in (decision.run_reason, run_so_far.reason if run_so_far is not None else None)
 
 
-def recovery_login(rig: Rig, allowlist: Allowlist, clock: Clock, fixture_account: str | None) -> bool:
+@dataclass(frozen=True)
+class RecoveryLogin:
+    """What `recovery_login` did (6.6 step 5): `ok` when the session is usable for the proof; `identity` the 6.4
+    mismatch result of its A1 read (`judge_identity`: `aborted_safety` with `live_identity`, S1 and the login blocked,
+    or `paper_mode_mismatch`, S2) when the selector showed a text that is not an allowlist entry, for the caller to
+    apply like any other assertion (choice 18)."""
+
+    ok: bool
+    identity: ControlResult | None = None
+
+    @property
+    def live_identity(self) -> bool:
+        return self.identity is not None and self.identity.run_reason == "live_identity"
+
+
+def _assert_identity(rig: Rig, allowlist: Allowlist, clock: Clock) -> tuple[ControlResult, SelectorRead]:
+    """One A1 read with the two-read unreadable path (6.4): the verdict and the read it judged."""
+    reads = [rig.read_account_selector()]
+    try:
+        return judge_identity(reads, allowlist), reads[-1]
+    except ValueError:
+        clock.sleep(READ_GAP_S)
+        reads.append(rig.read_account_selector())
+        return judge_identity(reads, allowlist), reads[-1]
+
+
+def recovery_login(rig: Rig, allowlist: Allowlist, clock: Clock, fixture_account: str | None) -> RecoveryLogin:
     """A fresh scripted login with A1 and A2 (6.6 step 5): relaunch, LOGIN, an allowlisted selector, the fixture
-    account selected. True when the session is usable for the proof. The caller puts the hook in the recovery-only arm
+    account selected (A1 holds for the selected account too, 6.4). The caller puts the hook in the recovery-only arm
     first (choice 17): the login's typing goes through the gateway like any other input."""
     rig.launch()
     o = rig.login()
     if o.auth_error or o.challenge or o.session_kicked or o.live_selected or not o.vault_lease \
             or o.main_window_s is None or not o.post_login_anchor:
-        return False
-    reads = [rig.read_account_selector()]
-    try:
-        verdict = judge_identity(reads, allowlist)
-    except ValueError:
-        clock.sleep(READ_GAP_S)
-        reads.append(rig.read_account_selector())
-        verdict = judge_identity(reads, allowlist)
-    if not verdict.passed:
-        return False
-    if fixture_account is not None and reads[-1].text != fixture_account:
+        return RecoveryLogin(False)
+    verdict, read = _assert_identity(rig, allowlist, clock)
+    if verdict.passed and fixture_account is not None and read.text != fixture_account:
         rig.select_account(fixture_account)
-        after = rig.read_account_selector().text
-        return after == fixture_account and after in allowlist      # A1 holds for the selected account too (6.4)
-    return True
+        verdict, read = _assert_identity(rig, allowlist, clock)
+    if verdict.passed:
+        return RecoveryLogin(fixture_account is None or read.text == fixture_account)
+    return RecoveryLogin(False, verdict if verdict.run_status == "aborted_safety" else None)
 
 
 def cancel_new_working(rig: Rig, start: OrderBook | None, end: OrderBook, *, clock: Clock,
@@ -602,28 +630,32 @@ def execute_kill_switch(rig: Rig, decision: ControlResult, *, clock: Clock, allo
     steps.append(("kill_tree", clock.monotonic()))
     sends = tuple(declared_sends)
     end: OrderBook | None = None
+    so_far = run_so_far or decision.run
+    login = RecoveryLogin(False)
     if live_identity_blocked(decision, run_so_far):
         inputs = ProofInputs(start=start, end=None, session="blocked", declared_sends=sends)
     else:
         cancel = "not_needed"
         rig.set_hook_phase("recovery")
-        login_ok = recovery_login(rig, allowlist, clock, fixture_account)
+        login = recovery_login(rig, allowlist, clock, fixture_account)
         steps.append(("recovery_login", clock.monotonic()))
         found = None
-        if login_ok:
+        if login.ok:
             cancel, end, found = cancel_new_working(rig, start, rig.read_orders(), clock=clock, steps=steps)
-        inputs = ProofInputs(start=start, end=end, recovery_login_ok=login_ok, cancel_all=cancel, declared_sends=sends,
+        inputs = ProofInputs(start=start, end=end, recovery_login_ok=login.ok, cancel_all=cancel, declared_sends=sends,
                              found=found)
+        if login.identity is not None and login.live_identity:      # 6.4, SD-64: the login is now blocked for it
+            inputs = ProofInputs(start=start, end=None, session="blocked", declared_sends=sends)
+            so_far = login.identity.run
     proof = post_run_proof(inputs)
     steps.append(("proof", clock.monotonic()))
     rig.revert_snapshot()
     steps.append(("revert_snapshot", clock.monotonic()))
     rig.set_hook_phase("between_runs")
     shot = end.screenshot_sha256 if isinstance(end, MonitorBook) else None
-    return KillSwitchReport(decision, proof, proof_result(proof, run_so_far=run_so_far or decision.run,
-                                                          unproven_streak=unproven_streak,
+    return KillSwitchReport(decision, proof, proof_result(proof, run_so_far=so_far, unproven_streak=unproven_streak,
                                                           account=account_ref(allowlist, fixture_account),
-                                                          screenshot_sha256=shot), steps)
+                                                          screenshot_sha256=shot), steps, identity=login.identity)
 
 
 def teardown_proof(found: Proof, ks: KillSwitchReport) -> Proof:

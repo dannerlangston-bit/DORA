@@ -404,7 +404,7 @@ def drill_rows(result: DrillResult, chords: Sequence[Chord], *, checkpoint_id: s
     obs = result.observation
     if obs is None:
         raise ValueError("drill rows need the observation run_drill returns")
-    sent = result.result.run_status == "aborted_safety"
+    sent = result.result.run_reason == "drill_order_placed"
     pre = next((f for f in result.failed if f in PRECONDITIONS), None)
     rows = []
     for n in range(1, 6):

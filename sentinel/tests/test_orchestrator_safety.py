@@ -616,6 +616,64 @@ def test_an_order_found_at_teardown_stays_orders_sent_when_the_recovery_login_th
     assert (rep.verdict.status, rep.verdict.reason) == ("aborted_safety", "undeclared_order_row")
 
 
+LIVE = SelectorRead("12345678SCHW", crop_sha256="crop-live")
+
+
+def test_a_live_account_at_the_recovery_login_is_live_identity_s1_and_the_proof_session_unavailable():
+    """killswitch:3: the file-flag kill switch's recovery login reads a live-format id. The sequence reports the 6.4
+    result (aborted_safety live_identity, S1, the login blocked for live_identity, the selector crop) for the caller to
+    apply, reads nothing more through that session, and the proof is UNPROVEN session_unavailable (SD-64) with no
+    cancel-by-hand hand-over through it."""
+    clock = ManualClock()
+    rig = SimulatedRig(SimScenario(selector_reads=[LIVE]), clock=clock)
+    rep = _ks(rig, clock, rig.read_orders())
+    i = rep.identity
+    assert i is not None and (i.run_status, i.run_reason, i.incident) == ("aborted_safety", "live_identity", "S1")
+    assert i.has("block_login") and i.evidence["crop"] == "crop-live"
+    assert (rep.proof.verdict, rep.proof.reason) == (UNPROVEN, "session_unavailable")
+    assert rig.calls.count("read_orders") == 1                                           # the start read only
+    e = rep.proof_effect
+    assert e.evidence["blocked_reason"] == "live_identity" and "instruction" not in e.evidence
+    assert "login_owner" not in e.alert.paged
+
+
+def test_a_foreign_paper_id_at_the_recovery_login_is_paper_mode_mismatch_and_recovery_login_failed():
+    """killswitch:3: any other text that is not an allowlist entry is the S2 mismatch; the proof stays UNPROVEN
+    recovery_login_failed with the hand-over."""
+    clock = ManualClock()
+    rig = SimulatedRig(SimScenario(selector_reads=[SelectorRead("D-99999999")]), clock=clock)
+    rep = _ks(rig, clock, rig.read_orders())
+    assert (rep.identity.run_reason, rep.identity.incident) == ("paper_mode_mismatch", "S2")
+    assert not rep.identity.has("block_login")
+    assert (rep.proof.reason, rep.proof_effect.evidence["blocked_reason"]) == ("recovery_login_failed",) * 2
+    assert rep.proof_effect.evidence["instruction"] == CANCEL_BY_HAND
+    clean_rig = SimulatedRig(clock=clock)
+    assert _ks(clean_rig, clock, clean_rig.read_orders()).identity is None
+
+
+def test_the_orchestrator_applies_a_live_identity_its_kill_switch_recovery_login_saw():
+    """killswitch:3 through the Orchestrator: S1, the login blocked for live_identity on every result that blocks."""
+    from sentinel.orchestrator.machine import Orchestrator
+    from sentinel.orchestrator.simrig import MemorySink, default_context
+    from sentinel.store.safety import blocked_reason_for
+
+    clock = ManualClock()
+    rig = SimulatedRig(clock=clock)
+    flag, _ = rig.kill_channels()
+
+    def work(o):
+        rig.s.selector_reads.append(LIVE)                     # the next read is the recovery login's
+        flag.post(KillRequest("rig-01", "cli", "oncall", "stop", "t"))
+        assert o.step_boundary() is o.stop is not None
+
+    rep = Orchestrator(rig, default_context(), MemorySink(["c1"]), clock=clock).run(work)
+    assert (rep.verdict.status, rep.verdict.reason) == ("aborted_safety", "kill_switch")      # the first abort stands
+    live = [r for r in rep.results if r.run_reason == "live_identity"]
+    assert len(live) == 1 and live[0].incident == "S1"
+    assert {blocked_reason_for(r) for r in rep.results if r.has("block_login")} == {"live_identity"}
+    assert rep.proof.line == "UNPROVEN: session_unavailable"
+
+
 def test_the_proof_takes_orders_sent_from_a_clean_found_read_and_names_that_read():
     """killswitch:0: `found` only ever adds undeclared rows, and only from a clean read; its sha is the end read the
     proof compared when the last read was not clean."""

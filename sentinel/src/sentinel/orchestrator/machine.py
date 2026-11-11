@@ -682,13 +682,16 @@ class Orchestrator:
     def _kill_switch_sequence(self, decision: ControlResult, so_far: RunVerdict | None,
                               sends: tuple[DeclaredSend, ...]) -> KillSwitchReport:
         """The 6.6 sequence on the rig with the run's declared sends; its recovery login counts toward the 6.4 rate
-        caps, and the human requests pending on the kill channels are handled once it has run (killflag.py)."""
+        caps, a 6.4 mismatch that login saw is applied (killswitch choice 18), and the human requests pending on the
+        kill channels are handled once it has run (killflag.py)."""
         ctx = self.ctx
         ks = execute_kill_switch(self.rig, decision, clock=self.clock, allowlist=ctx.allowlist, start=self.start_book,
                                  fixture_account=ctx.fixture_account, declared_sends=sends, run_so_far=so_far,
                                  unproven_streak=ctx.history.unproven_streak)
         if any(name == "recovery_login" for name, _ in ks.steps):
             self.counters.login(self.clock.now())
+        if ks.identity is not None:
+            self.apply(ks.identity)
         killflag.acknowledge(self.kill_flag, self.kill_pipe)
         return ks
 
@@ -703,7 +706,7 @@ class Orchestrator:
             if kicked:
                 self.clock.sleep(SESSION_RELEASE_WAIT_S)
             self.counters.login(self.clock.now())
-            ok = recovery_login(rig, ctx.allowlist, self.clock, ctx.fixture_account)
+            ok = recovery_login(rig, ctx.allowlist, self.clock, ctx.fixture_account).ok
             if ok:
                 break
         end = rig.read_orders() if ok else None

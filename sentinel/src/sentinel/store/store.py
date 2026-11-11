@@ -94,18 +94,20 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from importlib import resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Sequence
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Sequence
 
+from ..canonical import canonical_json
 from ..records import (ACTION_VERDICT, DATA_MODES, PERSONAS, RUN_TYPES, CheckpointOutcome, Classification, Component,
-                       Decision, DiffSummary, Finding, RegionDiff, RunOutcome, Signature, StepOutcome, now,
-                       to_jsonable)
+                       Decision, DiffSummary, EgressRow, Escape, ExplorerFinding, Extraction, Finding, Fingerprint,
+                       MaintenanceItem, ModelUsage, OutboxJob, Proposal, RegionDiff, RunOutcome, Signature, StepEvent,
+                       StepOutcome, SyntheticOutcome, now, to_jsonable)
 from ..taxonomy import Taxonomy, TaxonomyError, checkpoint_parts, load
 from .artifacts import ArtifactStore, StoredArtifact, is_visual
 
 if TYPE_CHECKING:
     from ..canary import CanaryResult
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2              # 2: the foundation tables and columns of the 8.3 DDL
 DEFAULT_TOLERANCE = 8          # 4.14, 9.7: bits of 64
 TIER1_TOLERANCE = 6
 RELATED_LIMIT = 12             # 4.14: distances above the tolerance and up to 12 are shown, never inherited
@@ -135,6 +137,14 @@ NETWORK_FS = frozenset({"nfs", "nfs4", "cifs", "smb3", "smbfs", "afs", "ncpfs", 
 _PHASH_RE = re.compile(r"^[0-9a-f]{16}$")
 _DECISION_RE = re.compile(r"^dec-(\d+)$")
 _PLACEHOLDER = re.compile(r"\{\{([a-z_]+)(?::([^}]*))?\}\}")
+_IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
+# 8.3 system_state keys a store client may set; schema_version and schema_sha256 are the store's own
+SYSTEM_STATE_KEYS = frozenset({
+    "last_backup_at", "last_backup_error", "last_integrity_check_at", "last_restore_drill_at",
+    "last_artifact_audit_at", "kill_switch_state", "detector_state", "canaries_pending", "nightly_skipped_for",
+    "reviewer_disabled", "harness_freeze", "free_bytes_at_last_preflight"})
+OUTBOX_OPEN = ("queued", "failed")             # 9.1: states a job is retried from
+RUN_REFS = ("report_sha256", "comment_sha256", "coverage_matrix_ref", "egress_log_ref", "post_run_proof_ref")   # 4.13
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -207,15 +217,22 @@ class RunPlan:
     pr_ref: str | None = None
     pr_author: str | None = None
     started_at: str = field(default_factory=now)
+    base_commit_distance: int | None = None     # SD-02, L-BLD-04
+    authorization_sha256: str | None = None     # 6.12
+    diff_params_sha256: str | None = None
+    reviewer_version_sha256: str | None = None
+    requeue_of: str | None = None
+    pr_committers: tuple[str, ...] | None = None   # 9.6 two-person rule, from the PR host
 
 
 @dataclass(frozen=True)
 class PostRunProof:
     """One 8.3 `post_run_proofs` row: the ORDER SAFETY PROOF of one shard (6.6). `counts` is `counts_json`; it
-    names the undeclared rows an `orders_sent` verdict lists (`counts["undeclared"]`, 6.6)."""
-    shard_id: str
+    names the undeclared rows an `orders_sent` verdict lists (`counts["undeclared"]`, 6.6). `shard_id` None is the
+    run-level row of a run that started no session (SD-61), which may have no login."""
+    shard_id: str | None
     run_id: str
-    login_alias: str                       # the vault alias the store keys logins by (8.3); never printed
+    login_alias: str | None                # the vault alias the store keys logins by (8.3); never printed
     verdict: str
     send_policy_ref: str
     counts: dict
@@ -230,8 +247,13 @@ class PostRunProof:
     end_snapshot_sha256: str | None = None
     verified_by: str | None = None
     verified_at: str | None = None
+    unreadable_count: int = 0              # SD-61
+    refusals_count: int = 0
+    attestation_ref: str | None = None
 
     def __post_init__(self):
+        if self.shard_id is not None and not self.login_alias:
+            raise StoreRefused("a shard's proof names its login (8.3)")
         if self.verdict not in PROOF_VERDICTS:
             raise StoreRefused(f"post-run proof verdict {self.verdict!r}; one of {PROOF_VERDICTS} (8.3)")
         if self.cancel_all not in PROOF_CANCEL_ALL:
@@ -267,6 +289,13 @@ class Review:
     cost_usd: float | None = None
     batch_id: str | None = None
     created_at: str = field(default_factory=now)
+    response_model: str | None = None      # the 3.13 provenance columns
+    registry_version: str | None = None
+    request_ids_json: str | None = None
+    cache_read_tokens: int | None = None
+    votes_json: str | None = None
+    task: str | None = None                # manifest_match | describe_collateral | manifest_visibility
+    intent: str | None = None
 
 
 @dataclass(frozen=True)
@@ -432,12 +461,19 @@ def render_schema(t: Taxonomy) -> str:
 
 
 def seed_rows(t: Taxonomy) -> list[tuple[str, str, int, str | None, str]]:
-    """The outcome_reasons seed (outcome, reason, parametric, detail_means, owner_section) from taxonomy.yaml."""
+    """The outcome_reasons seed (outcome, reason, parametric, detail_means, owner_section) from taxonomy.yaml.
+
+    With a `reason_metadata` map in taxonomy.yaml (`{outcome: {code: {owner_section, detail_means}}}`, generated
+    from the 8.3 seed and 12.2), each row takes its owner section and detail meaning from it; a reason the map
+    lacks keeps the fallback of the module docstring."""
+    meta = t.data.get("reason_metadata") or {}
     rows: dict[tuple[str, str], tuple[str, str, int, str | None, str]] = {}
     for outcome, pats in t.data["reasons"].items():
         for p in pats:
             code, par, means, _ = _pattern(p)
-            rows.setdefault((outcome, code), (outcome, code, par, means, "4.13"))
+            m = (meta.get(outcome) or {}).get(code) or {}
+            rows.setdefault((outcome, code), (outcome, code, par, m.get("detail_means", means),
+                                              m.get("owner_section", "4.13")))
     for child, parent in t.data.get("reason_inheritance", {}).items():
         for (o, code), (_, _, par, means, _) in list(rows.items()):
             if o == parent:
@@ -879,11 +915,12 @@ class Store:
         rows.append({"op": "upsert" if upsert else "insert", "table": table, "row": values})
         return cur.lastrowid
 
-    def _update(self, rows: list[dict], table: str, key: dict, values: dict) -> None:
+    def _update(self, rows: list[dict], table: str, key: dict, values: dict) -> int:
         sets = ",".join(f"{c} = ?" for c in values)
         where = " AND ".join(f"{c} = ?" for c in key)
-        self._conn.execute(f"UPDATE {table} SET {sets} WHERE {where}", [*values.values(), *key.values()])
+        cur = self._conn.execute(f"UPDATE {table} SET {sets} WHERE {where}", [*values.values(), *key.values()])
         rows.append({"op": "update", "table": table, "key": key, "set": values})
+        return cur.rowcount
 
     def _one(self, sql: str, args: Sequence = ()) -> sqlite3.Row | None:
         return self._conn.execute(sql, args).fetchone()
@@ -1007,7 +1044,11 @@ class Store:
                 "snapshot_set_sha256": plan.snapshot_set_sha256, "harness_sha": plan.harness_sha,
                 "authorization_ref": plan.authorization_ref, "manifest_sha256": plan.manifest_sha256,
                 "pr_ref": plan.pr_ref, "pr_author": plan.pr_author, "budget_sec": plan.budget_sec,
-                "started_at": utc(plan.started_at), "scope_count": len(ids)})
+                "started_at": utc(plan.started_at), "scope_count": len(ids),
+                "base_commit_distance": plan.base_commit_distance, "authorization_sha256": plan.authorization_sha256,
+                "diff_params_sha256": plan.diff_params_sha256, "reviewer_version_sha256": plan.reviewer_version_sha256,
+                "requeue_of": plan.requeue_of,
+                "pr_committers_json": None if plan.pr_committers is None else json.dumps(list(plan.pr_committers))})
             for e in plan.scope:
                 self._upsert_checkpoint(rows, e, plan.config_commit)
                 self._insert(rows, "run_scope", {"run_id": plan.run_id, "checkpoint_id": e.checkpoint_id,
@@ -1127,11 +1168,20 @@ class Store:
             raise RunNotComplete(f"run {r.run_id} cannot be complete: " + "; ".join(blockers))
         counts = self.run_counts(r.run_id)
         ended = utc(r.ended_at) or now()
+        summary: dict[str, Any] = {"counts": counts, "last_gate": r.last_gate}
+        if r.summary is not None:
+            summary["summary"] = r.summary
+        refs = {k: getattr(r, k) for k in RUN_REFS if getattr(r, k) is not None}
+        if refs:
+            summary["refs"] = refs
+        change: dict[str, Any] = {"lifecycle": "finished", "outcome": r.status, "abort_reason": code,
+                                  "abort_detail": param, "finished_at": ended,
+                                  "summary_json": json.dumps(summary, sort_keys=True)}
+        for k in ("base_commit_distance", "authorization_sha256"):
+            if getattr(r, k) is not None:
+                change[k] = getattr(r, k)
         with self._batch("run_end") as rows:
-            self._update(rows, "runs", {"run_id": r.run_id}, {
-                "lifecycle": "finished", "outcome": r.status, "abort_reason": code, "abort_detail": param,
-                "finished_at": ended, "summary_json": json.dumps({"counts": counts, "last_gate": r.last_gate},
-                                                                 sort_keys=True)})
+            self._update(rows, "runs", {"run_id": r.run_id}, change)
         return self.run_outcome(r.run_id)
 
     def run_outcome(self, run_id: str) -> RunOutcome | None:
@@ -1144,7 +1194,10 @@ class Store:
                           last_gate=summary.get("last_gate", "reported"),
                           reason=self._join_reason(run["outcome"], run["abort_reason"], run["abort_detail"]),
                           counts=summary.get("counts", self.run_counts(run_id)),
-                          started_at=run["started_at"], ended_at=run["finished_at"])
+                          started_at=run["started_at"], ended_at=run["finished_at"],
+                          pair_id=None if run["pair_id"] is None else str(run["pair_id"]),
+                          summary=summary.get("summary"), base_commit_distance=run["base_commit_distance"],
+                          authorization_sha256=run["authorization_sha256"], **summary.get("refs", {}))
 
     # -- outcomes, steps, findings, artifacts ----------------------------------------------------------------
     def _outcome_row(self, o: CheckpointOutcome, shard_id: str | None) -> dict:
@@ -1170,7 +1223,11 @@ class Store:
             "largest_bbox": ",".join(map(str, largest.bbox)) if largest else None,
             "threshold_source": o.threshold_source, "recaptures": o.recaptures, "stability": o.stability,
             "stability_cause": o.stability_cause, "decision_id": did, "manifest_entry": o.manifest_entry_ref,
-            "primitive": o.primitive, "synthetic": int(o.synthetic), "recorded_at": utc(o.recorded_at)}
+            "primitive": o.primitive, "synthetic": int(o.synthetic), "recorded_at": utc(o.recorded_at),
+            "outcome_id": o.outcome_id, "profile_id": o.profile_id, "settle_ms": o.settle_ms,
+            "cand_rig_id": o.cand_rig_id, "base_rig_id": o.base_rig_id, "diff_pixels": o.diff_pixels,
+            "masked_pct": o.masked_pct, "data_epoch_id": o.data_epoch_id,
+            "paper_asserted_at": utc((o.paper_assertion or {}).get("asserted_at"))}
 
     def _step_row(self, s: StepOutcome, shard_id: str, side: str, checkpoint_id: str | None) -> dict:
         seq = self._one("SELECT COALESCE(MAX(seq), 0) + 1 FROM step_events WHERE shard_id = ?", (shard_id,))[0]
@@ -1190,7 +1247,11 @@ class Store:
                 "category": f.category, "description": f.description,
                 "evidence_json": json.dumps(f.evidence, sort_keys=True), "decision_id": decision_int(f.decision_ref),
                 "ticket_ref": f.ticket, "triage_state": f.triage_state, "synthetic": int(synthetic),
-                "first_seen_run_id": f.first_seen_run_id, "created_at": utc(f.created_at)}
+                "first_seen_run_id": f.first_seen_run_id, "created_at": utc(f.created_at),
+                "severity": f.severity, "side": f.side, "step_id": f.step_id, "detail": f.detail,
+                "pre_existing": int(f.pre_existing), "cluster_id": f.cluster_id, "contested": int(f.contested),
+                "held": int(f.held), "closed_at": utc(f.closed_at),
+                "explorer_json": None if f.explorer is None else _json(f.explorer)}
 
     def _put_finding(self, rows: list[dict], f: Finding, synthetic: bool) -> None:
         row = self._finding_row(f, synthetic)
@@ -1198,7 +1259,8 @@ class Store:
         if old is None:
             self._insert(rows, "findings", row)
             return
-        later = {"decision_id", "ticket_ref", "triage_state"}          # 4.14: decisions move these
+        later = {"decision_id", "ticket_ref", "triage_state",          # 4.14: decisions move these
+                 "closed_at", "contested", "held"}                       # 8.6, 9.7, 2.9: triage moves these
         if any(old[k] != v for k, v in row.items() if k not in later):
             raise ImportConflict(f"finding {f.finding_id} is already recorded with other content (8.2)")
 
@@ -1377,7 +1439,8 @@ class Store:
     # -- post-run proofs -------------------------------------------------------------------------------------
     _PROOF_COLUMNS = ("shard_id", "run_id", "login_alias", "verdict", "reason", "send_policy_ref", "cancel_all",
                       "paper_mode_assertions", "paper_mode_mismatches", "gateway_events", "gateway_drops",
-                      "start_snapshot_sha256", "end_snapshot_sha256", "produced_at", "verified_by", "verified_at")
+                      "start_snapshot_sha256", "end_snapshot_sha256", "produced_at", "verified_by", "verified_at",
+                      "unreadable_count", "refusals_count", "attestation_ref")
 
     def write_proof(self, proof: PostRunProof) -> None:
         """Write a shard's post-run proof (8.3 `post_run_proofs`, 6.6): one per shard, written once, before the run
@@ -1385,16 +1448,20 @@ class Store:
         no-op, a different row for the shard an ImportConflict (8.2)."""
         p = dataclasses.replace(proof)                  # re-validates
         self._running(p.run_id)
-        shard = self._one("SELECT run_id FROM shards WHERE shard_id = ?", (p.shard_id,))
-        if shard is None or shard["run_id"] != p.run_id:
-            raise StoreRefused(f"{p.shard_id} is not a shard of run {p.run_id} (8.3)")
+        if p.shard_id is not None:
+            shard = self._one("SELECT run_id FROM shards WHERE shard_id = ?", (p.shard_id,))
+            if shard is None or shard["run_id"] != p.run_id:
+                raise StoreRefused(f"{p.shard_id} is not a shard of run {p.run_id} (8.3)")
+            old = self._one("SELECT * FROM post_run_proofs WHERE shard_id = ?", (p.shard_id,))
+        else:
+            old = self._one("SELECT * FROM post_run_proofs WHERE run_id = ? AND shard_id IS NULL", (p.run_id,))
         values = {c: getattr(p, c) for c in self._PROOF_COLUMNS}
         values.update(counts_json=_json(p.counts), produced_at=utc(p.produced_at), verified_at=utc(p.verified_at))
-        old = self._one("SELECT * FROM post_run_proofs WHERE shard_id = ?", (p.shard_id,))
         if old is not None:
             if {k: old[k] for k in values} == values:
                 return
-            raise ImportConflict(f"{p.shard_id} already has a post-run proof; one per shard, written once (8.2)")
+            raise ImportConflict(f"{p.shard_id or p.run_id} already has a post-run proof; one per shard (or one "
+                                 "run-level row), written once (8.2)")
         with self._batch("post_run_proof") as rows:
             self._insert(rows, "post_run_proofs", values)
 
@@ -1452,7 +1519,10 @@ class Store:
                        phash=bytes(r["phash"]).hex() if r["phash"] is not None else None, category=r["category"],
                        evidence=json.loads(r["evidence_json"]), triage_state=r["triage_state"],
                        decision_ref=decision_ref(r["decision_id"]), ticket=r["ticket_ref"],
-                       created_at=r["created_at"])
+                       created_at=r["created_at"], severity=r["severity"], side=r["side"], step_id=r["step_id"],
+                       detail=r["detail"], pre_existing=bool(r["pre_existing"]), cluster_id=r["cluster_id"],
+                       contested=bool(r["contested"]), held=bool(r["held"]), closed_at=r["closed_at"],
+                       explorer=(ExplorerFinding(**json.loads(r["explorer_json"])) if r["explorer_json"] else None))
 
     def findings(self, run_id: str) -> list[Finding]:
         return [self._finding(r) for r in self._conn.execute(
@@ -1720,3 +1790,505 @@ class Store:
             artifacts.unlink(sha)
             deleted.append(sha)
         return SweepResult(tuple(deleted), tuple(kept))
+
+    # -- the public writer path (8.2): batches, inserts, updates and read queries for the store/* modules ------------
+    def _table_columns(self, table: str) -> frozenset[str]:
+        if not _IDENT.match(table):
+            raise StoreRefused(f"table name {table!r}")
+        cols = frozenset(r[1] for r in self._conn.execute(f"PRAGMA table_info({table})"))
+        if not cols:
+            raise StoreRefused(f"unknown table {table!r} (8.3)")
+        return cols
+
+    def _checked(self, table: str, *parts: Mapping[str, Any]) -> None:
+        cols = self._table_columns(table)
+        unknown = sorted(c for part in parts for c in part if c not in cols)
+        if unknown:
+            raise StoreRefused(f"{table} has no column {', '.join(unknown)} (8.3)")
+
+    @contextlib.contextmanager
+    def batch(self, kind: str) -> Iterator["WriteBatch"]:
+        """One writer batch (8.2): a `BEGIN IMMEDIATE` transaction whose rows reach results.jsonl before COMMIT.
+        Write through the yielded `WriteBatch`; an exception rolls everything back."""
+        with self._batch(kind) as rows:
+            yield WriteBatch(self, rows)
+
+    def insert(self, table: str, values: Mapping[str, Any], *, upsert: str | None = None) -> int:
+        """Insert one row in its own batch; returns its rowid. The schema's CHECKs and triggers apply."""
+        with self.batch(f"insert:{table}") as b:
+            return b.insert(table, values, upsert=upsert)
+
+    def update(self, table: str, key: Mapping[str, Any], values: Mapping[str, Any]) -> int:
+        """Update the rows matching `key` in its own batch; returns how many changed."""
+        with self.batch(f"update:{table}") as b:
+            return b.update(table, key, values)
+
+    def query(self, sql: str, args: Sequence[Any] | Mapping[str, Any] = ()) -> list[sqlite3.Row]:
+        """A read on the writer's connection with `query_only` set, so it can never write (8.2)."""
+        if self._conn is None:
+            raise StoreError("store is closed")
+        self._conn.execute("PRAGMA query_only = 1")
+        try:
+            return self._conn.execute(sql, args).fetchall()
+        except sqlite3.OperationalError as e:
+            raise StoreRefused(f"query refused: {e}") from e
+        finally:
+            self._conn.execute("PRAGMA query_only = 0")
+
+    def _write_once(self, rows: list[dict], table: str, key: Mapping[str, Any], values: dict) -> int | None:
+        """Insert a row with a natural key once: the same row again is a no-op (None), a different one an
+        ImportConflict (8.2). `values` must include the key columns."""
+        where = " AND ".join(f"{c} IS ?" for c in key)
+        old = self._one(f"SELECT * FROM {table} WHERE {where}", list(key.values()))
+        if old is not None:
+            if all(old[k] == v for k, v in values.items()):
+                return None
+            raise ImportConflict(f"{table} {dict(key)} is already recorded with other content (8.2)")
+        return self._insert(rows, table, values)
+
+    # -- system state (8.3, 8.6) -------------------------------------------------------------------------------------
+    def set_system_state(self, key: str, value: str, *, at: str | None = None) -> None:
+        """Set one documented `system_state` key; schema_version and schema_sha256 are the store's own."""
+        if key not in SYSTEM_STATE_KEYS:
+            raise StoreRefused(f"system_state key {key!r}; one of {sorted(SYSTEM_STATE_KEYS)} (8.3)")
+        if not isinstance(value, str):
+            raise StoreRefused("system_state values are text")
+        with self._batch("system_state") as rows:
+            self._insert(rows, "system_state", {"key": key, "value": value, "updated_at": utc(at) or now()},
+                         upsert="(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at")
+
+    def get_system_state(self, key: str) -> str | None:
+        r = self._one("SELECT value FROM system_state WHERE key = ?", (key,))
+        return None if r is None else r[0]
+
+    # -- step events (8.3, SD-16) ------------------------------------------------------------------------------------
+    @staticmethod
+    def _event_row(e: StepEvent) -> dict:
+        row = {f.name: getattr(e, f.name) for f in dataclasses.fields(e) if f.name != "usage"}
+        row.update(wall_at=utc(e.wall_at), drill=int(e.drill), injected=int(e.injected),
+                   usage_json=None if e.usage is None else canonical_json(e.usage))
+        return row
+
+    def write_events(self, events: Sequence[StepEvent]) -> None:
+        """Write `step_events` rows (8.3): inputs, popups, captures, gateway decisions, Watchdog events and
+        relaunches, with each event's own seq and mono_ms. Keyed (shard_id, seq): the same event again is a no-op,
+        a different one an ImportConflict. Refuses a shard not of the event's run and a finished run."""
+        evs = [_revalidate(e) for e in events]
+        for e in evs:
+            self._running(e.run_id)
+            shard = self._one("SELECT run_id FROM shards WHERE shard_id = ?", (e.shard_id,))
+            if shard is None or shard["run_id"] != e.run_id:
+                raise StoreRefused(f"{e.shard_id} is not a shard of run {e.run_id} (8.3)")
+        with self._batch("events") as rows:
+            for e in evs:
+                self._write_once(rows, "step_events", {"shard_id": e.shard_id, "seq": e.seq}, self._event_row(e))
+
+    def step_events(self, run_id: str) -> list[StepEvent]:
+        """The run's step events in shard and seq order (8.3)."""
+        names = {f.name for f in dataclasses.fields(StepEvent)}
+        out = []
+        for r in self._conn.execute("SELECT * FROM step_events WHERE run_id = ? ORDER BY shard_id, seq", (run_id,)):
+            d = {k: r[k] for k in r.keys() if k in names}
+            d.update(drill=bool(r["drill"]), injected=bool(r["injected"]),
+                     usage=json.loads(r["usage_json"]) if r["usage_json"] else None)
+            out.append(StepEvent(**d))
+        return out
+
+    # -- Oracle extractions (SD-09) ----------------------------------------------------------------------------------
+    _EXTRACTION_KEY = ("run_id", "checkpoint_id", "side", "assertion_id", "field", "source", "second_pass")
+
+    def write_extractions(self, extractions: Sequence[Extraction]) -> None:
+        """Store every Oracle extraction (2.8.1, 8.3 oracle_extractions); replays are no-ops, a different read for
+        the same key an ImportConflict."""
+        xs = [dataclasses.replace(x) for x in extractions]
+        for x in xs:
+            self._running(x.run_id)
+        with self._batch("extractions") as rows:
+            for x in xs:
+                row = {**dataclasses.asdict(x), "second_pass": int(x.second_pass), "read_at": utc(x.read_at)}
+                self._write_once(rows, "oracle_extractions", {k: row[k] for k in self._EXTRACTION_KEY}, row)
+
+    def extractions(self, run_id: str, checkpoint_id: str | None = None) -> list[Extraction]:
+        sql = "SELECT * FROM oracle_extractions WHERE run_id = ?" + (" AND checkpoint_id = ?" if checkpoint_id else "")
+        args = (run_id, checkpoint_id) if checkpoint_id else (run_id,)
+        names = {f.name for f in dataclasses.fields(Extraction)}
+        return [Extraction(**{**{k: r[k] for k in r.keys() if k in names}, "second_pass": bool(r["second_pass"])})
+                for r in self._conn.execute(sql + " ORDER BY extraction_id", args)]
+
+    # -- fingerprints (4.12, 7.4) ------------------------------------------------------------------------------------
+    def write_fingerprint(self, fp: Fingerprint) -> None:
+        """Write one side's fingerprint of a shard (8.3 env_fingerprints), once: the same fingerprint again is a
+        no-op, a different one an ImportConflict (8.2). The build and rig must be registered."""
+        f = dataclasses.replace(fp)                      # re-validates; fingerprint_id recomputes (L-FPR-01)
+        if f.shard_id is None:
+            raise StoreRefused("a stored fingerprint names its shard (8.3 env_fingerprints.shard_id)")
+        self._running(f.run_id)
+        probe = f.match.get("render_probe_hash")
+        row = {"run_id": f.run_id, "shard_id": f.shard_id, "side": f.side, "rig_id": f.rig_id, "build_id": f.build_id,
+               "fingerprint_sha256": f.fingerprint_id, "read_at": utc(f.read_at),
+               "fields_json": canonical_json({"schema_version": f.schema_version, "match": f.match,
+                                              "record": f.record}),
+               "render_probe_hash": phash_bytes(probe) if isinstance(probe, str) and _PHASH_RE.match(probe) else None}
+        with self._batch("fingerprint") as rows:
+            self._write_once(rows, "env_fingerprints", {"shard_id": f.shard_id, "side": f.side}, row)
+
+    def fingerprint(self, shard_id: str, side: str) -> Fingerprint | None:
+        r = self._one("SELECT * FROM env_fingerprints WHERE shard_id = ? AND side = ?", (shard_id, side))
+        if r is None:
+            return None
+        fields_ = json.loads(r["fields_json"])
+        return Fingerprint(run_id=r["run_id"], side=r["side"], rig_id=r["rig_id"], read_at=r["read_at"],
+                           match=fields_["match"], record=fields_["record"], shard_id=r["shard_id"],
+                           fingerprint_id=r["fingerprint_sha256"], schema_version=fields_["schema_version"])
+
+    # -- egress and the outbox (6.10, 9.1) ---------------------------------------------------------------------------
+    def log_egress(self, row: EgressRow) -> int:
+        """Write one `egress_log` row (6.10): every outbound request, sent, refused (with its refusal_reason) or
+        failed. Returns the egress id."""
+        e = dataclasses.replace(row)
+        with self._batch("egress") as rows:
+            return self._insert(rows, "egress_log", {**dataclasses.asdict(e), "sent_at": utc(e.sent_at)})
+
+    def enqueue(self, job: OutboxJob) -> int:
+        """Write an outbound post as a queued job before any send (9.1); returns its job id."""
+        j = dataclasses.replace(job)
+        if j.state != "queued" or j.attempts or j.job_id is not None:
+            raise StoreRefused("a new outbox job is queued, with no attempts and no id (9.1)")
+        values = {k: v for k, v in dataclasses.asdict(j).items() if k != "job_id"}
+        values.update(created_at=utc(j.created_at), next_attempt_at=utc(j.next_attempt_at))
+        with self._batch("outbox_enqueue") as rows:
+            return self._insert(rows, "outbox", values)
+
+    def outbox_job(self, job_id: int) -> OutboxJob | None:
+        r = self._one("SELECT * FROM outbox WHERE job_id = ?", (job_id,))
+        return None if r is None else OutboxJob(**{k: r[k] for k in r.keys()})
+
+    def due(self, at: str | None = None) -> list[OutboxJob]:
+        """Queued and failed jobs whose next attempt is due at `at` (default now), oldest first (9.1)."""
+        rows = self._conn.execute(
+            "SELECT * FROM outbox WHERE state IN ('queued','failed') AND (next_attempt_at IS NULL "
+            "OR next_attempt_at <= ?) ORDER BY created_at, job_id", (utc(at) or now(),))
+        return [OutboxJob(**{k: r[k] for k in r.keys()}) for r in rows]
+
+    def _open_job(self, job_id: int, states: tuple[str, ...]) -> sqlite3.Row:
+        r = self._one("SELECT * FROM outbox WHERE job_id = ?", (job_id,))
+        if r is None:
+            raise StoreRefused(f"unknown outbox job {job_id}")
+        if r["state"] not in states:
+            raise StoreRefused(f"outbox job {job_id} is {r['state']}; this change needs {' or '.join(states)} (9.1)")
+        return r
+
+    def mark_sent(self, job_id: int, *, at: str | None = None) -> None:
+        """A send succeeded: state sent with sent_at (8.3)."""
+        r = self._open_job(job_id, OUTBOX_OPEN)
+        with self._batch("outbox_sent") as rows:
+            self._update(rows, "outbox", {"job_id": job_id},
+                         {"state": "sent", "sent_at": utc(at) or now(), "attempts": r["attempts"] + 1})
+
+    def mark_failed(self, job_id: int, *, error: str, next_attempt_at: str) -> None:
+        """A send failed: state failed, the error and when to try again (the 9.1 schedule is the caller's)."""
+        r = self._open_job(job_id, OUTBOX_OPEN)
+        if not error:
+            raise StoreRefused("a failed attempt records its error (9.1)")
+        with self._batch("outbox_failed") as rows:
+            self._update(rows, "outbox", {"job_id": job_id},
+                         {"state": "failed", "last_error": error, "next_attempt_at": utc(next_attempt_at),
+                          "attempts": r["attempts"] + 1})
+
+    def abandon(self, job_id: int) -> None:
+        """24 hours of failure: the job is abandoned and listed until a human closes it (9.1)."""
+        self._open_job(job_id, OUTBOX_OPEN)
+        with self._batch("outbox_abandon") as rows:
+            self._update(rows, "outbox", {"job_id": job_id}, {"state": "abandoned", "next_attempt_at": None})
+
+    def close_job(self, job_id: int, *, by: str, at: str | None = None) -> None:
+        """A human closes an abandoned job (9.1)."""
+        self._open_job(job_id, ("abandoned",))
+        self._human(by, "closed_by")
+        if self._one("SELECT closed_by FROM outbox WHERE job_id = ?", (job_id,))[0] is not None:
+            raise StoreRefused(f"outbox job {job_id} is already closed")
+        with self._batch("outbox_close") as rows:
+            self._update(rows, "outbox", {"job_id": job_id}, {"closed_by": by, "closed_at": utc(at) or now()})
+
+    def fill_ticket_ref(self, decision_id: str, ticket: str) -> Decision:
+        """The outbox's late ticket for a confirm_bug written while Jira was unreachable: set once (L-DEC-02,
+        9.9). The finding that took the decision gets the ticket too."""
+        did = decision_int(decision_id)
+        if not ticket:
+            raise StoreRefused("a ticket reference is non-empty")
+        if self._one("SELECT 1 FROM decisions WHERE decision_id = ?", (did,)) is None:
+            raise StoreRefused(f"unknown decision {decision_id}")
+        with self._batch("decision_ticket") as rows:
+            self._update(rows, "decisions", {"decision_id": did}, {"ticket_ref": ticket})
+            for f in self._conn.execute("SELECT finding_id FROM findings WHERE decision_id = ? AND ticket_ref IS NULL",
+                                        (did,)).fetchall():
+                self._update(rows, "findings", {"finding_id": f[0]}, {"ticket_ref": ticket})
+        return self.get_decision(decision_id)
+
+    def set_mask_ref(self, decision_id: str, mask_id: str) -> Decision:
+        """A request_mask decision's mask file landed: mask_ref set once, which makes the decision act (4.14)."""
+        did = decision_int(decision_id)
+        if self._one("SELECT 1 FROM decisions WHERE decision_id = ?", (did,)) is None:
+            raise StoreRefused(f"unknown decision {decision_id}")
+        with self._batch("decision_mask") as rows:
+            self._update(rows, "decisions", {"decision_id": did}, {"mask_ref": mask_id})
+        return self.get_decision(decision_id)
+
+    # -- flake, calibration, evals, soak, coverage, usage (8.1, 8.3) ------------------------------------------------
+    def write_flake_event(self, run_id: str, checkpoint_id: str, *, captures: Sequence[str],
+                          metrics: Mapping[str, Any], region_id: str | None = None,
+                          created_at: str | None = None) -> int:
+        """One `flake_events` row per unstable targeted re-run (3.10 step 5)."""
+        if len(captures) < 2:
+            raise StoreRefused("a flake event compares at least two captures (3.10)")
+        with self._batch("flake_event") as rows:
+            return self._insert(rows, "flake_events", {
+                "run_id": run_id, "checkpoint_id": checkpoint_id, "region_id": region_id,
+                "captures_json": json.dumps(list(captures)), "metrics_json": canonical_json(dict(metrics)),
+                "created_at": utc(created_at) or now()})
+
+    def replace_flake_stats(self, rows_in: Iterable[Mapping[str, Any]]) -> None:
+        """Replace the rolling 30-day `flake_stats` row of each checkpoint given (10.5); the CHECK refuses a
+        quarantined row without its commit, owner and ticket."""
+        stats = [dict(r) for r in rows_in]
+        with self._batch("flake_stats") as rows:
+            for r in stats:
+                r.setdefault("updated_at", now())
+                r["updated_at"] = utc(r["updated_at"])
+                self._checked("flake_stats", r)
+                sets = ", ".join(f"{c} = excluded.{c}" for c in r if c != "checkpoint_id")
+                self._insert(rows, "flake_stats", r, upsert=f"(checkpoint_id) DO UPDATE SET {sets}")
+
+    def write_calibration(self, floors: Sequence[Mapping[str, Any]],
+                          fixes: Sequence[Mapping[str, Any]] = ()) -> list[int]:
+        """Write calibration floors and fix-list items (3.9, SD-19, SD-20). A floor supersedes the current floor of
+        its (checkpoint, region, rendering key), so `ux_floor_current` holds; a fix item without `floor_id` that
+        names a region links to the floor written here for its checkpoint and region. Returns the floor ids."""
+        with self._batch("calibration") as rows:
+            ids, by_region = [], {}
+            for f in floors:
+                f = dict(f)
+                f["valid_from"] = utc(f.get("valid_from")) or now()
+                self._checked("calibration_floors", f)
+                self._conn.execute(
+                    "UPDATE calibration_floors SET superseded_at = ? WHERE checkpoint_id = ? AND region_id = ? "
+                    "AND rendering_key_sha256 = ? AND superseded_at IS NULL",
+                    (f["valid_from"], f["checkpoint_id"], f["region_id"], f["rendering_key_sha256"]))
+                rows.append({"op": "supersede", "table": "calibration_floors",
+                             "key": {k: f[k] for k in ("checkpoint_id", "region_id", "rendering_key_sha256")}})
+                fid = self._insert(rows, "calibration_floors", f)
+                ids.append(fid)
+                by_region[(f["checkpoint_id"], f["region_id"])] = fid
+            for x in fixes:
+                x = dict(x)
+                x["opened_at"] = utc(x.get("opened_at")) or now()
+                if x.get("floor_id") is None and x.get("region_id") is not None:
+                    x["floor_id"] = by_region.get((x["checkpoint_id"], x["region_id"]))
+                self._checked("calibration_fixes", x)
+                self._insert(rows, "calibration_fixes", x)
+        return ids
+
+    def write_reviewer_eval(self, *, eval_set_version: str, model_id: str, prompt_hash: str, items: int,
+                            metrics: Mapping[str, Any], passed_gate: bool, run_at: str | None = None) -> int:
+        """One `reviewer_evals` row per evaluation of a model and prompt version (3.14, 10.4)."""
+        with self._batch("reviewer_eval") as rows:
+            return self._insert(rows, "reviewer_evals", {
+                "eval_set_version": eval_set_version, "model_id": model_id, "prompt_hash": prompt_hash,
+                "items": items, "metrics_json": canonical_json(dict(metrics)), "passed_gate": int(passed_gate),
+                "run_at": utc(run_at) or now()})
+
+    def write_soak_samples(self, run_id: str, samples: Iterable[Mapping[str, Any]]) -> None:
+        """`soak_samples` rows, one per process, metric and 60 s sample (10.11); replays are no-ops."""
+        with self._batch("soak") as rows:
+            for smp in samples:
+                row = {"run_id": run_id, "sampled_at": utc(smp["sampled_at"]), "pid": smp["pid"],
+                       "metric": smp["metric"], "value": smp["value"]}
+                self._write_once(rows, "soak_samples", {k: row[k] for k in ("run_id", "sampled_at", "pid", "metric")},
+                                 row)
+
+    def write_coverage_cells(self, cells: Iterable[Mapping[str, Any]]) -> None:
+        """The 2.12 coverage cells of a merge, RC or Nightly run (the 8.3 trigger refuses a PR run's); rows as
+        `coverage.CoverageMatrix.to_rows` gives them, optionally with profile_id. Replays are no-ops."""
+        with self._batch("coverage") as rows:
+            for c in cells:
+                row = dict(c)
+                self._checked("coverage_cells", row)
+                key = {k: row[k] for k in ("run_id", "surface_id", "persona", "entitlement")}
+                self._write_once(rows, "coverage_cells", key, row)
+
+    def write_model_usage(self, usage: ModelUsage) -> int:
+        """The usage block of one model response, per component (11.4)."""
+        u = dataclasses.replace(usage)
+        with self._batch("model_usage") as rows:
+            return self._insert(rows, "model_usage", {**dataclasses.asdict(u), "at": utc(u.at)})
+
+    # -- canaries (10.3, SD-91) --------------------------------------------------------------------------------------
+    def write_synthetic_outcome(self, o: SyntheticOutcome) -> int | None:
+        """What one canary mutant produced on one checkpoint (SD-91), keyed (run, mutant, checkpoint): the same row
+        again is a no-op (None), a different one an ImportConflict. Returns the synthetic id when written."""
+        so = dataclasses.replace(o)
+        self._running(so.run_id)
+        code, param = self._split_reason(so.outcome, so.reason)
+        detail = so.detail if param is None else (param if so.detail is None else f"{param}\n{so.detail}")
+        row = {"run_id": so.run_id, "mutant_id": so.mutant_id, "checkpoint_id": so.checkpoint_id,
+               "outcome": so.outcome, "reason": code, "reason_detail": detail, "gate": so.gate,
+               "mutant_sha256": so.mutant_sha256, "recorded_at": utc(so.recorded_at)}
+        with self._batch("synthetic_outcome") as rows:
+            sid = self._write_once(rows, "synthetic_outcomes",
+                                   {k: row[k] for k in ("run_id", "mutant_id", "checkpoint_id")}, row)
+        self.link_synthetic_refs(so.run_id)
+        return sid
+
+    def link_synthetic_refs(self, run_id: str) -> int:
+        """Point every mutant `canary_results` row of the run at its synthetic outcome (SD-91); returns how many."""
+        with self._batch("synthetic_link") as rows:
+            cur = self._conn.execute(
+                "UPDATE canary_results SET synthetic_ref = (SELECT s.synthetic_id FROM synthetic_outcomes s "
+                "WHERE s.run_id = canary_results.run_id AND s.mutant_id = canary_results.mutant_id "
+                "AND s.checkpoint_id = canary_results.checkpoint_id) WHERE run_id = ? AND kind = 'mutant' "
+                "AND synthetic_ref IS NULL AND EXISTS (SELECT 1 FROM synthetic_outcomes s "
+                "WHERE s.run_id = canary_results.run_id AND s.mutant_id = canary_results.mutant_id "
+                "AND s.checkpoint_id = canary_results.checkpoint_id)", (run_id,))
+            if cur.rowcount:
+                rows.append({"op": "link", "table": "canary_results", "key": {"run_id": run_id}})
+            return cur.rowcount
+
+    def write_canary_manifest(self, run_id: str, *, catalog_sha256: str, manifest: Any,
+                              created_at: str | None = None) -> None:
+        """The generated catalog of a run for the 10.3 determinism check, once per run (8.2)."""
+        row = {"run_id": run_id, "catalog_sha256": catalog_sha256, "manifest_json": canonical_json(manifest)}
+        old = self._one("SELECT catalog_sha256, manifest_json FROM canary_manifests WHERE run_id = ?", (run_id,))
+        if old is not None:
+            if (old[0], old[1]) == (catalog_sha256, row["manifest_json"]):
+                return
+            raise ImportConflict(f"run {run_id} already has a canary manifest (8.2)")
+        with self._batch("canary_manifest") as rows:
+            self._insert(rows, "canary_manifests", {**row, "created_at": utc(created_at) or now()})
+
+    # -- triage records (9.6, 9.11, 9.12, 10.9, 11.5) ---------------------------------------------------------------
+    def _finding_int(self, finding_id: str) -> int:
+        r = self._one("SELECT finding_id FROM findings WHERE natural_key = ?", (finding_id,))
+        if r is None:
+            raise StoreRefused(f"unknown finding {finding_id}")
+        return r[0]
+
+    def write_escape(self, e: Escape) -> int:
+        """One G+1 escape row (10.9, 9.11)."""
+        x = dataclasses.replace(e)
+        values = {"release": x.release, "ticket_ref": x.ticket, "escape_class": x.escape_class,
+                  "checkpoint_id": x.checkpoint_id, "surface_id": x.surface_id, "tier": x.tier,
+                  "entered_by": x.entered_by, "entered_at": utc(x.entered_at)}
+        with self._batch("escape") as rows:
+            return self._insert(rows, "escapes", values)
+
+    def write_proposal(self, p: Proposal) -> int:
+        """A two-person-rule proposal on a finding (9.6), written in state proposed; returns its id."""
+        x = dataclasses.replace(p)
+        if x.state != "proposed" or x.proposal_id is not None:
+            raise StoreRefused("a new proposal is written proposed, without an id (9.6)")
+        values = {"finding_id": self._finding_int(x.finding_id), "run_id": x.run_id, "action": x.action,
+                  "proposed_by": x.proposed_by, "proposed_at": utc(x.proposed_at), "ticket_ref": x.ticket,
+                  "reason": x.reason, "state": "proposed"}
+        with self._batch("proposal") as rows:
+            return self._insert(rows, "proposals", values)
+
+    def proposal(self, proposal_id: int) -> Proposal | None:
+        r = self._one("SELECT p.*, f.natural_key FROM proposals p JOIN findings f USING (finding_id) "
+                      "WHERE p.proposal_id = ?", (proposal_id,))
+        if r is None:
+            return None
+        return Proposal(finding_id=r["natural_key"], run_id=r["run_id"], action=r["action"],
+                        proposed_by=r["proposed_by"], reason=r["reason"], proposed_at=r["proposed_at"],
+                        ticket=r["ticket_ref"], state=r["state"], decided_by=r["decided_by"],
+                        decided_at=r["decided_at"], decline_reason=r["decline_reason"],
+                        decision_ref=decision_ref(r["decision_id"]), proposal_id=r["proposal_id"])
+
+    def update_proposal(self, proposal_id: int, *, state: str, decided_by: str, decided_at: str | None = None,
+                        decline_reason: str | None = None, decision_id: str | None = None) -> Proposal:
+        """Confirm (naming the decision written for it) or decline (with the reason) an open proposal (9.6)."""
+        old = self.proposal(proposal_id)
+        if old is None:
+            raise StoreRefused(f"unknown proposal {proposal_id}")
+        if old.state != "proposed":
+            raise StoreRefused(f"proposal {proposal_id} is already {old.state} (9.6)")
+        new = dataclasses.replace(old, state=state, decided_by=decided_by, decided_at=utc(decided_at) or now(),
+                                  decline_reason=decline_reason, decision_ref=decision_id)
+        with self._batch("proposal_update") as rows:
+            self._update(rows, "proposals", {"proposal_id": proposal_id},
+                         {"state": new.state, "decided_by": new.decided_by, "decided_at": new.decided_at,
+                          "decline_reason": new.decline_reason, "decision_id": decision_int(new.decision_ref)})
+        return self.proposal(proposal_id)
+
+    def write_maintenance_item(self, m: MaintenanceItem) -> int:
+        """One flow-maintenance item (11.5); returns its id."""
+        x = dataclasses.replace(m)
+        values = {k: v for k, v in dataclasses.asdict(x).items() if k != "item_id"}
+        values.update(opened_at=utc(x.opened_at), closed_at=utc(x.closed_at))
+        with self._batch("maintenance_item") as rows:
+            return self._insert(rows, "maintenance_items", values)
+
+    def write_triage_assignment(self, finding_id: str, *, assignee: str, assigned_by: str,
+                                sla_due_at: str | None = None, escalation_step: int = 0,
+                                at: str | None = None) -> int:
+        """Assign a finding (9.12): the current assignment, if any, is released in the same batch."""
+        fid = self._finding_int(finding_id)
+        when = utc(at) or now()
+        with self._batch("triage_assignment") as rows:
+            self._conn.execute("UPDATE triage_assignments SET released_at = ? WHERE finding_id = ? "
+                               "AND released_at IS NULL", (when, fid))
+            rows.append({"op": "release", "table": "triage_assignments", "key": {"finding_id": fid}})
+            return self._insert(rows, "triage_assignments", {
+                "finding_id": fid, "assignee": assignee, "assigned_by": assigned_by, "assigned_at": when,
+                "escalation_step": escalation_step, "sla_due_at": utc(sla_due_at)})
+
+    # -- artifact sets (SD-82) and the fleet (11.2) ------------------------------------------------------------------
+    def write_artifact_set(self, sha256: str, set_path: str, *, created_at: str | None = None) -> None:
+        """Record a copy of an indexed object in a set (SD-82); a copy already recorded is a no-op."""
+        if self._one("SELECT 1 FROM artifacts WHERE sha256 = ?", (sha256,)) is None:
+            raise StoreRefused(f"artifact {sha256} is not indexed (8.3)")
+        if self._one("SELECT 1 FROM artifact_sets WHERE sha256 = ? AND set_path = ?", (sha256, set_path)):
+            return
+        with self._batch("artifact_set") as rows:
+            self._insert(rows, "artifact_sets", {"sha256": sha256, "set_path": set_path,
+                                                 "created_at": utc(created_at) or now()})
+
+    def reassign_login(self, from_rig: str, to_rig: str, *, operator: str, snapshot_id: str,
+                       at: str | None = None) -> None:
+        """Swap a spare in for a failed rig (11.2): the old rig is deactivated and the spare, re-snapshotted with
+        the old rig's login (`snapshot_id`), takes its login and role; both rows record the operator and time."""
+        self._human(operator, "operator")
+        old = self._one("SELECT * FROM rigs WHERE rig_id = ?", (from_rig,))
+        spare = self._one("SELECT * FROM rigs WHERE rig_id = ?", (to_rig,))
+        if old is None or spare is None:
+            raise StoreRefused(f"unknown rig {from_rig if old is None else to_rig}")
+        if not old["active"]:
+            raise StoreRefused(f"{from_rig} is not active; its login is not on it (11.2)")
+        if not snapshot_id or snapshot_id == spare["snapshot_id"]:
+            raise StoreRefused("the spare is re-snapshotted with the moved login first (11.2): a new snapshot id")
+        when = utc(at) or now()
+        with self._batch("reassign_login") as rows:
+            self._update(rows, "rigs", {"rig_id": from_rig},
+                         {"active": 0, "reassigned_by": operator, "reassigned_at": when})
+            self._update(rows, "rigs", {"rig_id": to_rig},
+                         {"login_alias": old["login_alias"], "role": old["role"], "snapshot_id": snapshot_id,
+                          "active": 1, "reassigned_by": operator, "reassigned_at": when})
+
+
+class WriteBatch:
+    """The writer handle of one `Store.batch` (8.2): every insert and update is journaled with the batch."""
+
+    def __init__(self, store: Store, rows: list[dict]):
+        self._store = store
+        self.rows = rows
+
+    def insert(self, table: str, values: Mapping[str, Any], *, upsert: str | None = None) -> int:
+        """Insert one row; returns its rowid."""
+        self._store._checked(table, values)
+        return self._store._insert(self.rows, table, dict(values), upsert=upsert)
+
+    def update(self, table: str, key: Mapping[str, Any], values: Mapping[str, Any]) -> int:
+        """Update the rows matching `key`; returns how many changed."""
+        if not key or not values:
+            raise StoreRefused("an update names its key and its values")
+        self._store._checked(table, key, values)
+        return self._store._update(self.rows, table, dict(key), dict(values))

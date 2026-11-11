@@ -7,11 +7,36 @@ import pytest
 
 from sentinel import canary
 from sentinel.canary import CanaryResult
-from sentinel.records import (CheckpointOutcome, Decision, EgressRow, Escape, ExplorerFinding, Extraction, Finding,
-                              Fingerprint, MaintenanceItem, ModelUsage, OutboxJob, Proposal, RunOutcome, Signature,
-                              StepEvent, SyntheticOutcome, outcome_id)
-from sentinel.store.store import (ImportConflict, PostRunProof, Review, RunPlan, ScopeEntry, ShardPlan, Store,
-                                  StoreRefused, seed_rows)
+from sentinel.records import (
+    CheckpointOutcome,
+    Decision,
+    EgressRow,
+    Escape,
+    ExplorerFinding,
+    Extraction,
+    Finding,
+    Fingerprint,
+    MaintenanceItem,
+    ModelUsage,
+    OutboxJob,
+    Proposal,
+    RunOutcome,
+    Signature,
+    StepEvent,
+    SyntheticOutcome,
+    outcome_id,
+)
+from sentinel.store.store import (
+    ImportConflict,
+    PostRunProof,
+    Review,
+    RunPlan,
+    ScopeEntry,
+    ShardPlan,
+    Store,
+    StoreRefused,
+    seed_rows,
+)
 from sentinel.taxonomy import Taxonomy, TaxonomyError, load
 
 RUN = "run-01"
@@ -47,8 +72,8 @@ def out(cid, outcome="identical", **kw):
 
 
 def ev(**kw):
-    base = dict(run_id=RUN, shard_id=SHARD, side="candidate", seq=1, source="orchestrator", wall_at=TS, mono_ms=4242,
-                mode="scripted", action="click")
+    base = {"run_id": RUN, "shard_id": SHARD, "side": "candidate", "seq": 1, "source": "orchestrator", "wall_at": TS, "mono_ms": 4242,
+                "mode": "scripted", "action": "click"}
     return StepEvent(**{**base, **kw})
 
 
@@ -455,9 +480,9 @@ def test_run_complete_trigger_holds_the_1_10_conditions(store):
 
 
 def proof(**kw):
-    base = dict(shard_id=None, run_id=RUN, login_alias=None, verdict="proven_no_session", send_policy_ref="dec-1",
-                counts={}, cancel_all="not_needed", paper_mode_assertions=0, paper_mode_mismatches=0,
-                gateway_events=0, gateway_drops=0, produced_at=TS)
+    base = {"shard_id": None, "run_id": RUN, "login_alias": None, "verdict": "proven_no_session", "send_policy_ref": "dec-1",
+                "counts": {}, "cancel_all": "not_needed", "paper_mode_assertions": 0, "paper_mode_mismatches": 0,
+                "gateway_events": 0, "gateway_drops": 0, "produced_at": TS}
     return PostRunProof(**{**base, **kw})
 
 

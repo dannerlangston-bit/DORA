@@ -1824,7 +1824,7 @@ class Store:
             raise StoreRefused(f"{table} has no column {', '.join(unknown)} (8.3)")
 
     @contextlib.contextmanager
-    def batch(self, kind: str) -> Iterator["WriteBatch"]:
+    def batch(self, kind: str) -> Iterator[WriteBatch]:
         """One writer batch (8.2): a `BEGIN IMMEDIATE` transaction whose rows reach results.jsonl before COMMIT.
         Write through the yielded `WriteBatch`; an exception rolls everything back."""
         with self._batch(kind) as rows:
@@ -1905,7 +1905,7 @@ class Store:
         names = {f.name for f in dataclasses.fields(StepEvent)}
         out = []
         for r in self._conn.execute("SELECT * FROM step_events WHERE run_id = ? ORDER BY shard_id, seq", (run_id,)):
-            d = {k: r[k] for k in r.keys() if k in names}
+            d = {k: v for k, v in dict(r).items() if k in names}
             d.update(drill=bool(r["drill"]), injected=bool(r["injected"]),
                      usage=json.loads(r["usage_json"]) if r["usage_json"] else None)
             out.append(StepEvent(**d))
@@ -1929,7 +1929,7 @@ class Store:
         sql = "SELECT * FROM oracle_extractions WHERE run_id = ?" + (" AND checkpoint_id = ?" if checkpoint_id else "")
         args = (run_id, checkpoint_id) if checkpoint_id else (run_id,)
         names = {f.name for f in dataclasses.fields(Extraction)}
-        return [Extraction(**{**{k: r[k] for k in r.keys() if k in names}, "second_pass": bool(r["second_pass"])})
+        return [Extraction(**{**{k: v for k, v in dict(r).items() if k in names}, "second_pass": bool(r["second_pass"])})
                 for r in self._conn.execute(sql + " ORDER BY extraction_id", args)]
 
     # -- fingerprints (4.12, 7.4) ------------------------------------------------------------------------------------
@@ -1978,14 +1978,14 @@ class Store:
 
     def outbox_job(self, job_id: int) -> OutboxJob | None:
         r = self._one("SELECT * FROM outbox WHERE job_id = ?", (job_id,))
-        return None if r is None else OutboxJob(**{k: r[k] for k in r.keys()})
+        return None if r is None else OutboxJob(**dict(r))
 
     def due(self, at: str | None = None) -> list[OutboxJob]:
         """Queued and failed jobs whose next attempt is due at `at` (default now), oldest first (9.1)."""
         rows = self._conn.execute(
             "SELECT * FROM outbox WHERE state IN ('queued','failed') AND (next_attempt_at IS NULL "
             "OR next_attempt_at <= ?) ORDER BY created_at, job_id", (utc(at) or now(),))
-        return [OutboxJob(**{k: r[k] for k in r.keys()}) for r in rows]
+        return [OutboxJob(**dict(r)) for r in rows]
 
     def _open_job(self, job_id: int, states: tuple[str, ...]) -> sqlite3.Row:
         r = self._one("SELECT * FROM outbox WHERE job_id = ?", (job_id,))
@@ -2020,9 +2020,9 @@ class Store:
 
     def close_job(self, job_id: int, *, by: str, at: str | None = None) -> None:
         """A human closes an abandoned job (9.1)."""
-        self._open_job(job_id, ("abandoned",))
+        r = self._open_job(job_id, ("abandoned",))
         self._human(by, "closed_by")
-        if self._one("SELECT closed_by FROM outbox WHERE job_id = ?", (job_id,))[0] is not None:
+        if r["closed_by"] is not None:
             raise StoreRefused(f"outbox job {job_id} is already closed")
         with self._batch("outbox_close") as rows:
             self._update(rows, "outbox", {"job_id": job_id}, {"closed_by": by, "closed_at": utc(at) or now()})
@@ -2040,7 +2040,7 @@ class Store:
             for f in self._conn.execute("SELECT finding_id FROM findings WHERE decision_id = ? AND ticket_ref IS NULL",
                                         (did,)).fetchall():
                 self._update(rows, "findings", {"finding_id": f[0]}, {"ticket_ref": ticket})
-        return self.get_decision(decision_id)
+        return self._stored_decision(decision_id)
 
     def set_mask_ref(self, decision_id: str, mask_id: str) -> Decision:
         """A request_mask decision's mask file landed: mask_ref set once, which makes the decision act (4.14)."""
@@ -2049,7 +2049,13 @@ class Store:
             raise StoreRefused(f"unknown decision {decision_id}")
         with self._batch("decision_mask") as rows:
             self._update(rows, "decisions", {"decision_id": did}, {"mask_ref": mask_id})
-        return self.get_decision(decision_id)
+        return self._stored_decision(decision_id)
+
+    def _stored_decision(self, decision_id: str) -> Decision:
+        d = self.get_decision(decision_id)
+        if d is None:
+            raise StoreRefused(f"unknown decision {decision_id}")
+        return d
 
     # -- flake, calibration, evals, soak, coverage, usage (8.1, 8.3) ------------------------------------------------
     def write_flake_event(self, run_id: str, checkpoint_id: str, *, captures: Sequence[str],
@@ -2234,7 +2240,7 @@ class Store:
             self._update(rows, "proposals", {"proposal_id": proposal_id},
                          {"state": new.state, "decided_by": new.decided_by, "decided_at": new.decided_at,
                           "decline_reason": new.decline_reason, "decision_id": decision_int(new.decision_ref)})
-        return self.proposal(proposal_id)
+        return new
 
     def write_maintenance_item(self, m: MaintenanceItem) -> int:
         """One flow-maintenance item (11.5); returns its id."""

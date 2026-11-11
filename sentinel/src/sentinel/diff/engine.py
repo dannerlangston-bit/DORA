@@ -83,7 +83,7 @@ import numpy as np
 from skimage.color import deltaE_ciede2000, rgb2lab
 from skimage.metrics import structural_similarity
 
-from ..canonical import fingerprint_id as fingerprint_id   # 4.12, 7.4: the one definition, re-exported
+from ..canonical import fingerprint_id  # noqa: F401  (4.12, 7.4: the one definition, re-exported)
 from ..records import Component, DiffSummary, Finding, RegionDiff
 from ..taxonomy import load as load_taxonomy
 from . import load_params

@@ -47,7 +47,7 @@ def statements(sql: str, *, keep_comments: bool = False, spans: bool = False) ->
         if c == ";" and start is not None:
             body = sql[start:i + 1]
             flat = strip_comments(body)
-            if re.match(r"\s*CREATE\s+TRIGGER", flat, re.I) and not re.search(r"\bEND\s*;\s*$", flat, re.I):
+            if re.match(r"\s*CREATE\s+TRIGGER", flat, re.IGNORECASE) and not re.search(r"\bEND\s*;\s*$", flat, re.IGNORECASE):
                 i += 1
                 continue
             end = i + 1
@@ -94,7 +94,7 @@ def key_of(stmt: str) -> str | None:
 def spec_sql() -> list[str]:
     text = SPEC.read_text(encoding="utf-8")
     section = text[text.index("### 8.3 Schema"):text.index("### 8.4")]
-    return re.findall(r"```sql\n(.*?)```", section, re.S)
+    return re.findall(r"```sql\n(.*?)```", section, re.DOTALL)
 
 
 def creates(blocks: list[str]) -> dict[str, str]:

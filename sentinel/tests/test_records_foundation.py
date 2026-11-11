@@ -6,10 +6,32 @@ import pytest
 
 from sentinel import records as R
 from sentinel.canonical import fingerprint_id
-from sentinel.records import (CaptureMeta, CheckpointOutcome, Decision, DeclaredSend, EgressRow, Escape,
-                              ExplorerFinding, Extraction, Finding, Fingerprint, Incident, MaintenanceItem, ModelUsage,
-                              OutboxJob, PreflightAttempt, Proposal, RunOutcome, SafetyQuarantine, Signature,
-                              StepEvent, StepOutcome, SyntheticOutcome, from_dict, outcome_id)
+from sentinel.records import (
+    CaptureMeta,
+    CheckpointOutcome,
+    Decision,
+    DeclaredSend,
+    EgressRow,
+    Escape,
+    ExplorerFinding,
+    Extraction,
+    Finding,
+    Fingerprint,
+    Incident,
+    MaintenanceItem,
+    ModelUsage,
+    OutboxJob,
+    PreflightAttempt,
+    Proposal,
+    RunOutcome,
+    SafetyQuarantine,
+    Signature,
+    StepEvent,
+    StepOutcome,
+    SyntheticOutcome,
+    from_dict,
+    outcome_id,
+)
 from sentinel.taxonomy import Taxonomy, TaxonomyError, load
 
 CID = "sweep/trade.active-trader.ladder/flexgrid/640x720"
@@ -19,14 +41,14 @@ STAMP = {"account_id_sha256": "sha256:51f20a0a", "mode": "paper", "asserted_at":
 
 
 def co(**kw):
-    base = dict(run_id=RUN, checkpoint_id=CID, outcome="identical", workspace_id="ws.tier-c.sweep-harness",
-                persona="active_trader", data_mode="masked_live")
+    base = {"run_id": RUN, "checkpoint_id": CID, "outcome": "identical", "workspace_id": "ws.tier-c.sweep-harness",
+                "persona": "active_trader", "data_mode": "masked_live"}
     return CheckpointOutcome(**{**base, **kw})
 
 
 def ev(**kw):
-    base = dict(run_id=RUN, shard_id=f"{RUN}/1", side="candidate", seq=1, source="orchestrator", wall_at=TS,
-                mono_ms=1234567, mode="scripted", action="click")
+    base = {"run_id": RUN, "shard_id": f"{RUN}/1", "side": "candidate", "seq": 1, "source": "orchestrator", "wall_at": TS,
+                "mono_ms": 1234567, "mode": "scripted", "action": "click"}
     return StepEvent(**{**base, **kw})
 
 
@@ -134,15 +156,15 @@ def test_run_outcome_refs_and_distance():
 
 
 def explorer(**kw):
-    base = dict(session_id="xs-1", signature={"surface_id": "trade.all-products", "observation": "INV-03",
+    base = {"session_id": "xs-1", "signature": {"surface_id": "trade.all-products", "observation": "INV-03",
                                               "crop_sha256": "sha256:cc"},
-                severity="high", confidence=0.8, trace_ref="sha256:tt", replayed="reproduced",
-                candidate_flow="flow.quarantine.fnd-1")
+                "severity": "high", "confidence": 0.8, "trace_ref": "sha256:tt", "replayed": "reproduced",
+                "candidate_flow": "flow.quarantine.fnd-1"}
     return ExplorerFinding(**{**base, **kw})
 
 
 def finding(**kw):
-    base = dict(finding_id="fnd-1", run_id=RUN, kind="explorer_candidate", description="x", first_seen_run_id=RUN)
+    base = {"finding_id": "fnd-1", "run_id": RUN, "kind": "explorer_candidate", "description": "x", "first_seen_run_id": RUN}
     return Finding(**{**base, **kw})
 
 

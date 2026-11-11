@@ -75,7 +75,7 @@ class AccessNode:
     name: str
     rect: Rect | None
     states: frozenset[str] = frozenset()
-    children: tuple["AccessNode", ...] = ()
+    children: tuple[AccessNode, ...] = ()
     opaque: bool = False                         # a custom-painted container exposing no children (2.6)
 
 

@@ -20,8 +20,8 @@ Choices where the spec is ambiguous or silent:
   4.13 keys, when present, must have their 4.13 shapes.
 - `Decision.hamming_tolerance` None means unset (4.14's default 8 applies); a value is one a human asked for, which
   L-DEC-03 bounds (at most 8 here; 6 on tier 1 is checked where the tier is known).
-- `Decision.role` is the 9.12 role the decider acted in (system owner, triage rotation, flow owner, PR author) or
-  the Jira resolver of a `jira_sync` row (L-DEC-01).
+- `Decision.role` is the 4.14 role the decider acted in (triage rotation, flow owner, system owner, release manager,
+  PR author) or the ticket resolver of a `jira_sync` row (9.12, L-DEC-01); 4.14 is authoritative for the list.
 """
 from __future__ import annotations
 
@@ -51,7 +51,8 @@ STEP_EVENT_SOURCES = ("orchestrator", "gateway_hook", "watchdog")
 GATE_DECISIONS = ("emitted", "dropped", "refused", "late_up", "none")
 GATE_CLASSES = ("allowed", "safety", "integrity", "none")
 REDACTED = re.compile(r"^<redacted:[^<>\s]+>$")          # 6.2, 8.3: '<redacted:login.password>'
-DECIDER_ROLES = ("system_owner", "triage_rotation", "flow_owner", "pr_author", "jira_resolver")   # 9.12, L-DEC-01
+DECIDER_ROLES = ("triage_rotation", "flow_owner", "system_owner", "release_manager", "pr_author",
+                 "ticket_resolver")                                             # 4.14 role, 9.12, L-DEC-01
 # 4.13 finding.explorer (2.9)
 EXPLORER_SEVERITIES = ("low", "medium", "high")
 EXPLORER_REPLAYED = ("not_replayed", "reproduced", "not_reproduced", "lint_failed")

@@ -265,7 +265,8 @@ def test_a_steps_gateway_event_is_stored_in_the_gate_columns_and_read_back(tmp_p
         assert [tuple(r) for r in rows] == [("s07+enter", "refused", "guarded_key_refused", "safety"),
                                             ("s06", "dropped", "token_expired", "integrity"),
                                             ("s05", "emitted", None, "allowed"), ("s04", "none", None, None)]
-        assert s.step_outcomes(RUN) == [refused, dropped, emitted, plain]
+        placed = dict(side="candidate", shard_id=f"{RUN}/1", mode="scripted")   # stored under its shard and side
+        assert s.step_outcomes(RUN) == [dataclasses.replace(x, **placed) for x in (refused, dropped, emitted, plain)]
         assert s.gateway_drops(RUN) == 2                          # 9.11: dropped or refused rows
         for bad in ({"decision": "refused"},                                       # a refusal names its code
                     {"decision": "refused", "reason": "blocked", "class": "safety"},   # a coarse class, not a code
@@ -308,7 +309,8 @@ def test_steps_and_findings_need_a_shard_and_round_trip(tmp_path):
         with pytest.raises(StoreRefused, match="shard"):
             s.write_checkpoint(out(FLOW, "collateral"), steps=[step])
         s.write_checkpoint(out(FLOW, "collateral"), steps=[step], findings=[f], shard_id=f"{RUN}/1")
-        assert s.step_outcomes(RUN) == [step] and s.findings(RUN) == [f]
+        stored = dataclasses.replace(step, side="candidate", shard_id=f"{RUN}/1", mode="agent")
+        assert s.step_outcomes(RUN) == [stored] and s.findings(RUN) == [f]
         finish_all(s)
         with pytest.raises(RunNotComplete, match="not imported"):
             s.end_run(RunOutcome(RUN, "pr", "complete", "reported"))
@@ -425,7 +427,7 @@ def test_end_of_review_without_verdict(store):
 
 def record(store, did, action, verdict, phash=ph(), cid=SWEEP, category="collateral", by="alice", **kw):
     ticket = kw.pop("ticket", "TOS-1" if action in ("confirm_bug", "mark_intended", "fixed_in_build") else None)
-    tol = kw.pop("hamming_tolerance", 8)
+    tol = kw.pop("hamming_tolerance", None)                 # unset: the 4.14 default for the tier
     d = Decision(did, action, verdict, Signature(cid, "rgn.ladder.bid-column", phash, category), decided_by=by,
                  ticket=ticket, reason="because", hamming_tolerance=tol,
                  decided_at=kw.pop("decided_at", "2026-11-09T15:05:32-05:00"))
@@ -481,6 +483,11 @@ def test_decision_defaults_and_tier1_tolerance(store):
     row = store.conn.execute("SELECT expires_at FROM decisions WHERE decision_id = 7").fetchone()
     assert row[0] == "2026-12-09T20:05:32+00:00"
     assert record(store, "dec-000008", "noise_signature", "noise", cid=CENSUS).hamming_tolerance == 6
+    with pytest.raises(StoreRefused, match="L-DEC-03"):     # an explicit 8 on tier 1 is refused, not clamped
+        record(store, "dec-000010", "noise_signature", "noise", cid=CENSUS, hamming_tolerance=8,
+               phash=ph(range(40)))
+    assert record(store, "dec-000011", "noise_signature", "noise", cid=CENSUS, hamming_tolerance=6,
+                  phash=ph(range(50))).hamming_tolerance == 6
     store.conn.execute("INSERT INTO regions (checkpoint_id, region_id, config_commit, kind, landmark_id, dx, dy, w, h, "
                        "hamming_tolerance) VALUES (?, 'rgn.ladder.bid-column', 'c0ffee', 'diff', 'lm', 0, 0, 9, 9, 3)",
                        (SWEEP,))

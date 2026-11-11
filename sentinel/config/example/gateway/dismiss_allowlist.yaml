@@ -1,0 +1,7 @@
+# The dismiss allowlist of 6.2 (4.16): the only labels the gateway may click while an order dialog is in front.
+# Empty until Phase 0 reads the Order Confirmation dialog on the pinned build (6.13 item 10): with an empty list no
+# dialog click is tokened and the gateway refuses Confirm and Send, so ticket flows stop before the dialog. Once read,
+# list Delete (and Edit only if phase0/branches.yaml records it as observed for safety item 10) with read_on_build,
+# read_by and read_at; labels without that record are ignored (L-XREF-18).
+schema_version: 1
+labels: []

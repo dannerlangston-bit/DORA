@@ -1,0 +1,13 @@
+# The pinned build's default order-action chords (4.16, 5.4.7): loaded at settings_attested beside the Hot Keys rows
+# A6 reads, blocked by the hook while the ticket flag is set, and injected one by one by fire drill item 3 (6.5).
+# Example values standing in for the Phase 0 read of the pinned build's default hotkey table; a file that still holds
+# placeholders says verified: false, which L-XREF-17 warns about from Phase 1. A missing file fails the run closed at
+# settings_attested.
+schema_version: 1
+build: main-1998.2.0-4f1c9a2
+verified: true
+read_by: system-owner
+read_at: "2026-10-05T14:00:00Z"
+chords:
+  - {chord: Shift+B, action: buy}
+  - {chord: Shift+S, action: sell}

@@ -303,6 +303,10 @@ class _Unit:
                 self.outcomes[c] = rest
 
     def record(self, r: StepResult, *, teardown: bool = False) -> None:
+        """Keep a step's result, tagged with the app's age when it carries none (10.2)."""
+        if r.app_uptime_s is None and r.app_restart_count is None:
+            up, restarts = self.ctx.tags()
+            r = replace(r, app_uptime_s=up, app_restart_count=restarts)
         (self.teardown if teardown else self.steps).append(r)
         self.events.extend(r.events)
         self.findings.extend(r.findings)
@@ -447,10 +451,9 @@ def _guarded(u: _Unit, step: Mapping[str, Any], work: Callable[[], StepResult], 
         assert value is not None
         return value
     stops = mapped.run is not None
-    up, restarts = u.ctx.tags()
     return StepResult(step_id=sid, status="failed", consequences=(_run_level(mapped),),
                       led_to=None if stops else mapped.checkpoint, rest=None if stops else step_failed(sid),
-                      app_uptime_s=up, app_restart_count=restarts, detail=mapped.detail)
+                      detail=mapped.detail)
 
 
 def _step(u: _Unit, step: Mapping[str, Any], index: int, *, teardown: bool = False) -> StepResult:
@@ -517,16 +520,15 @@ def _wait_for(u: _Unit, step: Mapping[str, Any]) -> StepResult:
     status = "passed" if poll.satisfied else "failed"
     ev = ctx.event("wait", sid, step_outcome=status, duration_ms=ms,
                    reason=None if poll.satisfied else (poll.failing or "timeout"))
-    up, restarts = ctx.tags()
     if poll.satisfied:
         if ctx.heartbeat is not None:
             ctx.heartbeat.screen_settled()
         return StepResult(step_id=sid, status=status, events=(ev,), consequences=tuple(consequences),
-                          duration_ms=ms, app_uptime_s=up, app_restart_count=restarts)
+                          duration_ms=ms)
     reason = (poll.failing or "anchor_missing") if poll.frame else "timeout"
     return StepResult(step_id=sid, status=status, events=(ev,), consequences=tuple(consequences),
                       led_to=Outcome("not_settled", reason), rest=step_failed(sid), duration_ms=ms,
-                      app_uptime_s=up, app_restart_count=restarts, detail=f"wait_for timed out: {reason}")
+                      detail=f"wait_for timed out: {reason}")
 
 
 def _assert(u: _Unit, step: Mapping[str, Any], index: int, *, teardown: bool) -> StepResult:
@@ -589,10 +591,8 @@ def _checkpoint(u: _Unit, step: Mapping[str, Any], cid: str, *, rescued: bool) -
             if hb is not None:
                 hb.screen_settled(cap.sha256)
         ev = ctx.event("capture", sid, checkpoint_id=cid, post_hash=cap.sha256, step_outcome="passed")
-        up, restarts = ctx.tags()
         return StepResult(step_id=sid, status="passed", events=(ev,), post_screenshot=cap.sha256,
-                          duration_ms=int((ctx.clock.monotonic() - started) * 1000), app_uptime_s=up,
-                          app_restart_count=restarts)
+                          duration_ms=int((ctx.clock.monotonic() - started) * 1000))
 
     r = _guarded(u, step, work, site="capture", checkpoint_id=cid)
     u.heartbeat(lambda: hb.step_end())                                             # type: ignore[union-attr]

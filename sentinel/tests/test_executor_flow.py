@@ -10,7 +10,7 @@ from sentinel.executor.emitter import ExecContext, Rescue
 from sentinel.executor.failures import FailureLedger, FaultInjector
 from sentinel.executor.flow import (CENSUS_CHECKS, AssertVerdict, Captured, CheckRead, Unit, UnitHooks, WaitPoll,
                                     WorkspaceStreak, census_unit, run_unit)
-from sentinel.executor.heartbeat import HeartbeatPolicy
+from sentinel.executor.heartbeat import AppLife, HeartbeatPolicy
 from sentinel.orchestrator.boundary import FlowTimer, flow_budget_cut
 from sentinel.orchestrator.budgets import ShardBudgets
 from sentinel.orchestrator.clock import ManualClock
@@ -407,3 +407,19 @@ def test_a_flag_left_up_keeps_the_order_stage_declaration():
     ports.flag_value = Flag.SET
     run(ports, loc, plan, ctx)
     assert ctx.order_stage is True
+
+
+def test_rows_after_a_relaunch_carry_the_restart_count_and_a_reset_uptime():
+    clock = ManualClock()
+    life = AppLife()
+    life.launched(clock.monotonic(), pid=6120)
+    ports, loc, plan, ctx = setup(clock, life=life)
+    clock.advance(600)
+    first = run(ports, loc, plan, ctx).step_outcomes("pr-1-1")
+    assert {(x.app_restart_count, x.app_uptime_s >= 600) for x in first} == {(0, True)}
+    life.relaunched(clock.monotonic(), pid=6200)                    # the app-crash relaunch (10.2)
+    clock.advance(5)
+    after = run(ports, loc, plan, ctx)
+    assert {x.app_restart_count for x in after.step_outcomes("pr-1-1")} == {1}
+    assert max(x.app_uptime_s for x in after.step_outcomes("pr-1-1")) < 60
+    assert all(e.app_restart_count == 1 for e in after.events)

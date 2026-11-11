@@ -37,18 +37,19 @@ Enforced here and, where SQL can say it, again by the schema:
 - every write batch is one `BEGIN IMMEDIATE` transaction, appended to `results.jsonl` before it commits (8.2).
 
 Choices where the spec is ambiguous or silent (reported to the coordinator):
-- Additions to the 8.3 DDL, at the end of schema.sql: `run_scope` (the scoped checkpoint ids with the persona
-  of the visit; 8.3 keeps only `runs.scope_count`, which cannot say which checkpoint is missing),
-  `outcome_records` (the 4.13 record as written, so the store returns persona, classification and diff regions,
-  which 8.3 has no column for), and triggers for F65 (an env_error names a gate from taxonomy.yaml), for "nothing
-  else is ever rewritten" (every outcome column the 8.3 triggers leave open, and deletion), for decision_ref
-  set once, review_id only with the review transition, complete-needs-every-scoped-id, and complete-needs-no
-  fingerprint mismatch, UNPROVEN or ORDERS SENT proof or worse shard (trg_run_complete_env).
-- outcome_reasons seed: taxonomy.yaml has no owner_section or detail_means, so rows carry owner_section '4.13'
-  (the reason vocabulary table the file is generated from; '1.10' for rows inherited through
-  `reason_inheritance`, as 8.3's INSERT ... SELECT writes) and detail_means is the parameter placeholder
-  (`<step>`). A reason is parametric when its taxonomy pattern has a placeholder. So `fingerprint_mismatch`,
-  parametric in 8.3's hand-written seed but plain in taxonomy.yaml, is not parametric here.
+- schema.sql rendered equals the 8.3 DDL blocks (tests/test_schema_mirror.py), including what once were store
+  additions: `run_scope` (the scoped checkpoint ids with the persona of the visit; `runs.scope_count` cannot say
+  which checkpoint is missing), `outcome_records` (the 4.13 record as written, so the store returns persona,
+  classification and diff regions, which have no column), and triggers for F65 (an env_error names a gate from
+  taxonomy.yaml), for "nothing else is ever rewritten" (every outcome column the other triggers leave open, and
+  deletion), for decision_ref set once, review_id only with the review transition, complete-needs-every-scoped-id
+  and complete-needs-no ORDERS SENT proof or worse shard (trg_run_complete_env; SD-80 put the fingerprint mismatch
+  and UNPROVEN conditions into trg_run_complete itself), and the SD-78 non-empty fingerprint_mismatch detail.
+- outcome_reasons seed: owner_section and detail_means come from taxonomy.yaml `reason_metadata` when it lists the
+  reason; otherwise owner_section is '4.13' (the reason vocabulary table the file is generated from; '1.10' for
+  rows inherited through `reason_inheritance`, as 8.3's INSERT ... SELECT writes) and detail_means the parameter
+  placeholder (`<step>`). A reason is parametric when its taxonomy pattern has a placeholder; `fingerprint_mismatch`
+  is plain (SD-78).
 - At service start the seed is synced (8.3: "seeded ... at service start"): new reasons are added, reasons no
   longer in the file are retired (active = 0), never deleted. A taxonomy change that alters a generated CHECK
   (any list) is refused at open: that needs a migration, and none exists yet.
@@ -76,7 +77,23 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   8.3 names, the undeclared and declared row keys, since an ORDERS SENT verdict lists every undeclared row (6.6)
   and no other column can hold them.
 - A finished run is not re-ended with a different outcome (the 10.7 re-evaluation of a returning rig belongs
-  to the import, which is not this module).
+  to the import, which is not this module). A RunOutcome's summary and 4.13 artifact refs go into `summary_json`
+  (8.3 has no column for them); `base_commit_distance` and `authorization_sha256` have their `runs` columns.
+- The foundation helpers are thin: no business rule beyond the 8.3 constraints and the record validation. Rows
+  with a natural key (step events by shard and seq, extractions, fingerprints by shard and side, soak samples,
+  coverage cells, synthetic outcomes, canary manifests) are written once: a replay is a no-op, a different row an
+  ImportConflict (8.2). Step events from `write_events` carry their own seq; a shard writes its events either
+  there or through `write_steps`, whose seq is the next free one.
+- `post_run_proofs` may hold one run-level row (shard NULL) for a run that started no session (SD-61); the
+  clearance (`verified_by`, `verified_at`) is set once, on an unproven verdict only (trigger).
+- `calibration_floors` are keyed by the rendering key (SD-69): `write_calibration` supersedes the current floor of
+  the same checkpoint, region and key in the batch that writes the new one.
+- The outbox job's human close is `close_job` (`close` is the store's own lifecycle). A confirm_bug written without
+  a ticket gets it once through `fill_ticket_ref`; a request_mask decision its mask once through `set_mask_ref`
+  (both also guarded by triggers).
+- `reassign_login` (11.2) deactivates the failed rig and gives the spare, re-snapshotted under a new snapshot id,
+  that rig's login and role; one active rig per login is a partial unique index, and the rig role and login kind
+  must agree (explorer with explorer, pool and nightly with scripted; 11.3).
 - Timestamps are normalised to UTC ISO 8601 seconds on write (8.3).
 """
 from __future__ import annotations

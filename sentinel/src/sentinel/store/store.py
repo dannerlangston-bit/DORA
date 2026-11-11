@@ -1009,11 +1009,12 @@ def apply_inheritance(outcome: CheckpointOutcome, lookup: DecisionLookup) -> Che
 # record <-> row
 
 def _component(c: dict) -> Component:
-    """A stored diff component; one with a region-relative box comes back as the engine's `RegionComponent`."""
+    """A stored diff component; one with a region-relative box comes back as the engine's `RegionComponent`, one
+    without (absent or null `bbox_region`: a plain `records.Component`) as itself."""
     c = {**c, "bbox": tuple(c["bbox"])}
-    if "bbox_region" not in c:
+    if c.get("bbox_region") is None:
         return Component(**c)
-    from ..diff.engine import RegionComponent      # records.Component has no bbox_region field (engine choice 16)
+    from ..diff.engine import RegionComponent      # the engine's region-relative component (engine choice 16)
     return RegionComponent(**{**c, "bbox_region": tuple(c["bbox_region"])})
 
 

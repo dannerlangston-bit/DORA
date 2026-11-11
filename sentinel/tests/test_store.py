@@ -8,7 +8,8 @@ import sys
 
 import pytest
 
-from sentinel.records import CheckpointOutcome, Decision, DiffSummary, Finding, RunOutcome, Signature, StepOutcome
+from sentinel.records import (CheckpointOutcome, Component, Decision, DiffSummary, Finding, RunOutcome, Signature,
+                              StepOutcome)
 from sentinel.store import (ImportConflict, Review, RunNotComplete, RunPlan, ScopeEntry, ShardPlan, Store, StoreError,
                             StoreRefused, StoreWriteFailed, WriterLockError, apply_inheritance, connect_reader, hamming,
                             render_schema, seed_rows)
@@ -236,6 +237,17 @@ def test_outcome_mutation_refused(store):
         with pytest.raises(sqlite3.IntegrityError):
             store.conn.execute(sql, key)
     assert store.get_outcome(*key).outcome == "collateral"
+
+
+def test_a_component_without_a_region_box_reads_back(store):
+    # records.Component's bbox_region is null when the engine gave no region-relative box; Store.outcomes() reads
+    # such a stored component back as a plain Component instead of crashing on tuple(None)
+    comp = Component(area=40, bbox=(10, 20, 8, 5), region_id="rgn.ladder.bid-column")
+    o = out(CENSUS, "collateral", diff=DiffSummary(whole_pixel_fraction=0.02, whole_ssim=0.97, components=[comp]))
+    store.write_checkpoint(o)
+    (back,) = store.outcomes(RUN)
+    assert back.diff.components == [comp] and back.diff.components[0].bbox_region is None
+    assert store.get_outcome(RUN, CENSUS) == o
 
 
 def test_round_trip_of_records(store):

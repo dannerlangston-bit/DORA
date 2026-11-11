@@ -107,13 +107,13 @@ from .gates import (AccountExpectation, WorkspaceExpectation, check_authenticate
                     check_launched, check_provisioned, check_teardown, check_workspace, decide_run_outcome)
 from .identity import (READ_GAP_S, TIMER_S, Allowlist, assertion_due, deferral_unreadable, judge_fixture_account,
                        judge_identity, paper_stamp, readable as selector_readable, stamp_current)
-from .killswitch import (ORDERS_SENT, KillSwitchReport, Proof, ProofInputs, account_ref, cancel_new_working,
-                         execute_kill_switch, kill_switch, post_run_proof, proof_result, recovery_login,
-                         teardown_incident, teardown_proof)
+from .killswitch import (ORDERS_SENT, KillSwitchReport, Proof, ProofInputs, RecoveryLogin, account_ref,
+                         cancel_new_working, execute_kill_switch, kill_switch, post_run_proof, proof_result,
+                         recovery_login, teardown_incident, teardown_proof)
 from .alerts import AlertRoute
 from .orderbook import MonitorBook
 from .ports import SessionSafety
-from .results import ControlResult, OutcomeSink, RunVerdict, write_unreached
+from .results import ControlResult, OutcomeSink, RunVerdict, worse, write_unreached
 from .rig import ConfirmationCheck, OrderBook, Rig, SelectorRead
 from .watchdog import (Heartbeat, HeartbeatUnwritable, HeartbeatWriter, disk_check, heartbeat_failed,
                        proactive_relaunch_due, watchdog_check)
@@ -646,7 +646,8 @@ class Orchestrator:
             self.apply(proof_result(proof, run_so_far=so_far, unproven_streak=streak))
         elif self.session == "kicked" or (stop is not None and stop.has("kill_tree")):
             proof, end = self._recovery_proof(kicked=self.session == "kicked", sends=sends)
-            self.apply(proof_result(proof, run_so_far=so_far, unproven_streak=streak, account=account,
+            # the run so far includes a 6.4 mismatch the proof's login applied (the login blocked for it, SD-64)
+            self.apply(proof_result(proof, run_so_far=self._run_so_far(), unproven_streak=streak, account=account,
                                     screenshot_sha256=_screenshot(end)))
         else:
             self.state = last_gate = "teardown"
@@ -679,6 +680,13 @@ class Orchestrator:
         report.last_gate = stop.gate if stop is not None and stop.gate else last_gate
         return report
 
+    def _run_so_far(self) -> RunVerdict | None:
+        """The most severe run outcome recorded so far (results.worse: the first wins a tie)."""
+        out: RunVerdict | None = None
+        for r in self.results:
+            out = worse(out, r.run)
+        return out
+
     def _kill_switch_sequence(self, decision: ControlResult, so_far: RunVerdict | None,
                               sends: tuple[DeclaredSend, ...]) -> KillSwitchReport:
         """The 6.6 sequence on the rig with the run's declared sends; its recovery login counts toward the 6.4 rate
@@ -697,18 +705,27 @@ class Orchestrator:
 
     def _recovery_proof(self, *, kicked: bool, sends: tuple[DeclaredSend, ...]) -> tuple[Proof, OrderBook | None]:
         """6.6 step 5 (and the kicked-session rule): in the hook's recovery-only arm, a fresh scripted login with A1
-        and A2, then the proof; returns it with the last Monitor read."""
+        and A2, then the proof; returns it with the last Monitor read. A 6.4 mismatch that login reads is applied like
+        any assertion and ends the attempts (killswitch choice 18); after `live_identity` the proof is UNPROVEN
+        `session_unavailable` and nothing more is read (SD-64)."""
         rig, ctx = self.rig, self.ctx
         rig.set_hook_phase("recovery")
         attempts = 2 if kicked else 1
-        ok = False
+        login = RecoveryLogin(False)
         for _ in range(attempts):
             if kicked:
                 self.clock.sleep(SESSION_RELEASE_WAIT_S)
             self.counters.login(self.clock.now())
-            ok = recovery_login(rig, ctx.allowlist, self.clock, ctx.fixture_account).ok
-            if ok:
+            login = recovery_login(rig, ctx.allowlist, self.clock, ctx.fixture_account)
+            if login.identity is not None:
+                self._contain(self.apply(login.identity))
                 break
+            if login.ok:
+                break
+        if login.live_identity:
+            return post_run_proof(ProofInputs(start=self.start_book, end=None, session="blocked",
+                                              declared_sends=sends)), None
+        ok = login.ok
         end = rig.read_orders() if ok else None
         cancel, found = "not_needed", None
         if end is not None:

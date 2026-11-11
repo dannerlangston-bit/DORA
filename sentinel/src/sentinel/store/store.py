@@ -134,6 +134,41 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   that rig's login and role; one active rig per login is a partial unique index, and the rig role and login kind
   must agree (explorer with explorer, pool and nightly with scripted; 11.3).
 - Timestamps are normalised to UTC ISO 8601 seconds on write (8.3).
+
+The decision lifecycle (4.14, 8.3, 9.6, 9.7, 9.9; `store.lifecycle` and `store.mirror` hold the jobs that run
+over it). Choices where the spec is ambiguous (reported):
+- fixed_in_build (SD-79) is a new row that supersedes the active confirm_bug on the same signature (checkpoint,
+  region and category equal, pHash within the confirm_bug's tolerance), or a reopened fixed_in_build for a later
+  fix; without a finding it takes the superseded row's finding, which moves to fixed_pending_verify. "On or after
+  that build" compares `builds.first_seen_at` (the L-DEC-08 order): the lookup lists a fixed_in_build match whose
+  fix build is on or before the run's candidate build in `fixed_returned`, outside `applicable`, so the returning
+  signature keeps its computed outcome and goes to Unexpected; the status change, the finding and the ticket move
+  in `lifecycle.verify_fixes`, after the run (the lookup also runs on read-only snapshots). A candidate build the
+  store cannot order (unknown, or no build given and no build pair on the run) is treated as before the fix: the
+  row stays a known bug, since the outcome is unchanged either way and nothing can be asserted.
+- Status `reopened`, `reopen_count`, a ticket-not-found `expires_at` (shortened, never extended) and a status move
+  to `expired` are the in-place changes 4.14 and 9.9 name ("sets status: reopened", "sets the decision to expire in
+  one business day"); every other change is a superseding row or a revoke.
+- The 9.7 freeze counts contest supersessions only: a fixed_in_build row (the confirm_bug lifecycle) and a
+  re-confirmation written by `lifecycle.reconfirm` (same action, verdict and signature, reason `RECONFIRM_PREFIX`
+  plus the old reason) are not counted, so a noise signature re-confirmed every 30 days never freezes itself.
+- L-DEC-01, L-DEC-06 and the roster: the store enforces the roster once `roster` is given (`Roster.from_oncall`
+  over ops/oncall.yaml, SD-74); without one only service identities are refused, as before. A decider is in the
+  triage roster or a triage rotation, a tier's flow owner or deputy, or the system owner or release manager (or
+  deputy), the roles 9.6 lets decide; besides them the PR author (`runs.pr_author` or a PR committer) may
+  confirm_bug and mark_intended on tier 3, and `source: jira_sync` may write fixed_in_build (the resolver). L-DEC-06
+  also refuses a committer, not only `pr_author`; a confirmed proposal has `confirmed_by` = `decided_by`, a
+  different human from `proposed_by`, and with a roster a triage member or the tier's flow owner. L-DEC-05's
+  author of the change is the run's PR author and committers plus `change_authors`, the authors of the merged
+  change the caller names (the merge run's manifest `author`), since a merge run carries no PR author.
+- Revoke reopens the decision's finding (9.6); a decision on a money cell at the run's config commit is refused in
+  Python before the 8.3 trigger (L-DEC-04), so the message names the region.
+- Renames (8.3, gap G33): `rename_checkpoint` sets `renamed_from` on the new id and tombstones the old one
+  (`retired_in_build`, `retired_commit`), creating either row from the other when only one is known (the foreign
+  key needs both); `retire_checkpoint` tombstones; a tombstoned id is refused when registered again. The signature
+  lookup follows the `renamed_from` chain (`rename_chain`), so a decision on the old id is inherited by the new.
+- A finding's `evidence_json` takes triage notes under `TRIAGE_EVIDENCE_KEYS` (9.6 stores a proposal there; 9.9
+  "ticket not found"); a replay of the finding compares the evidence without them.
 """
 from __future__ import annotations
 
@@ -205,6 +240,9 @@ OUTBOX_OPEN = ("queued", "failed")             # 9.1: states a job is retried fr
 PAIR_KINDS = ("pr", "merge", "rc", "aa")       # 8.3 build_pairs.pair_kind
 SUMMARY_RESERVED = frozenset({"counts", "last_gate", "summary", "refs"})   # summary_json keys end_run owns
 RUN_REFS = ("report_sha256", "comment_sha256", "coverage_matrix_ref", "egress_log_ref", "post_run_proof_ref")   # 4.13
+RECONFIRM_PREFIX = "re-confirmed: "            # 9.7: the reason of a re-confirmation row (`lifecycle.reconfirm`)
+TRIAGE_EVIDENCE_KEYS = frozenset({"proposal", "triage_note"})   # 9.6, 9.9: triage notes on a finding's evidence
+DECIDING_ROLES = ("system_owner", "release_manager")             # 9.6: the role holders that decide (ops/oncall.yaml)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -395,17 +433,58 @@ class Review:
 
 
 @dataclass(frozen=True)
+class Roster:
+    """ops/oncall.yaml as the decision rules read it (4.16, 9.12, SD-74): who may decide (L-DEC-01) and who may
+    confirm a PR author's intended proposal (L-DEC-06). Logins only."""
+    triage: frozenset[str] = frozenset()                       # triage_roster plus every triage rotation person
+    flow_owners: Mapping[int, frozenset[str]] = field(default_factory=dict)   # tier -> owner and deputy
+    roles: Mapping[str, frozenset[str]] = field(default_factory=dict)         # role -> holder and deputy
+
+    @classmethod
+    def from_oncall(cls, doc: Mapping[str, Any]) -> "Roster":
+        """The roster of an ops/oncall.yaml document (its 4.16 schema: roles, flow_owners, rotations,
+        triage_roster)."""
+        def people(entry: Mapping[str, Any]) -> frozenset[str]:
+            return frozenset(str(entry[k]) for k in ("person", "deputy") if entry.get(k))
+
+        triage = {str(x) for x in doc.get("triage_roster") or ()}
+        triage |= {str(r["person"]) for r in doc.get("rotations") or () if r.get("rotation") == "triage"}
+        owners: dict[int, frozenset[str]] = {}
+        for e in doc.get("flow_owners") or ():
+            owners[int(e["tier"])] = owners.get(int(e["tier"]), frozenset()) | people(e)
+        roles: dict[str, frozenset[str]] = {}
+        for e in doc.get("roles") or ():
+            roles[str(e["role"])] = roles.get(str(e["role"]), frozenset()) | people(e)
+        return cls(frozenset(triage), owners, roles)
+
+    def deciders(self) -> frozenset[str]:
+        """Every login L-DEC-01 lets decide from the roster: triage, flow owners, system owner, release manager."""
+        out = set(self.triage)
+        for group in self.flow_owners.values():
+            out |= group
+        for role in DECIDING_ROLES:
+            out |= self.roles.get(role, frozenset())
+        return frozenset(out)
+
+    def confirmers(self, tier: int) -> frozenset[str]:
+        """L-DEC-06: the triage rotation or the tier's flow owner."""
+        return self.triage | self.flow_owners.get(tier, frozenset())
+
+
+@dataclass(frozen=True)
 class DecisionLookup:
     """The answer of the 8.3 signature lookup: the full verdict set (F25, 9.7)."""
     matches: tuple[DecisionMatch, ...] = ()       # every active decision within tolerance, nearest then newest
     related: tuple[DecisionMatch, ...] = ()       # above tolerance, up to 12 bits: shown, never inherited (4.14)
     frozen: bool = False                          # two supersessions within 30 days: nothing inherited (9.7)
     out_of_scope: tuple[DecisionMatch, ...] = ()  # the mark_intended matches outside their 9.7 scope for this run
+    fixed_returned: tuple[DecisionMatch, ...] = ()   # fixed_in_build matches on or after the fix build (4.14, 9.7)
 
     @property
     def applicable(self) -> tuple[DecisionMatch, ...]:
-        """The matches that apply to this run: all but the out-of-scope mark_intended ones (9.7)."""
-        outside = {m.decision.decision_id for m in self.out_of_scope}
+        """The matches that apply to this run: all but the out-of-scope mark_intended ones (9.7) and the
+        fixed_in_build ones whose fix build the run's candidate has reached (the signature returned: L-DEC-08)."""
+        outside = {m.decision.decision_id for m in (*self.out_of_scope, *self.fixed_returned)}
         return tuple(m for m in self.matches if m.decision.decision_id not in outside)
 
     @property
@@ -711,7 +790,7 @@ def connect_reader(path: str | os.PathLike, *, busy_timeout_ms: int = 5000) -> s
 # action tables): request_mask is inert until its mask merges (mask_ref set); agent_mistake and expected_behavior
 # close an Explorer finding's signature; approve_baseline and reject_baseline move a baselines row.
 _LOOKUP_WHERE = """
-WHERE d.checkpoint_id = :cp AND d.region_id = :region AND d.category = :cat
+WHERE d.checkpoint_id IN (SELECT value FROM json_each(:cps)) AND d.region_id = :region AND d.category = :cat
   AND d.verdict IS NOT NULL AND d.status IN ('active','reopened')
   AND d.revoked_at IS NULL AND (d.expires_at IS NULL OR d.expires_at > :now)
   AND (d.action IN ('confirm_bug','mark_intended','noise_signature','fixed_in_build')
@@ -757,19 +836,70 @@ def _match(r: sqlite3.Row) -> DecisionMatch:
     return DecisionMatch(d, r["distance"], build_pair_id=d.build_pair_id)
 
 
+_CHAIN_COLUMNS = ("decision_id, decided_at, supersedes_decision_id, action, verdict, reason, phash, "
+                  "hamming_tolerance, checkpoint_id, region_id, category")
+
+
+def _lifecycle_supersession(new: sqlite3.Row, old: sqlite3.Row) -> bool:
+    """A replacement that is not a contest (9.7 freeze): fixed_in_build (the confirm_bug lifecycle, 4.14) or a
+    re-confirmation of the same decision (`lifecycle.reconfirm`)."""
+    if new["action"] == "fixed_in_build":
+        return True
+    same = all(new[k] == old[k] for k in ("action", "verdict", "phash", "hamming_tolerance", "checkpoint_id",
+                                           "region_id", "category"))
+    return same and new["reason"] == RECONFIRM_PREFIX + old["reason"]
+
+
 def _frozen(conn: sqlite3.Connection, rows: Iterable[sqlite3.Row]) -> bool:
-    """9.7: two supersessions within 30 days on one signature freeze it (S-05). Walks each row's chain."""
-    for row in rows:
+    """9.7: two supersessions within 30 days on one signature freeze it (S-05). Walks each row's chain; lifecycle
+    replacements (fixed_in_build, re-confirmation) are not supersessions in this sense."""
+    for start in rows:
         times, seen = [], set()
+        row = conn.execute(f"SELECT {_CHAIN_COLUMNS} FROM decisions WHERE decision_id = ?",
+                           (start["decision_id"],)).fetchone()
         while row is not None and row["supersedes_decision_id"] is not None and row["decision_id"] not in seen:
             seen.add(row["decision_id"])
-            times.append(datetime.fromisoformat(row["decided_at"]))
-            row = conn.execute("SELECT decision_id, decided_at, supersedes_decision_id FROM decisions "
-                               "WHERE decision_id = ?", (row["supersedes_decision_id"],)).fetchone()
+            old = conn.execute(f"SELECT {_CHAIN_COLUMNS} FROM decisions WHERE decision_id = ?",
+                               (row["supersedes_decision_id"],)).fetchone()
+            if old is None or not _lifecycle_supersession(row, old):
+                times.append(datetime.fromisoformat(row["decided_at"]))
+            row = old
         times.sort()
         if any(b - a <= timedelta(days=FREEZE_DAYS) for a, b in zip(times, times[1:])):
             return True
     return False
+
+
+def rename_chain(conn: sqlite3.Connection, checkpoint_id: str) -> tuple[str, ...]:
+    """The checkpoint id followed by every id it was renamed from, newest first (8.3 `renamed_from`, gap G33): the
+    ids whose decisions, baselines and flake statistics carry to `checkpoint_id`."""
+    chain = [checkpoint_id]
+    while True:
+        r = conn.execute("SELECT renamed_from FROM checkpoints WHERE checkpoint_id = ?", (chain[-1],)).fetchone()
+        if r is None or r[0] is None or r[0] in chain:
+            return tuple(chain)
+        chain.append(r[0])
+
+
+def candidate_build_of(conn: sqlite3.Connection, run_id: str | None) -> str | None:
+    """The candidate build of a run's build pair (8.3 `build_pairs`), or None (no run, no pair: a Nightly run)."""
+    if run_id is None:
+        return None
+    r = conn.execute("SELECT p.candidate_build_id FROM runs r JOIN build_pairs p ON p.pair_id = r.pair_id "
+                     "WHERE r.run_id = ?", (run_id,)).fetchone()
+    return None if r is None else r[0]
+
+
+def build_reached(conn: sqlite3.Connection, candidate: str | None, fix: str | None) -> bool:
+    """True when `candidate` is `fix` or newer by `builds.first_seen_at` (the L-DEC-08 order); False when it is
+    older or either build is unknown to the store (nothing can be asserted, 4.14)."""
+    if candidate is None or fix is None:
+        return False
+    if candidate == fix:
+        return True
+    seen = dict(conn.execute("SELECT build_id, first_seen_at FROM builds WHERE build_id IN (?, ?)",
+                             (candidate, fix)).fetchall())
+    return candidate in seen and fix in seen and seen[candidate] >= seen[fix]
 
 
 def _in_ticket_scope(d: Decision, run_id: str | None, run_pair: str | None, entries: frozenset[str],
@@ -786,8 +916,8 @@ def _in_ticket_scope(d: Decision, run_id: str | None, run_pair: str | None, entr
 
 def lookup_decisions(conn: sqlite3.Connection, signature: Signature, *, at: str | None = None,
                      rescued: bool = False, synthetic: bool = False, run_id: str | None = None,
-                     manifest_entries: Iterable[str] = (), manifest_tickets: Iterable[str] = ()
-                     ) -> DecisionLookup:
+                     manifest_entries: Iterable[str] = (), manifest_tickets: Iterable[str] = (),
+                     candidate_build: str | None = None) -> DecisionLookup:
     """Every active decision within tolerance of `signature`, plus the related ones up to 12 bits (8.3, 4.14).
 
     A rescued checkpoint (5.5) and a synthetic outcome (10.3) never run the query: the answer is empty.
@@ -796,21 +926,32 @@ def lookup_decisions(conn: sqlite3.Connection, signature: Signature, *, at: str 
     `mark_intended` decision: one outside it stays in `matches` (the full 8.3 answer) but is listed in
     `out_of_scope`, so it neither conflicts nor is inherited. Without them no `mark_intended` decision made on
     another run is in scope.
+
+    The checkpoint matches along its rename chain (`rename_chain`): a decision on an id it was renamed from is a
+    decision on it (8.3, G33). `candidate_build` (default: the candidate of the run's build pair) is the build
+    under test: a fixed_in_build match whose fix build it has reached is listed in `fixed_returned` and does not
+    apply, since from that build on the signature must be absent (4.14, L-DEC-08); `lifecycle.verify_fixes` then
+    reopens the decision after the run.
     """
     if rescued or synthetic:
         return DecisionLookup()
-    args = {"cp": signature.checkpoint_id, "region": signature.region_id, "cat": signature.category,
+    cps = json.dumps(list(rename_chain(conn, signature.checkpoint_id)))
+    args = {"cps": cps, "region": signature.region_id, "cat": signature.category,
             "phash": phash_bytes(signature.phash), "now": utc(at) or now(), "related": RELATED_LIMIT}
     rows = conn.execute(LOOKUP_SQL, args).fetchall()
     pair = None
     if run_id is not None:
         r = conn.execute("SELECT pair_id FROM runs WHERE run_id = ?", (run_id,)).fetchone()
         pair = None if r is None or r["pair_id"] is None else str(r["pair_id"])
+    candidate = candidate_build or candidate_build_of(conn, run_id)
     entries, tickets = frozenset(manifest_entries), frozenset(manifest_tickets)
     found = [_match(r) for r in rows]
     outside = [m for m in found if not _in_ticket_scope(m.decision, run_id, pair, entries, tickets)]
+    returned = [m for m, r in zip(found, rows)
+                if r["action"] == "fixed_in_build" and build_reached(conn, candidate, r["fixed_in_build_id"])]
     related = [_match(r) for r in conn.execute(RELATED_SQL, args)]
-    return DecisionLookup(tuple(found), tuple(related), frozen=_frozen(conn, rows), out_of_scope=tuple(outside))
+    return DecisionLookup(tuple(found), tuple(related), frozen=_frozen(conn, rows), out_of_scope=tuple(outside),
+                          fixed_returned=tuple(returned))
 
 
 def apply_inheritance(outcome: CheckpointOutcome, lookup: DecisionLookup) -> CheckpointOutcome:
@@ -894,6 +1035,12 @@ def _summary_json(summary: Mapping[str, Any]) -> str:
     return json.dumps(summary, sort_keys=True)
 
 
+def _evidence_core(evidence_json: str) -> dict:
+    """A finding's evidence without the triage notes a later triage action adds (9.6 proposal, 9.9 ticket not
+    found): what an import replay must match."""
+    return {k: v for k, v in json.loads(evidence_json).items() if k not in TRIAGE_EVIDENCE_KEYS}
+
+
 def _ledger_default(v: Any) -> Any:
     if isinstance(v, (bytes, bytearray, memoryview)):
         return bytes(v).hex()
@@ -907,13 +1054,15 @@ class Store:
 
     def __init__(self, path: str | os.PathLike, *, taxonomy: Taxonomy | None = None, ledger: bool = True,
                  busy_timeout_ms: int = 5000, require_local: bool = True, strict_records: bool = False,
-                 system_owners: Iterable[str] = ()):
+                 system_owners: Iterable[str] = (), roster: Roster | None = None):
         """`strict_records` refuses, at `write_checkpoint`, a record that fails the 4.13 required-fields table
-        (L-OUT-02, `RecordIncomplete`); `system_owners` are the logins that may decide on a frozen signature (9.7)."""
+        (L-OUT-02, `RecordIncomplete`); `system_owners` are the logins that may decide on a frozen signature (9.7);
+        `roster` (ops/oncall.yaml) turns on the L-DEC-01 and L-DEC-06 roster checks (`set_roster` later)."""
         self.path = Path(path)
         self.taxonomy = taxonomy or load()
         self.strict_records = strict_records
         self.system_owners = frozenset(system_owners)
+        self.roster = roster
         self._sessions: dict[str | None, SessionContext] = {}
         self._flow_steps: dict[str, dict[str, frozenset[str]]] = {}
         if require_local:
@@ -958,6 +1107,11 @@ class Store:
     def conn(self) -> sqlite3.Connection:
         """The writer connection, for reads in this process. Write only through the methods."""
         return self._conn
+
+    def set_roster(self, roster: Roster | None) -> None:
+        """Load the run's ops/oncall.yaml roster (`Roster.from_oncall`): from now on L-DEC-01 and L-DEC-06 check
+        deciders and confirmers against it (4.14, 9.12). None turns the roster checks off."""
+        self.roster = roster
 
     def _open_schema(self) -> None:
         ddl = render_schema(self.taxonomy)
@@ -1141,34 +1295,100 @@ class Store:
                 "candidate_build_id": candidate_build_id, "base_build_id": base_build_id, "pair_kind": pair_kind,
                 "merge_base_commit": merge_base_commit, "created_at": utc(created_at) or now()})
 
-    def _checkpoint_row(self, e: ScopeEntry, config_commit: str) -> dict:
-        parts = checkpoint_parts(e.checkpoint_id)
+    @staticmethod
+    def _id_columns(checkpoint_id: str, workspace_id: str, flow_class: str | None) -> dict[str, Any]:
+        """The `checkpoints` columns the id itself determines (8.3 grammar), with the census workspace check."""
+        parts = checkpoint_parts(checkpoint_id)
         kind, q = parts["kind"], parts["qualifier"].split("/")
-        if e.persona not in PERSONAS:
-            raise TaxonomyError(f"persona {e.persona!r}")
-        if e.data_mode not in DATA_MODES:
-            raise TaxonomyError(f"data_mode {e.data_mode!r}")
-        row: dict[str, Any] = {"checkpoint_id": e.checkpoint_id, "kind": kind, "surface_id": parts["surface"],
-                               "workspace_id": e.workspace_id, "tier": e.tier, "data_mode": e.data_mode,
-                               "recapturable": int(e.recapturable), "first_seen_commit": config_commit}
-        if kind == "census" and q[0] != e.workspace_id:
-            raise StoreRefused(f"{e.checkpoint_id}: a census id's qualifier is its workspace id (8.3)")
+        row: dict[str, Any] = {"checkpoint_id": checkpoint_id, "kind": kind, "surface_id": parts["surface"],
+                               "workspace_id": workspace_id}
+        if kind == "census" and q[0] != workspace_id:
+            raise StoreRefused(f"{checkpoint_id}: a census id's qualifier is its workspace id (8.3)")
         if kind == "sweep":
             w, h = q[1].removesuffix("-asc").split("x")       # SD-04: Ladder F ascending ids end in -asc
             row.update(host=q[0], size_w=int(w), size_h=int(h))
         elif kind == "split":
             row.update(splitter_id=q[0], fraction=float(q[1]))
         elif kind == "flow":
-            if not e.flow_class:
-                raise StoreRefused(f"{e.checkpoint_id}: a flow checkpoint needs its flow_class (8.3)")
-            row.update(flow_id=q[0], step_id=q[1], flow_class=e.flow_class)
+            if not flow_class:
+                raise StoreRefused(f"{checkpoint_id}: a flow checkpoint needs its flow_class (8.3)")
+            row.update(flow_id=q[0], step_id=q[1], flow_class=flow_class)
         return row
 
+    def _checkpoint_row(self, e: ScopeEntry, config_commit: str) -> dict:
+        if e.persona not in PERSONAS:
+            raise TaxonomyError(f"persona {e.persona!r}")
+        if e.data_mode not in DATA_MODES:
+            raise TaxonomyError(f"data_mode {e.data_mode!r}")
+        return {**self._id_columns(e.checkpoint_id, e.workspace_id, e.flow_class), "tier": e.tier,
+                "data_mode": e.data_mode, "recapturable": int(e.recapturable), "first_seen_commit": config_commit}
+
+    def _refuse_tombstone(self, checkpoint_id: str) -> None:
+        """8.3: ids are never reused; a retired (tombstoned) id is refused when registered again."""
+        r = self._one("SELECT retired_in_build, retired_commit FROM checkpoints WHERE checkpoint_id = ?",
+                      (checkpoint_id,))
+        if r is not None and (r["retired_in_build"] is not None or r["retired_commit"] is not None):
+            raise StoreRefused(f"{checkpoint_id} was retired in build {r['retired_in_build']} at config commit "
+                               f"{r['retired_commit']}; checkpoint ids are never reused (8.3)")
+
     def _upsert_checkpoint(self, rows: list[dict], e: ScopeEntry, config_commit: str) -> None:
+        self._refuse_tombstone(e.checkpoint_id)
         self._insert(rows, "checkpoints", self._checkpoint_row(e, config_commit),
                      upsert="(checkpoint_id) DO UPDATE SET workspace_id = excluded.workspace_id, tier = excluded.tier, "
                             "data_mode = excluded.data_mode, flow_class = excluded.flow_class, "
                             "recapturable = excluded.recapturable")
+
+    def _derived_checkpoint(self, rows: list[dict], checkpoint_id: str, template: sqlite3.Row,
+                            config_commit: str) -> None:
+        """Insert `checkpoint_id` with the tier, data mode and flow class of `template`, the other end of a rename
+        (the foreign key of `renamed_from` needs both rows, 8.3)."""
+        kind = checkpoint_parts(checkpoint_id)["kind"]
+        workspace = checkpoint_id.split("/")[2] if kind == "census" else template["workspace_id"]
+        flow_class = template["flow_class"] if kind == "flow" else None
+        self._insert(rows, "checkpoints", {
+            **self._id_columns(checkpoint_id, workspace, flow_class), "tier": template["tier"],
+            "data_mode": template["data_mode"], "recapturable": template["recapturable"],
+            "first_seen_commit": config_commit})
+
+    def rename_checkpoint(self, old: str, new: str, *, build_id: str, config_commit: str) -> bool:
+        """Apply one flows/RENAMES.yaml entry (8.3, gap G33): `new.renamed_from = old`, so decisions, baselines and
+        flake statistics of `old` carry to `new`, and `old` is tombstoned (`retired_in_build`, `retired_commit`)
+        because ids are never reused. A row missing on either side is created from the other; with neither known
+        there is nothing to carry and False is returned. Applying the entry again is a no-op; `new` renamed from
+        another id is an ImportConflict."""
+        if old == new:
+            raise StoreRefused(f"rename of {old} to itself (8.3)")
+        o = self._one("SELECT * FROM checkpoints WHERE checkpoint_id = ?", (old,))
+        n = self._one("SELECT * FROM checkpoints WHERE checkpoint_id = ?", (new,))
+        if o is None and n is None:
+            return False
+        if n is not None and n["renamed_from"] not in (None, old):
+            raise ImportConflict(f"{new} is already renamed from {n['renamed_from']}, not {old} (8.3)")
+        if n is not None and n["retired_in_build"] is not None:
+            raise StoreRefused(f"{new} is retired; a rename cannot reuse it (8.3)")
+        with self._batch("checkpoint_rename") as rows:
+            if o is None:
+                self._derived_checkpoint(rows, old, n, config_commit)
+            if n is None:
+                self._derived_checkpoint(rows, new, o, config_commit)
+            if o is None or o["retired_in_build"] is None:
+                self._update(rows, "checkpoints", {"checkpoint_id": old},
+                             {"retired_in_build": build_id, "retired_commit": config_commit})
+            if n is None or n["renamed_from"] is None:
+                self._update(rows, "checkpoints", {"checkpoint_id": new}, {"renamed_from": old})
+        return True
+
+    def retire_checkpoint(self, checkpoint_id: str, *, build_id: str, config_commit: str) -> bool:
+        """Tombstone a checkpoint retired without a rename (a RENAMES.yaml entry with `new: retired`, 8.3): the id
+        is kept, never reused. False when the store has never seen the id; the first tombstone stands."""
+        r = self._one("SELECT retired_in_build FROM checkpoints WHERE checkpoint_id = ?", (checkpoint_id,))
+        if r is None:
+            return False
+        if r["retired_in_build"] is None:
+            with self._batch("checkpoint_retire") as rows:
+                self._update(rows, "checkpoints", {"checkpoint_id": checkpoint_id},
+                             {"retired_in_build": build_id, "retired_commit": config_commit})
+        return True
 
     def register_checkpoints(self, entries: Iterable[ScopeEntry], *, config_commit: str) -> None:
         """Add or refresh `checkpoints` rows (8.3) outside a run's scope, e.g. for probe-found surfaces."""
@@ -1524,8 +1744,10 @@ class Store:
             self._insert(rows, "findings", row)
             return
         later = {"decision_id", "ticket_ref", "triage_state",          # 4.14: decisions move these
-                 "closed_at", "contested", "held"}                       # 8.6, 9.7, 2.9: triage moves these
-        if any(old[k] != v for k, v in row.items() if k not in later):
+                 "closed_at", "contested", "held",                       # 8.6, 9.7, 2.9: triage moves these
+                 "evidence_json"}                                         # compared below without triage notes
+        if any(old[k] != v for k, v in row.items() if k not in later) or (
+                _evidence_core(old["evidence_json"]) != _evidence_core(row["evidence_json"])):
             raise ImportConflict(f"finding {f.finding_id} is already recorded with other content (8.2)")
 
     def _check_decision_reason(self, o: CheckpointOutcome, code: str | None) -> None:
@@ -2027,10 +2249,21 @@ class Store:
         if identity is not None and identity.strip().lower() in SERVICE_IDENTITIES:
             raise StoreRefused(f"{role} {identity!r} is not a person: decisions are human-only (4.14, L-DEC-01)")
 
-    def _approvable(self, run_id: str, d: Decision, tier: int) -> None:
+    def _run_authors(self, run_id: str) -> frozenset[str]:
+        """The PR author and every committer the PR host reported for the run (9.6 two-person rule)."""
+        run = self._one("SELECT pr_author, pr_committers_json FROM runs WHERE run_id = ?", (run_id,))
+        if run is None:
+            return frozenset()
+        out = set(json.loads(run["pr_committers_json"])) if run["pr_committers_json"] else set()
+        if run["pr_author"]:
+            out.add(run["pr_author"])
+        return frozenset(out)
+
+    def _approvable(self, run_id: str, d: Decision, tier: int, change_authors: frozenset[str]) -> None:
         """L-DEC-05: approve_baseline never from a PR run, a run not `complete`, a run with a synthetic outcome on
-        the checkpoint (the 8.3 trg_baseline_approve form), or by the change's author on a tier-1 checkpoint."""
-        run = self._one("SELECT run_type, outcome, pr_author FROM runs WHERE run_id = ?", (run_id,))
+        the checkpoint (the 8.3 trg_baseline_approve form), or by the change's author on a tier-1 checkpoint: the
+        run's PR author and committers and the `change_authors` of the merged change."""
+        run = self._one("SELECT run_type, outcome FROM runs WHERE run_id = ?", (run_id,))
         if run is None:
             raise StoreRefused(f"unknown run {run_id}")
         if run["run_type"] == "pr":
@@ -2042,8 +2275,63 @@ class Store:
         if self._one("SELECT 1 FROM outcomes WHERE run_id = ? AND checkpoint_id = ? AND synthetic = 1",
                      (run_id, d.signature.checkpoint_id)) is not None:
             raise StoreRefused("approve_baseline is refused from a synthetic outcome (L-DEC-05)")
-        if tier == 1 and run["pr_author"] is not None and d.decided_by == run["pr_author"]:
+        if tier == 1 and d.decided_by in self._run_authors(run_id) | change_authors:
             raise StoreRefused("the author of the change never approves a tier-1 baseline (L-DEC-05, 9.6)")
+
+    def _check_people(self, d: Decision, run_id: str, tier: int, proposed_by: str | None,
+                      confirmed_by: str | None) -> None:
+        """L-DEC-01 (the roster, when loaded) and L-DEC-06 (the two-person rule) at write (4.14, 9.6)."""
+        authors = self._run_authors(run_id)
+        if d.action == "mark_intended" and tier in (1, 2):
+            if d.decided_by in authors:
+                raise StoreRefused(f"two-person rule (L-DEC-06): {d.decided_by} committed to this PR, so their "
+                                   f"mark_intended on a tier-{tier} finding is a proposal until the triage rotation "
+                                   "or the tier's flow owner confirms it")
+            if proposed_by is not None:
+                if confirmed_by is None or confirmed_by != d.decided_by or confirmed_by == proposed_by:
+                    raise StoreRefused(f"two-person rule (L-DEC-06): a proposal by {proposed_by} is written when a "
+                                       "different human confirms it, as decided_by and confirmed_by")
+                if self.roster is not None and confirmed_by not in self.roster.confirmers(tier):
+                    raise StoreRefused(f"two-person rule (L-DEC-06): {confirmed_by} is neither in the triage "
+                                       f"rotation nor the tier-{tier} flow owner (ops/oncall.yaml)")
+        if self.roster is None or d.decided_by in self.roster.deciders():
+            return
+        if d.action == "fixed_in_build" and d.source == "jira_sync":
+            return                                                   # the Jira ticket's resolver (9.9)
+        if d.decided_by in authors and (d.action == "confirm_bug" or (d.action == "mark_intended" and tier == 3)):
+            return                                                   # the PR author (9.6, 9.12)
+        raise StoreRefused(f"L-DEC-01: {d.decided_by} is not in the triage roster of ops/oncall.yaml, and only the "
+                           "PR author (confirm_bug, tier-3 mark_intended) or a Jira resolver (fixed_in_build) may "
+                           "decide from outside it")
+
+    def _money_cell(self, run_id: str, d: Decision) -> None:
+        """L-DEC-04: no noise signature or request_mask on a money cell of the run's config commit (the 8.3
+        trg_decision_money_cell rule, refused here first so the message names the region)."""
+        if d.action not in ("noise_signature", "request_mask"):
+            return
+        if self._one("SELECT 1 FROM regions g JOIN runs r ON r.config_commit = g.config_commit WHERE r.run_id = ? "
+                     "AND g.checkpoint_id = ? AND g.region_id = ? AND g.money_cell = 1",
+                     (run_id, d.signature.checkpoint_id, d.signature.region_id)) is not None:
+            raise StoreRefused(f"L-DEC-04: {d.signature.region_id} of {d.signature.checkpoint_id} is a money cell; "
+                               f"no {d.action} on a money cell (decide it by confirm_bug or mark_intended)")
+
+    def _fix_supersedes(self, d: Decision, supersedes: str | None, old: sqlite3.Row | None) -> None:
+        """SD-79: fixed_in_build is a new row superseding the active confirm_bug on the same signature (or a
+        reopened fixed_in_build, for a later fix)."""
+        if supersedes is None or old is None:
+            raise StoreRefused("fixed_in_build supersedes the active confirm_bug decision on its signature "
+                               "(SD-79, 4.14): name it in supersedes")
+        ok = ((old["action"] == "confirm_bug" and old["status"] == "active")
+              or (old["action"] == "fixed_in_build" and old["status"] in ("active", "reopened")))
+        if not ok:
+            raise StoreRefused(f"fixed_in_build supersedes a confirm_bug (or a reopened fixed_in_build); {supersedes} "
+                               f"is a {old['status']} {old['action']} (SD-79)")
+        same = (old["checkpoint_id"], old["region_id"], old["category"]) == (
+            d.signature.checkpoint_id, d.signature.region_id, d.signature.category)
+        near = hamming(bytes(old["phash"]), d.signature.phash)
+        if not same or near is None or near > old["hamming_tolerance"]:
+            raise StoreRefused(f"fixed_in_build names the signature of {supersedes} (SD-79): same checkpoint, region "
+                               "and category, pHash within its tolerance")
 
     def _newer_build(self, fixed: str, base: str | None) -> None:
         """L-DEC-08: fixed_in_build names a build newer (by builds.first_seen_at) than the decision's build_id,
@@ -2068,7 +2356,7 @@ class Store:
                         fixed_in_build_id: str | None = None, baseline_id: int | None = None,
                         mask_ref: str | None = None, cluster_id: str | None = None,
                         supersedes: str | None = None, manifest_entries: Iterable[str] = (),
-                        manifest_tickets: Iterable[str] = ()) -> Decision:
+                        manifest_tickets: Iterable[str] = (), change_authors: Iterable[str] = ()) -> Decision:
         """Write a human decision (4.14, 8.3) and return it as stored (canonical id, effective tolerance, UTC).
 
         `finding_id`, `expires_at`, `confirmed_by` and `supersedes` default to the Decision's `finding_ref`,
@@ -2077,13 +2365,17 @@ class Store:
         decision and the triage state of the 4.14 table. With `supersedes` the old decision is marked superseded in
         the same batch (8.3); a decision is never edited otherwise.
 
-        Refused besides the 8.3 constraints: a service identity (L-DEC-01); an explicit `hamming_tolerance` above 6
-        on a tier-1 checkpoint (L-DEC-03); a waiver without an expiry at most 30 days out (L-DEC-07); the L-DEC-05
-        and L-DEC-08 cases; any decision on a frozen signature by a login not in `system_owners` (9.7); and, for a
-        decision made on a finding, a plain (not superseding) decision on a signature that already has an
-        applicable active decision (`ActiveDecisionExists`, 9.7; `manifest_entries` and `manifest_tickets` of the
-        run give the mark_intended scope). The same action on the same finding by the same person again returns the
-        decision already written (9.6 idempotent).
+        Refused besides the 8.3 constraints: a service identity, and with a `roster` a decider outside it
+        (L-DEC-01); an explicit `hamming_tolerance` above 6 on a tier-1 checkpoint (L-DEC-03); noise_signature or
+        request_mask on a money cell of the run's config commit (L-DEC-04); a waiver without an expiry at most 30
+        days out (L-DEC-07); the L-DEC-05 cases (`change_authors`: the authors of the merged change a baseline comes
+        from), the L-DEC-06 two-person rule and the L-DEC-08 build order; a fixed_in_build that does not supersede
+        the active confirm_bug on its signature (SD-79); any decision on a frozen signature by a login not in
+        `system_owners` (9.7); and, for a decision made on a finding, a plain (not superseding) decision on a
+        signature that already has an applicable active decision (`ActiveDecisionExists`, 9.7; `manifest_entries`
+        and `manifest_tickets` of the run give the mark_intended scope). The same action on the same finding by the
+        same person again returns the decision already written (9.6 idempotent). A fixed_in_build without a finding
+        takes the finding of the row it supersedes, which moves to fixed_pending_verify.
         """
         d = _revalidate(decision)
         finding_id = self._same("finding_id", finding_id, d.finding_ref)
@@ -2120,6 +2412,8 @@ class Store:
                                       > datetime.fromisoformat(decided_at) + timedelta(days=EXPIRY_DAYS)):
                 raise StoreRefused("a waiver (mark_intended on an invariant or assertion) carries expires_at at most "
                                    "30 days after decided_at (L-DEC-07)")
+        self._check_people(d, run_id, cp["tier"], proposed_by, confirmed_by)
+        self._money_cell(run_id, d)
         source_finding = None
         if finding_id is not None:
             f = self._one("SELECT finding_id, synthetic FROM findings WHERE natural_key = ?", (finding_id,))
@@ -2133,14 +2427,20 @@ class Store:
                 return self._stored_decision(decision_ref(again[0]))
         old = None
         if supersedes is not None:
-            old = self._one("SELECT status, build_id, decided_by, source_finding_id FROM decisions "
-                            "WHERE decision_id = ?", (decision_int(supersedes),))
+            old = self._one("SELECT * FROM decisions WHERE decision_id = ?", (decision_int(supersedes),))
             if old is None or old["status"] not in ("active", "reopened"):
                 raise StoreRefused(f"{supersedes} is not an active decision to supersede (8.3)")
         if d.action == "approve_baseline":
-            self._approvable(run_id, d, cp["tier"])
-        if d.action == "fixed_in_build" and fixed_in_build_id is not None:
-            self._newer_build(fixed_in_build_id, build_id or (old["build_id"] if old is not None else None))
+            self._approvable(run_id, d, cp["tier"], frozenset(change_authors))
+        if d.action == "fixed_in_build":
+            self._fix_supersedes(d, supersedes, old)
+            if fixed_in_build_id is not None:
+                prior = old["fixed_in_build_id"] if old["action"] == "fixed_in_build" else old["build_id"]
+                self._newer_build(fixed_in_build_id, build_id or prior)
+                if prior is not None and build_id is not None and prior != build_id:
+                    self._newer_build(fixed_in_build_id, prior)
+            if source_finding is None:
+                source_finding = old["source_finding_id"]
         triage = (TRIAGE_FOR_ACTION.get(d.action)
                   or ("confirmed_bug" if d.verdict == "confirmed_bug" else "open"))   # reject_baseline (4.14)
         self.taxonomy.check_member("triage_states", triage)
@@ -2190,12 +2490,13 @@ class Store:
                                        "it (9.7)", active)
 
     def revoke_decision(self, decision_id: str, *, by: str, reason: str, at: str | None = None) -> Decision:
-        """Revoke a decision: the three revoke fields together and status revoked (8.3, 4.14); the row stays."""
+        """Revoke a decision: the three revoke fields together and status revoked (8.3, 4.14); the row stays. The
+        decision's finding is reopened (9.6 Revoke decision): triage state open, no longer closed."""
         self._human(by, "revoked_by")
         if not reason:
             raise StoreRefused("a revoke carries its reason (8.3)")
         did = decision_int(decision_id)
-        row = self._one("SELECT status FROM decisions WHERE decision_id = ?", (did,))
+        row = self._one("SELECT status, source_finding_id FROM decisions WHERE decision_id = ?", (did,))
         if row is None:
             raise StoreRefused(f"unknown decision {decision_id}")
         if row["status"] == "revoked":
@@ -2204,6 +2505,9 @@ class Store:
             self._update(rows, "decisions", {"decision_id": did},
                          {"status": "revoked", "revoked_at": utc(at) or now(), "revoked_by": by,
                           "revoke_reason": reason})
+            if row["source_finding_id"] is not None:
+                self._update(rows, "findings", {"finding_id": row["source_finding_id"]},
+                             {"triage_state": "open", "closed_at": None})
         return self.get_decision(decision_id)
 
     def get_decision(self, decision_id: str) -> Decision | None:
@@ -2215,10 +2519,11 @@ class Store:
 
     def lookup_decisions(self, signature: Signature, *, at: str | None = None, rescued: bool = False,
                          synthetic: bool = False, run_id: str | None = None, manifest_entries: Iterable[str] = (),
-                         manifest_tickets: Iterable[str] = ()) -> DecisionLookup:
+                         manifest_tickets: Iterable[str] = (), candidate_build: str | None = None) -> DecisionLookup:
         """The 8.3 signature lookup on this database (see the module-level `lookup_decisions`)."""
         return lookup_decisions(self._conn, signature, at=at, rescued=rescued, synthetic=synthetic, run_id=run_id,
-                                manifest_entries=manifest_entries, manifest_tickets=manifest_tickets)
+                                manifest_entries=manifest_entries, manifest_tickets=manifest_tickets,
+                                candidate_build=candidate_build)
 
     # -- retention (8.6) -------------------------------------------------------------------------------------
     def deletable(self, sha256: str) -> bool:

@@ -528,6 +528,27 @@ def test_secrets_12_an_item_without_a_redaction_version_is_refused_as_an_image()
     assert [(r.status, r.refusal_reason) for r in sink.rows] == [("refused", "redaction version missing")]
 
 
+# == secrets:13: the signature pHash is taken from the redacted candidate =======================================
+
+def test_secrets_13_the_signature_phash_hashes_the_redacted_candidate(tmp_path, monkeypatch):
+    """3.6 (nothing is hashed before redaction), 9.7: the signature pHash is the hash of the redacted candidate crop
+    that is stored and diffed, never of the raw frame."""
+    import numpy as np
+
+    import sentinel.pipeline.run as pr
+    hashed, evs = [], []
+    real_phash, real_eval = pr.phash, pr.evaluate
+    monkeypatch.setattr(pr, "phash", lambda img: hashed.append(img) or real_phash(img))
+    monkeypatch.setattr(pr, "evaluate", lambda *a, **k: evs.append(real_eval(*a, **k)) or evs[-1])
+    run_pipeline(EXAMPLE, clean_scenario(TODAY), tmp_path, today=TODAY)
+    signed = [ev for ev in evs if ev.phash and ev.redaction is not None]
+    assert signed and len(hashed) >= len(signed)
+    for ev in signed:
+        src = [img for img in hashed if np.shares_memory(img, ev.images()[1])]
+        assert src, f"{ev.cp.checkpoint_id}: pHash not taken from the redacted candidate"
+        assert not any(np.shares_memory(img, ev.cand.screen.image) for img in src)
+
+
 def test_secrets_6_scan_run_reads_a_ledger_tail_and_in_memory_texts(tmp_path):
     """6.9 choice 1: a shared results.jsonl is scanned from the offset where this run began (an earlier run's lines
     are not this run's), and text the run has not written yet (the report's inputs) is scanned from memory."""

@@ -680,7 +680,8 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
             region, box = "_window", (0, 0, w, h)
         if region is not None and box is not None:
             ev.region = region
-            ev.phash = phash(_crop(cand.screen.image, _clip(box, w, h)))
+            if ev.storable:                    # 3.6: hash the redacted crop, as stored; a refused pair, nothing
+                ev.phash = phash(_crop(ev.images()[1], _clip(box, w, h)))
             ev.crop = _clip(box, w, h, 24)
     if comparison is not None and comparison.fired:
         u = inv.Rect.union(r.violation.crop for r in comparison.reported)

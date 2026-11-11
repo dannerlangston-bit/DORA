@@ -66,6 +66,7 @@ def finish_all(store, outcome="identical"):
 
 def test_schema_lists_come_from_taxonomy(tmp_path):
     data = copy.deepcopy(load().data)
+    data.pop("reason_metadata")                     # the fallback when taxonomy.yaml carries no 8.3 seed metadata
     data["finding_kinds"].append("test_only_kind")
     data["reasons"]["not_run"].append("test_only_reason")
     t = Taxonomy(data)

@@ -1,6 +1,6 @@
 # GENERATED from the spec by tools/gen_taxonomy.py. Do not edit by hand.
 schema_version: 1
-generated_from: sentinel-spec sections 1.10, 4.1, 4.13, 4.14, 12.7 (tools/gen_taxonomy.py)
+generated_from: sentinel-spec sections 1.10, 2.8.3, 3.13, 4.1, 4.8, 4.10, 4.11, 4.13, 4.14, 8.3, 10.3, 10.5, 12.2, 12.7 (tools/gen_taxonomy.py)
 checkpoint_outcomes:
 - identical
 - noise
@@ -184,6 +184,7 @@ reasons:
   - taxonomy_check_failed
   - orchestrator_restart_budget
   - hook_lost
+  - bounds_source_unavailable
   - watchdog_dead
   - heartbeat_unwritable
   - disk_full
@@ -337,3 +338,685 @@ reviewer_verdicts:
 - no_visible_difference
 - cannot_judge
 - not_applicable
+quarantine_reasons:
+- flake
+- aa_drift
+- aa_floor
+- maintenance_budget
+- fire_drill
+- safety_canary
+- kill_switch
+- gateway_drops
+- fallback_rate
+money_roles:
+- qty
+- price
+- bp_effect
+- max_loss
+- send
+- cancel
+- delete
+popup_actions:
+- dismiss_key
+- click
+- wait
+- relogin
+- abort
+- ignore
+canary_kinds:
+- mutant
+- safety_canary
+- fire_drill
+- path_equivalence
+mutant_classes:
+- erased_control
+- swapped_digit
+- swapped_label
+- color_swap
+- shifted_panel
+- clipped_label
+- overlapped_panels
+- missing_row
+- header_change
+- placeholder
+- font_height
+- scrollbar
+- redaction
+- sub_floor
+- global_shift
+- landmark_loss
+- study_removed
+- aa_control
+- wrong_quantity
+- blank_field
+- gateway
+- outside_parent
+- window_offscreen
+- misaligned_column
+- focus_order
+- error_dialog
+step_event_actions:
+- click
+- dblclick
+- rclick
+- drag
+- wheel
+- key_chord
+- type
+- secret
+- wait
+- capture
+- popup
+- relogin
+- reset_input_state
+- relaunch
+- resume
+- watchdog_hang
+- watchdog_crash
+- kill_switch
+- gateway_decision
+- size_step
+- probe
+- oracle_source_fallback
+- focus_correction
+- hook_reinstalled
+- foreign_window
+- export
+- clipboard
+- recovery_login
+- explorer_action
+decision_statuses:
+- active
+- expired
+- superseded
+- reopened
+- revoked
+decision_sources:
+- report_ui
+- pr_comment
+- jira_sync
+- explorer_triage
+reason_metadata:
+  noise:
+    below_floor:
+      owner_section: '3.11'
+      detail_means: null
+    decision:
+      owner_section: '4.14'
+      detail_means: decision id of the approved noise signature or active mask decision (4.13 writes decision:<id>)
+  intended:
+    decision:
+      owner_section: '4.14'
+      detail_means: decision id of the inherited mark_intended decision
+  collateral:
+    decision:
+      owner_section: '4.14'
+      detail_means: decision id of the matched confirm_bug decision; the computed collateral outcome is kept (4.14)
+    manifest_missing:
+      owner_section: '4.3'
+      detail_means: null
+  needs_human:
+    reviewer_uncertain:
+      owner_section: '3.11'
+      detail_means: null
+    reviewer_no_match:
+      owner_section: '3.11'
+      detail_means: null
+    no_manifest:
+      owner_section: '4.3'
+      detail_means: null
+    uncalibrated:
+      owner_section: '3.9'
+      detail_means: null
+    reviewer_unavailable:
+      owner_section: '10.7'
+      detail_means: null
+    reviewer_cap:
+      owner_section: '3.15'
+      detail_means: null
+    rescued_capture:
+      owner_section: '5.5'
+      detail_means: null
+    oracle_unreadable:
+      owner_section: '5.10'
+      detail_means: null
+    bounds_unreadable:
+      owner_section: '5.9'
+      detail_means: null
+    global_shift:
+      owner_section: '3.7'
+      detail_means: null
+  invariant_violation:
+    INV-01:
+      owner_section: '2.7'
+      detail_means: null
+    INV-02:
+      owner_section: '2.7'
+      detail_means: null
+    INV-03:
+      owner_section: '2.7'
+      detail_means: null
+    INV-04:
+      owner_section: '2.7'
+      detail_means: null
+    INV-05:
+      owner_section: '2.7'
+      detail_means: null
+    INV-06:
+      owner_section: '2.7'
+      detail_means: null
+    INV-07:
+      owner_section: '2.7'
+      detail_means: null
+    INV-08:
+      owner_section: '2.7'
+      detail_means: null
+    INV-09:
+      owner_section: '2.7'
+      detail_means: null
+    INV-10:
+      owner_section: '2.7'
+      detail_means: null
+    INV-11:
+      owner_section: '2.7'
+      detail_means: null
+    INV-12:
+      owner_section: '2.7'
+      detail_means: null
+    INV-13:
+      owner_section: '2.7'
+      detail_means: null
+    INV-14:
+      owner_section: '2.7'
+      detail_means: null
+    INV-15:
+      owner_section: '2.7'
+      detail_means: null
+  assertion_failed:
+    assertion:
+      owner_section: 2.6.2
+      detail_means: assertion id or Oracle rule R01 to R10; the built-in assertions are app_alive (detail also carries jvm_crash,
+        hang, oom or process_exit), size_reached and soak.<metric> (10.1, 10.11)
+  not_settled:
+    frames_unstable:
+      owner_section: '3.5'
+      detail_means: null
+    anchor_missing:
+      owner_section: '3.5'
+      detail_means: null
+    anti_anchor_present:
+      owner_section: '3.5'
+      detail_means: null
+    timeout:
+      owner_section: '3.5'
+      detail_means: null
+    unexpected_window:
+      owner_section: '3.4'
+      detail_means: title of the thinkorswim window still present at max wait
+    unstable:
+      owner_section: '10.5'
+      detail_means: null
+    aa_drift:
+      owner_section: '10.6'
+      detail_means: null
+  not_comparable:
+    fingerprint_mismatch:
+      owner_section: '3.3'
+      detail_means: the differing match-class field names, never empty; data_epoch, bounds source and render_probe_hash are
+        fields (7.4)
+    window_mismatch:
+      owner_section: '3.4'
+      detail_means: null
+    surface_mismatch:
+      owner_section: '3.4'
+      detail_means: null
+  landmark_missing:
+    landmark:
+      owner_section: '3.8'
+      detail_means: landmark id and the side it was missing on
+    locator:
+      owner_section: '5.5'
+      detail_means: step id whose locator failed on every rung
+    redaction_landmark:
+      owner_section: '6.10'
+      detail_means: redaction landmark id; nothing stored, nothing released
+    probe:
+      owner_section: 2.2.3
+      detail_means: registry validation probe P1 to P8 whose anchor was not found
+  env_error:
+    gate:
+      owner_section: '5.2'
+      detail_means: null
+    version_mismatch:
+      owner_section: '7.3'
+      detail_means: null
+    version_changed_mid_run:
+      owner_section: '7.3'
+      detail_means: null
+    rig_spec_mismatch:
+      owner_section: '7.1'
+      detail_means: null
+    session_kicked:
+      owner_section: '7.7'
+      detail_means: null
+    fixture_drift:
+      owner_section: '7.6'
+      detail_means: null
+    occluded:
+      owner_section: '3.4'
+      detail_means: null
+    identity_unreadable:
+      owner_section: '6.4'
+      detail_means: null
+    attestation_unreadable:
+      owner_section: '6.3'
+      detail_means: null
+    vault_unreachable:
+      owner_section: '6.9'
+      detail_means: null
+    delay_state:
+      owner_section: '7.9'
+      detail_means: null
+    data_epoch_mismatch:
+      owner_section: '7.9'
+      detail_means: null
+    prices_stale:
+      owner_section: '4.9'
+      detail_means: null
+    fixture_maintenance_needed:
+      owner_section: '7.6'
+      detail_means: null
+    backend_degraded:
+      owner_section: '7.11'
+      detail_means: null
+    agreement_pending:
+      owner_section: '7.3'
+      detail_means: null
+    authentication_challenge:
+      owner_section: '7.7'
+      detail_means: null
+    authentication_failed:
+      owner_section: '7.7'
+      detail_means: null
+    live_mode_selected:
+      owner_section: '7.7'
+      detail_means: null
+    timeout:
+      owner_section: '7.7'
+      detail_means: null
+    relogin_budget:
+      owner_section: '7.7'
+      detail_means: null
+    snapshot_revert_failed:
+      owner_section: '7.2'
+      detail_means: null
+    install_failed:
+      owner_section: '7.3'
+      detail_means: null
+    fingerprint_unreadable:
+      owner_section: '7.4'
+      detail_means: fingerprint field that could not be read
+    ondemand_timeout:
+      owner_section: '7.9'
+      detail_means: null
+    ondemand_state:
+      owner_section: '7.9'
+      detail_means: null
+    precondition:
+      owner_section: 2.6.1
+      detail_means: flow precondition check that still failed after one reset_ui and one reset_profile
+    maintenance:
+      owner_section: '7.8'
+      detail_means: null
+  harness_error:
+    bounds_source_unavailable:
+      owner_section: '5.9'
+      detail_means: null
+    ocr_calibration:
+      owner_section: '5.10'
+      detail_means: null
+    mask_budget_exceeded:
+      owner_section: '3.8'
+      detail_means: null
+    invariant_on_aa:
+      owner_section: '2.7'
+      detail_means: null
+    hook_lost:
+      owner_section: '5.4'
+      detail_means: null
+    orchestrator_died:
+      owner_section: '10.2'
+      detail_means: null
+    canary_generation_failed:
+      owner_section: '10.3'
+      detail_means: null
+    canary_path_divergence:
+      owner_section: '10.3'
+      detail_means: null
+    detector_blind:
+      owner_section: '10.3'
+      detail_means: null
+    detector_degraded:
+      owner_section: '10.3'
+      detail_means: null
+    safety_canary_blind:
+      owner_section: '6.5'
+      detail_means: 'blind detector: attestation, identity, proof, deny_list, secret_scan or redaction'
+    drill_failed:
+      owner_section: '6.5'
+      detail_means: fire drill item 1 to 5 that was not blocked or could not run
+    validation_self_test:
+      owner_section: '10.3'
+      detail_means: null
+    chaos_unobserved:
+      owner_section: '10.2'
+      detail_means: null
+    aa_drift_global:
+      owner_section: '10.6'
+      detail_means: null
+    registry_entry_not_found:
+      owner_section: 2.2.3
+      detail_means: null
+    export_header_mismatch:
+      owner_section: 2.8.1
+      detail_means: null
+    chaos_rule_stuck:
+      owner_section: '7.11'
+      detail_means: null
+    exception:
+      owner_section: '10.1'
+      detail_means: exception class and Watchdog event id
+    store_write_failed:
+      owner_section: '8.9'
+      detail_means: null
+    artifact_persist_failed:
+      owner_section: '8.9'
+      detail_means: null
+    redaction_version_missing:
+      owner_section: '8.9'
+      detail_means: null
+  not_run:
+    entitlement:
+      owner_section: '2.12'
+      detail_means: null
+    budget:
+      owner_section: '11.2'
+      detail_means: null
+    scope:
+      owner_section: '2.11'
+      detail_means: null
+    quarantine:
+      owner_section: '10.5'
+      detail_means: null
+    step_failed:
+      owner_section: '5.2'
+      detail_means: step id that ended failed or blocked_by_gateway
+    base_step_failed:
+      owner_section: '3.1'
+      detail_means: null
+    app_crash:
+      owner_section: '10.1'
+      detail_means: null
+    model_unavailable:
+      owner_section: '10.7'
+      detail_means: null
+  unregistered_surface:
+    probe:
+      owner_section: 2.2.3
+      detail_means: registry validation probe P1 to P8 that enumerated the entry; the label goes in detail
+  needs_baseline:
+    new_surface:
+      owner_section: '1.10'
+      detail_means: null
+    base_not_settled:
+      owner_section: '1.10'
+      detail_means: null
+    base_env_error:
+      owner_section: '1.10'
+      detail_means: null
+    base_harness_error:
+      owner_section: '1.10'
+      detail_means: null
+    lineage_missing:
+      owner_section: '9.8'
+      detail_means: null
+    reuse_missing:
+      owner_section: '7.4'
+      detail_means: null
+    explorer_replay:
+      owner_section: '2.9'
+      detail_means: null
+  aborted_safety:
+    attestation_mismatch:
+      owner_section: '6.3'
+      detail_means: null
+    paper_mode_mismatch:
+      owner_section: '6.4'
+      detail_means: null
+    kill_switch:
+      owner_section: '6.6'
+      detail_means: null
+    attempted_send:
+      owner_section: '6.2'
+      detail_means: null
+    unexpected_working_order:
+      owner_section: '7.6'
+      detail_means: null
+    undeclared_order_row:
+      owner_section: '6.6'
+      detail_means: null
+    drill_order_placed:
+      owner_section: '6.5'
+      detail_means: null
+    unknown_dialog_in_order_stage:
+      owner_section: 5.4.3
+      detail_means: null
+    live_identity:
+      owner_section: '6.4'
+      detail_means: null
+  aborted_budget:
+    wall_clock:
+      owner_section: '11.2'
+      detail_means: null
+    app_restart_budget:
+      owner_section: '10.2'
+      detail_means: null
+    pool_saturated:
+      owner_section: '11.2'
+      detail_means: null
+    rate_cap:
+      owner_section: '6.4'
+      detail_means: null
+    dollar_cap:
+      owner_section: '11.4'
+      detail_means: null
+    superseded:
+      owner_section: '11.2'
+      detail_means: null
+  aborted_harness:
+    config_invalid:
+      owner_section: '4.15'
+      detail_means: null
+    bounds_source_unavailable:
+      owner_section: '5.9'
+      detail_means: null
+    preflight:
+      owner_section: '12.7'
+      detail_means: H item of 12.7; rendered preflight.<item> as 12.7 writes it
+    dead_man:
+      owner_section: '10.2'
+      detail_means: null
+    orchestrator_restart_budget:
+      owner_section: '10.2'
+      detail_means: null
+    start_failed:
+      owner_section: '11.2'
+      detail_means: null
+    hook_lost:
+      owner_section: 5.4.2
+      detail_means: null
+    watchdog_dead:
+      owner_section: '10.2'
+      detail_means: null
+    heartbeat_unwritable:
+      owner_section: '10.2'
+      detail_means: null
+    disk_full:
+      owner_section: '10.2'
+      detail_means: null
+    rig_lost:
+      owner_section: '10.7'
+      detail_means: null
+    canary_generation_failed:
+      owner_section: '10.3'
+      detail_means: null
+    taxonomy_check_failed:
+      owner_section: '1.4'
+      detail_means: null
+    dpi_awareness:
+      owner_section: '7.1'
+      detail_means: null
+    store_write_failed:
+      owner_section: '8.9'
+      detail_means: null
+    artifact_persist_failed:
+      owner_section: '8.9'
+      detail_means: null
+    secret_leaked:
+      owner_section: '6.9'
+      detail_means: null
+    secret_scan_unavailable:
+      owner_section: '6.9'
+      detail_means: null
+    egress_unlogged:
+      owner_section: '6.10'
+      detail_means: null
+    base_build_missing:
+      owner_section: '3.1'
+      detail_means: null
+    import_conflict:
+      owner_section: '8.9'
+      detail_means: null
+  complete_with_env_errors:
+    unproven_proof:
+      owner_section: '6.6'
+      detail_means: null
+    teardown_fault:
+      owner_section: '5.2'
+      detail_means: null
+    relogin_budget:
+      owner_section: '7.7'
+      detail_means: null
+rule_operands:
+  R01:
+    qty:
+      type: integer
+      required: true
+    price:
+      type: price
+      required: true
+    multiplier:
+      type: integer
+      required: true
+    total:
+      type: money
+      required: true
+  R02:
+    bp_effect:
+      type: money
+      required: true
+    notional:
+      type: money
+      required: true
+  R03:
+    bid:
+      type: price
+      required: true
+    mark:
+      type: price
+      required: true
+    ask:
+      type: price
+      required: true
+    last:
+      type: price
+      required: false
+    low:
+      type: price
+      required: false
+    high:
+      type: price
+      required: false
+  R04:
+    count:
+      type: integer
+      required: true
+    selector:
+      type: text
+      required: true
+  R05:
+    delta:
+      type: decimal
+      required: true
+    gamma:
+      type: decimal
+      required: false
+    vega:
+      type: decimal
+      required: false
+    theta:
+      type: decimal
+      required: false
+  R06:
+    call:
+      type: price
+      required: true
+    put:
+      type: price
+      required: true
+    strike:
+      type: price
+      required: true
+    underlying:
+      type: price
+      required: true
+    rate:
+      type: percent
+      required: false
+    dte:
+      type: integer
+      required: false
+  R07:
+    dte:
+      type: integer
+      required: true
+    expiration:
+      type: date
+      required: true
+  R08:
+    pl_open:
+      type: money
+      required: true
+    mark:
+      type: price
+      required: true
+    trade_price:
+      type: price
+      required: true
+    qty:
+      type: integer
+      required: true
+    multiplier:
+      type: integer
+      required: true
+  R09:
+    export_total:
+      type: money
+      required: true
+    screen_total:
+      type: money
+      required: true
+  R10:
+    value:
+      type: text
+      required: true

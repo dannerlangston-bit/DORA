@@ -536,6 +536,16 @@ _SCHEMA_OF: dict[str, tuple[str, str]] = {      # doc kind -> (schema name, rule
     "profile": ("profile", "L-FIX-05"), "configs_allowed": ("configs-allowed", "L-WSP-05"), "send_policy": ("send-policy", "L-FLW-08"),
     "explorer_budget": ("explorer-budget", "L-XREF-14"), "branches": ("branches", "L-XREF-15"),
     "quarantine": ("quarantine", "L-XREF-11"),
+    # 4.16 files: schema failures report under the rule that governs the file
+    "default_order_hotkeys": ("default-order-hotkeys", "L-XREF-17"), "dismiss_allowlist": ("dismiss-allowlist", "L-XREF-18"),
+    "explorer_deny_list": ("explorer-deny-list", "L-XREF-13"), "egress_allowlist": ("egress-allowlist", "L-XREF-19"),
+    "computer_use_ruling": ("computer-use-ruling", "L-XREF-19"), "budgets": ("budgets", "L-XREF-22"),
+    "release_gate": ("release-gate", "L-XREF-23"), "reporting": ("reporting", "L-XREF-21"),
+    "authorization": ("authorization", "L-XREF-20"), "windows": ("windows", "L-XREF-24"),
+    "oncall": ("oncall", "L-XREF-26"), "credential_rotation": ("credential-rotation", "L-XREF-25"),
+    "process_allowlist": ("process-allowlist", "L-FPR-00"), "measured_sizes": ("measured-sizes", "L-WSP-00"),
+    "palette": ("palette", "L-XREF-30"), "soak": ("soak", "L-XREF-27"),
+    "calibration": ("calibration", "L-RGN-00"), "eval_report": ("eval-report", "L-XREF-29"),
 }
 _CATALOGS = {"popups": ("popup#popup", "L-POP-00", "popups"), "mutants": ("mutant#mutant", "L-MUT-00", "mutants")}   # one catalog entry
 

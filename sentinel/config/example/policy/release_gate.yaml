@@ -2,3 +2,4 @@
 schema_version: 1
 default_business_days: 3
 trains: []
+owner: release.manager            # the release manager (9.12)

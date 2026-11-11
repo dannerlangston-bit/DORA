@@ -62,7 +62,7 @@ from __future__ import annotations
 
 import struct
 import sys
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any, NamedTuple, Protocol
 
@@ -442,7 +442,7 @@ class SegmentWriter:
         self._published: set[int] = set()
 
     @contextmanager
-    def transaction(self):
+    def transaction(self) -> Iterator[Any]:
         """seq to odd, the body writes, seq to even; an exception leaves seq odd so the hook fails closed."""
         seq = _U64.unpack_from(self.buf, OFF_SEQ)[0]
         if not seq & 1:

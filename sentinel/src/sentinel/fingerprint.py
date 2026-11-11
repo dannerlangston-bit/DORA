@@ -20,7 +20,8 @@ in the closed taxonomy, what each check over it gives:
 - `cheap_reread(os_reads, title_build_id)` and `midrun_fingerprint_change(start, reread)`: the re-reads at every
   flow boundary and after every relaunch (3.3, 7.4, SD-73).
 
-Every comparison is `lint.rules.fingerprint_differences`, the one the lint and the Diff Engine use.
+Every match-field comparison but the mid-run build id is `lint.rules.fingerprint_differences`, the one the lint and
+the Diff Engine use.
 
 Choices where the spec is ambiguous or silent (reported):
 
@@ -122,7 +123,12 @@ def _unreadable_read(field: str, value: Any) -> bool:
 
 
 def _gate_of(field: str) -> str:
-    return "launched" if field in APP_FIELDS else "provisioned"
+    """The gate a rig-read field is read at (choice 1); ValueError for a field the run supplies."""
+    if field in APP_FIELDS:
+        return "launched"
+    if field in OS_FIELDS or field == "time_zone":
+        return "provisioned"
+    raise ValueError(f"{field} is supplied by the run, not read from the rig (7.4)")
 
 
 def _os_values(r: OsReads) -> dict[str, Any]:

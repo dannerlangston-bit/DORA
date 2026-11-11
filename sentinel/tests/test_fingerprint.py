@@ -300,6 +300,8 @@ def test_an_unreadable_reread_is_env_error_at_its_gate():
     assert outcome(r)[:3] == ("env_error", "fingerprint_unreadable:build_id", "launched")
     with pytest.raises(ValueError, match="bounds_source"):
         F.midrun_fingerprint_change(fp(), {"bounds_source": "B"})
+    with pytest.raises(ValueError, match="supplied by the run"):
+        F.midrun_fingerprint_change(fp(), {"data_epoch": None})          # never a rig read
 
 
 # -- storage (8.3 env_fingerprints) -------------------------------------------------------------------------------

@@ -73,7 +73,6 @@ from __future__ import annotations
 
 import hashlib
 import itertools
-import json
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
@@ -82,6 +81,8 @@ from typing import Any, Iterable
 
 from PIL import Image
 
+from ..canonical import epoch_id
+from ..canonical import fingerprint_id_of as fingerprint_id
 from ..taxonomy import is_checkpoint_id, is_slug, load as load_taxonomy
 from . import schemas
 from .repo import Doc, Repo
@@ -452,22 +453,6 @@ def _short_sha(build_id: str) -> str:
 def _id_diff(got: set, want: Iterable[str]) -> str:
     want = set(want)
     return f"missing {sorted(want - got)}, extra {sorted(map(str, got - want))}"
-
-
-def _canonical(obj: Any) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-
-def epoch_id(epoch: dict) -> str:
-    """4.9: sha256 over the canonical JSON of the epoch fields other than `epoch_id`."""
-    rest = {k: v for k, v in epoch.items() if k != "epoch_id"}
-    return "sha256:" + hashlib.sha256(_canonical(rest).encode("utf-8")).hexdigest()
-
-
-def fingerprint_id(fingerprint: dict) -> str:
-    """4.12: sha256 over the canonical JSON of `match` with `build_id` removed."""
-    match = {k: v for k, v in _d(fingerprint.get("match")).items() if k != "build_id"}
-    return "sha256:" + hashlib.sha256(_canonical(match).encode("utf-8")).hexdigest()
 
 
 def file_sha256(path: Path) -> str:

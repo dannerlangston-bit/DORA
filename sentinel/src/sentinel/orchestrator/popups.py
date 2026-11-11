@@ -51,9 +51,11 @@ Choices where the spec is ambiguous or silent (reported):
    error dialog. With a `template_ok` check an entry that carries a template matches only when its template does too;
    without one (no grab, or Phase 0 drafts) the title decides.
 3. One hit per appearance (7.8 policy 3 "every hit is counted"): `PopupSentinel` counts a window the first sweep that
-   sees it (by hwnd and the entry or title it matched) and forgets it once a sweep no longer sees it; an `ignore` entry
-   (product state) is never counted. Unmatched windows are counted under their raw title, which is the 8.3
-   `popup_title` of an unknown popup; matched windows under their `popup_id`.
+   sees it (by hwnd and the entry it matched; an unmatched window that retitles itself stays one appearance) and
+   forgets it once a sweep no longer sees it; an `ignore` entry (product state) is never counted. Unmatched windows are
+   counted under their raw title, which is the 8.3 `popup_title` of an unknown popup; matched windows under their
+   `popup_id`. A window seen again keeps a POP-21 hand-off while the LOGIN flow's recovery runs, so the recovery is
+   never charged twice.
 4. Abort scope by class. `abort` and an expired `wait` are flow-level as 4.10 states (step `failed`, the checkpoint in
    progress takes `on_abort`, `rest_of_flow` is `not_run (reason: step_failed:<step>)`, `end_flow`), except: an
    `env_error` of the `env` and `login` classes ends the shard (7.8 policy 3 "abort the shard", 7.7 POP-04 "every
@@ -613,11 +615,12 @@ def proposed_entry(window: Any, ctx: PopupContext, popup_id: str, *, safety: boo
     return draft
 
 
-def unknown_window(window: Any, ctx: PopupContext, catalog: PopupCatalog, *, popup_id: str | None = None) -> ControlResult:
-    """An unmatched window (4.10, 7.8 policy 5): `aborted_safety (reason: unknown_dialog_in_order_stage)` while the step's
-    `order_stage` is set; otherwise the flow is quarantined and the window goes to the agent's dismiss-only toolset, or
-    WM_CLOSE with agent mode off, unless its title is in the order-dialog or order-event set, which is never handed to the
-    agent and never closed. Either way an `unknown_popup` finding carries the proposed entry."""
+def unknown_window(window: Any, ctx: PopupContext, catalog: PopupCatalog, *,
+                   popup_id: str | None = None) -> ControlResult:
+    """An unmatched window (4.10, 7.8 policy 5): `aborted_safety (reason: unknown_dialog_in_order_stage)` while the
+    step's `order_stage` is set; otherwise the flow is quarantined and the window goes to the agent's dismiss-only
+    toolset, or WM_CLOSE with agent mode off, unless its title is in the order-dialog or order-event set, which is never
+    handed to the agent and never closed. Either way an `unknown_popup` finding carries the proposed entry."""
     title = window.title or ""
     safety_title = any(re.search(p, title) for p in order_dialog_regexes(catalog) + order_event_regexes(catalog))
     draft = proposed_entry(window, ctx, popup_id or catalog.next_popup_id(), safety=ctx.order_stage or safety_title)
@@ -709,24 +712,30 @@ class PopupSentinel:
         self.counter = counter if counter is not None else PopupCounter()
         self.ondemand_timeouts = 0
         self.challenge_recoveries = 0
-        self._active: dict[int, str] = {}
+        self._active: dict[int, str | None] = {}           # hwnd -> the popup_id it matched (None: unmatched)
+        self._handoffs: dict[int, ControlResult] = {}       # hwnd -> a LOGIN-flow recovery in progress
         self._proposed: dict[str, str] = {}
         self._occluders: set[str] = set()
 
     def sweep(self, windows: Iterable[Any], ctx: PopupContext, *, expected_hwnds: Collection[int] = (),
               expected_titles: Iterable[str] = (),
               template_ok: Callable[[PopupEntry, Any], bool] | None = None) -> tuple[PopupHit, ...]:
-        """Before every step and every capture (4.10, 7.8 policy 1): one decision per unexpected window. A window seen
-        again whose dismissal or close should have removed it is `persisting`; a waiting or kill-switch window is decided
-        again with no new count."""
+        """Before every step and every capture (4.10, 7.8 policy 1): one decision per unexpected window. A window is
+        one appearance while its hwnd stays matched to the same entry (an unmatched one may retitle itself). Seen again,
+        a window its dismissal or close should have removed is `persisting`; a waiting or kill-switch window is decided
+        again with no new count, and a LOGIN-flow recovery in progress keeps its hand-off."""
         ctx = replace(ctx, ondemand_timeouts=self.ondemand_timeouts, challenge_recoveries=self.challenge_recoveries)
         hits: list[PopupHit] = []
-        active: dict[int, str] = {}
+        active: dict[int, str | None] = {}
         for w in unexpected_windows(windows, expected_hwnds=expected_hwnds, expected_titles=expected_titles):
             entry = self.catalog.match(w, ctx.phase, template_ok=template_ok)
-            key = entry.popup_id if entry else (w.title or "")
-            new = self._active.get(w.hwnd) != key
-            active[w.hwnd] = key
+            ident = entry.popup_id if entry else None
+            new = w.hwnd not in self._active or self._active[w.hwnd] != ident
+            active[w.hwnd] = ident
+            key = ident or (w.title or "")
+            if not new and w.hwnd in self._handoffs:
+                hits.append(PopupHit(w, entry, self._handoffs[w.hwnd], new=False))
+                continue
             if not new and (entry is None or not _passive(entry)):
                 hits.append(PopupHit(w, entry, persisting(w, ctx, entry), new=False))
                 continue
@@ -740,8 +749,10 @@ class PopupSentinel:
                 self.counter.add(key)
             if new and result.evidence.get("handoff") == "login_recovery":
                 self.challenge_recoveries += 1
+                self._handoffs[w.hwnd] = result
             hits.append(PopupHit(w, entry, result, new=new))
         self._active = active
+        self._handoffs = {h: r for h, r in self._handoffs.items() if h in active}
         return tuple(hits)
 
     def wait_over(self, hit: PopupHit, ctx: PopupContext, *, cleared: bool) -> ControlResult | None:
@@ -775,8 +786,8 @@ class PopupSentinel:
 def popup_event(hit: PopupHit, *, run_id: str, shard_id: str, side: str, seq: int, wall_at: str, mono_ms: int,
                 mode: str = "system", flow_id: str | None = None, step_id: str | None = None,
                 checkpoint_id: str | None = None, screenshot_sha256: str | None = None) -> StepEvent:
-    """The 8.3 `step_events` row of one new hit: action `popup`, `popup_title` the matched `popup_id` or the raw title of
-    an unknown popup, the key or click target sent, the catalog action (or `unknown:<close>`) as `reason`, and the
+    """The 8.3 `step_events` row of one new hit: action `popup`, `popup_title` the matched `popup_id` or the raw title
+    of an unknown popup, the key or click target sent, the catalog action (or `unknown:<close>`) as `reason`, and the
     hit's screenshot as `pre_hash` (7.8 policy 3: every hit logged with a screenshot)."""
     ev = hit.result.evidence
     inp = ev.get("input") or {}
@@ -827,10 +838,10 @@ def popup_rate_findings(history: Sequence[BuildCounts]) -> tuple[FindingSpec, ..
     for key in sorted(k for k in cur.counts if POP_ID.match(k)):
         before, after = prev.rate(key), cur.rate(key)
         if after > before:
-            out.append(FindingSpec("popup_rate_increase",
-                                   f"{key}: {after:.2f} hits per run on {cur.build_id}, {before:.2f} on {prev.build_id}",
-                                   detail=canonical_json({"popup_id": key, "build": cur.build_id, "hits": cur.counts[key],
-                                                          "runs": cur.runs, "previous_build": prev.build_id,
-                                                          "previous_hits": prev.counts.get(key, 0),
-                                                          "previous_runs": prev.runs})))
+            detail = {"popup_id": key, "build": cur.build_id, "hits": cur.counts[key], "runs": cur.runs,
+                      "previous_build": prev.build_id, "previous_hits": prev.counts.get(key, 0),
+                      "previous_runs": prev.runs}
+            out.append(FindingSpec("popup_rate_increase", f"{key}: {after:.2f} hits per run on {cur.build_id}, "
+                                                          f"{before:.2f} on {prev.build_id}",
+                                   detail=canonical_json(detail)))
     return tuple(out)

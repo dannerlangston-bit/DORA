@@ -288,6 +288,9 @@ def test_challenge_prompt_recovers_once_inside_login_only():
     (hit,) = sentinel.sweep([win("Enter verification code")], login)
     assert hit.result.passed and hit.result.evidence["handoff"] == "login_recovery"
     assert sentinel.challenge_recoveries == 1
+    (during,) = sentinel.sweep([win("Enter verification code")], login)   # the recovery is still running
+    assert not during.new and during.result is hit.result and sentinel.challenge_recoveries == 1
+    sentinel.sweep([], login)
     (again,) = sentinel.sweep([win("Enter verification code", hwnd=501)], login)
     r = again.result
     assert (r.checkpoint.gate, r.checkpoint.reason) == ("authenticated", "authentication_challenge")
@@ -346,7 +349,8 @@ def test_unknown_window_is_quarantined_and_dismissed_by_the_agent_or_wm_close():
     assert r.has("quarantine_flow") and r.run is None and r.evidence["close"] == "agent_dismiss"
     assert r.evidence["dismiss_labels"] == list(AGENT_DISMISS_LABELS)
     draft = json.loads(r.findings[0].detail)
-    assert draft["popup_id"] == "POP-23" and draft["class"] == "dismissable" and draft["seed_titles"] == ["Rate this app"]
+    assert draft["popup_id"] == "POP-23" and draft["class"] == "dismissable"
+    assert draft["seed_titles"] == ["Rate this app"]
     assert draft["first_seen_build"] == "main-2000.1.0-aaaaaaa" and draft["name"] == "popup.unknown-rate-this-app"
     parsed = parse_catalog([draft]).entries[0]                    # the draft is a catalog entry
     assert parsed.pattern.search("Rate this app") and not parsed.pattern.search("Rate this app now")
@@ -392,6 +396,10 @@ def test_a_window_that_leaves_and_comes_back_is_a_new_hit_and_unknown_titles_kee
     (c,) = sentinel.sweep([win("Rate this app", hwnd=10)], RUN)
     ids = [h.result.evidence["proposed_entry"]["popup_id"] for h in (a, b, c)]
     assert ids == ["POP-23", "POP-24", "POP-23"]
+    loading = PopupSentinel(CAT)
+    (first,) = loading.sweep([win("Loading 10%", hwnd=11)], RUN)
+    (retitled,) = loading.sweep([win("Loading 20%", hwnd=11)], RUN)    # one appearance that retitled itself
+    assert first.new and not retitled.new and sum(loading.counter.counts.values()) == 1
 
 
 # -- foreground occlusion before an input batch (7.8 policy 1) ----------------------------------------------------

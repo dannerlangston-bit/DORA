@@ -247,15 +247,24 @@ def test_slow_half_allows_cancel_all_only_to_the_teardown_action_and_declared_en
     assert slow_half(click("Splitter"), SafetyContext(hook_alive=False)).reason == "hook_host_dead"
 
 
+def pinned(**kw) -> SafetyContext:
+    """A context with the dismiss allowlist pinned as Phase 0 would pin it (choice 10: the default is empty)."""
+    return SafetyContext(dismiss_allowlist=DISMISS_ALLOWLIST, **kw)
+
+
 def test_confirm_and_send_needs_order_stage_attestation_and_paper_assertion():
     a = click("Confirm and Send", order_stage_step=True)
-    assert slow_half(a, SafetyContext(attestation_passed=True)).reason == "deny_profile"
-    ok = slow_half(a, SafetyContext(flag=Flag.SET, attestation_passed=True, paper_assertion_current=True))
+    assert slow_half(a, pinned(attestation_passed=True)).reason == "deny_profile"
+    ok = slow_half(a, pinned(flag=Flag.SET, attestation_passed=True, paper_assertion_current=True))
     assert not ok.refused and ok.dialog_ok                         # the sticky flag is already set; no dialog yet
+    # the default context loads no allowlist: nothing could dismiss the dialog, so it is never opened
+    assert SafetyContext().dismiss_allowlist == frozenset()
+    s = slow_half(a, SafetyContext(flag=Flag.SET, attestation_passed=True, paper_assertion_current=True))
+    assert s.reason == "deny_profile" and "empty dismiss allowlist" in s.detail
 
 
 def test_dialog_allowlist_inverts_inside_the_order_dialog():
-    ctx = SafetyContext(flag=Flag.SET, order_dialog_present=True, deny_rects=(SEND,))
+    ctx = pinned(flag=Flag.SET, order_dialog_present=True, deny_rects=(SEND,))
     ok = slow_half(click("Delete", point=DELETE_POINT), ctx)
     assert not ok.refused and ok.dialog_ok
     both = slow_half(click("Delete", "Del ete"), ctx)                                     # both labels must match
@@ -368,8 +377,23 @@ def test_chart_right_click_buy_is_denied_to_agent_and_explorer_and_counted():
         r = rig.send_input(a)
         assert r.refused_reason == "deny_profile"
         res = ledger.record(GatewayDrop("deny_profile", "refused", "integrity", profile), unit=f"s{i}")
-        assert res.step == "blocked_by_gateway" and res.run is None
+        # 5.4.8 rule 3: the Explorer's tool call is blocked and its session goes on; an agent rescue ends, step failed
+        expected = ("blocked_by_gateway", ()) if profile == "explorer" else ("failed", ("end_session",))
+        assert (res.step, res.actions) == expected and res.run is None
     assert ledger.run_count == 2 and rig.sent_orders == 0
+
+
+def test_a_non_send_refusal_ends_a_scripted_flow_blocked_and_an_agent_rescue_failed():
+    """5.4.8 rule 3 by mode (SD-53): scripted step `blocked_by_gateway` with the rest of the flow `not_run`; agent
+    rescue `failed`, the rescue ends, and the rest of the flow is the Executor's (5.5)."""
+    scripted = DropLedger().record(GatewayDrop("deny_profile", "refused", "integrity"), unit="flow.a", step_id="s04")
+    assert scripted.step == "blocked_by_gateway" and scripted.actions == ("end_flow",)
+    assert [(o.selector, o.outcome.outcome, o.outcome.reason) for o in scripted.outcomes] == [
+        ("rest_of_flow", "not_run", "step_failed:s04")]
+    agent = DropLedger().record(GatewayDrop("deny_profile", "refused", "integrity", "agent"), unit="flow.a",
+                                step_id="s04")
+    assert (agent.step, agent.step_reason, agent.actions, agent.outcomes) == ("failed", "deny_profile",
+                                                                              ("end_session",), ())
 
 
 def test_an_unguarded_enter_would_send_on_the_simulated_app():
@@ -493,30 +517,31 @@ def confirm(**kw) -> Action:
 
 
 def test_confirm_and_send_reads_the_session_safety_the_orchestrator_sets():
-    ok = slow_half(confirm(), SafetyContext(flag=Flag.SET, session=session(), now=NOW))
+    ok = slow_half(confirm(), pinned(flag=Flag.SET, session=session(), now=NOW))
     assert not ok.refused and ok.dialog_ok
-    failed_attestation = SafetyContext(session=session("none"), now=NOW)          # attest() failed or never ran
-    after_kill = SafetyContext(session=SessionSafety(), now=NOW)                 # cleared on kill_tree or relaunch
-    stale = SafetyContext(session=session(age=PAPER_ASSERTION_CURRENT_S + 0.1), now=NOW)
-    for ctx in (failed_attestation, after_kill, stale, SafetyContext(session=session(kicked=True), now=NOW),
-                SafetyContext(session=session(), now=None), SafetyContext(session=session(age=None), now=NOW)):
+    failed_attestation = pinned(session=session("none"), now=NOW)                 # attest() failed or never ran
+    after_kill = pinned(session=SessionSafety(), now=NOW)                        # cleared on kill_tree or relaunch
+    stale = pinned(session=session(age=PAPER_ASSERTION_CURRENT_S + 0.1), now=NOW)
+    for ctx in (failed_attestation, after_kill, stale, pinned(session=session(kicked=True), now=NOW),
+                pinned(session=session(), now=None), pinned(session=session(age=None), now=NOW)):
         s = slow_half(confirm(), ctx)
         assert (s.reason, s.attempted_send) == ("deny_profile", False), ctx
+        assert "allowlist" not in s.detail                                       # refused for the session itself
     # with a session the legacy booleans are not read
-    assert slow_half(confirm(), SafetyContext(session=session("none"), now=NOW, attestation_passed=True,
-                                              paper_assertion_current=True)).refused
+    assert slow_half(confirm(), pinned(session=session("none"), now=NOW, attestation_passed=True,
+                                       paper_assertion_current=True)).refused
 
 
 def test_the_a9_click_needs_a3_to_a8_and_every_later_click_a3_to_a9():
-    staged = SafetyContext(session=session("a3_a8"), now=NOW)
+    staged = pinned(session=session("a3_a8"), now=NOW)
     assert slow_half(confirm(), staged).reason == "deny_profile"
     assert not slow_half(confirm(a9_check=True), staged).refused
-    assert slow_half(confirm(a9_check=True), SafetyContext(session=session("none"), now=NOW)).refused
+    assert slow_half(confirm(a9_check=True), pinned(session=session("none"), now=NOW)).refused
 
 
 def test_paper_assertion_currency_is_the_two_minute_timer_of_6_4():
     assert PAPER_ASSERTION_CURRENT_S == TIMER_S
-    edge = SafetyContext(session=session(age=PAPER_ASSERTION_CURRENT_S), now=NOW)
+    edge = pinned(session=session(age=PAPER_ASSERTION_CURRENT_S), now=NOW)
     assert edge.assertion_current() and not slow_half(confirm(), edge).refused
     assert not SafetyContext(session=session(age=-1.0), now=NOW).assertion_current()   # a stamp from the future
 
@@ -532,7 +557,7 @@ def test_an_empty_dismiss_allowlist_refuses_confirm_and_send_and_tokens_no_dialo
 
 
 def test_edit_is_an_unknown_dialog_label_unless_pinned():
-    ctx = SafetyContext(flag=Flag.SET, order_dialog_present=True, deny_rects=(SEND,))
+    ctx = pinned(flag=Flag.SET, order_dialog_present=True, deny_rects=(SEND,))
     assert DISMISS_ALLOWLIST == frozenset({"Delete"})
     s = slow_half(click("Edit"), ctx)
     assert s.reason == "dialog_allowlist" and s.unknown_dialog

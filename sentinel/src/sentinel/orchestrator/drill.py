@@ -29,11 +29,12 @@ re-check in stage 4 of 5.4.3 (the hook drops both raw attempts `shift_click_dial
 
 `run_drill` drives the drill on a `Rig` and scores it with `score_drill`. What it needs beyond the `Rig` is the
 `DrillPort` (build the drill ticket, locate the drill's targets, the `close_dialog` and `clear_ticket`
-teardown actions with the `absent` assertion, and `Cancel All` located by template without a click);
-`SimDrillPort` implements it over `SimulatedRig`, the Windows track over the drill flow's scripted steps.
-Item 5 writes the kill flag through a `ports.KillChannel`, then runs the 6.6 sequence itself (deny-all, the
-tree killed, the recovery login with A1 and A2, the Working read, `Cancel All` located, the proof, the revert)
-and times each part with the clock from the moment the flag was written.
+teardown actions with the `absent` assertion); `SimDrillPort` implements it over `SimulatedRig`, the Windows track
+over the drill flow's scripted steps. Item 5 writes the kill flag through a `ports.KillChannel`, then runs the 6.6
+sequence itself with the hook in each phase of `gateway.HOOK_STATES` (deny-all, the tree killed, the recovery login
+with A1 and A2 in the recovery-only arm, the Working read, `Cancel All` located by `Rig.locate_cancel_all` without a
+click, the proof, the revert, then `between_runs`) and times each part with the clock from the moment the flag was
+written.
 
 Choices for `run_drill` (reported):
 - The preconditions are checked first, with the drill ticket built on the way (the fourth precondition is
@@ -47,7 +48,7 @@ Choices for `run_drill` (reported):
   drop of it, drained in the drill's declared raw phase, is the record. A gateway attempt is refused in the
   slow half; anything else the slow half lets through is recorded as the hook decided it, so it is never in
   the declared set. Every drop and refusal goes to the run's `DropLedger` as exempt (drill tag, 5.4.8).
-- Item 5's `Cancel All` counts as located when the recovery read showed no new row and `DrillPort` located it,
+- Item 5's `Cancel All` counts as located when the recovery read showed no new row and the rig located it,
   or when a new row made the recovery flow click it and the re-read came back clean. The rig counts as
   reverted when `revert_snapshot` returned without an exception. The final Oracle read is item 5's recovery
   read (taken before the revert): with no usable read the new-row count is 0 and item 5 fails, so the drill
@@ -238,9 +239,6 @@ class DrillPort(Protocol):
         """The `close_dialog` and `clear_ticket` teardown actions, then the `absent` assertion on the dialog
         title and the ticket: True when both are absent."""
 
-    def locate_cancel_all(self) -> bool:
-        """`Cancel All` in Working Orders located by template; never clicked (6.5 item 5)."""
-
 
 @dataclass(frozen=True)
 class DrillPreconditions:
@@ -254,7 +252,7 @@ class DrillPreconditions:
 class SimDrillPort:
     """`DrillPort` over `SimulatedRig`: the drill ticket is the simulated docked ticket (`ticket_visible`), the
     targets are the simulated app's fixed points (`unlocated` names targets to report as not located, as after a
-    rename in a new build), and `Cancel All` is located when the scenario says so."""
+    rename in a new build)."""
 
     POINTS = {"confirm_and_send": CONFIRM_POINT, "delete": DELETE_POINT, "ladder_buy_cell": (300, 700),
               "ticket_buy_button": (50, 50)}
@@ -280,9 +278,6 @@ class SimDrillPort:
         self.rig.ticket_visible = False                  # the simulated app clears the ticket on clear_ticket
         self.rig.send_input(Action("press", keys=(VK_ESCAPE,), flow_class="canary", teardown_action="clear_ticket"))
         return not (self.rig.dialog_open or self.rig.ticket_visible)
-
-    def locate_cancel_all(self) -> bool:
-        return self.rig.app_running and self.rig.s.cancel_all_located
 
 
 class _Drive:
@@ -388,21 +383,24 @@ def _item5(d: _Drive, *, clock: Clock, kill_channel: KillChannel, rig_id: str, s
         d.could_not_run[5] = "the kill flag did not arrive on the channel"
         d.port.clear_drill_ticket()
         return Item5(None, None, False, False, None, False), None
-    d.rig.set_hook_state(armed=False, deny_all=True)
+    d.rig.set_hook_phase("kill_switch")
     deny_all_s = clock.monotonic() - t0
     tree_gone_s = clock.monotonic() - t0 if d.rig.kill_process_tree() else None
+    d.rig.reset_input_state()
+    d.rig.set_hook_phase("recovery")                 # the recovery-only arm, as in the sequence itself (6.6 step 5)
     login_ok = recovery_login(d.rig, allowlist, clock, fixture_account)
     end: OrderBook | None = None
     cancel, located = "not_needed", False
     if login_ok:
         cancel, end = cancel_new_working(d.rig, start, d.rig.read_orders(), clock=clock)
-        located = cancel == "done" or (cancel == "not_needed" and d.port.locate_cancel_all())
+        located = cancel == "done" or (cancel == "not_needed" and d.rig.locate_cancel_all())
     proof = post_run_proof(ProofInputs(start=start, end=end, recovery_login_ok=login_ok, cancel_all=cancel))
     try:
         d.rig.revert_snapshot()
         reverted = True
     except Exception:            # noqa: BLE001 - any revert failure is "rig not reverted" (6.5 item 5), never a crash
         reverted = False
+    d.rig.set_hook_phase("between_runs")
     kill_channel.acknowledge(req)
     return Item5(deny_all_s, tree_gone_s, login_ok, located, proof.verdict, reverted), end
 

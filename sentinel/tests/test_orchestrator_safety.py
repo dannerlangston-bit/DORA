@@ -414,7 +414,13 @@ def test_kill_switch_sequence_then_proven_no_orders_sent():
     rep = _ks(rig, clock, rig.read_orders())
     assert rep.proof.verdict == PROVEN_NONE and rep.proof_effect.passed
     assert [s for s, _ in rep.steps] == ["deny_all", "kill_tree", "recovery_login", "proof", "revert_snapshot"]
-    assert rig.gw.deny_all and "cancel_all" not in rig.calls
+    assert "cancel_all" not in rig.calls
+    # the hook per phase (gateway.HOOK_STATES): deny-all, the recovery-only arm for the login, disarmed at the end
+    assert [c for c in rig.calls if c.startswith("set_hook_state")] == [
+        "set_hook_state:False:True", "set_hook_state:True:False:recovery_only", "set_hook_state:False:False"]
+    assert rig.calls.index("set_hook_state:True:False:recovery_only") < rig.calls.index("login") \
+        < rig.calls.index("revert_snapshot") < rig.calls.index("set_hook_state:False:False")
+    assert not (rig.gw.armed or rig.gw.deny_all or rig.recovery_only)
 
 
 def test_kill_switch_cancels_a_sent_order_and_the_proof_names_the_row():

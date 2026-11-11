@@ -1,22 +1,56 @@
 """`SimulatedRig`: a scriptable, deterministic `Rig` for tests and the demo (no Windows, no thinkorswim).
 
 A `SimScenario` holds what each capability returns (preflight results, launch outcomes, the login, the
-selector reads, the settings rows, the workspace, the accounts, the Monitor book, teardown). Input runs
-through the real decision code of gateway.py: `send_input` applies `slow_half`, writes tokens into a
-`GatewayState` and passes every event through `hook_decide`, and a small simulated app reacts to what
-gets through: a visible docked ticket (`ticket_visible`) sets the flag through the ticket detector,
-`Confirm and Send` opens the Order Confirmation dialog (the Window Watcher then sets the
-flag and writes the Send deny rectangle), `Delete` closes it, and an Enter, a Space or a click on `Send`
-that reaches the app while the dialog is open sends an order, which appears as a new Working row. So a
-bypass that the gateway failed to stop is visible to the post-run proof exactly as on a real rig.
+selector reads, the settings rows, the workspace, the accounts, the Monitor book, teardown, the Watchdog's reverse
+heartbeat and free space, the configuration the gateway enforces). Input runs through the real decision code of
+gateway.py: `send_input` applies `slow_half` with the full `SafetyContext` (the session's safety state the
+Orchestrator pushes through `set_session_safety`, the dismiss allowlist and Explorer deny list of the scenario's
+configuration, the recovery-only arm, the gated branch's `SendGate`), writes tokens into a `GatewayState` (a
+cleared send carries `send_ok`) and passes every event through `hook_decide`, and a small simulated app reacts to
+what gets through: a visible docked ticket (`ticket_visible`) shows `Confirm and Send`, which the ticket detector
+matches, `Confirm and Send` opens the Order Confirmation dialog (the Window Watcher then sets the flag and writes
+the Send deny rectangle), `Delete` closes it, and an Enter, a Space or a click on `Send` that reaches the app while
+the dialog is open sends an order, which appears as a new Working row; a `Cancel All` click that reaches it moves
+every Working row to Canceled. So a bypass that the gateway failed to stop is visible to the post-run proof exactly
+as on a real rig.
 
-As on a real rig, the flag has three sources (5.4.6): the dialog by enumeration, the docked ticket by the
-detector, and the flow's sticky `order_stage` declaration. A cleared action of an order-stage step sets the
-sticky flag before its first event is emitted; a `close_dialog` or `clear_ticket` teardown action that
-completes with the dialog and the ticket absent releases it, and so does killing the process tree. The
-Watcher is polled again after every emitted event, so the hook reads the flag per event: an Enter that
-follows the `Confirm and Send` click in the same action meets the open dialog's flag. An agent or Explorer
-action refused because the flag is up is listed in `flag_aborts` (the caller takes the 5.4.6 path).
+As on a real rig, the flag has three sources (5.4.6), and the simulated screen feeds the real Window Watcher
+(`windows.WindowWatcher.poll_into`): the dialog by enumeration (title regexes `SimScenario.titles`, the stand-in for
+the popup catalog's order-dialog set), the docked ticket by the template detector on a synthetic grab, and the
+flow's sticky `order_stage` declaration. A cleared action of an order-stage step sets the sticky flag before its
+first event is emitted; a `close_dialog` or `clear_ticket` teardown action that completes with the dialog and the
+ticket absent releases it, and so does killing the process tree. The Watcher is polled again after every emitted
+event, so the hook reads the flag per event: an Enter that follows the `Confirm and Send` click in the same action
+meets the open dialog's flag. An agent or Explorer action refused because the flag is up is listed in `flag_aborts`
+(the caller takes the 5.4.6 path). The Watcher's classification also gives the kill switch its `order_event`
+window and the dialog's open time (`window_tripwires`).
+
+The LOGIN flow's typing and the `cancel_all` click go through `send_input` like every other input, so a hook in
+deny-all or outside the recovery-only arm stops them (6.6 step 5); `read_orders` renders the book as grid OCR rows
+and Copy All text and reads it back through `orderbook.build_order_book`; preflight runs H5 over the rig's kill
+channels (`killflag.h5_round_trip`) and H6 through the redaction stage (`capture.h6_self_test`).
+
+Choices (reported):
+
+1. Configuration. With `config_root` the rig enforces that checkout's `gateway/dismiss_allowlist.yaml` (empty in
+   the example config, so `Confirm and Send` is refused) and `policy/explorer_deny_list.yaml`; `dismiss_allowlist`
+   and `deny_list` pin either explicitly. A scenario with no configuration stands for a rig after Phase 0: the
+   dialog's `Delete` (`gateway.DISMISS_ALLOWLIST`) and `explorer.DEFAULT_DENY_LIST`.
+2. The synthetic grab covers the screen area where the simulated controls are drawn (`FRAME_ORIGIN`, `FRAME_SIZE`)
+   as random textures matched by `SIM_TEMPLATES`; app windows other than the main frame and the dialog
+   (`extra_windows`) carry no bounds, so the main frame stays the detector's foreground. Each poll is a new grab:
+   a grab whose content changed at an unchanged clock reading is stamped a nanosecond earlier per change, since the
+   Watcher keys its detector cache on the grab time and the simulation has no detector latency. A real Watcher polls
+   every 100 ms, so two polls pass between one input and the next; the simulation takes the second one too.
+3. Without a pushed session (`set_session_safety`, the Orchestrator's `safety_listener`), the slow half falls back to
+   the booleans `attested` and a current paper-mode assertion (gateway.py choice 9), as for a rig driven directly.
+4. The simulated Monitor's order grids carry an `Order ID` column, the rows' key (`SIM_LAYOUTS`; the real columns
+   are pinned in Phase 0, orderbook.py choice 1); the buying power cell equals Net Liq unless the scenario sets it.
+5. `reset_input_state` models the fresh gateway instance: no token of the dead tree's input survives; the simulation
+   has no OS key state to release.
+6. The login's typing is a click on the paperMoney switch, the login id, the secret (stand-in keys, never a value)
+   and a click on `Log In`, all of class `login`; when the gateway stops any of it, the login dialog stays and the
+   main window never appears (`timeout`).
 
 `MemorySink` is an in-memory `OutcomeSink` over a list of scoped checkpoint ids, and `default_context`
 builds the `RunContext` that matches the default scenario (the example config's rig-01 accounts).
@@ -26,20 +60,34 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
+import numpy as np
+
+from ..capture import h6_self_test
+from ..records import DeclaredSend
 from .attestation import AttestationProfile
 from .clock import Clock, ManualClock
-from .gateway import (VK_RETURN, VK_SPACE, Action, Chord, DenyRect, Flag, FlagWatcher, GatewayState, InputEvent,
-                      Rect, SafetyContext, hook_decide, slow_half)
-from .explorer import match_deny
+from .explorer import DEFAULT_DENY_LIST, DenyEntry, load_deny_list, match_deny
 from .gates import PREFLIGHT_ITEMS, AccountExpectation, WorkspaceExpectation
-from .identity import Allowlist
+from .gateway import (DISMISS_ALLOWLIST, VK_RETURN, VK_SPACE, Action, Chord, Flag, GatewayState, InputEvent, Rect,
+                      SafetyContext, hook_decide, slow_half)
+from .gateway_config import DISMISS_ALLOWLIST_PATH, load_dismiss_allowlist
+from .identity import Allowlist, account_id_sha256
+from .killflag import FileFlagChannel, MemoryKillChannel, h5_passed, h5_round_trip, rig_flag_path
+from .killswitch import TripWires
 from .machine import RunContext
+from .orderbook import ORDER_GRIDS, POSITION_GRID, POSITION_LAYOUT, GridLayout, MonitorBook, build_order_book
+from .ports import Frame, KillChannel, SessionSafety
+from .ports import WindowInfo as ScreenWindow
 from .rig import (AccountState, CanaryFlowObservation, CancelAllResult, ConfirmationCheck, CrashSignal, EmitResult,
                   GatewayLog, HotkeyRow, LaunchObservation, LoginObservation, NotificationsRead, OrderBook, OrderRow,
                   PreflightReport, Rig, SelectorRead, SettingRead, TeardownObservation, WindowInfo,
                   WorkspaceObservation)
+from .sendgate import ACCOUNT_ROLES, SendGate, SendPolicy
+from .windows import SendTemplate, TitleSets, WindowWatcher
 
 BUILD = "2026.44.1"
 GOLDEN, EMPTY = "D-20481133", "D-20481134"
@@ -48,10 +96,59 @@ TABS = ("Monitor", "Trade", "Charts")
 SEND_RECT = Rect(900, 600, 80, 28)          # the Send button of the simulated Order Confirmation dialog
 DELETE_POINT = (1010, 614)
 CONFIRM_POINT = (1500, 900)
+CONFIRM_RECT = Rect(1440, 886, 120, 28)     # the docked ticket's Confirm and Send button, around CONFIRM_POINT
+CANCEL_ALL_POINT = (1700, 300)              # Working Orders' Cancel All
+MODE_SWITCH_POINT = (960, 420)              # the login dialog's paperMoney switch
+LOG_IN_POINT = (960, 560)
+MAIN_RECT = (0, 0, 1920, 1080)
+DIALOG_RECT = (860, 560, 300, 120)          # holds SEND_RECT and DELETE_POINT
+FRAME_ORIGIN = (840, 560)                   # the synthetic grab's area (choice 2)
+FRAME_SIZE = (760, 380)
+GRAB_EPS_S = 1e-9
+FREE_BYTES = 500 * 1024 ** 3
+H6_THEME = (18, 18, 18)                     # the simulated dark theme's background
+LOGIN_ID_KEYS = tuple(ord(c) for c in "SIM")
+SECRET_KEYS = (ord("X"), ord("Y"), ord("Z"))  # stand-ins: the secret's value never reaches the simulation (6.9)
+SIM_TITLES = TitleSets.compile(order_dialog=(r"^Order Confirmation$",), detached_ticket=(r"^Order Entry\b",),
+                               order_event=(r"(?i)^order (submitted|rejected|filled)\b",))
+SIM_ORDER_LAYOUT = GridLayout(header=("Order ID", "Symbol", "Qty", "Status"), key=("Order ID",), status="Status",
+                              symbol="Symbol", qty="Qty")
+SIM_LAYOUTS = {"working": SIM_ORDER_LAYOUT, "filled": SIM_ORDER_LAYOUT, "canceled": SIM_ORDER_LAYOUT,
+               POSITION_GRID: POSITION_LAYOUT}
 
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _texture(seed: int, rect: Rect) -> np.ndarray:
+    img = np.random.default_rng(seed).integers(0, 256, size=(rect.h, rect.w), dtype=np.uint8)
+    img.setflags(write=False)
+    return img
+
+
+SIM_TEMPLATES = (SendTemplate("Send", _texture(1, SEND_RECT)),
+                 SendTemplate("Confirm and Send", _texture(2, CONFIRM_RECT)))
+
+
+@lru_cache(maxsize=4)
+def _screen(dialog: bool, ticket: bool) -> np.ndarray:
+    """The synthetic grab's pixels (choice 2): the dialog's Send and the ticket's Confirm and Send when shown."""
+    img = np.full((FRAME_SIZE[1], FRAME_SIZE[0]), 128, dtype=np.uint8)
+    for shown, rect, t in ((dialog, SEND_RECT, SIM_TEMPLATES[0]), (ticket, CONFIRM_RECT, SIM_TEMPLATES[1])):
+        if shown:
+            x, y = rect.x - FRAME_ORIGIN[0], rect.y - FRAME_ORIGIN[1]
+            img[y:y + rect.h, x:x + rect.w] = t.image
+    img.setflags(write=False)
+    return img
+
+
+def _copy_all(header: Sequence[str], rows: Sequence[dict[str, str]]) -> str:
+    return "\n".join(["\t".join(header)] + ["\t".join(r[c] for c in header) for r in rows])
+
+
+def _money(v: float | None) -> str | None:
+    return None if v is None else f"{v:,.2f}"
 
 
 def default_settings() -> dict[str, Any]:
@@ -83,11 +180,26 @@ class SimScenario:
     accounts_after_reset: tuple[AccountState, ...] | None = None
     canary: CanaryFlowObservation = field(default_factory=lambda: CanaryFlowObservation(1, True, True, True))
     book: OrderBook = field(default_factory=lambda: OrderBook(position_rows=0, net_liq=2500.0))
-    monitor_unreadable: bool = False
+    monitor_unreadable: bool = False                                     # every read after the snapshot unreadable
+    copy_all_disagrees: bool = False                                     # after the snapshot Copy All misses Working
+    buying_power: float | None = None                                    # None: the Net Liq value (choice 4)
     cancel_all_located: bool = True
     teardown: TeardownObservation = field(default_factory=TeardownObservation)
     crash_signals: tuple[CrashSignal, ...] = ()
     hook_dead: bool = False
+    rig_id: str = "rig-01"
+    config_root: Path | None = None                  # a sentinel-config checkout the gateway enforces (choice 1)
+    dismiss_allowlist: tuple[str, ...] | None = None  # pinned dismiss labels, over the configuration's
+    deny_list: tuple[DenyEntry, ...] | None = None     # the enforced Explorer deny list, over the configuration's
+    kill_root: Path | None = None                    # the file flag at <kill_root>/<rig_id>/run/kill.flag; None: memory
+    watchdog: tuple[float, bool] = (1.0, True)       # watchdog.json age in seconds, Watchdog PID alive (10.2)
+    free_bytes: int = FREE_BYTES                     # the Watchdog's free-space result (10.2)
+    redaction_ocr: Any = None                        # the OCR engine of the H6 probe; None: the probe's known word box
+    send_policy: SendPolicy | None = None            # the gated branch's policy: the rig holds a SendGate (6.7)
+    dialog_numbers_read: bool = True                 # the Oracle read the Order Confirmation dialog's numbers (6.7)
+    extra_windows: tuple[str, ...] = ()              # titles of other app windows shown (an order_event window)
+    capture_fails: bool = False                      # every grab fails: the flag is unknown (5.4.6)
+    titles: TitleSets = SIM_TITLES                   # the Watcher's title regexes (the popup catalog's sets, 7.8)
 
 
 class SimulatedRig(Rig):
@@ -97,36 +209,70 @@ class SimulatedRig(Rig):
         self.s = scenario or SimScenario()
         self.clock = clock or ManualClock()
         self.gw = GatewayState()
-        self.watcher = FlagWatcher()
+        self.watcher = WindowWatcher(self.s.titles)
         self.selected = self.s.selected
         self.dialog_open = False
         self.ticket_visible = False
+        self.extra_windows = list(self.s.extra_windows)
         self.order_stage = False                  # the sticky order_stage declaration (5.4.6 source 3)
         self.flag_aborts: list[str] = []          # profiles of agent or Explorer actions refused under the flag
-        self.attested = False
+        self.attested = False                     # read only without a pushed session (choice 3)
+        self.session_safety: SessionSafety | None = None
+        self.recovery_only = False
         self.app_running = False
         self.title_build_id: str | None = None    # the build in the main window's title, as last launched
         self.book = self.s.book
         self.calls: list[str] = []
+        self.dismiss_allowlist, self.deny_list = self._configuration()
+        self.send_gate = SendGate(self.s.send_policy, {a.role: account_id_sha256(a.account_id) for a in self.s.accounts
+                                                       if a.role in ACCOUNT_ROLES}) if self.s.send_policy else None
+        flag: KillChannel = FileFlagChannel(rig_flag_path(self.s.kill_root, self.s.rig_id)) \
+            if self.s.kill_root is not None else MemoryKillChannel()
+        self.flag_channel, self.pipe_channel = flag, MemoryKillChannel()
         self._launch_i = 0
         self._logins = 0
         self._reads: dict[str, int] = {}
         self._frame = 0
         self._order_reads = 0
+        self._dialog_hwnd = 1000
+        self._shown: tuple[bool, bool] | None = None
+        self._grabs = 0
         self.session_tokens = 0
         self.allowed = 0
         self.drops = 0
         self.refusals = 0
         self.sent_orders = 0
 
+    def _configuration(self) -> tuple[frozenset[str], tuple[DenyEntry, ...]]:
+        """The dismiss allowlist and Explorer deny list the gateway enforces (choice 1)."""
+        root = self.s.config_root
+        allow = frozenset(self.s.dismiss_allowlist) if self.s.dismiss_allowlist is not None else (
+            load_dismiss_allowlist(root / DISMISS_ALLOWLIST_PATH).labels if root is not None else DISMISS_ALLOWLIST)
+        deny = self.s.deny_list if self.s.deny_list is not None else (
+            load_deny_list(root)[0] if root is not None else DEFAULT_DENY_LIST)
+        return allow, tuple(deny)
+
     def _log(self, name: str) -> None:
         self.calls.append(name)
 
     # -- provisioning, launch, login --------------------------------------------------------------------
     def preflight(self) -> PreflightReport:
+        """The 12.7 items as the scenario sets them, with H5 round-tripped over the rig's kill channels and H6 run
+        through the redaction stage (an item the scenario fails is failed without running)."""
         self._log("preflight")
         items = {i: i not in self.s.preflight_failures for i in PREFLIGHT_ITEMS}
-        return PreflightReport(items, {k: v for k, v in self.s.preflight_failures.items() if v})
+        detail = {k: v for k, v in self.s.preflight_failures.items() if v}
+        if items["H5"]:
+            h5 = h5_round_trip(self.flag_channel, self.pipe_channel, rig_id=self.s.rig_id, clock=self.clock)
+            items["H5"] = h5_passed(h5)
+            if not items["H5"]:
+                detail["H5"] = h5.detail or "the kill channels did not round-trip"
+        if items["H6"]:
+            h6 = h6_self_test(H6_THEME, self.s.redaction_ocr)
+            items["H6"] = h6.passed
+            if not h6.passed:
+                detail["H6"] = h6.detail or "the redaction self-test failed"
+        return PreflightReport(items, detail)
 
     def launch(self) -> LaunchObservation:
         self._log("launch")
@@ -143,13 +289,31 @@ class SimulatedRig(Rig):
         return self.title_build_id if self.app_running else None
 
     def login(self) -> LoginObservation:
+        """The LOGIN flow (choice 6): its typing through the gateway, then the scenario's outcome (the first login),
+        a failed recovery login while `recovery_login_fails` lasts, or a clean one."""
         self._log("login")
         self._logins += 1
+        if not self._type_login():
+            return LoginObservation(main_window_s=None, post_login_anchor=False, login_dialog_gone=False)
         if self._logins == 1:
             return self.s.login
         if self._logins - 1 <= self.s.recovery_login_fails:
             return LoginObservation(auth_error=True)
         return LoginObservation()
+
+    def _type_login(self) -> bool:
+        """The LOGIN flow's input, every action of class `login`; True when every event reached the app."""
+        steps = (Action("click", point=MODE_SWITCH_POINT, resolved_name="paperMoney", under_point_text="paperMoney",
+                        flow_class="login"),
+                 Action("type_fixture", keys=LOGIN_ID_KEYS, flow_class="login"),
+                 Action("secret", keys=SECRET_KEYS, flow_class="login"),
+                 Action("click", point=LOG_IN_POINT, resolved_name="Log In", under_point_text="Log In",
+                        flow_class="login"))
+        for a in steps:
+            r = self.send_input(a)
+            if r.refused is not None or not all(d.allowed for d in r.decisions):
+                return False
+        return True
 
     def read_account_selector(self) -> SelectorRead:
         self._log("read_account_selector")
@@ -202,24 +366,43 @@ class SimulatedRig(Rig):
         return self.s.canary
 
     # -- screen -----------------------------------------------------------------------------------------
+    def _grab(self, now: float) -> Frame | None:
+        """The synthetic grab of the simulated screen, a new one per poll (choice 2); None when capture fails."""
+        if self.s.capture_fails:
+            return None
+        shown = (self.dialog_open, self.ticket_visible)
+        if shown != self._shown:
+            self._shown = shown
+            self._grabs += 1
+        return Frame(_screen(*shown), FRAME_ORIGIN, now - GRAB_EPS_S * (self._grabs % 1000))
+
     def _watch(self) -> None:
-        """One Window Watcher poll: the dialog sets the flag and its Send button is a deny rectangle (5.4.6)."""
+        """One Window Watcher poll (5.4.6): the windows and a grab through `WindowWatcher.poll_into`, which stamps the
+        flag and writes the deny rectangles; a second poll when the flag is not clear (choice 2)."""
         now = self.clock.monotonic()
-        flag = self.watcher.poll(enumeration_hit=self.dialog_open, detector_hit=self.ticket_visible,
-                                 sticky=self.order_stage)
-        if not (self.dialog_open or self.ticket_visible or self.order_stage) and flag != Flag.CLEAR:
-            flag = self.watcher.poll(enumeration_hit=False, detector_hit=False, sticky=False)
-        self.gw.stamp_watcher(flag, now)
-        self.gw.write_deny_rects([DenyRect(SEND_RECT, "Send")] if self.dialog_open else [])
+        windows, frame = self.enumerate_windows(), self._grab(now)
+        if self.watcher.poll_into(self.gw, windows, frame, SIM_TEMPLATES, now=now, sticky=self.order_stage) \
+                != Flag.CLEAR:
+            self.watcher.poll_into(self.gw, windows, frame, SIM_TEMPLATES, now=now, sticky=self.order_stage)
         if not self.s.hook_dead:
             self.gw.hook_alive_mono_ts = now
 
     def enumerate_windows(self) -> tuple[WindowInfo, ...]:
-        wins = [WindowInfo(1, 4100, "SunAwtFrame", f"Main@thinkorswim [build {self.title_build_id}]")] \
-            if self.app_running else []
+        wins: list[WindowInfo] = []
         if self.dialog_open:
-            wins.append(WindowInfo(2, 4100, "SunAwtDialog", "Order Confirmation"))
+            wins.append(ScreenWindow(self._dialog_hwnd, 4100, "SunAwtDialog", "Order Confirmation", rect=DIALOG_RECT,
+                                     z_order=0))
+        if self.app_running:
+            wins += [ScreenWindow(2000 + i, 4100, "SunAwtDialog", t) for i, t in enumerate(self.extra_windows)]
+            wins.append(ScreenWindow(1, 4100, "SunAwtFrame", f"Main@thinkorswim [build {self.title_build_id}]",
+                                     rect=MAIN_RECT, z_order=1))
         return tuple(wins)
+
+    def window_tripwires(self) -> TripWires:
+        """The Watcher's `order_event` window and the dialog's open time at a fresh poll (6.6 Triggers)."""
+        self._watch()
+        c = self.watcher.classes
+        return TripWires(order_event_window=c.order_event_window, dialog_open_s=c.dialog_open_s(self.clock.monotonic()))
 
     def capture_frame(self) -> tuple[str, float]:
         return _sha(f"frame:{self._frame}"), self.clock.monotonic()
@@ -228,10 +411,11 @@ class SimulatedRig(Rig):
         return self.s.crash_signals
 
     # -- input ------------------------------------------------------------------------------------------
-    def _emit(self, a: Action, dialog_ok: bool) -> list[tuple[InputEvent, Any]]:
+    def _emit(self, a: Action, dialog_ok: bool, send_ok: bool = False) -> list[tuple[InputEvent, Any]]:
         """Stages 5 to 7 for one cleared action: the absolute move (before any token is pending, so the hook's
-        move rule allows it), the tokens, then each event through the hook and the app, with a Watcher poll
-        after every event so the hook acts on the flag as the app has just changed it (5.4.6)."""
+        move rule allows it), the tokens (a cleared send's click token carries `send_ok`, 6.7), then each event
+        through the hook and the app, with a Watcher poll after every event so the hook acts on the flag as the app
+        has just changed it (5.4.6)."""
         now = self.clock.monotonic()
         steps: list[InputEvent] = []
         out: list[tuple[InputEvent, Any]] = []
@@ -245,7 +429,7 @@ class SimulatedRig(Rig):
             x, y = a.point
             button = "right" if a.kind == "rclick" else "left"
             run(InputEvent("move", x, y))
-            self.gw.issue_click(x, y, now, button=button, dialog_ok=dialog_ok)
+            self.gw.issue_click(x, y, now, button=button, dialog_ok=dialog_ok, send_ok=send_ok)
             steps = [InputEvent("button_down", x, y, button=button, mods=a.mods),
                      InputEvent("button_up", x, y, button=button, mods=a.mods)]
         for vk in a.keys:
@@ -272,10 +456,13 @@ class SimulatedRig(Rig):
         if e.type == "button_up" and a is not None:
             if "confirm and send" in label:
                 self.dialog_open = True
+                self._dialog_hwnd += 1                # a new dialog window: its 30 s age starts now
             elif self.dialog_open and "delete" in label:
                 self.dialog_open = False
             elif self.dialog_open and (SEND_RECT.contains(e.x, e.y) or "send" in label):
                 self._send()
+            elif "cancel all" in label and a.teardown_action == "cancel_all":
+                self._cancel_working()
         if e.type == "key_down" and self.dialog_open and e.vk in (VK_RETURN, VK_SPACE):
             self._send()
         if e.type == "button_down" and self.dialog_open and SEND_RECT.contains(e.x, e.y):
@@ -287,20 +474,30 @@ class SimulatedRig(Rig):
         row = OrderRow(f"sim-order-{self.sent_orders}", "working", "WORKING", "CEI", 1.0)
         self.book = replace(self.book, working=self.book.working + (row,))
 
+    def _cancel_working(self) -> None:
+        moved = tuple(replace(r, grid="canceled", status="CANCELED") for r in self.book.working)
+        self.book = replace(self.book, working=(), canceled=self.book.canceled + moved)
+
+    def _context(self, action: Action, now: float) -> SafetyContext:
+        """Stage 4's context from a fresh poll (5.4.3): the flag, the dialog, the rectangles and chords, the
+        configuration's allowlist and deny list, the session, the gated send's gate and the recovery-only arm."""
+        title = "Order Confirmation" if self.dialog_open else None
+        hit = match_deny(title=title, labels=action.labels, target_kind=action.target_kind, end_kind=action.end_kind,
+                         deny_list=self.deny_list) if action.profile != "scripted" else None
+        return SafetyContext(
+            flag=self.gw.effective_flag(now), order_dialog_present=self.dialog_open, deny_rects=tuple(self.gw.deny_rects),
+            chords=tuple(self.gw.chords), dismiss_allowlist=self.dismiss_allowlist,
+            attestation_passed=self.attested, paper_assertion_current=True, deny_list_hit=hit,
+            hook_alive=self.gw.hook_alive(now), order_stage=self.order_stage, session=self.session_safety, now=now,
+            dialog_foreground=self.dialog_open, dialog_read=self.dialog_open and self.s.dialog_numbers_read,
+            send_gate=self.send_gate, recovery_only=self.recovery_only)
+
     def send_input(self, action: Action, *, events: Sequence[InputEvent] = ()) -> EmitResult:
         self._watch()
         now = self.clock.monotonic()
         if events:
             return EmitResult(decisions=tuple(self._through(None, e, now) for e in events), events=tuple(events))
-        title = "Order Confirmation" if self.dialog_open else None
-        ctx = SafetyContext(flag=self.gw.effective_flag(now), order_dialog_present=self.dialog_open,
-                            deny_rects=tuple(self.gw.deny_rects), chords=tuple(self.gw.chords),
-                            attestation_passed=self.attested, paper_assertion_current=True,
-                            deny_list_hit=match_deny(title=title, labels=action.labels, target_kind=action.target_kind,
-                                                     end_kind=action.end_kind)
-                            if action.profile != "scripted" else None, hook_alive=self.gw.hook_alive(now),
-                            order_stage=self.order_stage)
-        s = slow_half(action, ctx)
+        s = slow_half(action, self._context(action, now))
         if s.refused:
             self.refusals += 1
             if s.flag_abort:
@@ -309,16 +506,27 @@ class SimulatedRig(Rig):
         if action.order_stage_step and not self.order_stage:
             self.order_stage = True              # the declaration sets the flag before the click is emitted (6.2)
             self._watch()
-        out = self._emit(action, s.dialog_ok)
+        out = self._emit(action, s.dialog_ok, s.send_ok)
         self._frame += 1
         if action.teardown_action in ("close_dialog", "clear_ticket") and not (self.dialog_open or self.ticket_visible):
             self.order_stage = False             # the teardown completed and the dialog and ticket are absent
         self._watch()
         return EmitResult(decisions=tuple(d for _, d in out), events=tuple(e for e, _ in out))
 
-    def set_hook_state(self, *, armed: bool, deny_all: bool) -> None:
-        self._log(f"set_hook_state:{armed}:{deny_all}")
+    def set_hook_state(self, *, armed: bool, deny_all: bool, recovery_only: bool = False) -> None:
+        self._log(f"set_hook_state:{armed}:{deny_all}" + (":recovery_only" if recovery_only else ""))
         self.gw.armed, self.gw.deny_all = armed, deny_all
+        self.recovery_only = recovery_only
+
+    def set_session_safety(self, safety: SessionSafety) -> None:
+        self.session_safety = safety
+
+    def reset_input_state(self) -> bool:
+        """A fresh gateway instance (choice 5): every token and the drag's move window of the dead tree are gone."""
+        self._log("reset_input_state")
+        self.gw.tokens.clear()
+        self.gw.move_allow = None
+        return True
 
     def load_order_chords(self, chords: Sequence[Chord]) -> None:
         self._log("load_order_chords")
@@ -327,28 +535,52 @@ class SimulatedRig(Rig):
     def gateway_log(self) -> GatewayLog:
         return GatewayLog(self.session_tokens, self.allowed, self.drops, self.refusals)
 
+    def declared_sends(self) -> tuple[DeclaredSend, ...]:
+        return tuple(self.send_gate.declared) if self.send_gate is not None else ()
+
     # -- orders and containment -------------------------------------------------------------------------
     def cancel_all(self) -> CancelAllResult:
+        """The `cancel_all` teardown action: located by template, then clicked through the gateway (6.6)."""
         self._log("cancel_all")
-        if not self.s.cancel_all_located:
+        if not self.locate_cancel_all():
             return CancelAllResult(False)
-        rows = self.book.working
-        moved = tuple(replace(r, grid="canceled", status="CANCELED") for r in rows)
-        self.book = replace(self.book, working=(), canceled=self.book.canceled + moved)
-        return CancelAllResult(True, clicked=bool(rows))
+        r = self.send_input(Action("click", point=CANCEL_ALL_POINT, resolved_name="Cancel All",
+                                   under_point_text="Cancel All", teardown_action="cancel_all"))
+        return CancelAllResult(True, clicked=r.refused is None and bool(r.decisions)
+                               and all(d.allowed for d in r.decisions))
 
-    def read_orders(self) -> OrderBook:
-        """The Monitor book; with `monitor_unreadable` every read after the run-start snapshot is unreadable."""
+    def locate_cancel_all(self) -> bool:
+        return self.app_running and self.s.cancel_all_located
+
+    def read_orders(self) -> MonitorBook:
+        """The Monitor book rendered as grid OCR rows and Copy All text and read back through
+        `orderbook.build_order_book` (choice 4); with `monitor_unreadable` every read after the run-start snapshot
+        has an unreadable Working grid, with `copy_all_disagrees` its Copy All misses the Working rows."""
         self._log("read_orders")
         self._order_reads += 1
-        if self.s.monitor_unreadable and self._order_reads > 1:
-            return replace(self.book, readable=False)
-        return self.book
+        later = self._order_reads > 1
+        b = self.book
+        cells: dict[str, list[dict[str, str]]] = {
+            g: [{"Order ID": r.key, "Symbol": r.symbol, "Qty": f"{r.qty:g}", "Status": r.status} for r in b.rows(g)]
+            for g in ORDER_GRIDS}
+        cells[POSITION_GRID] = [{"Instrument": f"POS-{i}", "Qty": "1", "Trade Price": "1.00", "Mark": "1.00"}
+                                for i in range(1, b.position_rows + 1)]
+        text: dict[str, str | None] = {g: _copy_all(SIM_LAYOUTS[g].header, rows) for g, rows in cells.items()}
+        ocr: dict[str, list[dict[str, str]] | None] = dict(cells)
+        if (self.s.copy_all_disagrees and later) or not b.copy_all_agrees:
+            text["working"] = _copy_all(SIM_ORDER_LAYOUT.header, [])
+        if (self.s.monitor_unreadable and later) or not b.readable:
+            ocr["working"] = None
+        bp = self.s.buying_power if self.s.buying_power is not None else b.net_liq
+        return build_order_book(ocr, text, net_liq=_money(b.net_liq), buying_power=_money(bp), layouts=SIM_LAYOUTS,
+                                screenshot_sha256=_sha(f"working-orders:{self._order_reads}"))
 
     def kill_process_tree(self) -> bool:
         self._log("kill_process_tree")
         self.app_running = False
         self.dialog_open = False
+        self.ticket_visible = False              # the docked ticket and every app window go with the tree
+        self.extra_windows.clear()
         self.order_stage = False                 # the flow that declared it is gone with the tree
         return True
 
@@ -358,6 +590,16 @@ class SimulatedRig(Rig):
 
     def revert_snapshot(self) -> None:
         self._log("revert_snapshot")
+
+    # -- the rig host -----------------------------------------------------------------------------------
+    def kill_channels(self) -> tuple[KillChannel, KillChannel]:
+        return self.flag_channel, self.pipe_channel
+
+    def watchdog_status(self) -> tuple[float, bool]:
+        return self.s.watchdog
+
+    def free_bytes(self) -> int:
+        return self.s.free_bytes
 
 
 class MemorySink:

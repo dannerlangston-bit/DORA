@@ -71,6 +71,12 @@ def test_clean_drill_passes_with_exactly_the_declared_set_and_exempt_counts():
     assert rig.sent_orders == 0 and "cancel_all" not in rig.calls                 # located, never clicked
     assert rig.calls.index("set_hook_state:False:True") < rig.calls.index("kill_process_tree") \
         < rig.calls.index("revert_snapshot")
+    # item 5 runs the sequence in the hook's phases: reset after the kill, the recovery-only arm, disarmed at the end
+    c = rig.calls
+    assert c.index("kill_process_tree") < c.index("reset_input_state") \
+        < c.index("set_hook_state:True:False:recovery_only") < len(c) - 1 - c[::-1].index("login") \
+        < c.index("revert_snapshot") < c.index("set_hook_state:False:False")
+    assert not (rig.gw.armed or rig.gw.deny_all or rig.recovery_only)
     assert isinstance(SimDrillPort(rig), DrillPort) and isinstance(channel, KillChannel)
 
 

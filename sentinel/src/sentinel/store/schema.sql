@@ -169,7 +169,7 @@ CREATE TABLE checkpoints (
   flow_id TEXT, step_id TEXT,
   flow_class        TEXT CHECK (flow_class IN ('standard','login','fixture_reset','teardown','canary',
                       'paper_send_ok','explorer_candidate')),
-  host              TEXT CHECK (host IS NULL OR host IN ('tab','sidebar','flexgrid','detached','dialog')),   -- sweep: the host enum of 4.1
+  host              TEXT CHECK (host IS NULL OR host IN ('flexgrid','detached','dialog')),   -- sweep: the w x h hosts of 4.1; tab and sidebar hosts are swept through their splitters only (SD-05)
   size_w INTEGER, size_h INTEGER,           -- sweep
   splitter_id TEXT, fraction REAL,          -- split
   tier              INTEGER NOT NULL CHECK (tier IN (1,2,3)),
@@ -183,6 +183,8 @@ CREATE TABLE checkpoints (
   CHECK (length(checkpoint_id) - length(replace(checkpoint_id, '/', '')) = CASE kind WHEN 'census' THEN 2 ELSE 3 END
       OR (kind = 'census' AND length(checkpoint_id) - length(replace(checkpoint_id, '/', '')) = 3 AND instr(checkpoint_id, '=') > 0)),   -- census/<surface>/<workspace>[/<dim>=<value>,...] (2.4)
   CHECK ((kind = 'sweep') = (host IS NOT NULL AND size_w IS NOT NULL AND size_h IS NOT NULL)),
+  CHECK (kind <> 'sweep' OR checkpoint_id GLOB ('sweep/*/' || host || '/' || size_w || 'x' || size_h)
+      OR checkpoint_id GLOB ('sweep/*/' || host || '/' || size_w || 'x' || size_h || '-asc')),   -- <host>/<w>x<h>, or -asc for Ladder F's ascending pass (SD-04)
   CHECK ((kind = 'split') = (splitter_id IS NOT NULL AND fraction IS NOT NULL)),
   CHECK ((kind = 'flow') = (flow_id IS NOT NULL AND step_id IS NOT NULL AND flow_class IS NOT NULL))
 );
@@ -418,7 +420,7 @@ CREATE TABLE decisions (
   category          TEXT NOT NULL CHECK (category IN ({{checkpoint_outcomes:intended,collateral,noise,needs_human,invariant_violation,assertion_failed}})),
   action            TEXT NOT NULL CHECK (action IN ({{decision_actions}})),                          -- the UI action of 4.14 and 9.6
   verdict           TEXT NOT NULL CHECK (verdict IN ({{decision_verdicts}})),   -- the stored effect
-  source            TEXT NOT NULL CHECK (source IN ('report_ui','pr_comment','jira_sync','explorer_triage')),
+  source            TEXT NOT NULL CHECK (source IN ({{decision_sources}})),
   decided_by        TEXT NOT NULL,          -- SSO identity of a human; for jira_sync the ticket's resolver
   proposed_by       TEXT,                   -- PR author when a tier 1 or 2 intended proposal was confirmed by another
   confirmed_by      TEXT,                   -- 4.14's name for the second human of the two-person rule; equals decided_by when a proposal was confirmed
@@ -432,7 +434,7 @@ CREATE TABLE decisions (
   fixed_in_build_id TEXT REFERENCES builds(build_id),   -- fixed_in_build: next run asserts the signature is gone
   cluster_id        TEXT,                   -- written per member signature when decided as a cluster
   expires_at        TEXT,                   -- noise_signature, request_mask and waivers: default 30 days
-  status            TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','expired','superseded','reopened','revoked')),   -- 4.14
+  status            TEXT NOT NULL DEFAULT {{decision_statuses:active}} CHECK (status IN ({{decision_statuses}})),   -- 4.14
   supersedes_decision_id INTEGER REFERENCES decisions(decision_id),
   revoked_at TEXT, revoked_by TEXT, revoke_reason TEXT,
   source_finding_id INTEGER REFERENCES findings(finding_id),
@@ -448,7 +450,7 @@ CREATE TABLE decisions (
   CHECK (action NOT IN ({{decision_actions:noise_signature,request_mask}}) OR expires_at IS NOT NULL),
   CHECK (decided_by NOT IN ('reviewer','system','orchestrator','reporter')),                        -- L-DEC-01
   CHECK ((revoked_at IS NULL) = (revoked_by IS NULL) AND (revoked_at IS NULL) = (revoke_reason IS NULL)),
-  CHECK ((revoked_at IS NOT NULL) = (status = 'revoked'))
+  CHECK ((revoked_at IS NOT NULL) = (status = {{decision_statuses:revoked}}))
 );
 
 CREATE TRIGGER trg_decision_two_person BEFORE INSERT ON decisions
@@ -516,10 +518,10 @@ CREATE TABLE regions (                      -- mirror of the Region Registry at 
   landmark_id     TEXT NOT NULL,
   dx INTEGER NOT NULL, dy INTEGER NOT NULL, w INTEGER NOT NULL, h INTEGER NOT NULL,
   hamming_tolerance INTEGER CHECK (hamming_tolerance BETWEEN 0 AND 64),   -- lowered by calibration (9.7); NULL = default
-  money_role      TEXT CHECK (money_role IS NULL OR money_role IN ('qty','price','bp_effect','max_loss','send','cancel','delete')),   -- 4.8 (SD-28)
+  money_role      TEXT CHECK (money_role IS NULL OR money_role IN ({{money_roles}})),   -- 4.8 (SD-28)
   exact_fallback  INTEGER NOT NULL DEFAULT 0 CHECK (exact_fallback IN (0,1)),   -- tolerance at or below noise spread: pHash equality plus the 4 px box (4.14, 9.7)
   PRIMARY KEY (checkpoint_id, region_id, config_commit),
-  CHECK (money_cell = 0 OR kind IN ('diff','freeze')),   -- L-RGN-04: a money cell is always pixel-diffed, never rule-only or masked
+  CHECK (money_cell = 0 OR kind IN ('diff','freeze','rule')),   -- L-RGN-04: never masked; diff or freeze on a flow checkpoint, rule on census and sweep (3.8, SD-29)
   CHECK (identity_field = 0 OR kind = 'redaction'),
   CHECK (money_cell = (money_role IS NOT NULL))           -- a money cell is exactly a region with a money role (4.8, SD-28)
 );
@@ -566,8 +568,7 @@ CREATE TABLE flake_stats (                  -- rolling 30 days, refreshed by the
   quarantined      INTEGER NOT NULL DEFAULT 0 CHECK (quarantined IN (0,1)),
   quarantine_commit TEXT,                   -- sentinel-config commit whose quarantine.yaml holds the record
   quarantined_at TEXT, quarantined_by TEXT, quarantine_owner TEXT, quarantine_ticket_ref TEXT,
-  quarantine_reason TEXT CHECK (quarantine_reason IS NULL OR quarantine_reason IN ('flake','aa_drift','aa_floor',
-                      'maintenance_budget','fire_drill','safety_canary','kill_switch','gateway_drops','fallback_rate')),   -- 10.5 (SD-96)
+  quarantine_reason TEXT CHECK (quarantine_reason IS NULL OR quarantine_reason IN ({{quarantine_reasons}})),   -- 10.5 (SD-96)
   updated_at       TEXT NOT NULL,
   CHECK (quarantined = 0 OR (quarantine_commit IS NOT NULL AND quarantine_owner IS NOT NULL
                              AND quarantine_ticket_ref IS NOT NULL))
@@ -598,7 +599,7 @@ CREATE TABLE canary_manifests (             -- 10.3 determinism: the generated c
 CREATE TABLE canary_results (
   canary_id         INTEGER PRIMARY KEY,
   run_id            TEXT NOT NULL REFERENCES runs(run_id),
-  kind              TEXT NOT NULL DEFAULT 'mutant' CHECK (kind IN ('mutant','safety_canary','fire_drill','path_equivalence')),   -- 10.3 mutants; 6.3 to 6.10 safety canaries; 6.5 drill items; the nightly re-evaluated real pair of 10.3
+  kind              TEXT NOT NULL DEFAULT {{canary_kinds:mutant}} CHECK (kind IN ({{canary_kinds}})),   -- 10.3 mutants; 6.3 to 6.10 safety canaries; 6.5 drill items; the nightly re-evaluated real pair of 10.3
   mutant_id         TEXT NOT NULL,          -- M01 to M33 and on of sentinel-config/canaries/mutants.yaml (12.5); drill items are drill-1 to drill-5; safety canaries name their control (6.3 to 6.10)
   catalog_version   TEXT NOT NULL,
   checkpoint_id     TEXT NOT NULL,
@@ -617,12 +618,8 @@ CREATE TABLE canary_results (
   mask_version TEXT, threshold_version TEXT, model_id TEXT, prompt_hash TEXT,
   created_at        TEXT NOT NULL,
   synthetic_ref     INTEGER REFERENCES synthetic_outcomes(synthetic_id),   -- the mutant's produced outcome row (SD-91)
-  CHECK ((kind = 'mutant' AND defect_class IN ('erased_control','swapped_digit','swapped_label','color_swap',
-           'shifted_panel','clipped_label','overlapped_panels','missing_row','header_change','placeholder','font_height',
-           'scrollbar','redaction','sub_floor','global_shift','landmark_loss','study_removed','aa_control',
-           'wrong_quantity','blank_field','gateway','outside_parent','window_offscreen','misaligned_column',
-           'focus_order','error_dialog'))
-      OR (kind <> 'mutant' AND defect_class = kind)),   -- SD-81: a safety canary, drill item or path-equivalence pair names its kind
+  CHECK ((kind = {{canary_kinds:mutant}} AND defect_class IN ({{mutant_classes}}))
+      OR (kind <> {{canary_kinds:mutant}} AND defect_class = kind)),   -- SD-81: a safety canary, drill item or path-equivalence pair names its kind
   CHECK (NOT (money_cell = 1 AND state = {{canary_states:missed}})),            -- a money-cell miss is always detector_blind
   CHECK (NOT (money_cell = 0 AND state = {{canary_states:detector_blind}})),
   CHECK (state <> {{canary_states:detector_degraded}} OR (class_rate IS NOT NULL AND class_floor IS NOT NULL)),
@@ -654,7 +651,7 @@ CREATE TABLE calibration_floors (           -- 3.9 step 3 and 4: per calibration
   regions_file_sha256 TEXT, mask_versions_json TEXT, redaction_version TEXT,   -- what the floor was measured under (7.13)
   workspace_sha256   TEXT, epoch_definition_sha256 TEXT,
   nonzero_on_frozen  INTEGER NOT NULL DEFAULT 0,   -- 1 marks a flow or environment bug to fix
-  exported_commit    TEXT,                  -- sentinel-config commit of calibration/<hex>.yaml (SD-36)
+  exported_commit    TEXT,                  -- sentinel-config commit of calibration/<hex>.yaml, <hex> the calibration key without sha256: (4.12, SD-36, SD-69)
   valid_from         TEXT NOT NULL, superseded_at TEXT
 );
 CREATE UNIQUE INDEX ux_floor_current ON calibration_floors(checkpoint_id, region_id, rendering_key_sha256)
@@ -833,8 +830,7 @@ CREATE TABLE safety_quarantines (           -- 6.5, 6.12, 10.5: a flow, rig, log
   quarantine_id     INTEGER PRIMARY KEY,
   target_kind       TEXT NOT NULL CHECK (target_kind IN ('flow','rig','login','activity')),
   target            TEXT NOT NULL,
-  reason            TEXT NOT NULL CHECK (reason IN ('flake','aa_drift','aa_floor','maintenance_budget','fire_drill',
-                      'safety_canary','kill_switch','gateway_drops','fallback_rate')),   -- 10.5 (SD-96)
+  reason            TEXT NOT NULL CHECK (reason IN ({{quarantine_reasons}})),   -- 10.5 (SD-96)
   run_id            TEXT REFERENCES runs(run_id),
   detail            TEXT,
   ticket_ref        TEXT,

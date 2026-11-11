@@ -6,10 +6,9 @@ id raises TaxonomyError at the point it is made; a malformed value (a negative c
 mis-shaped nested block) raises TaxonomyError too, so a record that exists is one the store can write.
 
 Choices where the spec is ambiguous or silent:
-- Closed lists the generated `taxonomy.yaml` does not carry yet are read from it by name when present
-  (`step_event_actions`, `quarantine_reasons`, `decision_statuses`, `decision_sources`) and otherwise taken from the
-  spec table cited beside the constant (8.3 step_events action comment with the SD-16 additions, 10.5 and SD-96,
-  4.14).
+- The step event actions, quarantine reasons and decision statuses and sources are the generated `taxonomy.yaml`
+  lists (`step_event_actions` of 8.3 with SD-16, `quarantine_reasons` of 10.5 and SD-96, `decision_statuses` and
+  `decision_sources` of 4.14); no copy of them lives here.
 - `ExplorerFinding.replayed` accepts 4.13's `reproduced`, `not_reproduced` and `lint_failed`, plus `not_replayed`
   for a finding stored before its single replay (2.9; named by the build plan).
 - `paper_assertion` is the 6.4 stamp `{account_id_sha256, mode, asserted_at}` ("the asserted account_id and mode
@@ -51,21 +50,7 @@ STEP_EVENT_MODES = ("scripted", "agent", "explorer", "system")
 STEP_EVENT_SOURCES = ("orchestrator", "gateway_hook", "watchdog")
 GATE_DECISIONS = ("emitted", "dropped", "refused", "late_up", "none")
 GATE_CLASSES = ("allowed", "safety", "integrity", "none")
-# 8.3 step_events.action: the 8.3 list plus the SD-16 and taxonomy point 7 additions (taxonomy.yaml
-# `step_event_actions` replaces it once generated)
-STEP_EVENT_ACTIONS = (
-    "click", "dblclick", "rclick", "drag", "wheel", "key_chord", "type", "secret", "wait", "capture", "popup",
-    "relogin", "reset_input_state", "relaunch", "resume", "watchdog_hang", "watchdog_crash", "kill_switch",
-    "gateway_decision", "size_step", "probe", "oracle_source_fallback", "focus_correction", "hook_reinstalled",
-    "foreign_window", "export", "clipboard", "recovery_login", "explorer_action",
-)
 REDACTED = re.compile(r"^<redacted:[^<>\s]+>$")          # 6.2, 8.3: '<redacted:login.password>'
-# 10.5 quarantine reasons (SD-96); taxonomy.yaml `quarantine_reasons` replaces it once generated
-QUARANTINE_REASONS = ("flake", "aa_drift", "aa_floor", "maintenance_budget", "fire_drill", "safety_canary",
-                      "kill_switch", "gateway_drops", "fallback_rate")
-# 4.14 decision status and source (taxonomy.yaml `decision_statuses`, `decision_sources` replace them once generated)
-DECISION_STATUSES = ("active", "expired", "superseded", "reopened", "revoked")
-DECISION_SOURCES = ("report_ui", "pr_comment", "jira_sync", "explorer_triage")
 DECIDER_ROLES = ("system_owner", "triage_rotation", "flow_owner", "pr_author", "jira_resolver")   # 9.12, L-DEC-01
 # 4.13 finding.explorer (2.9)
 EXPLORER_SEVERITIES = ("low", "medium", "high")
@@ -106,11 +91,6 @@ def outcome_id(run_id: str, seq: int) -> str:
 
 def _asdict(obj) -> dict:
     return {k: v for k, v in dataclasses.asdict(obj).items() if v is not None}
-
-
-def _closed(t: Taxonomy, name: str, fallback: tuple[str, ...]) -> tuple[str, ...]:
-    """A closed list from taxonomy.yaml, or the cited spec list until the generated file carries it."""
-    return tuple(t.data.get(name) or fallback)
 
 
 def _need(ok: bool, message: str) -> None:
@@ -442,7 +422,7 @@ class StepEvent:
         _ts(self.wall_at, "wall_at")
         _count(self.mono_ms, "mono_ms")
         _member(self.mode, STEP_EVENT_MODES, "mode")
-        _member(self.action, _closed(t, "step_event_actions", STEP_EVENT_ACTIONS), "action")
+        _member(self.action, tuple(t.step_event_actions), "action")
         _member(self.locator_level, RUNGS, "locator_level", optional=True)
         _need(isinstance(self.attempt, int) and self.attempt >= 1, f"attempt {self.attempt!r}")
         if self.step_outcome is not None:
@@ -658,9 +638,9 @@ class Decision:
             raise TaxonomyError(f"{self.action} requires a ticket (L-DEC-02)")
         if self.hamming_tolerance is not None and not 0 <= self.hamming_tolerance <= 8:
             raise TaxonomyError("hamming_tolerance must be 0..8 (L-DEC-03)")
-        if self.source not in _closed(t, "decision_sources", DECISION_SOURCES):
+        if self.source not in t.decision_sources:
             raise TaxonomyError(f"source {self.source!r}")
-        if self.status not in _closed(t, "decision_statuses", DECISION_STATUSES):
+        if self.status not in t.decision_statuses:
             raise TaxonomyError(f"status {self.status!r}")
         if self.decided_by in NON_HUMAN:
             raise TaxonomyError("decisions are human-only (4.14)")
@@ -1070,7 +1050,7 @@ class SafetyQuarantine:
     def __post_init__(self):
         _member(self.target_kind, QUARANTINE_TARGETS, "quarantine target_kind")
         _text(self.target, "target")
-        _member(self.reason, _closed(load(), "quarantine_reasons", QUARANTINE_REASONS), "quarantine reason")
+        _member(self.reason, tuple(load().quarantine_reasons), "quarantine reason")
         _ts(self.opened_at, "opened_at")
         _paired(self.reenabled_by, self.reenabled_at, "reenabled_by and reenabled_at")
         _human(self.reenabled_by, "reenabled_by", optional=True)

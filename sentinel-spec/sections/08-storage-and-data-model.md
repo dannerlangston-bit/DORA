@@ -322,7 +322,7 @@ CREATE TABLE checkpoints (
   flow_id TEXT, step_id TEXT,
   flow_class        TEXT CHECK (flow_class IN ('standard','login','fixture_reset','teardown','canary',
                       'paper_send_ok','explorer_candidate')),
-  host              TEXT CHECK (host IS NULL OR host IN ('tab','sidebar','flexgrid','detached','dialog')),   -- sweep: the host enum of 4.1
+  host              TEXT CHECK (host IS NULL OR host IN ('flexgrid','detached','dialog')),   -- sweep: the w x h hosts of 4.1; tab and sidebar hosts are swept through their splitters only (SD-05)
   size_w INTEGER, size_h INTEGER,           -- sweep
   splitter_id TEXT, fraction REAL,          -- split
   tier              INTEGER NOT NULL CHECK (tier IN (1,2,3)),
@@ -336,6 +336,8 @@ CREATE TABLE checkpoints (
   CHECK (length(checkpoint_id) - length(replace(checkpoint_id, '/', '')) = CASE kind WHEN 'census' THEN 2 ELSE 3 END
       OR (kind = 'census' AND length(checkpoint_id) - length(replace(checkpoint_id, '/', '')) = 3 AND instr(checkpoint_id, '=') > 0)),   -- census/<surface>/<workspace>[/<dim>=<value>,...] (2.4)
   CHECK ((kind = 'sweep') = (host IS NOT NULL AND size_w IS NOT NULL AND size_h IS NOT NULL)),
+  CHECK (kind <> 'sweep' OR checkpoint_id GLOB ('sweep/*/' || host || '/' || size_w || 'x' || size_h)
+      OR checkpoint_id GLOB ('sweep/*/' || host || '/' || size_w || 'x' || size_h || '-asc')),   -- <host>/<w>x<h>, or -asc for Ladder F's ascending pass (SD-04)
   CHECK ((kind = 'split') = (splitter_id IS NOT NULL AND fraction IS NOT NULL)),
   CHECK ((kind = 'flow') = (flow_id IS NOT NULL AND step_id IS NOT NULL AND flow_class IS NOT NULL))
 );
@@ -838,7 +840,7 @@ CREATE TABLE regions (                      -- mirror of the Region Registry at 
                                                                    'cancel','delete')),   -- 4.8 (SD-28)
   exact_fallback  INTEGER NOT NULL DEFAULT 0 CHECK (exact_fallback IN (0,1)),   -- tolerance at or below noise spread: pHash equality plus the 4 px box (4.14, 9.7)
   PRIMARY KEY (checkpoint_id, region_id, config_commit),
-  CHECK (money_cell = 0 OR kind IN ('diff','freeze')),   -- L-RGN-04: a money cell is always pixel-diffed, never rule-only or masked
+  CHECK (money_cell = 0 OR kind IN ('diff','freeze','rule')),   -- L-RGN-04: never masked; diff or freeze on a flow checkpoint, rule on census and sweep (3.8, SD-29)
   CHECK (identity_field = 0 OR kind = 'redaction'),
   CHECK (money_cell = (money_role IS NOT NULL))           -- a money cell is exactly a region with a money role (4.8, SD-28)
 );
@@ -982,7 +984,7 @@ CREATE TABLE calibration_floors (           -- 3.9 step 3 and 4: per calibration
   regions_file_sha256 TEXT, mask_versions_json TEXT, redaction_version TEXT,   -- what the floor was measured under (7.13)
   workspace_sha256   TEXT, epoch_definition_sha256 TEXT,
   nonzero_on_frozen  INTEGER NOT NULL DEFAULT 0,   -- 1 marks a flow or environment bug to fix
-  exported_commit    TEXT,                  -- sentinel-config commit of calibration/<hex>.yaml (SD-36)
+  exported_commit    TEXT,                  -- sentinel-config commit of calibration/<hex>.yaml, <hex> the calibration key without sha256: (4.12, SD-36, SD-69)
   valid_from         TEXT NOT NULL, superseded_at TEXT
 );
 CREATE UNIQUE INDEX ux_floor_current ON calibration_floors(checkpoint_id, region_id, rendering_key_sha256)

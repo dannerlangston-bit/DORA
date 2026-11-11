@@ -61,8 +61,14 @@ teardown and post-run proof. The session safety state goes to the rig (`safety_l
 written under its session's L-OUT-06 context (`Store.set_session_context`). A control result that stops
 a shard gives its unreached checkpoints the Orchestrator's exact outcome (1.10); the run outcome is the
 worst of the shards' (8.2). The A/A calibration runs once a shard reaches `running`, so a run whose
-shards all stop at a gate captures nothing. Every gateway drop or refusal is a `step_events` row in the store with
-its `gateway_event` (8.3 `gate_decision`, `gate_reason`, `gate_class`), and the Safety row counts those rows. Every
+shards all stop at a gate captures nothing. Every gateway decision of a shard (the Executor's flow input, the
+LOGIN flow's typing and Cancel All, through the rig's `on_input`) is a `step_events` row from the shard's drop-log
+drainer (`gateway.drainer.Drainer`, 8.3 `gate_decision`, `gate_reason`, `gate_class`, `token_id`; dropped and
+refused rows also in its `gateway_drops.jsonl` journal), written with `Store.write_events` before any other step
+row of the shard so the two seq writers never collide; the Safety row counts the dropped and refused rows. A drop
+also goes to the `DropLedger` with the step and the shard's budgets: a blocked step ends its flow (the rest
+`not_run (reason: step_failed:<step>)`), a dead hook host restarts on its own budget with a relaunch, an attempted
+send is `aborted_safety`. The default order chords come from `gateway/default_order_hotkeys.yaml`. Every
 control result's 9.10 route goes to `alerts.json`; the shards, their gates and proofs (`Proof.line`, 6.6), the
 gateway events and the actions the Orchestrator does not perform itself go to `orchestrator.json`.
 
@@ -122,6 +128,8 @@ from ..store.store import PostRunProof, RunPlan, ScopeEntry, ShardPlan
 from ..taxonomy import checkpoint_parts, load
 from ..oracle.assertions import AssertionResult, step_assertions
 from ..oracle.tables import OracleConfigError
+from ..gateway.drainer import JOURNAL_NAME, DrainContext, Drainer, TokenNote, wall_from
+from ..gateway.segment import record_for
 from ..orchestrator.boundary import BoundaryObservations
 from ..orchestrator.budgets import RateCounters, WallBudget
 from ..orchestrator.clock import ManualClock
@@ -143,7 +151,8 @@ from ..reviewer.adapter import ModelReviewer, ReviewerUnavailable
 from ..reviewer.config import ReviewerConfig
 from ..reviewer.job import ReviewerJob
 from .live import CollectingReviewer, ItemBuilder
-from .orchestration import RigScript, ShardSink, alert_entry, login_alias, login_label, persisted_actions, shard_setup
+from .orchestration import (RigScript, ShardSink, alert_entry, login_alias, login_label, order_hotkeys,
+                            persisted_actions, shard_setup)
 from .reviewer import ReviewerAdapter, ReviewRequest, SimulatedReviewer, change_types, to_review, validate
 from .sim import Capture, SimApp, SimBuild, observe
 
@@ -995,6 +1004,7 @@ class _Shard:
     session_open: bool = False
     events: list[StepEvent] = field(default_factory=list)  # the shard's step events for `Store.write_events`
     seq: Iterator[int] = field(default_factory=lambda: itertools.count(1))   # the shard's step_events seq (8.3)
+    drainer: Drainer | None = None                         # every gateway decision as a step event (5.4.8)
 
     def assertion(self, stamp: dict[str, str] | None) -> None:
         """The Orchestrator pushed a new session safety state (its `safety_listener`): a stamp is a passing paper-mode
@@ -1065,7 +1075,14 @@ class _ShardWork:
 
         orch = self.orchestrator(rig, ctx, sink, clock, hb, sim, listener)
         st = _Shard(shard_id, rig_id, list(cps), orch, rig, sink, clock, ctx)
+        st.drainer = Drainer(DrainContext(sc.run_id, shard_id, "candidate", mode="scripted"),
+                             journal=self.out / "journal" / sc.run_id / f"shard-{shard_no}" / JOURNAL_NAME,
+                             next_seq=lambda: next(st.seq), wall_at=wall_from(clock))
+        rig.on_input = lambda action, res: self._drain(st, action, res)
         holder.append(st)
+        _, hotkeys_error = order_hotkeys(self.cfg)
+        if hotkeys_error is not None:                   # 5.4.7: fails the shard closed at settings_attested
+            orch.apply(hotkeys_error.result)
         entered: list[bool] = []
 
         def work(o: Orchestrator) -> None:
@@ -1251,15 +1268,16 @@ class _ShardWork:
                 break
             if step.get("type") == "type_fixture" and str(step.get("value_ref") or "").startswith("fixture.symbols."):
                 st.orch.counters.symbol_change(st.clock.now())     # 6.4 rate caps: a symbol-box change
+            rest = [want[str(s.get("id"))] for s in steps[i + 1:] if str(s.get("id")) in want]
             if cp is not None:
                 if cp in self._todo(st) and not self._capture(st, cp, cps[cps.index(cp) + 1:]):
                     return
-            elif step.get("type") in FLOW_INPUT_STEPS and not self._input(st, flow_id, step, doc):
+            elif step.get("type") in FLOW_INPUT_STEPS and not self._input(st, flow_id, step, doc, rest):
                 return
             if self.script.enter_after == (flow_id, sid):     # the scenario's scripted Enter on the open dialog
                 if not self._send(st, Action("press", keys=(VK_RETURN,), declared_guarded=True,
                                              flow_class=str(doc.get("class", "standard"))),
-                                  flow_id, f"{sid}+enter"):
+                                  flow_id, f"{sid}+enter", rest):
                     return
         for step in doc.get("teardown") or ():
             if st.orch.stop is not None:
@@ -1283,38 +1301,82 @@ class _ShardWork:
                 return cid
         return target
 
-    def _input(self, st: _Shard, flow_id: str, step: Mapping[str, Any], doc: Mapping[str, Any]) -> bool:
-        """One input-bearing flow step as the gateway's `Action` (5.4.3 stages 1 to 3 resolved here)."""
+    def _input(self, st: _Shard, flow_id: str, step: Mapping[str, Any], doc: Mapping[str, Any],
+               rest: Sequence[PlannedCheckpoint]) -> bool:
+        """One input-bearing flow step as the gateway's `Action` (5.4.3 stages 1 to 3 resolved here); `rest` are the
+        flow's checkpoints after it."""
         kind, cls = step.get("type"), str(doc.get("class", "standard"))
         if kind == "click_named":
             label = self._label(str(step.get("target", "")))
             stage = step.get("order_stage") is True
             ok = self._send(st, Action("click", point=CONFIRM_POINT if label.casefold() == "confirm and send" else (40, 40),
                                        resolved_name=label, under_point_text=label, order_stage_step=stage,
-                                       flow_class=cls), flow_id, str(step.get("id")))
+                                       flow_class=cls), flow_id, str(step.get("id")), rest)
             st.order_stage = st.order_stage or (stage and st.rig.dialog_open)
             return ok
         key = str(step.get("key") if kind == "press" else step.get("commit") or "").casefold()
         if key not in NAMED_KEYS:
             return True
         return self._send(st, Action(kind if kind == "press" else "type_fixture", keys=(NAMED_KEYS[key],),
-                                     declared_guarded=key in GUARDED_KEYS, flow_class=cls), flow_id, str(step.get("id")))
+                                     declared_guarded=key in GUARDED_KEYS, flow_class=cls), flow_id, str(step.get("id")),
+                          rest)
 
-    def _send(self, st: _Shard, action: Action, flow_id: str, step_id: str) -> bool:
-        """`Rig.send_input` and the drop ledger of 5.4.8: a refusal or a hook drop is a step event, and the
-        ledger's result may end the flow or the run (an attempted send is `aborted_safety`)."""
+    def _send(self, st: _Shard, action: Action, flow_id: str, step_id: str,
+              rest: Sequence[PlannedCheckpoint] = ()) -> bool:
+        """`Rig.send_input`, the shard's drainer and the drop ledger of 5.4.8: every gateway decision is a step
+        event (`Drainer`, written with `Store.write_events`); a refusal or a hook drop is also the step's outcome,
+        and the ledger's result may end the flow (its rest `not_run (reason: step_failed:<step>)`), restart the
+        hook host with a relaunch, or end the run (an attempted send is `aborted_safety`)."""
+        if st.drainer is not None:                   # the drainer's rows name the flow step (5.4.8)
+            st.drainer.set_context(flow_id=flow_id, step_id=step_id)
         res = st.rig.send_input(action)
+        if st.drainer is not None:
+            st.drainer.set_context(flow_id=None, step_id=None)
         drops = [refusal(res.refused)] if res.refused is not None else []
         drops += [drain(d, e) for e, d in zip(res.events, res.decisions) if not d.allowed]
         for drop in drops:
-            r = st.orch.apply(self.ledger.record(drop, unit=flow_id, order_stage=st.order_stage))
+            r = st.orch.apply(self.ledger.record(drop, unit=flow_id, step_id=step_id, order_stage=st.order_stage,
+                                                 budgets=st.orch.budgets))
             self._note(st, r, flow_id=flow_id)
+            self._subsets(st, r, None, rest)
+            st.seen = len(st.orch.results)
             self.steps.append((StepOutcome(self.scenario.run_id, flow_id, step_id, r.step or "blocked_by_gateway",
-                                           shard_id=st.shard_id, gateway_event={"decision": drop.decision,
-                                                                                "reason": drop.reason,
-                                                                                "class": drop.gate_class},
+                                           shard_id=st.shard_id, reason=drop.reason,
                                            recorded_at=_ts(self.today, self.scenario.clock, 600)), st.shard_id))
+            if st.orch.stop is None and (r.has("relaunch") or r.has("kill_tree")):
+                st.order_stage = False      # 5.4.2: the hook host restarts; the app relaunches through every gate
+                st.orch.relaunch("hook_host")
+                self._note_new(st)
+            if st.orch.stop is not None:
+                break
         return not drops and st.orch.stop is None
+
+    def _drain(self, st: _Shard, action: Action, res: Any) -> None:
+        """Every decision of one `send_input` as the shard's step-event rows (5.4.8, 6.2 Audit trail), the LOGIN
+        flow's typing and Cancel All's click included (the rig's `on_input`): a stage 4 refusal (`Drainer.refused`),
+        and each event's ring record (`segment.record_for`; the simulated rig has no shared segment) with the token
+        it consumed, under the drainer's context (the flow step `_send` names, none for the rig's own input)."""
+        d = st.drainer
+        if d is None:
+            return
+        flow_id, step_id = d.ctx.flow_id, d.ctx.step_id
+        now_ns = int(st.clock.monotonic() * 1e9)
+        if res.refused is not None:
+            keys = None
+            if action.keys:
+                keys = "key_down:" + ("<redacted>" if action.kind == "secret"
+                                      else "+".join(f"0x{vk:02X}" for vk in action.keys))
+            st.events.append(d.refused(res.refused, mono_ns=now_ns, point=action.point, keys=keys,
+                                       target_text=action.resolved_name))
+            return
+        records = []
+        for e, dec in zip(res.events, res.decisions):
+            if dec.token_id is not None:
+                d.note_token(TokenNote(dec.token_id, "scripted", flow_id, step_id, target_text=action.resolved_name))
+            rec = record_for(e, dec, now_ns, secret=action.kind == "secret")
+            if rec is not None:
+                records.append(rec)
+        st.events += d.drain(records)
 
     def _capture(self, st: _Shard, cp: PlannedCheckpoint, rest: Sequence[PlannedCheckpoint]) -> bool:
         """Capture and evaluate one checkpoint; False when the unit ends here (an app failure, 10.2)."""
@@ -1398,8 +1460,7 @@ class _ShardWork:
         for st, rep in self.reports:
             p, log = rep.proof, st.rig.gateway_log()
             pm = [r for r in rep.results if r.control == "paper_mode"]
-            drops = sum(1 for s, sid in self.steps
-                        if sid == st.shard_id and (s.gateway_event or {}).get("decision") in ("dropped", "refused"))
+            drops = sum(1 for e in st.events if e.gate_decision in ("dropped", "refused"))
             self.store.write_proof(PostRunProof(
                 shard_id=st.shard_id, run_id=sc.run_id, login_alias=login_alias(st.rig_id), verdict=p.verdict_code,
                 reason=p.reason, send_policy_ref=self.cfg.send_policy_ref, counts=p.counts,
@@ -1466,7 +1527,8 @@ class _ShardWork:
         _append_json(self.out / "alerts.json", self.alerts)
         _append_json(self.out / "orchestrator.json", [{
             "run_id": self.scenario.run_id, "shards": self.summaries, "persisted_actions": self.actions,
-            "gateway_events": [s.to_dict() for s, _ in self.steps], **dict(extra or {})}])
+            "gateway_events": [e.to_dict() for st, _ in self.reports for e in st.events
+                               if e.gate_decision in ("dropped", "refused")], **dict(extra or {})}])
 
 
 class _EvalIndex(abc.Mapping):

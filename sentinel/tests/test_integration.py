@@ -226,17 +226,24 @@ def test_attempted_send_is_dropped_by_the_gateway_and_proven_harmless(runs):
     assert (by[S07].outcome, by[S07].reason, by[S07].gate) == ("env_error", "attempted_send", "running")
     assert by[S03].outcome == by[S06].outcome == "identical"           # captured before the abort
     (blocked,) = [s for s in steps if s.status == "blocked_by_gateway"]
-    assert (blocked.flow_id, blocked.step_id) == (STOCK_FLOW, "open-confirm+enter")
-    # the gateway event goes through the store (8.3 step_events gate_decision, gate_reason, gate_class)
-    assert blocked.gateway_event == {"decision": "refused", "reason": "guarded_key_refused", "class": "safety"}
+    assert (blocked.flow_id, blocked.step_id, blocked.reason) == (STOCK_FLOW, "open-confirm+enter",
+                                                                  "guarded_key_refused")
+    # every gateway decision is a step event the shard's drainer wrote (5.4.8, 8.3 gate_decision, gate_reason,
+    # gate_class): the emitted events of the flow's input, then the stage 4 refusal, journaled
     with Store(out / "sentinel.db") as store:
-        rows = store.conn.execute("SELECT gate_decision, gate_reason, gate_class FROM step_events WHERE run_id = ? "
-                                  "AND gate_decision <> 'none'", (r.run_id,)).fetchall()
-        assert [tuple(x) for x in rows] == [("refused", "guarded_key_refused", "safety")]
-        assert store.gateway_drops(r.run_id) == 1
+        rows = store.conn.execute("SELECT gate_decision, gate_reason, gate_class, source, step_id FROM step_events "
+                                  "WHERE run_id = ? AND gate_decision IN ('dropped', 'refused')", (r.run_id,)).fetchall()
+        assert [tuple(x) for x in rows] == [("refused", "guarded_key_refused", "safety", "orchestrator",
+                                             "open-confirm+enter")]
+        emitted = store.conn.execute("SELECT count(*) FROM step_events WHERE run_id = ? AND gate_decision = 'emitted' "
+                                     "AND token_id IS NOT NULL", (r.run_id,)).fetchone()[0]
+        assert emitted > 0 and store.gateway_drops(r.run_id) == 1
+    (journal,) = (out / "journal" / r.run_id).rglob("gateway_drops.jsonl")
+    assert json.loads(journal.read_text().splitlines()[0])["gate_reason"] == "guarded_key_refused"
     (run,) = orchestrator(out)
     (event,) = run["gateway_events"]                 # orchestrator.json keeps its copy
-    assert event["gateway_event"] == blocked.gateway_event
+    assert (event["gate_decision"], event["gate_reason"], event["gate_class"]) == ("refused", "guarded_key_refused",
+                                                                                   "safety")
     shard = next(s for s in run["shards"] if s["verdict"] == "aborted_safety")
     assert shard["proof"] == "PROVEN: no orders sent" and "recovery_login" in shard["kill_switch"]
     assert [a for a in run["persisted_actions"] if a["action"] == "quarantine_flow"][0]["flow_id"] == STOCK_FLOW

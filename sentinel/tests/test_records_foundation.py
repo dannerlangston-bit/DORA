@@ -301,3 +301,13 @@ def test_declared_send_preflight_maintenance_synthetic():
     SyntheticOutcome(RUN, "M04", CID, "collateral")
     with pytest.raises(TaxonomyError):
         SyntheticOutcome(RUN, "M04", CID, "not_run")                 # not_run needs a reason
+
+
+def test_step_outcome_action_is_an_8_3_action_and_round_trips(tmp_path):
+    """8.3 step_events.action: a step outcome row carries a vocabulary action, and the reader can read it back."""
+    import pytest as _pytest
+    from sentinel.records import StepOutcome
+    from sentinel.taxonomy import TaxonomyError
+    with _pytest.raises(TaxonomyError):
+        StepOutcome("run", "flow.x", "s01", "passed", action="step")
+    assert StepOutcome("run", "flow.x", "s01", "passed", action="capture").action == "capture"

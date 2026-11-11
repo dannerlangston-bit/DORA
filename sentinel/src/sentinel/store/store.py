@@ -210,6 +210,14 @@ RUN_REFS = ("report_sha256", "comment_sha256", "coverage_matrix_ref", "egress_lo
 # ---------------------------------------------------------------------------------------------------------------
 # errors
 
+
+def _step_action(s: StepOutcome, checkpoint_id: str | None) -> str:
+    """The 8.3 action of a step outcome written without one: a gateway block is `gateway_decision`, a step that ended
+    at a checkpoint is its `capture`, anything else is the generic `wait` (the Executor passes the real action)."""
+    if s.status == "blocked_by_gateway" or s.gateway_event:
+        return "gateway_decision"
+    return "capture" if checkpoint_id else "wait"
+
 class StoreError(Exception):
     """The store cannot open or cannot do what was asked."""
 
@@ -1497,7 +1505,7 @@ class Store:
         return {"run_id": s.run_id, "shard_id": shard_id, "side": side, "seq": seq, "source": "orchestrator",
                 "flow_id": s.flow_id, "step_id": s.step_id, "checkpoint_id": checkpoint_id,
                 "wall_at": utc(s.recorded_at), "mono_ms": time.monotonic_ns() // 1_000_000,
-                "mode": s.mode or ("agent" if agent else "scripted"), "action": "step",
+                "mode": s.mode or ("agent" if agent else "scripted"), "action": s.action or _step_action(s, checkpoint_id),
                 "locator_level": s.locator_rung if s.locator_rung in LOCATOR_LEVELS else None,
                 "attempt": s.attempt, "step_outcome": s.status, **_gateway_columns(s.gateway_event),
                 "reason": ";".join(filter(None, (s.reason, finding))) or None, "duration_ms": s.duration_ms,
@@ -1892,7 +1900,7 @@ class Store:
                 finding_ref=finding or None, side=r["side"], shard_id=r["shard_id"], pre_screenshot=r["pre_hash"],
                 gateway_event=_gateway_event(r), recorded_at=r["wall_at"], reason=reason.rstrip(";") or None,
                 mode=r["mode"], app_uptime_s=r["app_uptime_s"], app_restart_count=r["app_restart_count"],
-                post_screenshot=r["post_hash"], click_crop=r["click_crop_sha256"]))
+                post_screenshot=r["post_hash"], click_crop=r["click_crop_sha256"], action=r["action"]))
         return out
 
     def gateway_drops(self, run_id: str) -> int:

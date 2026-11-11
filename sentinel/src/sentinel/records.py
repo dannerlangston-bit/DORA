@@ -352,9 +352,12 @@ class StepOutcome:
     app_restart_count: int | None = None
     post_screenshot: str | None = None       # sha256 of the post screenshot (8.3 post_hash)
     click_crop: str | None = None            # sha256 of the 96x96 click crop (8.3 click_crop_sha256)
+    action: str | None = None                # the 8.3 step_events action (capture, gateway_decision, click, ...)
 
     def __post_init__(self):
         load().check_step(self.status)
+        if self.action is not None and self.action not in load().step_event_actions:
+            raise TaxonomyError(f"step action {self.action!r} is not an 8.3 step_events action")
         _member(self.locator_rung, LOCATOR_RUNGS, "locator_rung", optional=True)
         _check_rung_results(self.rung_results)
         _member(self.mode, STEP_EVENT_MODES, "mode", optional=True)

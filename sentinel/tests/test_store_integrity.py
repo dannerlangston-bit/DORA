@@ -193,7 +193,7 @@ def test_outcome_columns_hold_the_record_fields(store):
 def test_a_step_keeps_its_side_shard_and_screenshots(store):
     step = StepOutcome(RUN, FLOW_ID, "s07", "passed", side="base", shard_id=SHARD, pre_screenshot="p" * 64,
                        post_screenshot="q" * 64, click_crop="r" * 64, mode="scripted", app_uptime_s=12,
-                       app_restart_count=1, reason="export_timeout", finding_ref="F-9")
+                       app_restart_count=1, reason="export_timeout", finding_ref="F-9", action="export")
     store.write_steps([step])
     assert store.step_outcomes(RUN) == [step]
     row = store.conn.execute("SELECT side, shard_id, pre_hash FROM step_events").fetchone()

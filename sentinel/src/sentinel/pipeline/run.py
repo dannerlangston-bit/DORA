@@ -1558,7 +1558,7 @@ class _ShardWork:
             self._subsets(st, r, None, rest)
             st.seen = len(st.orch.results)
             self.steps.append((StepOutcome(self.scenario.run_id, flow_id, step_id, r.step or "blocked_by_gateway",
-                                           shard_id=st.shard_id, reason=drop.reason,
+                                           shard_id=st.shard_id, reason=drop.reason, action="gateway_decision",
                                            recorded_at=_ts(self.today, self.scenario.clock, 600)), st.shard_id))
             if st.orch.stop is None and (r.has("relaunch") or r.has("kill_tree")):
                 st.order_stage = False      # 5.4.2: the hook host restarts; the app relaunches through every gate
@@ -2040,7 +2040,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
             steps = []
             if ev.cp.test_kind == "flow":
                 steps = [StepOutcome(scenario.run_id, ev.cp.flow_id or "", ev.cp.step_id or "", "passed",
-                                     locator_rung="image", duration_ms=ev.settle_ms or 750,
+                                     locator_rung="image", duration_ms=ev.settle_ms or 750, action="capture",
                                      recorded_at=_ts(today, scenario.clock, 600))]
             work.write_record(o, findings=fs, artifacts=stored, shard_id=shard_of[rig_of[ev.cp.checkpoint_id]],
                               steps=steps)

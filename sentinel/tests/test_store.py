@@ -255,11 +255,14 @@ def test_a_steps_gateway_event_is_stored_in_the_gate_columns_and_read_back(tmp_p
         s.register_rig("rig-a1", login_alias="paper-01", owner="qa", snapshot_id="snap-1", allowlist_entry=1)
         s.begin_run(plan(shards=(ShardPlan(f"{RUN}/1", "rig-a1"),)))
         refused = StepOutcome(RUN, flow, "s07+enter", "blocked_by_gateway",
-                              gateway_event={"decision": "refused", "reason": "guarded_key_refused", "class": "safety"})
+                              gateway_event={"decision": "refused", "reason": "guarded_key_refused", "class": "safety"},
+                              action="gateway_decision")
         dropped = StepOutcome(RUN, flow, "s06", "blocked_by_gateway",
-                              gateway_event={"decision": "dropped", "reason": "token_expired", "class": "integrity"})
-        emitted = StepOutcome(RUN, flow, "s05", "passed", gateway_event={"decision": "emitted", "class": "allowed"})
-        plain = StepOutcome(RUN, flow, "s04", "passed")
+                              gateway_event={"decision": "dropped", "reason": "token_expired", "class": "integrity"},
+                              action="gateway_decision")
+        emitted = StepOutcome(RUN, flow, "s05", "passed", gateway_event={"decision": "emitted", "class": "allowed"},
+                              action="click")
+        plain = StepOutcome(RUN, flow, "s04", "passed", action="wait")
         s.write_steps([refused, dropped, emitted, plain], shard_id=f"{RUN}/1", side="candidate")
         rows = s.conn.execute("SELECT step_id, gate_decision, gate_reason, gate_class FROM step_events ORDER BY seq")
         assert [tuple(r) for r in rows] == [("s07+enter", "refused", "guarded_key_refused", "safety"),
@@ -298,12 +301,23 @@ def test_an_orders_sent_proof_blocks_complete(tmp_path):
             s.conn.execute("UPDATE runs SET lifecycle = 'finished', outcome = 'complete' WHERE run_id = ?", (RUN,))
 
 
+
+def test_step_events_reads_back_a_run_with_step_outcomes(tmp_path):
+    """8.3: a step outcome row carries a vocabulary action, so `step_events` can read every row of the run back
+    (it used to store action 'step', which the reader refused)."""
+    with Store(tmp_path / "run.db") as s:
+        s.register_rig("rig-a1", login_alias="paper-01", owner="qa", snapshot_id="snap-1", allowlist_entry=1)
+        s.begin_run(plan(shards=(ShardPlan(f"{RUN}/1", "rig-a1"),)))
+        s.write_steps([StepOutcome(RUN, "flow.x", "s01", "passed"),
+                       StepOutcome(RUN, "flow.x", "s02", "blocked_by_gateway")], shard_id=f"{RUN}/1", side="candidate")
+        assert [e.action for e in s.step_events(RUN)] == ["wait", "gateway_decision"]
+
 def test_steps_and_findings_need_a_shard_and_round_trip(tmp_path):
     with Store(tmp_path / "run.db") as s:
         s.register_rig("rig-a1", login_alias="paper-01", owner="qa", snapshot_id="snap-1", allowlist_entry=1)
         s.begin_run(plan(shards=(ShardPlan(f"{RUN}/1", "rig-a1"),)))
         step = StepOutcome(RUN, "flow.trade.order-ticket.stock.limit", "s07", "passed_via_agent_fallback",
-                           locator_rung="agent", finding_ref="F-2")
+                           locator_rung="agent", finding_ref="F-2", action="click")
         f = Finding("F-1", RUN, "collateral", "ladder overlaps", RUN, checkpoint_id=FLOW, phash=ph(), tier=2,
                     category="collateral")
         with pytest.raises(StoreRefused, match="shard"):

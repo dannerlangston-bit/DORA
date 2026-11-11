@@ -62,7 +62,7 @@ Choices where the spec is silent or ambiguous (reported):
    consumed token stays pending until its up. A rule 1 or rule 2 drop of the emitter's button down, key down or
    wheel writes the token rule 3 would have used as `dropped` with the reason (`_spend`), so stage 7 reads the
    safety reason. Slots are reused as the slow half's picture says: `publish` frees every slot whose token
-   `GatewayState` no longer holds, and `GatewayState` lets an armed token go once it has expired.
+   `GatewayState` no longer holds, and `GatewayState._slot` lets an expired armed token go when its slot is needed.
 """
 from __future__ import annotations
 

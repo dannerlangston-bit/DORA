@@ -20,7 +20,7 @@ def test_closed_outcome_sets():
     assert len(t.checkpoint_outcomes) == 15
     assert len(t.step_outcomes) == 5
     assert len(t.run_outcomes) == 5
-    assert len(t.finding_kinds) == 40
+    assert len(t.finding_kinds) == 41
 
 
 @pytest.mark.parametrize("outcome,reason,gate", [
@@ -113,7 +113,8 @@ def test_checkpoint_parts():
 def test_generated_lists():
     t = load()
     assert t.quarantine_reasons == ["flake", "aa_drift", "aa_floor", "maintenance_budget", "fire_drill",
-                                    "safety_canary", "kill_switch", "gateway_drops", "fallback_rate"]   # 10.5, SD-96
+                                    "safety_canary", "kill_switch", "gateway_drops", "fallback_rate",
+                                    "unknown_popup"]                                                   # 10.5, SD-96
     assert t.money_roles == ["qty", "price", "bp_effect", "max_loss", "send", "cancel", "delete"]       # 4.8, SD-28
     assert t.popup_actions == ["dismiss_key", "click", "wait", "relogin", "abort", "ignore"]          # 4.10
     assert t.canary_kinds == ["mutant", "safety_canary", "fire_drill", "path_equivalence"]            # SD-81

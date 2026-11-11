@@ -71,16 +71,18 @@ def test_captures_carry_the_apps_uptime_and_restart_count(clean):
     assert by[S03].app_uptime_s is not None and by[S03].app_restart_count == 0
 
 
-def test_a_control_hidden_for_two_attempts_is_found_on_the_steps_retry(tmp_path):
-    _, by, steps, events, _ = _run(tmp_path, locator_miss=((QTY, 2),))
+def test_a_control_hidden_for_one_attempt_is_found_on_the_steps_retry(tmp_path):
+    _, by, steps, events, _ = _run(tmp_path, locator_miss=((QTY, 1),))
     s04 = next(s for s in steps if s.step_id == "s04")
     assert (s04.status, s04.locator_rung) == ("passed_after_retry", "image")
-    assert any(e.action == "reset_input_state" and e.step_id == "s04" for e in events)
+    assert [e.step_id for e in events if e.action == "reset_input_state" and e.step_id == "s04"] == ["s04"]
     assert by[S06].outcome == "identical"
 
 
 def test_an_exhausted_ladder_is_landmark_missing_and_ends_the_flow(tmp_path):
-    r, by, steps, _, findings = _run(tmp_path, locator_miss=((QTY, 4),))
+    """A target is tried twice in total (the ladder's attempt and the step's retry, locator choice 9): two misses
+    exhaust it."""
+    r, by, steps, _, findings = _run(tmp_path, locator_miss=((QTY, 2),))
     s04 = next(s for s in steps if s.step_id == "s04")
     assert (s04.status, s04.locator_rung) == ("failed", None)          # rung `none` is no 8.3 locator level
     assert (by[S06].outcome, by[S06].reason) == ("landmark_missing", "locator:s04")
@@ -136,9 +138,11 @@ def test_an_unreachable_vault_types_nothing_and_pages_the_system_owner(tmp_path)
 def test_census_visits_whose_precondition_fails_are_env_error(tmp_path):
     sc = dataclasses.replace(clean_scenario(TODAY), rig=RigScript(precondition_fail=(("single_main_frame", 999),)))
     r = run_pipeline(EXAMPLE, sc, tmp_path)
-    census = [o for o in r.outcomes if o.test_kind == "census"]
+    census = [o for o in r.outcomes if o.test_kind == "census" and not o.surface_id.startswith("registry.")]
     assert census and {(o.outcome, o.reason, o.gate) for o in census} == {
         ("env_error", "precondition:single_main_frame", "workspace_loaded")}
+    # registry validation's probes run at entry to running, before any census visit reads its preconditions
+    assert {o.outcome for o in r.outcomes if o.surface_id.startswith("registry.validation-")} == {"identical"}
     assert {o.outcome for o in r.outcomes if o.test_kind == "flow"} <= {"identical", "intended"}   # flows don't read it
 
 

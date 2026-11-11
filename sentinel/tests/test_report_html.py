@@ -9,6 +9,7 @@ from PIL import Image
 
 from sentinel.records import RunOutcome
 from sentinel.report import build_report, render_run_report, render_run_report_html
+from sentinel.report.html import PageSections
 
 from test_report_sample import ARTS, RUN_ID, sample
 
@@ -150,3 +151,103 @@ def test_page_is_well_formed(tmp_path):
     parser = Balance()
     parser.feed(_write(tmp_path))
     assert parser.stack == [] and parser.errors == []
+
+
+# -- the merge, RC and Nightly sections (PageSections) --------------------------------------------------------------
+
+def _cell(surface, persona, profile, state, *, tier=1, reason=None, worst=None, n=0):
+    return {"surface_id": surface, "persona": persona, "entitlement": profile, "tier": tier, "state": state,
+            "not_run_reason": reason, "worst_outcome": worst, "checkpoint_count": n}
+
+
+def test_the_matrix_has_one_column_group_per_profile_red_manifest_rows_and_a_tier_filter():
+    s = sample()
+    s["coverage"]["cells"] = [
+        _cell("trade.order-entry.stock", "swing_trader", "margin", "covered", worst="identical", n=3),
+        _cell("trade.order-entry.stock", "swing_trader", "ira", "not_run", reason="entitlement"),
+        _cell("charts.flexible-grid.chart-cell", "swing_trader", "margin", "covered", worst="noise", n=1, tier=2),
+        _cell("charts.flexible-grid.chart-cell", "swing_trader", "ira", "covered", worst="identical", n=1, tier=2)]
+    sections = PageSections(manifest_surfaces=frozenset({"dialog.order-confirmation"}),
+                            surface_tiers={"dialog.order-confirmation": 1})
+    page = render_run_report_html(build_report(**s), sections=sections)
+    matrix = page.split("<h3>Coverage matrix</h3>")[1].split("</section>")[0]
+    assert '<th colspan="1">margin</th><th colspan="1">ira</th>' in matrix   # neither profile overwrites the other
+    row = matrix.split("<code>trade.order-entry.stock</code>")[1].split("</tr>")[0]
+    assert row == '</td><td>1</td><td class="">identical (3)</td><td class="cell-notrun">not_run (entitlement)</td>'
+    assert ('<tr data-tier="1" class="row-bad"><td><code>dialog.order-confirmation</code> (in manifest, no covering '
+            'checkpoint)</td>') in matrix
+    assert '<tr data-tier="2"><td><code>charts.flexible-grid.chart-cell</code>' in matrix
+    assert 'id="tf-1"' in matrix and 'id="tf-2"' in matrix and 'id="tf-3"' not in matrix
+    assert '#tf-1:checked ~ table tbody tr:not([data-tier="1"])' in page
+    assert 'class="row-bad"' not in render_run_report_html(build_report(**s))     # no manifest given, no red row
+
+
+def test_every_page_section_renders_in_9_4_order_and_the_page_stays_well_formed():
+    from html.parser import HTMLParser
+
+    from sentinel.pipeline.config import SentinelConfig
+    from sentinel.report.blindspots import compute as blind
+    from sentinel.report.breakdown import Breakdown, DropCount
+    from sentinel.report.model import SafetyRows
+    from sentinel.report.safety import render as safety_render
+    from sentinel.report.sensitivity import compute as sens
+
+    from test_report_safety import HEADER, proof, shard_safety
+
+    report = build_report(**sample())
+    cfg = SentinelConfig.load(Path(__file__).resolve().parents[1] / "config" / "example")
+    sections = PageSections(
+        blindspots=blind(cfg, report.outcomes),
+        breakdown=Breakdown(drops=(DropCount("scripted", "refused", "deny_profile", 2),
+                                   DropCount("system", "dropped", "untokened_injected", 1))),
+        sensitivity=sens({"census/x/ws": {"diff_freeze": 90.0, "rule": 6.0, "mask_redaction": 4.0,
+                                          "panels": [{"panel": "position_statement", "side": "candidate",
+                                                      "share": 4.0, "budget": 10.0}]}}),
+        safety=safety_render(SafetyRows(proofs=(proof(),)), shards=[shard_safety()], header=HEADER, run_type="rc"))
+    page = render_run_report_html(report, sections=sections)
+    order = [page.index(f'<section id="{x}">') for x in ("coverage", "not-detectable", "health", "sensitivity",
+                                                         "safety")]
+    assert order == sorted(order)
+    assert "platform: Windows 11 desktop only" in page.split("</section>")[0]          # the header (9.2)
+    blind_sec = page.split('<section id="not-detectable">')[1].split("</section>")[0]
+    assert "<td><code>B15</code></td>" in blind_sec and "registered dialogs with zero flow checkpoints: 0 of 1" in \
+        blind_sec and "<h3>B16: Behavior with no visible symptom at any checkpoint</h3>" in blind_sec
+    health = page.split('<section id="health">')[1].split("</section>")[0]
+    assert ("<td>Gateway drops by reason and mode</td><td>2 deny_profile refused (scripted); 1 untokened_injected "
+            "dropped (system)</td>") in health
+    sens_sec = page.split('<section id="sensitivity">')[1].split("</section>")[0]
+    assert "<td>90.0</td><td>6.0</td><td>4.0</td><td>position_statement 4.0 of 10 percent</td>" in sens_sec
+    assert "No region carries a floor exception." in sens_sec
+    safety = page.split('<section id="safety">')[1].split("</section>")[0]
+    assert '<pre class="proof">ORDER SAFETY PROOF        run 2026-11-09T14:02Z  rig tos-rig-03' in safety
+    assert "VERDICT        PROVEN: no orders sent</pre>" in safety and "<h3>Attestation A1 to A11</h3>" in safety
+    assert "Known residuals (6.13), listed in the RC sign-off" in safety
+    assert "identity: paper mode asserted" not in safety          # the model's Safety proof blocks are replaced
+
+    class Balance(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.stack: list[str] = []
+            self.errors: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag not in ("meta", "img", "br"):
+                self.stack.append(tag)
+
+        def handle_endtag(self, tag):
+            if self.stack and self.stack[-1] == tag:
+                self.stack.pop()
+            else:
+                self.errors.append(tag)
+
+    parser = Balance()
+    parser.feed(page)
+    assert parser.stack == [] and parser.errors == []
+
+
+def test_write_run_report_passes_the_sections_through(tmp_path):
+    from sentinel.report.breakdown import Breakdown
+
+    out = render_run_report(**sample(), out_path=tmp_path / "r" / "index.html",
+                            sections=PageSections(breakdown=Breakdown()))
+    assert "<td>Agent rescue cap</td><td>0 of 25 rescued steps used</td>" in out.read_text(encoding="utf-8")

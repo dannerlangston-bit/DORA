@@ -31,6 +31,10 @@ Choices where the spec is silent or ambiguous (reported):
   the login-only canary of 6.9 has no `canary_results` kind (reported as a gap). "Passed on the current build"
   is: the latest run on that build (its `env_fingerprints` build, or the candidate of its build pair) holding
   rows of the canary, written at or after the cause, has every required row `detected`.
+- An unknown popup's flow quarantine (4.10 "from the next run until a human reviews the entry", 7.8) is a
+  `safety_quarantines` row with the 10.5 reason `unknown_popup`, written by the Orchestrator like the safety rows so
+  the next run's scope reads it; its re-enable needs no canary run: the person's ticket names the catalog entry
+  they reviewed (`quarantine_reason_for` picks the reason of a `quarantine_flow`).
 - A blocked login is re-enabled only when every UNPROVEN proof on it has been cleared by a person (6.6), whatever
   reason blocked it first (a `live_identity` block, for one, always comes with an UNPROVEN `session_unavailable`
   proof, SD-64). When the login's last two proofs are UNPROVEN, the re-enable of the login and of its rig needs the
@@ -69,7 +73,8 @@ BLOCKED_REASONS = ("unproven_proof", "identity_unreadable_twice", "cancel_all_fa
 DISABLE_REASONS = ("kill_switch", "undeclared_order_row", "unproven_twice", "version_mismatch")
 TARGET_KINDS = ("flow", "rig", "login", "activity")                  # 8.3 safety_quarantines.target_kind
 ACTIVITIES = ("order_stage_flows", "explorer_stage", "report_publication")
-SAFETY_QUARANTINE_REASONS = ("fire_drill", "safety_canary", "kill_switch", "gateway_drops")   # 10.5, the safety rows
+SAFETY_QUARANTINE_REASONS = ("fire_drill", "safety_canary", "kill_switch", "gateway_drops",   # 10.5, the safety rows
+                             "unknown_popup")              # and the unknown popup's flow (4.10, 7.8; choice below)
 CANARY_NAMES = ("attestation", "identity", "proof", "deny_list", "secret_scan", "redaction")    # 10.3
 DRILL_ITEMS = tuple(f"drill-{n}" for n in range(1, 6))
 SEVERITIES = ("S1", "S2", "S3")
@@ -561,8 +566,11 @@ def _reenable_quarantine(store: Store, quarantine_id: int, *, by: str, role: str
         raise SafetyRefused(f"quarantine {quarantine_id} was re-enabled at {q.reenabled_at}")
     if q.reason not in SAFETY_QUARANTINE_REASONS:
         raise SafetyRefused(f"a {q.reason} quarantine exits through the quarantine.yaml pull request of 10.5")
-    need = canary_requirement(q.cause.partition(":")[2]) if q.reason == "safety_canary" else DRILL
-    run = _evidence(store, need, build_id, q.opened_at)
+    if q.reason == "unknown_popup":
+        run = None                                  # the reviewed catalog entry is the evidence (4.10): the ticket
+    else:
+        need = canary_requirement(q.cause.partition(":")[2]) if q.reason == "safety_canary" else DRILL
+        run = _evidence(store, need, build_id, q.opened_at)
     when = _when(at)
     with store.batch("human:reenable") as b:
         b.update("safety_quarantines", {"quarantine_id": quarantine_id},
@@ -622,6 +630,18 @@ def disable_reason_for(result: ControlResult) -> str:
     return "kill_switch"
 
 
+def quarantine_reason_for(result: ControlResult) -> str:
+    """The 10.5 reason of a `quarantine_flow`: a gateway drop threshold (`gateway_drops`, 5.4.8), an unknown popup
+    that did not trip the kill switch (`unknown_popup`, 4.10, 7.8), else the kill-switch trip or safety incident
+    (`kill_switch`, 6.6)."""
+    from ..orchestrator.popups import CONTROL as POPUP     # lazy: the orchestrator package imports the store
+    if result.control == "gateway":
+        return "gateway_drops"
+    if result.control == POPUP and not result.has("kill_switch"):
+        return "unknown_popup"
+    return "kill_switch"
+
+
 def apply_safety_actions(store: Store, result: ControlResult, *, run_id: str, rig_id: str, login_alias: str | None,
                          flow_id: str | None = None, at: str | None = None) -> AppliedSafety:
     """Persist what one control result decided: the login block, the rig disable, the quarantines and the
@@ -633,7 +653,7 @@ def apply_safety_actions(store: Store, result: ControlResult, *, run_id: str, ri
     if result.has("quarantine_flow"):
         if flow_id is None:
             raise ValueError("quarantine_flow needs the running flow's id")
-        specs.append(("flow", flow_id, "gateway_drops" if result.control == "gateway" else "kill_switch"))
+        specs.append(("flow", flow_id, quarantine_reason_for(result)))
     if result.has("quarantine_order_stage_flows"):
         specs.append(("activity", "order_stage_flows", "fire_drill"))
     if result.has("quarantine_all_flows"):

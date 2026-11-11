@@ -1,0 +1,102 @@
+# Diff Engine parameters (spec 3.5, 3.7, 3.8, 3.9, 3.10). Read by sentinel.diff.load_params.
+# Any change here re-runs the canary catalog before the next product run (3.7), and changes the
+# fingerprint's harness.diff_engine_params_sha256 (or settle_params_sha256 for the settle section),
+# so it also invalidates calibration (7.13).
+schema_version: 1
+
+landmarks:                      # 3.7 "Landmarks and alignment"
+  confidence_min: 0.92          # best TM_CCOEFF_NORMED score; overridable per landmark (4.8 confidence_min)
+  second_peak_max: 0.85         # the second peak outside the radius must be below this
+  second_peak_radius_px: 5
+  search_margin_px: 200         # search box = expected position plus or minus this
+
+translation:                    # 3.7 granularity 1
+  response_min: 0.25            # cv2.phaseCorrelate response
+  shift_min_px: 1               # 1 <= max(|dx|, |dy|) <= 64
+  shift_max_px: 64
+  residual_max_ratio: 0.10      # residual changed pixels under 10 percent of the unshifted count
+  min_side_px: 16               # choice: regions smaller than this get no per-region estimate
+
+pixel:                          # 3.7 granularity 2 (pixelmatch-style)
+  t: 0.1                        # changed when delta > max_delta_scale * t^2 (352.15)
+  max_delta_scale: 35215
+  detect_antialiasing: true
+  # edge tolerance: not set here; each region with a human-approved floor_exception uses that
+  # exception's own edge_tolerance_px (4.8, default 1; 0 turns it off), and no other region has one
+
+ssim:                           # 3.7 SSIM per region (ranking, heatmap, Reviewer; decides nothing)
+  sigma: 1.5
+  k1: 0.01
+  k2: 0.03
+  data_range: 255
+  block_px: 16                  # minimum over 16x16 blocks of the full map
+
+color:                          # 3.7 color_shift and color_semantic_flip
+  color_shift_delta_e: 2.0      # region mean CIEDE2000 above this while the per-pixel map is nearly empty
+  flip_share_min: 0.5           # choice: share of a component's changed pixels that must cross bands
+  green_band: {hue_deg: [75, 165], sat_min: 0.35, val_min: 0.25}
+  red_band: {hue_deg: [330, 20], sat_min: 0.35, val_min: 0.25}   # wraps through 0; 330 takes in a
+                                # red-green channel swap of a blue-tinted green (M07: (24, 196, 92) -> hue 330 to 336)
+
+components:                     # 3.7 granularity 3
+  dilate_kernel_wh: [5, 3]      # 5 wide, 3 tall rectangle, one iteration
+  dilate_iterations: 1
+  connectivity: 8
+  min_area_px: 4                # components under 4 changed pixels are dropped
+
+global_shift:                   # 3.7 granularity 0, 10.6
+  min_pairs: 20
+  above_floor_fraction: 0.02    # more than 2 percent of compared checkpoints above floor
+  text_edge_share: 0.70         # and more than 70 percent of their changed pixels on text edges
+  component_text_edge_share: 0.70   # choice: a component is a text-edge component at this share
+  canny_low: 50                 # choice: Canny thresholds on the base crop (spec gives none)
+  canny_high: 150
+  edge_dilate_px: 1
+
+heatmap:                        # 3.7 "Heatmap and hash"
+  base_brightness: 0.4
+  changed_rgb: [255, 0, 0]
+  aa_rgb: [255, 255, 0]
+  region_rgb: [0, 170, 255]
+  component_rgb: [255, 255, 255]
+
+geometry:                       # 3.3 per-capture geometry
+  pad_rgb: [255, 0, 255]        # sentinel color for padding to the common size
+
+thresholds:                     # 3.9 threshold derivation: max(minimum, ceil(margin x floor))
+  margin: 2
+  component_area_min: 4
+  changed_px_min: 4
+  delta_e_min: 2.0
+  shift_px_min: 1
+
+mask_budget:                    # 3.8, 4.8: share of the panel's located bounds; money cells 0 percent
+  order_confirmation: 0.10
+  order_ticket: 0.10
+  position_statement: 0.10
+  account_info: 0.05
+
+calibration:                    # 3.9 procedure
+  session_captures: 5           # r1 to r5 back to back in one session
+  next_session_captures: 1      # r6 the following night in a fresh session
+  aa_drift_global_fraction: 0.02
+
+settle:                         # 3.5 settle rule
+  frame_interval_ms: 250
+  identical_frames: 3
+  anchor_confidence_min: 0.92
+  max_wait_ms: 15000
+  max_wait_long_ms: 30000       # chart and scan checkpoints
+  park_mask_px: 16
+  tooltip_delay_ms: 1000
+  regression_factor: 2          # settle_regression when p50 > 2 x calibration p50
+  masked_live:                  # 7.9, 5.7: the frames Capture takes at masked_live checkpoints
+    frames: 5                   # 3 to 5 frames, the first being the settle frame
+    interval_ms: 250            # 0 to 1000 ms: over 1 to 2 s; the first three are the settled triple, so their
+                                # per-pixel median equals the settled frame outside masks (3.5)
+
+rerun:                          # 3.10 targeted re-run budget
+  max_recaptures_diff: 2
+  max_recaptures_invariant: 1
+  run_budget_min: 30
+  run_budget_fraction: 0.10

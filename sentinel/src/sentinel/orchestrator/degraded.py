@@ -142,7 +142,11 @@ class SpendTracker:
 
 # -- network --------------------------------------------------------------------------------------------
 class NetworkPause:
-    """One mid-run connectivity loss, polled until it resolves (10.7 Network)."""
+    """One mid-run connectivity loss, polled until it resolves (10.7 Network).
+
+    The elapsed outage decides before the connection state does, so the outcome does not depend on how densely the
+    Orchestrator polls: a reconnect first observed past 15 minutes still ends the shard, and one first observed
+    between 5 and 15 minutes still fails the flow in progress, together with the resume at the next flow boundary."""
 
     def __init__(self, started: float):
         self.started = started
@@ -152,24 +156,32 @@ class NetworkPause:
         """None while waiting; else what the elapsed outage decides."""
         elapsed = now - self.started
         reverify = ("reassert_paper_mode", "light_fixture_check")
+        if elapsed > NETWORK_SHARD_S:
+            return ControlResult("network", False, "connectivity", run=RunVerdict("complete_with_env_errors"),
+                                 unreached=Outcome("env_error", "gate", "connectivity"), alert=alerts.env_error(),
+                                 detail=f"network {'back' if connected else 'down'} after {elapsed:.0f} s, past 15 "
+                                        "minutes: the shard's remaining checkpoints are env_error",
+                                 evidence={"pause_s": elapsed})
+        if elapsed > NETWORK_RETRY_S and not self.flow_failed:
+            self.flow_failed = True
+            o = Outcome("env_error", "gate", "connectivity")
+            subset = (SubsetOutcome("in_progress", o), SubsetOutcome("rest_of_flow", o))
+            if connected:
+                return ControlResult("network", False, "connectivity", checkpoint=o, outcomes=subset,
+                                     actions=reverify + ("resume_next_flow",), alert=alerts.env_error(),
+                                     detail=f"network back after {elapsed:.0f} s, past 5 minutes: the flow is "
+                                            "env_error; resume at the next flow boundary",
+                                     evidence={"pause_s": elapsed})
+            return ControlResult("network", False, "connectivity", checkpoint=o, outcomes=subset,
+                                 actions=("pause_capture",), alert=alerts.env_error(),
+                                 detail="network down past 5 minutes: the flow is env_error", evidence={"pause_s": elapsed})
         if connected:
-            if elapsed <= NETWORK_RETRY_S and not self.flow_failed:
+            if not self.flow_failed:
                 return ControlResult("network", True, "connectivity", actions=reverify + ("retry_step",),
                                      detail=f"network back after {elapsed:.0f} s: retry the step once",
                                      evidence={"pause_s": elapsed})
             return ControlResult("network", True, "connectivity", actions=reverify + ("resume_next_flow",),
                                  detail=f"network back after {elapsed:.0f} s", evidence={"pause_s": elapsed})
-        if elapsed > NETWORK_SHARD_S:
-            return ControlResult("network", False, "connectivity", run=RunVerdict("complete_with_env_errors"),
-                                 unreached=Outcome("env_error", "gate", "connectivity"), alert=alerts.env_error(),
-                                 detail="network down past 15 minutes", evidence={"pause_s": elapsed})
-        if elapsed > NETWORK_RETRY_S and not self.flow_failed:
-            self.flow_failed = True
-            o = Outcome("env_error", "gate", "connectivity")
-            return ControlResult("network", False, "connectivity", checkpoint=o,
-                                 outcomes=(SubsetOutcome("in_progress", o), SubsetOutcome("rest_of_flow", o)),
-                                 actions=("pause_capture",), alert=alerts.env_error(),
-                                 detail="network down past 5 minutes: the flow is env_error", evidence={"pause_s": elapsed})
         return None
 
 

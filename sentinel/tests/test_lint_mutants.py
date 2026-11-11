@@ -69,7 +69,8 @@ def test_a_behavioral_entry_counts_through_its_canary_flow_checkpoints(repo):
         "surface_id": "dialog.order-confirmation", "target_window": {"kind": "dialog"}, "data_mode": "frozen",
         "regions": "default"})
     assert found(repo) == []                                   # M26, M27, M28, M30 reach the dialog through the flow
-    repo.docs[CATALOG].data = [e for e in repo.docs[CATALOG].data if e["mutant_id"] not in ("M26", "M27", "M28")]
+    repo.docs[CATALOG].data["entries"] = [e for e in repo.docs[CATALOG].data["entries"]
+                                          if e["mutant_id"] not in ("M26", "M27", "M28")]
     (v,) = found(repo)
     assert v[0] == "L-MUT-03" and "1 behavioral entry bound (M30)" in v[3]
 
@@ -110,7 +111,7 @@ def test_delete_needs_the_pinned_dismiss_allowlist(repo):
 
 
 def test_behavioral_and_image_entries_and_the_wrapper_form(repo):
-    entries = repo.docs[CATALOG].data
+    entries = repo.docs[CATALOG].data["entries"]
     m26 = next(i for i, e in enumerate(entries) if e["mutant_id"] == "M26")
     m01 = next(i for i, e in enumerate(entries) if e["mutant_id"] == "M01")
     entries[m26]["canary_flow"] = "flow.trade.order-ticket.stock.limit"

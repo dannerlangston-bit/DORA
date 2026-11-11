@@ -34,6 +34,10 @@ Choices where 8.4 is silent:
 - `manifest.json` is written by `write_manifest`, not on every put, so a shard of 2,900 captures does not
   rewrite a growing file 2,900 times; the ledger of 8.2 carries the artifact rows in between. An existing
   manifest is loaded when the set is opened, so a resumed writer appends to it.
+- The artifact root is on a fixed local volume (8.2, preflight H7, 8.9): opening a set on a UNC path, a mapped drive
+  or a network file system raises `ArtifactRootRefused` before anything is created, through the same
+  `store.check_local_volume` the database path uses; `require_local=False` skips it, as `Store(require_local=False)`
+  does.
 """
 from __future__ import annotations
 
@@ -100,6 +104,10 @@ class ArtifactCorrupt(ArtifactError):
 
 class ArtifactMissing(ArtifactError):
     """No object with this hash is in the set (8.6 artifact audit: missing)."""
+
+
+class ArtifactRootRefused(ArtifactError):
+    """The artifact root is not on a fixed local volume (8.2, preflight H7, 8.9): the process refuses to start."""
 
 
 class ArtifactQuarantined(ArtifactError):
@@ -205,6 +213,16 @@ def _dimensions(data: bytes) -> tuple[int | None, int | None]:
         return None, None
 
 
+def _check_local(root: str | os.PathLike) -> None:
+    """Refuse an artifact root that is not on a fixed local volume (8.2, H7): `store.check_local_volume`, the check the
+    database path takes, imported here because `store.store` imports this module."""
+    from .store import StoreError, check_local_volume
+    try:
+        check_local_volume(root)
+    except StoreError as e:
+        raise ArtifactRootRefused(f"artifact root refused: {e}") from e
+
+
 class ArtifactStore:
     """One artifact set on disk (8.4): `<root>/objects/<aa>/<sha256>.<ext>` and `<root>/manifest.json`.
 
@@ -214,12 +232,16 @@ class ArtifactStore:
     """
 
     @classmethod
-    def at(cls, root: str | os.PathLike, set_path: str, *, scanner: TextScanner | None = None) -> "ArtifactStore":
+    def at(cls, root: str | os.PathLike, set_path: str, *, scanner: TextScanner | None = None,
+           require_local: bool = True) -> "ArtifactStore":
         """The set `set_path` in its own directory under an artifact root, `<root>/<set_path>/` (8.4: the control
         host's `runs/<run_id>/`), so one set's quarantine never moves or blocks another set's files."""
-        return cls(Path(root) / set_path, set_path, scanner=scanner)
+        return cls(Path(root) / set_path, set_path, scanner=scanner, require_local=require_local)
 
-    def __init__(self, root: str | os.PathLike, set_path: str, *, scanner: TextScanner | None = None):
+    def __init__(self, root: str | os.PathLike, set_path: str, *, scanner: TextScanner | None = None,
+                 require_local: bool = True):
+        if require_local:
+            _check_local(root)
         self.root = Path(root)
         self.set_path = set_path
         self.scanner = scanner

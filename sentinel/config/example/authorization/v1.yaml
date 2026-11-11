@@ -1,0 +1,18 @@
+# The machine-readable record of authorization/v1.md (6.12, schema in 4.16). Preflight and the lint check it
+# (L-XREF-16, L-XREF-20); every run manifest carries authorization/v1.md and document_sha256. Any change, the gated
+# send branch included, is a new version that supersedes this one.
+schema_version: 1
+version: v1
+document_sha256: "sha256:b589f86d0f4f52aea133b90ef316734a7728c21fa52559bd1cbeae6fa4aed667"
+signatures:
+  - {role: platform_owner, name: pplatform, signed_at: "2026-10-20T10:00:00-04:00"}
+  - {role: security_contact, name: security-contact, signed_at: "2026-10-20T11:30:00-04:00"}
+  - {role: compliance_contact, name: ccompliance, signed_at: "2026-10-21T09:15:00-04:00"}
+account_ids: [D-20481133, D-20481134]
+rig_hostnames: [rig-01]
+automation: [harness processes, input gateway injection, global hooks, screen capture, fire drill injector]
+model_endpoint: api.anthropic.com
+model_terms: zero data retention (computer-use ruling, 6.11)
+data_classes: [redacted crops and heatmaps, redacted manifest and oracle text]
+rate_caps: {logins_per_day: 40, symbol_changes_per_hour: 600, staged_orders_per_hour: 60, staged_orders_per_day: 300}
+send_policy_branch: default

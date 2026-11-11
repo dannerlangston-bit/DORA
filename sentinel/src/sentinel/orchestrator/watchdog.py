@@ -1,7 +1,9 @@
 """Watchdog decisions and the Orchestrator's heartbeat (10.2; 5.2, 5.4.2, 10.1; F27, F36, F44, F62).
 
-The Watchdog is a separate process that emits no input and never writes SQLite; these are the
-platform-independent decisions it and the Orchestrator take:
+The Watchdog is a separate process that emits no input and never writes SQLite (its sampling loop, reaction,
+`watchdog.json` and journal are `watchdog_loop.py`; `orchestrator --resume` and `--finalize` are `resume.py`; the
+control host's dead-man intake and the monthly chaos self-test are `deadman.py`); these are the platform-independent
+decisions it and the Orchestrator take:
 
 - Heartbeat staleness: over 120 s is a hung Orchestrator, over 5 minutes while `provisioned` or
   `launched` (installs and launches are slow). The reverse heartbeat `watchdog.json` older than 30 s or
@@ -21,11 +23,16 @@ platform-independent decisions it and the Orchestrator take:
 - An Orchestrator death consumes one of 2 restarts; spent, `aborted_harness (reason:
   orchestrator_restart_budget)`. A hook host death consumes its own budget of 1; the second ends the run
   `aborted_harness (reason: hook_lost)`, as does a shared-memory `magic` or `layout_version` mismatch.
+- The dead-man deadline is the run deadline plus grace: 15 minutes for PR, 30 for merge, 60 for RC; for the
+  Nightly run 06:00 America/New_York, and for a Calibration run 06:00 America/New_York after each night's pass,
+  the first 06:00 at or after the pass is scheduled to end (10.2, 9.10, 11.6, SD-98).
 - The dead-man finalize: a run that reached `running` and missed its deadline plus grace is
   `aborted_harness (reason: dead_man)` with `harness_error (reason: dead_man)` on every checkpoint without
   an outcome; a run still before `running` is a failure of the gate in force, `env_error (gate: <state>,
-  reason: timeout)`, run `complete_with_env_errors`. A run that never reached `running` is never
-  `dead_man`.
+  reason: timeout)`, run `complete_with_env_errors`, except a Nightly or Calibration run, which already
+  ended `aborted_harness (reason: start_failed)` at its earlier start deadline (11.2): the finalize writes that
+  outcome again (`start_deadline.start_failed`), so a start deadline the control host missed still pages. A run
+  that never reached `running` is never `dead_man`.
 - Detector precedence when two fire in one step (F27): `env_error`, then `assertion_failed (assertion:
   app_alive)`, then `harness_error`.
 
@@ -38,10 +45,11 @@ from __future__ import annotations
 import errno
 import json
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
+from typing import Any
 
 from . import alerts
 from .budgets import ShardBudgets
@@ -49,6 +57,7 @@ from .clock import Clock
 from .results import (ControlResult, FindingSpec, Outcome, RunVerdict, SubsetOutcome, budget_abort_outcome,
                       harness_abort_outcome)
 from .rig import CrashSignal
+from .start_deadline import first_local, start_failed
 
 HEARTBEAT_STALE_S = 120.0
 HEARTBEAT_STALE_SLOW_S = 300.0
@@ -59,6 +68,7 @@ DISK_ABORT_BYTES = 2 * 1024 ** 3
 PROACTIVE_FLOWS = 40
 PROACTIVE_UPTIME_S = 90 * 60.0
 DEAD_MAN_GRACE = {"pr": timedelta(minutes=15), "merge": timedelta(minutes=30), "rc": timedelta(minutes=60)}
+DEAD_MAN_CUTOFF = time(6, 0)        # 10.2: Nightly and Calibration runs, America/New_York
 APP_CAUSES = ("jvm_crash", "hang", "oom", "process_exit")
 
 
@@ -168,9 +178,13 @@ def crash_signal(signals: Sequence[CrashSignal]) -> CrashSignal | None:
     return next((s for s in signals if s.cause == "oom"), signals[0])
 
 
-def app_failure(sig: CrashSignal, budgets: ShardBudgets, *, phase: str) -> ControlResult:
+def app_failure(sig: CrashSignal, budgets: ShardBudgets, *, phase: str,
+                artifacts: Sequence[Mapping[str, Any]] = ()) -> ControlResult:
     """One app failure (10.1, 10.2, F36, F44, F62). `phase` is `first_launch`, `relaunch_gates` (a gate sequence
-    of the shard), `running` or `teardown`."""
+    of the shard), `running` or `teardown`. `artifacts` is the Watchdog reaction's evidence manifest
+    (`watchdog_loop.ReactionReport.manifest`: screenshot, thread dump, log slice, dumps, Event Log entries, heartbeats,
+    gateway events, and the "unavailable" notes); it rides in `evidence["artifacts"]` for the `app_crash` finding
+    (5.14: "a tier-1 app_crash finding with the artifacts attached")."""
     if sig.cause not in APP_CAUSES:
         raise ValueError(f"app_alive cause {sig.cause!r}")
     if phase not in ("first_launch", "relaunch_gates", "running", "teardown"):
@@ -188,6 +202,7 @@ def app_failure(sig: CrashSignal, budgets: ShardBudgets, *, phase: str) -> Contr
                              detail="app died in teardown with no relaunch left: the proof is UNPROVEN (6.6)")
     alive = Outcome("assertion_failed", "assertion:app_alive", detail=sig.cause)
     finding = FindingSpec("app_crash", f"thinkorswim {sig.cause} ({sig.source})", tier=1, detail=sig.cause)
+    ev: dict[str, Any] = {"artifacts": [dict(a) for a in artifacts]} if artifacts else {}
     if phase == "running":
         subset = (SubsetOutcome("in_progress", alive), SubsetOutcome("rest_of_flow", Outcome("not_run", "app_crash")))
     else:
@@ -197,12 +212,12 @@ def app_failure(sig: CrashSignal, budgets: ShardBudgets, *, phase: str) -> Contr
         return ControlResult("watchdog", False, gate, checkpoint=alive, outcomes=subset, findings=(finding,),
                              actions=("reset_input_state", "kill_tree", "wait_session_release", "relaunch",
                                       "resume_next_flow"), step="failed",
-                             detail=f"app relaunch {budgets.used_app} of {budgets.app_relaunches}")
+                             detail=f"app relaunch {budgets.used_app} of {budgets.app_relaunches}", evidence=ev)
     run, un = budget_abort_outcome("app_restart_budget")
     return ControlResult("watchdog", False, gate, run=run, checkpoint=alive, unreached=un, outcomes=subset,
                          findings=(finding,), alert=alerts.aborted_budget("app_restart_budget"),
                          actions=("reset_input_state", "kill_tree", "teardown"), step="failed",
-                         detail=f"app failure {budgets.app_relaunches + 1} in the shard")
+                         detail=f"app failure {budgets.app_relaunches + 1} in the shard", evidence=ev)
 
 
 def orchestrator_died(budgets: ShardBudgets, *, step_id: str | None, state: str = "running") -> ControlResult:
@@ -264,23 +279,32 @@ def resolve_detectors(candidates: Sequence[Outcome]) -> Outcome:
 
 # -- the dead-man -----------------------------------------------------------------------------------------
 def dead_man_deadline(run_type: str, deadline: datetime, *, nightly_cutoff: datetime | None = None) -> datetime:
-    """Deadline plus grace (10.2): 15 minutes for PR, 30 for merge, 60 for RC; the Nightly run's 06:00
-    America/New_York cutoff is passed in as `nightly_cutoff`."""
-    if run_type == "nightly":
-        if nightly_cutoff is None:
-            raise ValueError("a Nightly run's dead-man time is 06:00 America/New_York: pass nightly_cutoff")
+    """Deadline plus grace (10.2): 15 minutes for PR, 30 for merge, 60 for RC. A Nightly or Calibration run's
+    dead-man is 06:00 America/New_York: the first 06:00 at or after `deadline`, its run deadline (the Nightly) or
+    the scheduled end of the night's pass (a Calibration run, SD-98). `nightly_cutoff` overrides the computed
+    06:00 of a Nightly run."""
+    if run_type == "nightly" and nightly_cutoff is not None:
         return nightly_cutoff
+    if run_type in ("nightly", "calibration"):
+        return first_local(deadline, DEAD_MAN_CUTOFF, inclusive=True)
     if run_type not in DEAD_MAN_GRACE:
         raise ValueError(f"no dead-man grace for run type {run_type!r}")
     return deadline + DEAD_MAN_GRACE[run_type]
 
 
 def dead_man_finalize(state: str, reached_running: bool, *, run_type: str) -> ControlResult:
-    """`orchestrator --resume <run_id> --finalize` at deadline plus grace (10.2)."""
+    """`orchestrator --resume <run_id> --finalize` at deadline plus grace (10.2). A Nightly or Calibration run still
+    before `running` takes its start-deadline outcome, `aborted_harness (reason: start_failed)` (11.2)."""
     if reached_running:
         run, un = harness_abort_outcome("dead_man")
         return ControlResult("dead_man", False, state, run=run, unreached=un, alert=alerts.dead_man(run_type),
                              actions=("kill_tree",), detail="the run reached running and stopped reporting")
+    if run_type in ("nightly", "calibration"):
+        r = start_failed(run_type, state=state)
+        return ControlResult("dead_man", False, state, run=r.run, unreached=r.unreached, alert=r.alert,
+                             actions=("kill_tree",) + r.actions,
+                             detail=f"still at {state} at the dead-man deadline: its start deadline passed, "
+                                    f"start_failed (11.2)")
     return ControlResult("dead_man", False, state, run=RunVerdict("complete_with_env_errors"),
                          unreached=Outcome("env_error", "timeout", state), alert=alerts.env_error(),
                          actions=("kill_tree",), detail=f"still at {state} at the dead-man deadline: never dead_man")

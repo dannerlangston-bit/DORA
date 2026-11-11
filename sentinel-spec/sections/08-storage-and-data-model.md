@@ -658,7 +658,7 @@ CREATE TABLE findings (
                                                  'missed_in_pr_run','artifact_missing','orphaned_baseline',
                                                  'canary_miss','intended_change_not_observed',
                                                  'flow_maintenance_needed','harness_error','memory_warning',
-                                                 'hardening')),
+                                                 'hardening','fixture_finding')),
                      -- equals the finding vocabulary of 4.13; generated from taxonomy.yaml finding_kinds
   tier             INTEGER CHECK (tier IN (1,2,3)),
   severity         TEXT CHECK (severity IN ('S1','S2','S3')),   -- invariants, 2.7
@@ -892,7 +892,8 @@ CREATE TABLE flake_stats (                  -- rolling 30 days, refreshed by the
   quarantine_commit TEXT,                   -- sentinel-config commit whose quarantine.yaml holds the record
   quarantined_at TEXT, quarantined_by TEXT, quarantine_owner TEXT, quarantine_ticket_ref TEXT,
   quarantine_reason TEXT CHECK (quarantine_reason IS NULL OR quarantine_reason IN ('flake','aa_drift','aa_floor',
-                      'maintenance_budget','fire_drill','safety_canary','kill_switch','gateway_drops','fallback_rate')),   -- 10.5 (SD-96)
+                      'maintenance_budget','fire_drill','safety_canary','kill_switch','gateway_drops','fallback_rate',
+                      'unknown_popup')),   -- 10.5 (SD-96)
   updated_at       TEXT NOT NULL,
   CHECK (quarantined = 0 OR (quarantine_commit IS NOT NULL AND quarantine_owner IS NOT NULL
                              AND quarantine_ticket_ref IS NOT NULL))
@@ -1181,7 +1182,7 @@ CREATE TABLE safety_quarantines (           -- 6.5, 6.12, 10.5: a flow, rig, log
   target_kind       TEXT NOT NULL CHECK (target_kind IN ('flow','rig','login','activity')),
   target            TEXT NOT NULL,
   reason            TEXT NOT NULL CHECK (reason IN ('flake','aa_drift','aa_floor','maintenance_budget','fire_drill',
-                      'safety_canary','kill_switch','gateway_drops','fallback_rate')),   -- 10.5 (SD-96)
+                      'safety_canary','kill_switch','gateway_drops','fallback_rate','unknown_popup')),   -- 10.5 (SD-96)
   run_id            TEXT REFERENCES runs(run_id),
   detail            TEXT,
   ticket_ref        TEXT,

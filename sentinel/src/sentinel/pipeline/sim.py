@@ -1034,12 +1034,10 @@ class SimApp:
                 sizes.get(cp.workspace_id, (640, 420))
             layout, info = _chart_cell(size, b)
             return layout, size, info
-        if s == "charts.flexible-grid.level2-cell":
-            layout, info = _data_cell((480, 420), b, "level2")
-            return layout, (480, 420), info
-        if s == "charts.flexible-grid.time-sales-cell":
-            layout, info = _data_cell((480, 420), b, "time_sales")
-            return layout, (480, 420), info
+        if s in ("charts.flexible-grid.level2-cell", "charts.flexible-grid.time-sales-cell"):
+            size = b.clamp(s, (int(step["w"]), int(step["h"]))) if kind == "sweep" else (480, 420)   # 2.5.1
+            layout, info = _data_cell(size, b, "level2" if s.endswith("level2-cell") else "time_sales")
+            return layout, size, info
         if s == "trade.order-entry.stock":
             state = cp.step_id if kind == "flow" else "census"
             layout, info = _order_entry(state, b)

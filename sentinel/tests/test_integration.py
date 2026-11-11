@@ -69,7 +69,9 @@ def legal(outcomes: list[CheckpointOutcome]) -> None:
 
 
 def alerts(out: Path) -> list[dict]:
-    return json.loads((out / "alerts.json").read_text())
+    """The run's alerts, less 12.7 G5's on-call notice that a fresh store has no Calibration for the rendering key
+    (10.7; its own test is in test_demo)."""
+    return [a for a in json.loads((out / "alerts.json").read_text()) if a["control"] != "fingerprint"]
 
 
 def orchestrator(out: Path) -> list[dict]:
@@ -170,7 +172,8 @@ def test_clean_runs_pass_every_gate_page_nobody_and_prove_no_orders_sent(runs):
     (run,) = orchestrator(out)
     assert {s["verdict"] for s in run["shards"]} == {"complete"} and len(run["shards"]) == len(r.shards) == 4
     stage2 = {"ondemand", "delay_badge", "connectivity", "alerts", "prices", "pinned_quote", "symbol_precheck"}
-    assert all([c for c in dict.fromkeys(g["control"] for g in s["gates"]) if c not in stage2][:8] == [
+    hooks = {"fingerprint", "registry_validation"}      # the gate hooks' results: G5's notice, 2.2.3 at running
+    assert all([c for c in dict.fromkeys(g["control"] for g in s["gates"]) if c not in stage2 | hooks][:8] == [
         "preflight", "launch", "login", "paper_mode", "attestation", "workspace", "fixture", "canary_flow"]
         for s in run["shards"])
     assert all(any(g["control"] == "build_reread" for g in s["gates"]) for s in run["shards"])

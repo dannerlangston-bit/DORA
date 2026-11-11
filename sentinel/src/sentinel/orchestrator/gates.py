@@ -349,8 +349,8 @@ def _window_misses(windows: Sequence[WindowInfo], expected: Sequence[WindowExpec
 def check_workspace(obs: WorkspaceObservation, expected: WorkspaceExpectation, *,
                     windows: Sequence[WindowInfo] | None = None) -> ControlResult:
     """Gate `workspace_loaded`: file hash, anchor, tab set and the top-level windows (title regex, DWM rect within
-    4 px; 7.5, SD-77). An unlocated registry probe is `landmark_missing (reason: probe:<Pn>)` and the run continues
-    with the registry as truth there (2.2.3)."""
+    4 px; 7.5, SD-77). The registry probes run later, at entry to `running` (SD-15, `validation`): an unlocated probe
+    anchor is that probe's own `landmark_missing (reason: probe:<Pn>)`, not this gate's."""
     problems = [what for bad, what in ((obs.file_sha256 != expected.sha256, "workspace hash"),
                                        (not obs.anchor_present, "workspace anchor"),
                                        (tuple(obs.tabs) != tuple(expected.tabs), f"tab set {list(obs.tabs)}"),
@@ -362,8 +362,7 @@ def check_workspace(obs: WorkspaceObservation, expected: WorkspaceExpectation, *
         problems += _window_misses(windows, expected.windows)
     if problems:
         return _env_fail("workspace", "workspace_loaded", detail="; ".join(problems))
-    probes = tuple(SubsetOutcome(f"probe:{p}", Outcome("landmark_missing", f"probe:{p}")) for p in obs.probes_unlocated)
-    return ControlResult("workspace", True, "workspace_loaded", outcomes=probes)
+    return ControlResult("workspace", True, "workspace_loaded")
 
 
 # -- fixture_verified -----------------------------------------------------------------------------------

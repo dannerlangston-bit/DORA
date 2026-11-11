@@ -243,8 +243,8 @@ WS = WorkspaceExpectation("w" * 64, ("Monitor", "Trade"), 1)
 
 
 def test_workspace_loaded():
-    ok = check_workspace(WorkspaceObservation("w" * 64, True, ("Monitor", "Trade"), 1, ("P3",)), WS)
-    assert ok.passed and ok.outcomes[0].outcome == Outcome("landmark_missing", "probe:P3")
+    ok = check_workspace(WorkspaceObservation("w" * 64, True, ("Monitor", "Trade"), 1), WS)
+    assert ok.passed and ok.outcomes == ()                    # SD-15: the probes run at entry to running
     bad = check_workspace(WorkspaceObservation("x" * 64, True, ("Monitor", "Trade"), 1), WS)
     assert bad.unreached == Outcome("env_error", "gate", "workspace_loaded", bad.unreached.detail)
     assert not check_workspace(WorkspaceObservation("w" * 64, True, ("Monitor",), 1), WS).passed

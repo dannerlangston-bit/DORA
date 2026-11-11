@@ -30,7 +30,8 @@ consequences for the Orchestrator and the findings and step events. The sequence
    `exception:<class>` on the checkpoint in progress, the rest of the flow `not_run (reason: step_failed:<step>)`).
 4. Teardown runs after a failed or blocked step too (2.6.1), with no agent rung (4.7); it does not run when the run
    stopped or the process tree was killed. A `close_dialog` or `clear_ticket` that passes with the flag clear lifts
-   the sticky `order_stage` declaration (5.4.6 source 3).
+   the sticky `order_stage` declaration (5.4.6 source 3). A `close_dialog` with no dialog open (the main frame is
+   enabled, `modal_state`) has nothing to close: it passes as a no-op, with no input and no ladder (choice 7).
 
 `UnitHooks` lets the caller put the Orchestrator's own checks between steps: `before_step` (its `step_boundary`: the
 trip-wires, the flow budget, the paper-mode timer) and `after_step` (the Watchdog's app failure: `in_progress` becomes
@@ -53,6 +54,11 @@ Choices where the spec is ambiguous (reported):
    default; the caller fills `max_settle_ms` for chart and scan checkpoints).
 6. Base-side outcomes (2.4 and 2.6.1 base step failure, `not_run (reason: base_step_failed)` or `needs_baseline`)
    belong to the evaluation of both sides; `UnitResult.side` says which side ran.
+7. Teardown `close_dialog` when no dialog is open (2.6.1 "teardown leaves the app clean"): a flow that failed
+   before its dialog opened, or whose dialog was already closed, would otherwise click a target the ladder
+   cannot place and file a `locator_failure` for a control that is rightly absent. The step passes with the
+   detail "no dialog open; nothing to close", and the `order_stage` declaration lifts as for a close that
+   passed. `clear_ticket` always runs: the ticket lives in the main frame, open or not.
 """
 from __future__ import annotations
 
@@ -77,6 +83,7 @@ DEFAULT_WAIT_MS = 5000                  # 4.7 timeout_ms
 STREAK_LIMIT = 3                        # 2.4: three consecutive env_error visits in one workspace
 PRECONDITION_GATE = "workspace_loaded"
 TREE_GONE = ("kill_tree", "kill_switch", "relaunch")
+NO_DIALOG = "no dialog open; nothing to close"     # choice 7
 
 
 # -- observations ---------------------------------------------------------------------------------------------------
@@ -462,6 +469,9 @@ def _step(u: _Unit, step: Mapping[str, Any], index: int, *, teardown: bool = Fal
     hb = ctx.heartbeat
 
     def work() -> StepResult:
+        if teardown and kind == "teardown" and step.get("action") == "close_dialog" and \
+                u.ports.modal_state().main_enabled:
+            return StepResult(step_id=sid, status="passed", detail=NO_DIALOG)                       # choice 7
         if kind in INPUT_STEPS or (teardown and kind == "teardown" and step.get("target")):
             return emit(step, u.ports, u.locator, u.planner, ctx, teardown=teardown)
         if kind == "reset_input_state":

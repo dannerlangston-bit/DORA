@@ -144,6 +144,29 @@ def test_l_dec_04_a_money_cell_takes_no_noise_or_mask_and_calibration_clamps_tol
                              run_id=RUN).hamming_tolerance == 3
 
 
+def test_an_exact_fallback_region_stores_tolerance_0_with_the_box_and_matches_only_it(s):
+    """4.14, 9.7, L-DEC-03: a region whose tolerance is at or below its noise spread falls back to pHash equality
+    plus the largest component's 4 px box; the decision must carry `bbox_q4` and the lookup requires it equal."""
+    s.write_calibration([floor("rgn.confirm.symbol", 3, "sha256:k1", fallback=1)])
+    load_config_mirror(s, COMMIT, {FLOW: regions_doc()})
+    with pytest.raises(StoreRefused, match="L-DEC-03"):
+        s.record_decision(decision("dec-000001", "noise_signature", "rgn.confirm.symbol"), run_id=RUN)
+    d = s.record_decision(decision("dec-000001", "noise_signature", "rgn.confirm.symbol", bbox_q4=(8, 4, 16, 12)),
+                          run_id=RUN)
+    assert (d.hamming_tolerance, d.bbox_q4) == (0, (8, 4, 16, 12))
+    sig = Signature(FLOW, "rgn.confirm.symbol", PH, "collateral")
+    near = Signature(FLOW, "rgn.confirm.symbol", PH[:-1] + "e", "collateral")          # one bit away
+    assert [m.decision.decision_id for m in s.lookup_decisions(sig, at=TS, bbox_q4=(8, 4, 16, 12)).matches] == [
+        "dec-000001"]
+    assert s.lookup_decisions(sig, at=TS, bbox_q4=(8, 4, 20, 12)).matches == ()          # another box
+    assert s.lookup_decisions(sig, at=TS).matches == ()                                  # no box: no exact match
+    assert s.lookup_decisions(near, at=TS, bbox_q4=(8, 4, 16, 12)).matches == ()
+    other = s.record_decision(decision("dec-000002", "noise_signature", "rgn.confirm.title"), run_id=RUN)
+    title = Signature(FLOW, "rgn.confirm.title", PH, "collateral")
+    assert other.hamming_tolerance == 8 and s.lookup_decisions(title, at=TS).matches[0].decision.decision_id == \
+        "dec-000002"                                                                    # a tolerance needs no box
+
+
 def test_the_mirror_refuses_what_its_tables_cannot_hold(s):
     no_role = regions_doc(rgn_confirm_qty={"money_role": None})
     with pytest.raises(MirrorRefused, match="L-RGN-08"):

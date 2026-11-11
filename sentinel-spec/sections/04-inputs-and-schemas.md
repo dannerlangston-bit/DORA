@@ -1549,6 +1549,7 @@ A step record carries a reason only for an export step: `export_timeout` or `exp
 | `flow_maintenance_needed` | a Recorder anchor no longer matches the latest approved capture | 5.16, 11.5 |
 | `harness_error` | a harness exception that did not take a checkpoint with it (an event that never reached the hook) | 5.4 |
 | `memory_warning`, `hardening` | low-memory dialog per build; foreign-process occlusion on a hardened rig | 7.8, 7.12 |
+| `fixture_finding` | a catalog popup the fixture rules out appeared and the flow did not expect it: 12.8 POP-07, a price or study alert (`fixture_drift`, alerts must be zero, 7.6), or POP-15, an invalid or unknown symbol (`fixture_maintenance_needed`, 7.9); the reason is the finding's `detail`; the popup is counted and dismissed and no outcome changes | 7.6, 7.9, 12.8 |
 
 `lockstep_slip` and `rerun_budget_exhausted` are run-health counters, not findings (3.1, 3.10). An outcome's `reason` and `detail` are what the coverage matrix prints for a `not_run` cell and what the on-call page carries for an `env_error`; a code outside this table cannot be written, so a new failure mode is a change to this section and to `taxonomy.yaml` before it is a line of code.
 
@@ -2005,7 +2006,7 @@ quarantine_record:
   owner: str
   ticket: str
   entered: date
-  reason: enum[flake|aa_drift|aa_floor|maintenance_budget|fire_drill|safety_canary|kill_switch|gateway_drops|fallback_rate]
+  reason: enum[flake|aa_drift|aa_floor|maintenance_budget|fire_drill|safety_canary|kill_switch|gateway_drops|fallback_rate|unknown_popup]
   detail: str?
 ```
 

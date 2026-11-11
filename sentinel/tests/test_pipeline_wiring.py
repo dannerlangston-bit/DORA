@@ -326,8 +326,10 @@ def test_records_carry_the_build_pair_their_ids_and_what_the_run_measured(tmp_pa
     assert all(o.pair_id == str(pair["pair_id"]) and o.outcome_id.startswith(f"oc-{sc.run_id}-") for o in outs)
     assert len({o.outcome_id for o in outs}) == len(outs) and {o.profile_id for o in outs} == {"margin"}
     captured = [o for o in outs if o.artifacts]
-    assert all(o.cand_rig_id and o.base_rig_id == o.cand_rig_id and o.settle_ms and o.masked_pct is not None
-               for o in captured)
+    # registry validation's rows carry probe screenshots, not settled captures (2.2.3): no settle time or mask share
+    settled = [o for o in captured if not o.surface_id.startswith("registry.validation-")]
+    assert all(o.cand_rig_id and o.base_rig_id == o.cand_rig_id for o in captured)
+    assert all(o.settle_ms and o.masked_pct is not None for o in settled)
     assert any(o.diff_pixels for o in captured if o.outcome == "intended") and r.status == "complete"
 
 

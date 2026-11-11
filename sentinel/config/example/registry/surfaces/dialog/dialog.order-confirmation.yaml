@@ -9,14 +9,14 @@ smoke: true
 path:
   - {id: p1, type: click_named, target: trade.order-entry.stock.confirm-and-send, order_stage: true}
   - {id: p2, type: wait_for, anchor: {window_title_regex: "^Order Confirmation", landmark: lm.order-confirmation-title}, timeout_ms: 6000}
-primitives: [OrderTicketCore, Theme]
+primitives: [OrderTicketCore, QuoteStream, Theme, FontMetrics]   # 12.4
 roots: ["com.tos.desktop.trade.confirm"]
 personas: [active_trader, options_trader, futures_trader, swing_trader, beginner]
 entitlements: [margin]
 enumerable_by: none
 resizable: false
 target_window: {kind: dialog, title_regex: "^Order Confirmation"}
-data_mode: frozen
+data_mode: masked_live                # 12.4: Qty, Price, Buying Power Effect and Max Loss diffed at a zero floor, rules R01, R02
 account_state: true
 landmarks:
   - {id: lm.order-confirmation-title, template: registry/templates/dialog/order-confirmation-title.png, confidence_min: 0.93, must_see: true}

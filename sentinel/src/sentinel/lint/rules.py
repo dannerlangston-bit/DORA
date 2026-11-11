@@ -68,7 +68,10 @@ Choices where the spec is ambiguous (reported):
     false` (or `absent`), `active_trader_hotkeys: false`, `order_hotkeys: []` (L-FIX-05).
 14. `taxonomy.yaml` and `schemas/` are optional in a config checkout (this harness carries both);
     when present they must equal the harness's (L-XREF-08, L-XREF-09). The popup and mutant
-    catalogs are bare lists (4.10, 4.11) or a map with `schema_version` and the list.
+    catalogs are a map with `schema_version` and the list (4.10, 4.11); a bare list is still read, and
+    warns in Phase 0 and is an error from Phase 1 (SD-47, L-POP-01, L-MUT-01). A refused
+    `schema_version` names the migration `sentinel schemas --migrate` ships, or says none ships
+    (4.1, sentinel.config_migrations).
 15. "The fixture the run uses" (L-WSP-07) is every fixture a flow on that workspace names, or any
     fixture when no flow uses the workspace. The masked_live rule of L-SRF-08 covers census, sweep
     and split checkpoints; flow checkpoints carry their own data mode (L-FLW-05).
@@ -155,6 +158,14 @@ Choices where the spec is ambiguous (reported):
     and the calibration-file rules (L-XREF-04, L-XREF-05, L-XREF-11 on calibration/, L-RGN-06) are the check
     modules flow_classes, corpus and calibration_files; the history rules (removed checkpoint and surface ids,
     L-XREF-10, L-MSK-04, L-MSK-05), L-MSK-01 against the Central Store and L-MAN-10 are sentinel.lint.diffmode.
+31. L-XREF-12 compares every starter popup entry that is not retired with its 12.8 row (`POP_12_8`): the class,
+    the action (a row's "no input" is any of `abort`, `wait` and `ignore`; POP-21's "recovery once" is
+    `relogin`), the dismiss key, the click control's
+    label (its OCR text or JAB name), the `wait` timeout and the `on_abort` outcome, gate, reason, invariant and
+    run outcome the row names; a field the row does not name (POP-19's class and action, POP-05's on_abort, the
+    gate "in force" of POP-19) is not compared. While an entry of a 12.8 `click` row is `status: unverified`
+    (Phase 0 has not read its window and close control, 7.14 check 14), `dismiss_key: escape` stands in for the
+    click; a `verified` entry clicks its 12.8 control.
 
 Rules checked only in part from files (the rest needs live state, history or a store; reported):
 L-FLW-13 (the 6.8 Explorer deny list has no file), L-RGN-02 (bounds from the last calibration: the
@@ -385,8 +396,8 @@ RULES: dict[str, Rule] = {r.id: r for r in (
          _HISTORY + "the pull request's base tree and the approved checkpoints"),
     Rule("L-XREF-11", "error", "every checkpoint id matches the 4.1 grammar and names a registered surface; quarantined "
          "flows exist"),
-    Rule("L-XREF-12", "error", "every 12.8 starter popup present unless retired; M01 to M33 equal their 12.5 rows; further "
-         "ids in sequence"),
+    Rule("L-XREF-12", "error", "every 12.8 starter popup present unless retired, equal to its row; M01 to M33 equal "
+         "their 12.5 rows; further ids in sequence"),
     Rule("L-XREF-13", "error", "deny controls and policy/explorer_deny_list.yaml targets exist, detect, and are named by "
          "the nightly test", _PENDING),
     Rule("L-XREF-14", "error", "policy/explorer_budget.yaml equals 6.8 unless the Explorer owner approved"),
@@ -419,6 +430,60 @@ RULES: dict[str, Rule] = {r.id: r for r in (
 # -- spec constants ---------------------------------------------------------------------------------
 
 POP_IDS_12_8 = tuple(f"POP-{i:02d}" for i in range(1, 23))
+
+
+@dataclass(frozen=True)
+class StarterPopup:
+    """One 12.8 row as L-XREF-12 compares it (choice 31); None is a field the row does not name."""
+    klass: str | None
+    action: str | None                   # an action of 4.10, or no_input (any of abort, wait and ignore)
+    label: str | None = None             # click: the control's label; dismiss_key: the key
+    outcome: str | None = None
+    gate: str | None = None
+    reason: str | None = None
+    invariant_id: str | None = None
+    run_outcome: str | None = None
+    wait_ms: int | None = None
+
+
+_ENV, _DIS, _KILL = "env_error", "dismissable", ("aborted_run", None, "kill_switch", None, "aborted_safety")
+POP_12_8: dict[str, StarterPopup] = {
+    "POP-01": StarterPopup("env", "abort", None, _ENV, "launched", "version_mismatch"),
+    "POP-02": StarterPopup(_DIS, "click", "Close"),
+    "POP-03": StarterPopup("env", "abort", None, _ENV, "authenticated", "agreement_pending"),
+    "POP-04": StarterPopup("env", "abort", None, _ENV, "authenticated", "session_kicked"),
+    "POP-05": StarterPopup("login", "relogin"),
+    "POP-06": StarterPopup(_DIS, "click", "Close"),
+    "POP-07": StarterPopup(_DIS, "dismiss_key", "escape"),
+    "POP-08": StarterPopup(_DIS, "dismiss_key", "escape"),
+    "POP-09": StarterPopup("env", "abort", None, _ENV, "connectivity", "maintenance"),
+    "POP-10": StarterPopup("app_failure", "no_input", None, "invariant_violation", invariant_id="INV-14"),
+    "POP-11": StarterPopup(_DIS, "click", "Close"),
+    "POP-12": StarterPopup("env", "wait", None, _ENV, "fixture_verified", "ondemand_timeout", wait_ms=90_000),
+    "POP-13": StarterPopup(_DIS, "click", "Don't Save"),
+    "POP-14": StarterPopup("safety", "no_input", None, *_KILL),
+    "POP-15": StarterPopup(_DIS, "dismiss_key", "escape"),
+    "POP-16": StarterPopup(_DIS, "dismiss_key", "escape"),
+    "POP-17": StarterPopup(_DIS, "dismiss_key", "escape"),
+    "POP-18": StarterPopup("env", "abort", None, _ENV, "launched", "version_changed_mid_run"),
+    "POP-19": StarterPopup(None, None, None, _ENV, None, "occluded"),
+    "POP-20": StarterPopup("app_failure", "no_input", None, "invariant_violation", invariant_id="INV-14"),
+    "POP-21": StarterPopup("login", "relogin", None, _ENV, "authenticated", "authentication_challenge"),
+    "POP-22": StarterPopup("order_event", "no_input", None, *_KILL),
+}
+NO_INPUT_ACTIONS = frozenset({"abort", "wait", "ignore"})
+
+
+def mutant_ids_in_sequence(ids: Iterable[Any]) -> bool:
+    """L-MUT-01, L-XREF-12: M01 to M33 of 12.5 are all present and every further id continues the sequence from M34
+    without a gap (4.11, 12.5 "the catalog may grow from M34 on, each new id the next in sequence")."""
+    got = set(ids)
+    if not set(MUTANTS_12_5) <= got:
+        return False
+    extra = sorted(int(i[1:]) if isinstance(i, str) and re.fullmatch(r"M[0-9]{2,}", i) else -1
+                   for i in got - set(MUTANTS_12_5))
+    return extra == list(range(len(MUTANTS_12_5) + 1, len(MUTANTS_12_5) + 1 + len(extra)))
+CURLY_APOSTROPHE = chr(0x2019)               # the typographic apostrophe OCR may read in "Don't Save"
 # 12.5: id -> (class, money_cell); authoritative for ids, seed and the money_cell flag
 MUTANTS_12_5: dict[str, tuple[str, bool]] = {
     "M01": ("erased_control", True), "M02": ("erased_control", True), "M03": ("swapped_digit", True),
@@ -690,10 +755,11 @@ def _union_area(bounds: tuple[int, int, int, int], rects: Iterable[tuple[int, in
     return area
 
 
-def mask_budgets() -> dict[str, float]:
+def mask_budgets(config_root: str | Path | None = None) -> dict[str, float]:
     """The panel budgets of the Diff Engine parameters file (`diff_engine.yaml` `mask_budget`, 3.8), the one source
-    the run-time mask budget reads too; classes absent from it (`other`) have no budget."""
-    return {str(k): float(v) for k, v in load_diff_params()["mask_budget"].items()}
+    the run-time mask budget reads too: the file of the config checkout `config_root` when it holds one (4.1), else
+    the harness default (`diff.load_params`); classes absent from it (`other`) have no budget."""
+    return {str(k): float(v) for k, v in load_diff_params(config_root=config_root)["mask_budget"].items()}
 
 
 @dataclass(frozen=True)
@@ -905,7 +971,7 @@ class _Linter:
         self.p50 = flow_p50_s or {}
         self.run_start = run_start
         self.tax = load_taxonomy()
-        self.budgets = mask_budgets()
+        self.budgets = mask_budgets(repo.root)
         self.out: list[Violation] = []
         self.expired: list[ExpiredRecord] = []
         self._index()
@@ -1119,6 +1185,7 @@ class _Linter:
                 if not isinstance(items, list):
                     self.add(rule, doc.rel, f"must be a list of {name} entries (4.10, 4.11)")
                     continue
+                self._catalog_shape(doc, name.split("#")[0])
                 for i, item in enumerate(items):
                     for loc, msg in schemas.validate(name, item):
                         self.add(rule, doc.rel, msg, f"[{i}]" + (f".{loc}" if loc else ""))
@@ -1130,12 +1197,34 @@ class _Linter:
                 self.add(rule, doc.rel, doc.error)
                 continue
             for loc, msg in schemas.validate(name, doc.data):
-                self.add(rule, doc.rel, msg, loc)
+                self.add(rule, doc.rel, self._version_message(name, doc.data, loc, msg), loc)
             if doc.kind in ("regions", "redaction"):        # 4.8 rect {dx, dy, w, h}: an offset and a size
                 for i, x in enumerate(_l(_d(doc.data).get("regions"))):
                     rect = _d(_d(x).get("rect"))
                     if any(isinstance(rect.get(k), int) and not isinstance(rect.get(k), bool) and rect[k] <= 0 for k in ("w", "h")):
                         self.add(rule, doc.rel, "rect w and h are positive sizes", f"regions[{i}].rect")
+
+    def _version_message(self, schema: str, data: Any, loc: str, msg: str) -> str:
+        """A refused `schema_version` names the version the harness knows and the migration that ships, or that none
+        does (4.1 Common conventions, sentinel.config_migrations)."""
+        from .. import config_migrations as cm
+        if not (loc == "schema_version" or (loc == "" and "'schema_version' is a required property" in msg)):
+            return msg
+        got = cm.version_of(data)
+        shown = "schema_version is missing" if got is None else f"schema_version {got} is not known"
+        return f"{shown}: this harness knows version {cm.known_version(schema)} (4.1); {cm.hint(schema, got)}"
+
+    def _catalog_shape(self, doc: Doc, schema: str) -> None:
+        """SD-47 (L-POP-01, L-MUT-01): the catalog file is `{schema_version, entries}`; a bare list warns in Phase 0
+        and is an error from Phase 1, and a wrapper at a version the harness does not know is refused (4.1)."""
+        from .. import config_migrations as cm
+        shape_rule = "L-POP-01" if doc.kind == "popups" else "L-MUT-01"
+        if isinstance(doc.data, list):
+            self.add(shape_rule, doc.rel, "the catalog is a bare list; the file is {schema_version, entries} (SD-47): "
+                     + cm.hint(schema, None), "", self._phase_sev(1))
+        elif cm.version_of(doc.data) != cm.known_version(schema):
+            self.add(shape_rule, doc.rel, self._version_message(schema, doc.data, "schema_version", ""),
+                     "schema_version")
 
     # -- 4.1 identifiers (SD-33) -------------------------------------------------------------------
 
@@ -2660,6 +2749,34 @@ class _Linter:
                 self.add("L-POP-06", f, f"last_seen_build {last} is more than three releases old; flag for removal", f"{at}.last_seen_build")
         self._seed_titles(f, items)
 
+    def _starter_popup_drift(self, p: dict, row: StarterPopup) -> list[str]:
+        """How an entry differs from its 12.8 row (choice 31): one phrase per differing field."""
+        out = []
+        if row.klass is not None and p.get("class") != row.klass:
+            out.append(f"class {p.get('class')} (12.8: {row.klass})")
+        action = p.get("action")
+        same = action in NO_INPUT_ACTIONS if row.action == "no_input" else action == row.action
+        standin = (row.action == "click" and action == "dismiss_key" and _chord(_s(p.get("key"))) == "escape"
+                   and p.get("status") == "unverified")
+        if row.action is not None and not same and not standin:
+            out.append(f"action {action} (12.8: {'no input' if row.action == 'no_input' else row.action}"
+                       + (f" {row.label}" if row.label else "") + ")")
+        elif row.action == "dismiss_key" and _chord(_s(p.get("key"))) != _chord(_s(row.label)):
+            out.append(f"key {p.get('key')} (12.8: {row.label})")
+        elif row.action == "click" and action == "click":
+            ctl = self.controls.get(_s(p.get("target")))
+            labels = {t.replace(CURLY_APOSTROPHE, "'") for t in _labels(ctl[1])} if ctl else set()
+            if ctl is not None and _s(row.label).casefold() not in labels:
+                out.append(f"click target {p.get('target')} reads {sorted(labels) or 'nothing'} (12.8: {row.label})")
+        if row.wait_ms is not None and action == "wait" and p.get("wait_timeout_ms") != row.wait_ms:
+            out.append(f"wait_timeout_ms {p.get('wait_timeout_ms')} (12.8: {row.wait_ms})")
+        oa = _d(p.get("on_abort"))
+        for fld, want in (("outcome", row.outcome), ("gate", row.gate), ("reason", row.reason),
+                          ("invariant_id", row.invariant_id), ("run_outcome", row.run_outcome)):
+            if want is not None and oa.get(fld) != want:
+                out.append(f"on_abort.{fld} {oa.get(fld)} (12.8: {want})")
+        return out
+
     def _seed_titles(self, f: str, items: list[dict]) -> None:
         """L-POP-05 (choice 27): two entries not retired whose `title_regex` both match one title of either entry's
         `seed_titles`, matched as the Executor matches a window title (`re.search`, orchestrator.popups); an entry's
@@ -2763,8 +2880,8 @@ class _Linter:
                 tier1_classes.setdefault(_s(cls), set()).add(cid)
             if "invariant_id" in exp and exp.get("invariant_id") not in invs:
                 self.add("L-MUT-06", f, f"invariant_id {exp.get('invariant_id')} is not in INV-01 to INV-15", f"{at}.expected.invariant_id")
-        if set(ids) != set(MUTANTS_12_5):
-            self.add("L-MUT-01", f, "the catalog's id set is exactly M01 to M33 of 12.5")
+        if not mutant_ids_in_sequence(ids):
+            self.add("L-MUT-01", f, "the catalog's ids are M01 to M33 of 12.5, then M34 onward in sequence")
         for cls in BRIEF_CLASSES:
             if cls not in tier1_classes:
                 self.add("L-MUT-05", f, f"brief class {cls} is bound to no tier-1 checkpoint")
@@ -2885,13 +3002,20 @@ class _Linter:
             got = {p.get("popup_id") for p in pops}
             if not set(POP_IDS_12_8) <= got:          # SD-95: later ids extend the table (L-POP-01 checks them)
                 self.add("L-XREF-12", _f, "popup ids differ from POP-01 to POP-22 of 12.8: " + _id_diff(got, POP_IDS_12_8))
+            for i, p in enumerate(pops):
+                row = POP_12_8.get(_s(p.get("popup_id")))
+                if row is not None and p.get("retired") is not True:
+                    for what in self._starter_popup_drift(p, row):
+                        self.add("L-XREF-12", _f, f"{p.get('popup_id')} differs from its 12.8 row: {what}; a starter "
+                                                  "row is fixed in the same pull request", f"[{i}]")
         f_mut, mutants = self._catalog("mutants", "entries")
         if not f_mut:
             self.add("L-XREF-12", "canaries/mutants.yaml", "canaries/mutants.yaml is missing")
         else:
             got = {m.get("mutant_id") for m in mutants}
-            if got != set(MUTANTS_12_5):
-                self.add("L-XREF-12", f_mut, "mutant ids differ from M01 to M33 of 12.5: " + _id_diff(got, MUTANTS_12_5))
+            if not mutant_ids_in_sequence(got):
+                self.add("L-XREF-12", f_mut, "mutant ids are not M01 to M33 of 12.5 then M34 onward in sequence: "
+                         + _id_diff(got, MUTANTS_12_5))
             for i, m in enumerate(mutants):
                 want = MUTANTS_12_5.get(_s(m.get("mutant_id")))
                 if want and (m.get("class"), m.get("money_cell")) != want:

@@ -77,6 +77,7 @@ from ..orchestrator.popups import PopupCatalog, load_catalog, order_dialog_regex
 from ..orchestrator.windows import TitleSets
 from ..orchestrator.machine import LoginHistory
 from ..orchestrator.stage1 import APP_SETTINGS_PAGE, ORDER_DEFAULTS_PAGE, Stage1Profile
+from ..validation import PROBES
 from ..churn import reseed_due_passed
 from .config import SentinelConfig
 
@@ -129,6 +130,14 @@ class RigScript:
     # rig, one value per execution of the checkpoint (over 60 s is a slip)
     lockstep_slip_s: tuple[tuple[str, tuple[float, ...]], ...] = ()
     base_install_fails: str | None = None            # the base build cannot be installed on any rig (4.2): why
+    # registry validation (2.2.3): the candidate build's probe lists against the base's registry titles: (probe,
+    # label) it adds, (probe, label) it no longer lists, (probe, old, new) it renames; (probe, label) neither build
+    # lists; (probe, side) not located
+    probe_added: tuple[tuple[str, str], ...] = ()
+    probe_removed: tuple[tuple[str, str], ...] = ()
+    probe_hidden: tuple[tuple[str, str], ...] = ()
+    probe_renamed: tuple[tuple[str, str, str], ...] = ()
+    probe_unlocated: tuple[tuple[str, str], ...] = ()
 
 
 class ShardSink:
@@ -227,8 +236,18 @@ def shard_setup(cfg: SentinelConfig, *, run_id: str, run_type: str, shard_id: st
                            dpi_awareness=script.dpi_awareness or "PER_MONITOR_AWARE_V2",
                            foreign_foreground=script.foreign_foreground, titles=catalog_titles(cfg),
                            rig_id=rig_id or rig, kill_root=kill_root, dismiss_allowlist=SIM_DISMISS_LABELS,
-                           base_install_fails=script.base_install_fails)
+                           base_install_fails=script.base_install_fails, probe_lists=probe_lists(cfg),
+                           probe_added=script.probe_added, probe_removed=script.probe_removed,
+                           probe_hidden=script.probe_hidden,
+                           probe_renamed=script.probe_renamed, probe_unlocated=script.probe_unlocated)
     return ctx, scenario
+
+
+def probe_lists(cfg: SentinelConfig) -> dict[str, tuple[str, ...]]:
+    """What each registry probe lists on the main build (2.2.3), as the simulated app draws it: the title of every
+    registry entry the probe enumerates (`enumerable_by`), in entry id order."""
+    return {p: tuple(str(doc.get("title") or sid) for sid, doc in sorted(cfg.surfaces.items())
+                     if str(doc.get("enumerable_by") or "none") == p) for p in PROBES}
 
 
 # -- logins ---------------------------------------------------------------------------------------------------

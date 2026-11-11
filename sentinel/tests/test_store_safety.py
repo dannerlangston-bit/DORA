@@ -476,6 +476,29 @@ def test_kill_switch_and_gateway_results_quarantine_the_running_flow_and_disable
         S.apply_safety_actions(st, gw, run_id="pr-1", rig_id="rig-01", login_alias="login-01")
 
 
+def test_an_unknown_popup_quarantines_its_flow_until_a_person_reviews_the_entry(st):
+    """4.10, 7.8, 10.5 `unknown_popup`: the popup sentinel's quarantine_flow is its own reason, not a kill switch,
+    and its re-enable needs no canary run; an unknown dialog over a staged order stays a kill-switch quarantine."""
+    from sentinel.orchestrator.popups import PopupCatalog, PopupContext, unknown_window
+    from sentinel.orchestrator.ports import WindowInfo
+    run(st, "pr-1", rig="rig-01")
+    ctx = PopupContext(flow_id="flow.trade.x", agent_enabled=False)
+    popup = unknown_window(WindowInfo(41, 4100, "SunAwtDialog", "Survey"), ctx, PopupCatalog(()))
+    assert S.quarantine_reason_for(popup) == "unknown_popup"
+    a = S.apply_safety_actions(st, popup, run_id="pr-1", rig_id="rig-01", login_alias="login-01",
+                               flow_id="flow.trade.x")
+    (q,) = S.open_quarantines(st)
+    assert (q.target_kind, q.target, q.reason, q.quarantine_id) == ("flow", "flow.trade.x", "unknown_popup",
+                                                                     a.quarantine_ids[0])
+    assert S.quarantined_flow(S.open_quarantines(st), flow_id="flow.trade.x", flow_class="scripted",
+                              rig_id="rig-05", order_stage=False) == q
+    r = S.reenable(st, "quarantine", str(q.quarantine_id), **human())             # no drill or canary run needed
+    assert r.evidence_run_id is None and S.open_quarantines(st) == ()
+    staged = unknown_window(WindowInfo(42, 4100, "SunAwtDialog", "Confirm?"),
+                            PopupContext(flow_id="flow.trade.y", order_stage=True), PopupCatalog(()))
+    assert S.quarantine_reason_for(staged) == "kill_switch"
+
+
 def test_block_reasons_follow_the_control_that_asked(st):
     ctx = default_context()
     live = judge_identity([SelectorRead("12345678SCHW")], ctx.allowlist)

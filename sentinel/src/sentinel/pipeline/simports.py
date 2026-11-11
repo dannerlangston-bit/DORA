@@ -27,8 +27,9 @@ screen (its own second attempt re-grabs the desk); it records the label of the c
 - a type_fixture step's `verify` is its post-condition (an assertion, `Effect.assertion_id`), which holds.
 
 `RigScript` knobs (pipeline.orchestration) reach the ports: `locator_miss` hides a control from the ladder for that
-many attempts, `precondition_fail` fails a check for that many reads, `wait_timeout` keeps a step's wait
-unsatisfied, `postcondition_fail` makes a step's declared effect never appear.
+many scripted attempts (a step has two: the ladder's and the emitter's retry), `precondition_fail` fails a check
+for that many reads, `wait_timeout` keeps a step's wait unsatisfied, `postcondition_fail` makes a step's declared
+effect never appear.
 
 `fixture_values(fixture, docs)` gives the Planner the fixture's typed values (every `value_ref` the flows name,
 resolved with `oracle.tables.resolve_ref`); `step_action` names the 8.3 action of a step outcome row.
@@ -58,7 +59,7 @@ import numpy as np
 
 from ..executor.emitter import Effect, Foreground, ModalState
 from ..executor.flow import AssertVerdict, Captured, CheckRead, WaitPoll
-from ..executor.locator import Ladder, LadderContext, WindowCapture, target_from_control
+from ..executor.locator import Ladder, LadderContext, target_from_control
 from ..oracle.tables import OracleConfigError, resolve_ref
 from ..orchestrator.gateway import Action, Flag
 from ..orchestrator.ports import Frame, LocateResult, PointOwner, ProcessInfo, VaultLease, WindowInfo
@@ -198,12 +199,13 @@ class SimVault:
 
 
 class SimLadder(Ladder):
-    """`executor.locator.Ladder` over the desk (module docstring): it hides a control `misses` asks for, re-grabs
-    the desk for its own second attempt, and records the label of the control it resolved (choice 2)."""
+    """`executor.locator.Ladder` over the desk (module docstring), one scripted attempt per `locate` (the emitter
+    owns the step's retry, locator choice 9): it hides a control `misses` asks for and records the label of the
+    control it resolved (choice 2)."""
 
     def __init__(self, desk: SimDesk, rig: SimulatedRig, ctx: LadderContext, misses: dict[str, int], *,
                  branches: Mapping[str, Any] | None = None):
-        super().__init__(None, None, dict(branches or {}), ctx)
+        super().__init__(None, None, dict(branches or {}), ctx, single_attempt=True)
         self.desk, self.rig, self.misses = desk, rig, misses
         self.label: str | None = None
         self.results: list[Any] = []
@@ -219,8 +221,7 @@ class SimLadder(Ladder):
         name = str(target.get("name", ""))
         if name in self.misses and self.misses[name] > 0:
             frame = self.desk.frame(self.rig, hidden=self._hidden(name))
-        self.ctx = replace(self.ctx, retry=lambda: WindowCapture.from_frame(
-            self.desk.frame(self.rig, hidden=self._hidden(name))), templates=self.desk.templates)
+        self.ctx = replace(self.ctx, templates=self.desk.templates)
         res = super().locate(target, frame)
         self.results.append(self.last)
         self.label = str(target.get("label") or name) if res.point is not None else None

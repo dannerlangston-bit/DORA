@@ -24,7 +24,9 @@
 An exhausted ladder is step `failed`, the checkpoint `landmark_missing (reason: locator:<step>)`, the rest of the flow
 `not_run (reason: step_failed:<step>)` and a `locator_failure` finding (`LadderResult.consequence`). The resolved
 rung is recorded on every step (`LadderResult.rung`, `step_outcome_fields`). `RescueCap` counts rescues per run and
-gives the run-health line once spent. `Ladder` implements the `ports.Locator` protocol over a `Frame`.
+gives the run-health line once spent. `Ladder` implements the `ports.Locator` protocol over a `Frame`;
+`Ladder(..., single_attempt=True)` runs attempt 1 only (`ladder(..., retry=False)`), for a caller that owns the
+retry and the rescue itself (the emitter, choice 9).
 
 Choices where the spec is ambiguous or silent (reported):
 
@@ -49,6 +51,11 @@ Choices where the spec is ambiguous or silent (reported):
    step event carries, and `to_record` keeps the 4.13 keys only.
 8. The finding's crop is PNG-encoded and hashed (`LadderResult.crop_png`, evidence `crop_sha256` and `artifacts`) so
    the caller stores exactly the bytes the finding names; it is cut from the capture the rescue started from.
+9. Single attempt (5.5 "attempt 2 tries the scripted rungs once more", 4.7 "a step has one retry"): the emitter
+   runs the step's retry itself (`reset_input_state`, re-enumerate, re-grab) and then rung 4, so a ladder that
+   also retried inside `locate` tried a target four times and needed four misses to exhaust it. In single-attempt
+   mode a miss on attempt 1 returns `failed` with the rungs tried and no retry, rescue, finding or consequence:
+   the caller's retry is the second and last scripted attempt, and the caller files the finding.
 """
 from __future__ import annotations
 
@@ -289,12 +296,14 @@ class LadderResult:
 
 # -- the ladder -------------------------------------------------------------------------------------------------
 def ladder(target: Mapping[str, Any], capture: WindowCapture, ocr: WordOcr | None, jab: AccessPort | None,
-           branches: Branches | Mapping[str, Any], ctx: LadderContext) -> LadderResult:
-    """Resolve one step's target (module docstring)."""
+           branches: Branches | Mapping[str, Any], ctx: LadderContext, *, retry: bool = True) -> LadderResult:
+    """Resolve one step's target (module docstring); `retry=False` runs attempt 1 only (choice 9)."""
     br = branches if isinstance(branches, Branches) else Branches.from_doc(branches)
     first, hit = _attempt(target, capture, ocr, jab, br, ctx, 1)
     if hit is not None:
         return _passed("passed", hit, tuple(first), 1, capture.sha256)
+    if not retry:
+        return LadderResult("failed", "none", tuple(first), 1, None, None, capture.sha256)
     again = ctx.retry()
     second, hit = _attempt(target, again, ocr, jab, br, ctx, 2)
     tried = tuple(first + second)
@@ -356,14 +365,16 @@ class Ladder:
     """`ports.Locator` over the ladder for one step: `locate(target, frame)`; `last` keeps the full result."""
 
     def __init__(self, ocr: WordOcr | None, jab: AccessPort | None, branches: Branches | Mapping[str, Any],
-                 ctx: LadderContext, *, regions: Mapping[str, Rect] | None = None, hwnd: int | None = None) -> None:
+                 ctx: LadderContext, *, regions: Mapping[str, Rect] | None = None, hwnd: int | None = None,
+                 single_attempt: bool = False) -> None:
         self.ocr, self.jab, self.branches, self.ctx = ocr, jab, branches, ctx
         self.regions, self.hwnd = dict(regions or {}), hwnd
+        self.single_attempt = single_attempt
         self.last: LadderResult | None = None
 
     def locate(self, target: Mapping[str, Any], frame: Frame) -> LocateResult:
         cap = WindowCapture.from_frame(frame, self.regions, hwnd=self.hwnd)
-        self.last = ladder(target, cap, self.ocr, self.jab, self.branches, self.ctx)
+        self.last = ladder(target, cap, self.ocr, self.jab, self.branches, self.ctx, retry=not self.single_attempt)
         return self.last.to_locate_result()
 
 

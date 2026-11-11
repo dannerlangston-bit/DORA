@@ -363,6 +363,7 @@ class Unregistered:
     label: str
     record: ValidationRecord
     rename_candidate: str | None = None
+    stub: str | None = None                      # the stub PR's file, when no entry may be renamed
 
     @property
     def surface_id(self) -> str:
@@ -372,7 +373,7 @@ class Unregistered:
         """The `unregistered_surface` finding the record carries (4.13: the finding is the outcome); the caller
         attaches the record's checkpoint id and screenshots when it gives the finding an id."""
         what = (f"may rename {self.rename_candidate}; an alias PR is proposed" if self.rename_candidate
-                else "a registry stub PR is proposed")
+                else f"a registry stub PR adds {self.stub}" if self.stub else "a registry stub PR is proposed")
         return FindingSpec("unregistered_surface",
                            f"{self.probe} lists \"{self.label}\", which is not in the Surface Registry; {what} "
                            "(2.2.3)", tier=1, detail=self.record.outcome.detail)
@@ -658,7 +659,8 @@ def _unregistered(probe: str, cand: ProbeListing, base: ProbeListing, classes: P
         cp = PlannedCheckpoint(f"census/{sid}/{workspace_id}", sid, "census", 1, workspace_id, persona, "frozen")
         record = ValidationRecord(cp, Outcome("unregistered_surface", f"probe:{probe}", detail=detail),
                                   artifacts=shots)
-        out.append(Unregistered(probe, raw, record, pair.entry_id if pair else None))
+        stub = None if pair is not None else f"registry/surfaces/unregistered/{sid}.yaml"
+        out.append(Unregistered(probe, raw, record, pair.entry_id if pair else None, stub))
         if pair is not None:
             e = entries[pair.entry_id]
             props.append(RegistryProposal("alias", probe, raw, e.id, {"id": e.id, "aliases": [*e.aliases, raw]},
@@ -670,8 +672,7 @@ def _unregistered(probe: str, cand: ProbeListing, base: ProbeListing, classes: P
                 doc["parent"] = host.parent
             if host is not None and host.owner:
                 doc["owner"] = host.owner
-            props.append(RegistryProposal("stub", probe, raw, sid, doc,
-                                          path=f"registry/surfaces/unregistered/{sid}.yaml", screenshots=dict(shots)))
+            props.append(RegistryProposal("stub", probe, raw, sid, doc, path=stub, screenshots=dict(shots)))
     return tuple(out), tuple(props)
 
 

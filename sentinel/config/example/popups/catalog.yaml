@@ -1,6 +1,9 @@
-# The popup catalog (4.10): the 12.8 starter list, POP-01 to POP-22. Title regexes are drafts until
-# Phase 0 reads the real windows. 12.8 lists a Close or Don't Save click for POP-02, POP-06, POP-11 and
-# POP-13; their close controls are not registered in this example, so Escape stands in (see notes).
+# The popup catalog (4.10): the 12.8 starter list, POP-01 to POP-22, each entry with the class, action and
+# on_abort of its 12.8 row (L-XREF-12). Title regexes are drafts until Phase 0 reads the real windows (7.14
+# check 14). 12.8 lists a Close or Don't Save click for POP-02, POP-06, POP-11 and POP-13; their windows and close
+# controls are unread and not registered in this example, so while those entries are `status: unverified` Escape
+# stands in for the click (L-XREF-12 allows that stand-in only on an unverified entry). Once Phase 0 reads a window,
+# its close control is registered and the entry becomes `action: click` with `target` and `template` (L-POP-04).
 schema_version: 1
 entries:
   - popup_id: POP-01

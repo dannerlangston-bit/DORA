@@ -1,0 +1,21 @@
+# The Reporter's settings (4.16, 9.2, 9.9, 9.10): the commit status mode of sentinel/pr-run with the date and author
+# of every change, the Jira projects, the four Slack channels, paging and the digest recipients, and the auto-filing
+# switches per tier. Owner: the system owner (9.12). A mode change is announced in the release channel (9.2); an
+# auto_file switch turns on only in a pull request the system owner approves (L-XREF-21). Placeholder names until
+# the team fills them in.
+schema_version: 1
+check_mode_history:
+  - {mode: informational, since: 2026-06-01, by: asmith}       # Phase 1: never blocks a merge (1.6, 9.2)
+jira:
+  product_project: TOS                  # bugs from confirm_bug (9.9)
+  harness_project: SENT                 # harness tasks, canary bugs and the auto-filing triage queue (9.9)
+slack:
+  on_call: "#sentinel-oncall"
+  triage: "#sentinel-triage"
+  release: "#sentinel-release"
+  safety: "#sentinel-safety"            # the safety record: nothing else is posted here (9.9)
+paging:
+  service: oncall-paging                # the firm's paging service; its name is a Phase 0 item (11.8)
+  escalation_policy: sentinel-harness
+email: [sentinel-digest@example.internal]   # the daily digest (9.10)
+auto_file: {tier1: false, tier2: false, tier3: false}   # off: no ticket without a human (9.9)

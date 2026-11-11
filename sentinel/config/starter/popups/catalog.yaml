@@ -1,0 +1,269 @@
+# The popup catalog (4.10): the 12.8 starter list, POP-01 to POP-22, each entry with the class, action and
+# on_abort of its 12.8 row (L-XREF-12). Title regexes are drafts until Phase 0 reads the real windows (7.14
+# check 14). 12.8 lists a Close or Don't Save click for POP-02, POP-06, POP-11 and POP-13; their windows and close
+# controls are unread and not registered in this example, so while those entries are `status: unverified` Escape
+# stands in for the click (L-XREF-12 allows that stand-in only on an unverified entry). Once Phase 0 reads a window,
+# its close control is registered and the entry becomes `action: click` with `target` and `template` (L-POP-04).
+schema_version: 1
+entries:
+  - popup_id: POP-01
+    name: popup.launcher-update
+    class: env
+    title_regex: "(?i)(updat|download)ing"
+    action: abort
+    on_abort: {outcome: env_error, gate: launched, reason: version_mismatch}
+    severity: high
+    expected_phases: [launch]
+    owner: sentinel-ops
+    status: verified
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: Must never appear under pinned-install branch A; the build under test is no longer the one requested.
+  - popup_id: POP-02
+    name: popup.whats-new
+    class: dismissable
+    title_regex: "^What'?s New"
+    action: dismiss_key
+    key: escape
+    severity: info
+    expected_phases: [login, workspace_load]
+    owner: tos-shell-ui
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: 12.8 clicks Close; Escape until the close control is registered.
+  - popup_id: POP-03
+    name: popup.agreement
+    class: env
+    title_regex: "(?i)(agreement|terms of use)"
+    action: abort
+    on_abort: {outcome: env_error, gate: authenticated, reason: agreement_pending}
+    severity: high
+    expected_phases: [login]
+    owner: sentinel-ops
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: The accounts owner accepts once per login by hand; never scripted.
+  - popup_id: POP-04
+    name: popup.session-ended-elsewhere
+    class: env
+    title_regex: "(?i)logged in (from|on) another"
+    action: abort
+    on_abort: {outcome: env_error, gate: authenticated, reason: session_kicked}
+    severity: high
+    expected_phases: [running]
+    owner: sentinel-ops
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: No re-login for the run; the accounts owner is alerted (DR-06).
+  - popup_id: POP-05
+    name: popup.session-expired
+    class: login
+    title_regex: "(?i)(session expired|disconnected|reconnecting)"
+    action: relogin
+    on_abort: {outcome: env_error, gate: authenticated, reason: relogin_budget}
+    severity: medium
+    expected_phases: [running]
+    owner: sentinel-ops
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: Counts against the shard's re-login budget K (7.7, SD-66); past K the run ends relogin_budget.
+  - popup_id: POP-06
+    name: popup.message-center
+    class: dismissable
+    title_regex: "(?i)message center"
+    action: dismiss_key
+    key: escape
+    severity: info
+    expected_phases: [login, workspace_load, running]
+    owner: tos-shell-ui
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: 12.8 clicks Close; Escape until the close control is registered.
+  - popup_id: POP-07
+    name: popup.price-alert
+    class: dismissable
+    title_regex: "(?i)alert triggered"
+    action: dismiss_key
+    key: escape
+    severity: medium
+    expected_phases: [running]
+    owner: sentinel-ops
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: Also a fixture finding; alerts must be zero (7.6).
+  - popup_id: POP-08
+    name: popup.delayed-data
+    class: dismissable
+    title_regex: "(?i)delayed data"
+    action: dismiss_key
+    key: escape
+    severity: info
+    expected_phases: [login, workspace_load]
+    owner: sentinel-ops
+    status: verified
+    first_seen_build: main-1998.2.0-4f1c9a2
+  - popup_id: POP-09
+    name: popup.maintenance
+    class: env
+    title_regex: "(?i)scheduled maintenance"
+    action: abort
+    on_abort: {outcome: env_error, gate: connectivity, reason: maintenance}
+    severity: high
+    expected_phases: [login, running]
+    owner: sentinel-ops
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+  - popup_id: POP-10
+    name: popup.java-exception-dialog
+    class: app_failure
+    title_regex: "(?i)^(java|exception|error)"
+    action: abort
+    on_abort: {outcome: invariant_violation, invariant_id: INV-14}
+    severity: critical
+    expected_phases: [launch, login, workspace_load, running, teardown]
+    owner: sentinel-ops
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: INV-14 on the checkpoint being captured; a dead or frozen process is the app_alive assertion instead.
+  - popup_id: POP-11
+    name: popup.low-memory
+    class: dismissable
+    title_regex: "(?i)low memory"
+    action: dismiss_key
+    key: escape
+    severity: medium
+    expected_phases: [running]
+    owner: sentinel-ops
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: 12.8 clicks Close; a per-build memory_warning finding with heap and GDI counts.
+  - popup_id: POP-12
+    name: popup.ondemand-prebuffering
+    class: env
+    title_regex: "(?i)(prebuffering|ondemand)"
+    action: wait
+    wait_timeout_ms: 90000
+    on_abort: {outcome: env_error, gate: fixture_verified, reason: ondemand_timeout}
+    severity: medium
+    expected_phases: [workspace_load, running]
+    owner: sentinel-ops
+    status: disabled
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: Frozen branch B only; disabled under DR-02 branch A.
+  - popup_id: POP-13
+    name: popup.save-workspace
+    class: dismissable
+    title_regex: "(?i)save (workspace|changes)"
+    action: dismiss_key
+    key: escape
+    severity: info
+    expected_phases: [teardown]
+    owner: tos-shell-ui
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: 12.8 clicks Don't Save; never Save. The snapshot revert restores the workspace.
+  - popup_id: POP-14
+    name: popup.unowned-order-confirmation
+    class: safety
+    title_regex: "^Order Confirmation"
+    action: wait
+    wait_timeout_ms: 30000
+    on_abort: {outcome: aborted_run, run_outcome: aborted_safety, reason: kill_switch}
+    severity: critical
+    expected_phases: [running]
+    owner: sentinel-ops
+    status: verified
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: No key or click is ever emitted; after 30 s without an owning step the kill switch fires (6.6).
+  - popup_id: POP-15
+    name: popup.invalid-symbol
+    class: dismissable
+    title_regex: "(?i)(invalid|unknown) symbol"
+    action: dismiss_key
+    key: escape
+    severity: medium
+    expected_phases: [running]
+    owner: sentinel-ops
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+  - popup_id: POP-16
+    name: popup.survey
+    class: dismissable
+    title_regex: "(?i)(survey|special offer)"
+    action: dismiss_key
+    key: escape
+    severity: info
+    expected_phases: [login, running]
+    owner: tos-shell-ui
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+  - popup_id: POP-17
+    name: popup.trade-flash
+    class: dismissable
+    title_regex: "(?i)trade flash"
+    action: dismiss_key
+    key: escape
+    severity: info
+    expected_phases: [running]
+    owner: tos-shell-ui
+    status: disabled
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: Existed under TD Ameritrade; disabled until seen under Schwab.
+  - popup_id: POP-18
+    name: popup.restart-required
+    class: env
+    title_regex: "(?i)(restart required|new version)"
+    action: abort
+    on_abort: {outcome: env_error, gate: launched, reason: version_changed_mid_run}
+    severity: high
+    expected_phases: [running]
+    owner: sentinel-ops
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+  - popup_id: POP-19
+    name: popup.os-occlusion
+    class: env
+    title_regex: "(?i)(windows update|restart your device|security alert)"
+    action: abort
+    on_abort: {outcome: env_error, gate: running, reason: occluded}
+    severity: high
+    expected_phases: [running]
+    owner: sentinel-ops
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: Not a thinkorswim window; a hardening finding as well. Preflight R5 should have caught a pending restart.
+  - popup_id: POP-20
+    name: popup.windows-error-reporting
+    class: app_failure
+    title_regex: "(?i)has stopped working"
+    action: abort
+    on_abort: {outcome: invariant_violation, invariant_id: INV-14}
+    severity: critical
+    expected_phases: [launch, login, workspace_load, running, teardown]
+    owner: sentinel-ops
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: Suppressed by WER LocalDumps; if seen, the crash path of POP-10 with the dump attached.
+  - popup_id: POP-21
+    name: popup.verification-code
+    class: login
+    title_regex: "(?i)(verification code|two-step)"
+    action: relogin
+    on_abort: {outcome: env_error, gate: authenticated, reason: authentication_challenge}
+    severity: high
+    expected_phases: [login]
+    owner: sentinel-ops
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: Branch B recovery inside the LOGIN flow only; anywhere else, or a second time, the challenge ends the run.
+  - popup_id: POP-22
+    name: popup.order-event
+    class: order_event
+    title_regex: "(?i)order (submitted|rejected|filled)"
+    action: abort
+    on_abort: {outcome: aborted_run, run_outcome: aborted_safety, reason: kill_switch}
+    severity: critical
+    expected_phases: [running, teardown]
+    owner: sentinel-ops
+    status: unverified
+    first_seen_build: main-1998.2.0-4f1c9a2
+    notes: Must never occur in the no-send branch; the post-run proof names the row (6.6).

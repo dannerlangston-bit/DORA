@@ -475,7 +475,7 @@ class Orchestrator:
         if not self._gate("canary_flow_passed"):
             return False
         self.apply(check_canary_flow(rig.run_canary_flow()))
-        return self.stop is None
+        return self.stop is None and self._hook("canary_flow_passed")    # 2.2.3, SD-15: registry validation
 
     def _hook(self, name: str) -> bool:
         """The caller's check after gate `name` (`gate_hooks`): its result is applied; False when the run stopped."""

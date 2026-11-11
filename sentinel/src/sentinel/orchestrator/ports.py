@@ -21,10 +21,13 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from . import rig as _rig
 from .gateway import Action, Flag, InputEvent
+
+if TYPE_CHECKING:
+    from ..validation import ProbeListing
 
 Rect = tuple[int, int, int, int]                 # x, y, w, h in virtual-screen pixels
 ATTESTATION_STAGES = ("none", "a3_a8", "a3_a9")   # SD-57, in order
@@ -372,6 +375,16 @@ class FingerprintReader(Protocol):
 
     def read_app(self) -> AppReads:
         """App fields, at gate `launched` and after a relaunch."""
+
+
+@runtime_checkable
+class RegistryProbes(Protocol):
+    """Registry validation's probes P1 to P8 (2.2.3, SD-15): at entry to `running`, in the shard's first tier A
+    workspace, each probe OCRs its declared list on one build."""
+
+    def read_probe(self, probe: str, side: str) -> ProbeListing:
+        """The labels probe `probe` lists on build `side` (`candidate` or `base`), in list order, and whether its
+        anchor region was located; `screenshot` is the probe screenshot's sha256 once stored."""
 
 
 @runtime_checkable

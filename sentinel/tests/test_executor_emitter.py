@@ -91,6 +91,8 @@ class FakePorts:
         self.clock = clock
         self.fg = [Foreground(1, 100, True)]
         self.modal = ModalState(True)
+        self.track_dialog = False        # an allowed order-stage click opens the dialog; close_dialog shuts it
+        self.dialog_open = False
         self.flag_value = Flag.CLEAR
         self.label = None
         self.kept = []
@@ -124,7 +126,7 @@ class FakePorts:
         self.focus.append(window)
 
     def modal_state(self):
-        return self.modal
+        return ModalState(False, "Order Confirmation", 7) if self.dialog_open else self.modal
 
     def flag(self):
         return self.flag_value
@@ -159,6 +161,11 @@ class FakePorts:
                 decisions.append(HookDecision(False, directive.split(":", 1)[1], self.token))
             else:
                 decisions.append(HookDecision(True, token_id=self.token))
+        if self.track_dialog and all(d.allowed for d in decisions):
+            if action.order_stage_step:
+                self.dialog_open = True
+            elif action.teardown_action == "close_dialog":
+                self.dialog_open = False
         return EmitResult(decisions=tuple(decisions), events=events)
 
     def probe_hook(self):

@@ -257,3 +257,49 @@ def test_the_up_of_a_secret_down_is_redacted_even_when_its_own_record_is_not_fla
                        None)
     rows = drainer(tmp_path).drain([down, up, up._replace(seq=2)])
     assert [r.keys for r in rows] == ["key_down:<redacted>", "key_up:<redacted>", "key_up:shift+0x50"]
+
+
+def _key(seq: int, kind: str, vk: int, token: int | None, reason: str = "emitted") -> sg.RingRecord:
+    """A key record the hook did not flag secret (the case the context backstop covers, choice 8)."""
+    return sg.RingRecord(seq, kind, "emitter", reason, frozenset(), True, False, to_ns(T), 0, 0, vk, 0, token)
+
+
+def test_the_secret_flag_holds_until_the_ring_is_drained_past_the_secret_step(tmp_path):
+    """Choice 8 (6.9, gateway:0): on the drain_ring path the next step starts before the drainer thread reads the
+    secret step's records; they stay redacted, and the flag clears once the step's last key up is drained."""
+    d = drainer(tmp_path, flow_id="f.login", step_id="s1")
+    d.set_context(step_id="s2", secret_step=True)
+    for tok in (7, 8):
+        d.note_token(TokenNote(tok, "scripted", "f.login", "s2", target_text="<redacted:login.password>"))
+    d.set_context(step_id="s3", secret_step=False)                                   # the emitter moved on
+    assert d.secret_pending and d.ctx.secret_step and d.ctx.step_id == "s3"
+    rows = d.drain([_key(0, "key_down", 0x50, 7), _key(1, "key_up", 0x50, 7), _key(2, "key_down", 0x57, 8),
+                    _key(3, "key_down", 0x31, None, "foreign_input")])
+    assert [r.keys for r in rows] == ["key_down:<redacted>", "key_up:<redacted>", "key_down:<redacted>",
+                                      "key_down:<redacted>"]
+    assert d.secret_pending                                                          # token 8's up is still out
+    d.note_token(TokenNote(9, "scripted", "f.login", "s3", target_text="Log In"))
+    rows = d.drain([_key(4, "key_up", 0x57, 8), _key(5, "key_down", 0x0D, 9), _key(6, "key_up", 0x0D, 9)])
+    assert [r.keys for r in rows] == ["key_up:<redacted>", "key_down:0x0D", "key_up:0x0D"]
+    assert not d.secret_pending and not d.ctx.secret_step
+
+
+def test_a_later_steps_record_ends_the_secret_flag_when_a_secret_key_never_reached_the_hook(tmp_path):
+    d = drainer(tmp_path, flow_id="f.login", step_id="s2", secret_step=False)
+    d.set_context(secret_step=True)
+    d.note_token(TokenNote(7, "scripted", "f.login", "s2"))
+    d.set_context(step_id="s3", secret_step=False)
+    d.note_token(TokenNote(9, "scripted", "f.login", "s3"))
+    rows = d.drain([_key(0, "key_down", 0x0D, 9)])                                   # token 7's event never came
+    assert [r.keys for r in rows] == ["key_down:0x0D"] and not d.ctx.secret_step and not d.secret_pending
+
+
+def test_on_the_synchronous_path_the_secret_flag_clears_at_once(tmp_path):
+    d = drainer(tmp_path, flow_id="f.login", step_id="s2")
+    d.set_context(secret_step=True)
+    d.note_token(TokenNote(7, "scripted", "f.login", "s2"))
+    assert [r.keys for r in d.drain([_key(0, "key_down", 0x50, 7), _key(1, "key_up", 0x50, 7)])] == [
+        "key_down:<redacted>", "key_up:<redacted>"]
+    d.set_context(step_id="s3", secret_step=False)
+    assert not d.ctx.secret_step and not d.secret_pending
+    assert [r.keys for r in d.drain([_key(2, "key_down", 0x41, None, "foreign_input")])] == ["key_down:0x41"]

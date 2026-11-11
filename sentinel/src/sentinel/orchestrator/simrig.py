@@ -254,6 +254,16 @@ class SimScenario:
     foreign_foreground: str | None = None            # a foreign program's window title in the foreground (7.8)
     secret_ref: str = "login.password"               # the LOGIN flow's secret step vault_ref (4.7)
     base_install_fails: str | None = None            # why the base build cannot be installed (4.2), or None
+    # registry validation (2.2.3): what each probe lists on the base build (the registry titles of the entries it
+    # enumerates), and what the candidate build changes: a label it adds (at the end), one it no longer lists, one it
+    # lists renamed (old, new); the labels neither build lists (an entry the app no longer shows); and the (probe,
+    # side) pairs whose anchor region the probe cannot locate
+    probe_lists: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    probe_added: tuple[tuple[str, str], ...] = ()
+    probe_removed: tuple[tuple[str, str], ...] = ()
+    probe_hidden: tuple[tuple[str, str], ...] = ()
+    probe_renamed: tuple[tuple[str, str, str], ...] = ()
+    probe_unlocated: tuple[tuple[str, str], ...] = ()
 
 
 class SimulatedRig(Rig):
@@ -511,6 +521,26 @@ class SimulatedRig(Rig):
         if self.s.fp_unreadable in values:
             values[self.s.fp_unreadable] = None
         return AppReads(**values)
+
+    def read_probe(self, probe: str, side: str) -> Any:
+        """`ports.RegistryProbes.read_probe` (2.2.3): the base build lists `probe_lists[probe]`; the candidate build
+        lists it renamed, less the removed labels and with the added ones at the end; neither lists a hidden label
+        (`probe_*` knobs). A probe whose (probe, side) is in `probe_unlocated` did not locate its anchor and lists
+        nothing."""
+        from ..validation import ProbeListing                  # lazy: validation imports the orchestrator package
+        if side not in ("candidate", "base"):
+            raise ValueError(f"side {side!r}; candidate or base")
+        self._log(f"read_probe:{probe}:{side}")
+        if (probe, side) in self.s.probe_unlocated:
+            return ProbeListing((), located=False)
+        hidden = {label for p, label in self.s.probe_hidden if p == probe}
+        labels = [x for x in self.s.probe_lists.get(probe, ()) if x not in hidden]
+        if side == "candidate":
+            renamed = {old: new for p, old, new in self.s.probe_renamed if p == probe}
+            gone = {label for p, label in self.s.probe_removed if p == probe}
+            labels = [renamed.get(x, x) for x in labels if x not in gone]
+            labels += [label for p, label in self.s.probe_added if p == probe]
+        return ProbeListing(tuple(labels))
 
     def close_window(self, hwnd: int) -> bool:
         """`WM_CLOSE` (choice 10): an app window other than the main frame and the order dialog goes away."""

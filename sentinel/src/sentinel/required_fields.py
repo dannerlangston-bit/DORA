@@ -27,6 +27,11 @@ Choices where 4.13 is ambiguous or silent (each cites what it reads):
   sweep or split checkpoint has no flow: each ladder size is a step (2.5.1), so its step is the id of another sweep
   or split checkpoint of the same surface (the step whose size was not reached, `capture.sweep` choice 3).
 - Synthetic records (canary mutants, 10.3) are generated, not captured: the capture provenance rule skips them.
+- A registry validation probe's census checkpoint (surface `registry.validation-p<n>`, 2.2.3) is decided from the two
+  probe lists, not from a pixel diff: its two probe screenshots (`artifacts.base` and `artifacts.candidate`) stand in
+  for `diff`; its `intended` is decided by rule (the manifest declares the rows' parent) and needs the rule
+  classification and `manifest_entry_ref`, not a reviewer; its `collateral` needs the rule classification and the
+  screenshots, with no `primitive` (validation choice 5).
 """
 from __future__ import annotations
 
@@ -38,6 +43,7 @@ CAPTURE_KEYS = ("candidate", "base", "heatmap")
 WATCHDOG_EVENT = re.compile(r"\bwatchdog_event:\s*\S+")
 DIFF_OUTCOMES = ("identical", "noise", "intended", "needs_human")     # 4.13: `diff` required (collateral below)
 PENDING_REASONS = ("reviewer_unavailable", "global_shift")
+PROBE_SURFACE = re.compile(r"^registry\.validation-p[1-8]$")          # 2.2.3: the probes' census surfaces
 
 
 def references_capture(rec: Any) -> bool:
@@ -78,6 +84,16 @@ def errors(rec: Any, *, evidence: bool = True, flow_steps: Mapping[str, Collecti
         if not ok:
             out.append(f"{o}: {what} (4.13 required fields, L-OUT-02)")
 
+    probe = bool(PROBE_SURFACE.match(getattr(rec, "surface_id", None) or ""))
+    shots = bool(arts.get("base") and arts.get("candidate"))
+    if probe and o in ("identical", "intended", "collateral"):
+        if evidence:
+            need(diff is not None or shots, "diff, or the two probe screenshots (artifacts base and candidate)")
+        if o != "identical":
+            need(cls is not None and cls.by == "rule", "classification by rule")
+        if o == "intended":
+            need(getattr(rec, "manifest_entry_ref", None), "manifest_entry_ref")
+        return out
     if evidence and o in DIFF_OUTCOMES:
         need(diff is not None, "diff")
     if o == "noise":

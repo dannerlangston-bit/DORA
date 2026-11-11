@@ -40,6 +40,9 @@ and its calibration):
   candidate rig; it is re-queued once, then `not_run (reason: budget)` with `lockstep_slip` in run health (3.1).
 - `calibrated-floors`: a weekend Calibration run writes the base build's floors to the store; the PR run on that
   base reads them (`StoreCalibration`) instead of measuring its own and requests no Calibration (3.9, 7.13).
+- `unregistered-tab`: the candidate build gains a main window tab the Surface Registry does not list; registry
+  validation at entry to running (P1, SD-15) records a tier-1 `unregistered_surface` with a registry stub PR, and
+  the PR comment lists it (2.2.3).
 
 `sentinel demo all` runs every scenario, prints one line each and writes `DIR/index.html`, a page that
 links each scenario's report, PR comment, summary and alerts with what to check.
@@ -79,7 +82,8 @@ EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "example"
 SCENARIOS = ("flexgrid-ladder", "clean-pr", "backend-only", "ui-no-manifest", "nightly-canary", "decision-inheritance",
              "wrong-number", "paper-mode-mismatch", "attempted-send", "app-crash", "config-invalid", "expired-mask",
              "operator-stop", "redaction-miss", "popups", "fingerprint-mismatch", "clamped-gadget", "fixed-reopens",
-             "occluded-capture", "base-distance", "base-missing", "base-reuse", "lockstep-slip", "calibrated-floors")
+             "occluded-capture", "base-distance", "base-missing", "base-reuse", "lockstep-slip", "calibrated-floors",
+             "unregistered-tab")
 AT = "charts.flexible-grid.active-trader-cell"
 LADDER = "trade.active-trader.ladder"
 STOCK_FLOW = "flow.trade.order-ticket.stock.limit"
@@ -466,7 +470,7 @@ PR_SCENARIOS: dict[str, Callable[[date], Scenario]] = {
     "popups": lambda d: popups_scenario(d), "fingerprint-mismatch": lambda d: fingerprint_mismatch_scenario(d),
     "clamped-gadget": lambda d: clamped_gadget_scenario(d), "occluded-capture": lambda d: occluded_scenario(d),
     "base-distance": base_distance_scenario, "base-missing": base_missing_scenario,
-    "lockstep-slip": lockstep_slip_scenario,
+    "lockstep-slip": lockstep_slip_scenario, "unregistered-tab": lambda d: unregistered_tab_scenario(d),
 }
 
 S03_CHECKPOINT = f"flow/trade.order-entry.stock/{STOCK_FLOW}/s03"
@@ -519,7 +523,27 @@ expires_at: 2026-12-08T16:02:00-05:00
 ticket: TOS-48344
 decision_ref: dec-000830
 """
-    return {S07: text, S07_MASK: mask}
+    # the request_mask decision the pasted mask names, in the decisions export the simulated store is seeded from
+    # (pipeline.run.seed_decisions), so the run-start L-MSK-01 check finds it
+    decision = """decision_id: dec-000830
+signature:
+  checkpoint_id: flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07
+  region_id: rgn.confirm.clock
+  phash: 3c5a96e1f00f5a3c
+  category: collateral
+action: request_mask
+verdict: noise
+decided_by: triage.lead
+role: triage_rotation
+source: report_ui
+decided_at: '2026-11-05T21:02:00+00:00'
+run_id: run-2026-11-05-merge-0418
+ticket: TOS-48344
+reason: The confirmation clock ticks between captures.
+expires_at: '2026-12-05T21:02:00+00:00'
+status: active
+"""
+    return {S07: text, S07_MASK: mask, "decisions/dec-000830.yaml": decision}
 
 
 ORDER_FLOW = "flows/tier-1/flow.trade.order-ticket.stock.limit.yaml"
@@ -1178,10 +1202,8 @@ def demo_base_reuse(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMP
         "PR 4823's run then uses main@2c91ae4 as its base. Every frozen checkpoint's key matches, so the base side is",
         "read from the merge run's stored capture instead of being captured again (3.1): each outcome names the merge",
         "run as its base source, Run health counts base_reused, and the masked_live Position Statement is captured on",
-        "both builds as always. The outcomes are the same as clean-pr's.",
-        "",
-        "Simulation limit: the synthetic app draws the Level II and Time & Sales cells at one size, so the merge run's",
-        "sweeps of those two cells fail size_reached at their first step and the rest of each ladder is not run.",
+        "both builds as always. The outcomes are the same as clean-pr's. The merge run itself is complete: every",
+        "sweep, the Level II and Time & Sales cells' included, reaches each size of its ladder (2.5.1).",
     ]
     _write_summary(out, "Scenario base-reuse: a PR run reuses the merge run's base captures", story, [m, r],
                    _safety_lines(r))
@@ -1254,6 +1276,31 @@ def demo_calibrated_floors(out: Path, today: date = DEFAULT_TODAY, config: Path 
     return [r]
 
 
+def unregistered_tab_scenario(today: date) -> Scenario:
+    """PR 4823's run on a candidate build that shows a main window tab nobody registered (2.2.3, P1)."""
+    return replace(clean_scenario(today), name="unregistered-tab", run_id=f"run-{today.isoformat()}-pr-4823-14",
+                   rig=RigScript(probe_added=(("P1", "Crypto"),)))
+
+
+def demo_unregistered_tab(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                          ) -> list[RunResult]:
+    r = run_pipeline(config, unregistered_tab_scenario(today), out, today, **_rev(reviewer))
+    story = [
+        "PR 4823's run, but the candidate build shows a new top-level tab, \"Crypto\", that the Surface Registry does",
+        "not list. At entry to running, after the canary flow, each shard runs the registry probes P1 to P8 on both",
+        "builds in its first tier A workspace (2.2.3, SD-15). P1 (the top-level tabs) lists \"Crypto\" on the",
+        "candidate only:",
+        "- the label is a tier-1 unregistered_surface (reason probe:P1) on unregistered.p1.crypto, with a registry",
+        "  stub PR (registry/surfaces/unregistered/unregistered.p1.crypto.yaml) for the registry owner;",
+        "- P1's own census checkpoint is collateral, since its lists differ and no manifest entry declares the tabs;",
+        "- the other seven probes list the same labels on both builds: identical.",
+        "The PR comment lists the unregistered surface among the Unexpected items, and the commit status fails.",
+    ]
+    _write_summary(out, "Scenario unregistered-tab: a tab the Surface Registry does not list", story, [r],
+                   _safety_lines(r))
+    return [r]
+
+
 def demo_fixed_reopens(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
                        ) -> list[RunResult]:
     from .pipeline.config import SentinelConfig, materialize
@@ -1304,6 +1351,7 @@ DEMOS: dict[str, Callable[..., list[RunResult]]] = {
     "fixed-reopens": demo_fixed_reopens, "occluded-capture": demo_occluded_capture,
     "base-distance": demo_base_distance, "base-missing": demo_base_missing, "base-reuse": demo_base_reuse,
     "lockstep-slip": demo_lockstep_slip, "calibrated-floors": demo_calibrated_floors,
+    "unregistered-tab": demo_unregistered_tab,
 }
 
 # One sentence per scenario for out/index.html: what it demonstrates, and what a tester should check.
@@ -1385,6 +1433,9 @@ INDEX = {
     "lockstep-slip": ("The masked_live pair's base rig lags the candidate rig by more than 60 s, twice (3.1).",
                       "the Position Statement is not_run (budget) after one re-queue, Run health counts lockstep_slip "
                       "1, and no finding is written for it."),
+    "unregistered-tab": ("The candidate gains a top-level tab the Surface Registry does not list (2.2.3, P1).",
+                         "the PR comment lists a tier-1 unregistered_surface on unregistered.p1.crypto whose finding "
+                         "names the registry stub PR, P1's census checkpoint is collateral and the check fails."),
     "calibrated-floors": ("A weekend Calibration run writes the base build's floors; the PR run reads them from "
                           "the store (3.9, 7.13).",
                           "every threshold of the PR run is calibrated from the store, no Calibration is requested "

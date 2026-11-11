@@ -119,6 +119,17 @@ row (`ExecContext.audit`), so the run's drop count counts each decision once. Th
 `secret` step (`executor.secret.run_secret_step` over `simports.SimVault`); every lease's value joins the teardown
 plaintext scan and is then released (6.9).
 
+Registry validation (2.2.3, SD-15): the Orchestrator's `canary_flow_passed` hook runs `validation.validate_all`
+once per shard, in the shard's first tier A workspace (once per workspace in the run), over the rig's probe lists
+on both builds (`ports.RegistryProbes.read_probe`; each probe screenshot stored like a capture), and applies its
+control result: the `surface:<id>` subsets (`not_run (entitlement)`, `harness_error (registry_entry_not_found)`)
+and the 9.10 route. Each probe's census checkpoint and each unregistered label's synthetic checkpoint are written
+outside the plan (registered first), the label's finding naming its stub or alias PR (payload in
+`evidence.raw_values`); a removed entry's census visit is not attempted and takes 3.11 input B `removed`, an entry
+on the candidate only takes `absent (new_surface)`; a rename candidate's label replaces the entry's OCR rung in
+every path target (`validation.substitute_label`); the entry owners' maintenance tasks, the "validation
+incomplete" health lines and the PR proposals (`summary["registry_proposals"]`) follow.
+
 The Oracle (2.8, `pipeline.assertions`): every flow checkpoint that declares assertions or rule regions, and
 every census, sweep or split checkpoint whose regions file has rule regions (SD-29, `oracle.checks_for`), is
 evaluated on both builds; the candidate's verdict feeds `classify.Facts` (3.11 G and H), the failed
@@ -149,6 +160,7 @@ import hashlib
 import itertools
 import json
 import math
+import re
 from collections import abc
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -164,10 +176,11 @@ from .. import invariants as inv
 from ..classify import REVIEWER_ROWS, Classified, Condition, Facts, HarnessFailure, Review, classify
 from ..coverage import Profile, build_matrix, order_lifecycle_not_run, profile_for_role
 from ..diff import load_params
-from ..diff.calibration import (CalibrationFile, Capture as CalCapture, StoreCalibration, calibrate_checkpoint,
-                                calibrated_matches, canary_misses, carry_over, carry_over_source, fix_list_item,
-                                fix_list_lines, has_calibration, live_exceptions, mask_version, retune_tolerances,
-                                revoke_floor_exception, revoked_exceptions, settle_regression_finding)
+from ..diff.calibration import (CalibrationFile, Capture as CalCapture, StoreCalibration, bbox_q4,
+                                calibrate_checkpoint, calibrated_keys, calibrated_matches, canary_misses, carry_over,
+                                carry_over_source, fix_list_item, fix_list_lines, has_calibration, live_exceptions,
+                                mask_version, retune_tolerances, revoke_floor_exception, revoked_exceptions,
+                                settle_regression_finding)
 from ..diff.engine import (DiffContext, DiffResult, GlobalShiftSignal, diff_pair, fingerprint_id,
                            global_shift_prepass)
 from ..capture import (RedactionContext, RedactionError, RedactionList, RedactionResult, Sweep, SyntheticOcr,
@@ -184,8 +197,8 @@ from ..orchestrator.popups import error_title_patterns
 from ..store.lifecycle import expire_due, expiring_within, export_decisions, first_seen, suspect_decisions, verify_fixes
 from ..store.mirror import apply_renames, load_config_mirror
 from ..store.store import Roster
-from ..evaluation import (b_input_reason, declares_new_surface, flake_event, recapture_plan, rerun_stability,
-                          settle_base, settle_spec_for, take_recaptures)
+from ..evaluation import (BInput, b_input_reason, declares_new_surface, flake_event, recapture_plan,
+                          rerun_stability, settle_base, settle_spec_for, take_recaptures)
 from ..review_queue import global_shift_stop, order as review_order
 from ..orchestrator.popups import (BuildCounts, PopupContext, PopupSentinel, dismiss_action, popup_event,
                                    popup_rate_findings)
@@ -206,9 +219,10 @@ from ..diff.regions import Rect as RedactRect, Rect as RegionRect, RegionsFile, 
 from ..diff.settle import RerunBudget, SettleResult, Stability, settle
 from ..lint.repo import Repo, load_yaml_text
 from ..lint.rules import EXPIRY_KINDS, ExpiredRecord, Violation, check_pair
+from ..lint.diffmode import store_rules
 from ..lint.runstart import expiring_soon, lint_at_run_start, lint_manifest
-from ..records import (FINDING_CATEGORIES, PERSONAS, CheckpointOutcome, Decision, EgressRow, Finding, OutboxJob,
-                       RunOutcome, Signature, StepEvent, StepOutcome)
+from ..records import (FINDING_CATEGORIES, PERSONAS, CheckpointOutcome, Decision, EgressRow, Finding,
+                       MaintenanceItem, OutboxJob, RunOutcome, Signature, StepEvent, StepOutcome)
 from ..report import ReportContext, ReportInputs, render_report_markdown, write_run_report
 from ..report.cluster import Member, cluster_members
 from ..report.model import proof_severity, worst_proof
@@ -247,6 +261,8 @@ from ..orchestrator.ports import SessionSafety
 from ..orchestrator.machine import Orchestrator, RunContext, RunReport
 from ..orchestrator.results import ControlResult, Outcome, RunVerdict, SubsetOutcome, step_failed, worse
 from ..orchestrator.alerts import aborted_harness as aborted_harness_route, drill_failure as drill_failure_route
+from ..orchestrator.alerts import env_error as env_error_route
+from ..orchestrator.gates import NO_CALIBRATION
 from ..orchestrator.rig import CrashSignal
 from ..orchestrator.simrig import SimScenario, SimulatedRig, default_context
 from ..orchestrator.watchdog import HANG_FLOOR_S, HeartbeatWriter, app_failure
@@ -310,6 +326,7 @@ class Scenario:
     scan_status: str | None = None                                  # a merge run: the last depscan status file (2.10.1)
     main_history: tuple[Any, ...] = ()                              # first-parent main commits, newest first (3.1)
     requeue_of: str | None = None                                   # the run this one re-queues (base_build_missing)
+    seed_decisions: bool = True                                     # the store holds the config's decisions/ export
 
 
 @dataclass
@@ -493,6 +510,7 @@ class _Run:
         self.epoch = epoch
         self.calibration: CalibrationFile | StoreCalibration | None = None   # the floors the Diff Engine reads
         self.calibration_queued: dict | None = None      # 7.13, L-FPR-04: the Calibration run this run requests
+        self.g5_calibration: str | None = None            # 12.7 G5's calibration test, once both halves are whole
         self.rules: dict[str, inv.SurfaceRules] = {}
         self.disabled: dict[str, list[str]] = {}
         self.registries: dict[str, RegionsFile] = {}
@@ -864,7 +882,8 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
     if store is not None and not synthetic and ev.phash and ev.region:
         look = store.lookup_decisions(Signature(cp.checkpoint_id, ev.region, ev.phash, ev.category),
                                       at=run.now.isoformat(), run_id=run.run_id, manifest_entries=run.entries,
-                                      manifest_tickets=run.tickets, candidate_build=run.cand_app.build.build_id)
+                                      manifest_tickets=run.tickets, candidate_build=run.cand_app.build.build_id,
+                                      bbox_q4=_signature_box(res, ev.region))
         ev.related = [{"decision_id": m.decision.decision_id, "hamming": m.distance} for m in look.related]
         if look.applicable and not look.frozen:      # a frozen signature inherits nothing (9.7)
             facts = dataclasses.replace(facts, decisions=tuple(look.applicable))     # with each one's build pair
@@ -873,6 +892,15 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
                 ev.conflicts = [{"decision_id": m.decision.decision_id, "verdict": m.decision.verdict}
                                 for m in look.matches]
     return ev
+
+
+def _signature_box(res: DiffResult | None, region: str) -> tuple[int, int, int, int] | None:
+    """The exact-fallback key of the signature (4.14 `bbox_q4`, 9.7): the largest component of the signature region,
+    its region-relative box snapped to the 4 px grid; None when the region has no component."""
+    comps = [c for c in (res.components if res is not None else ()) if c.region_id == region]
+    if not comps:
+        return None
+    return bbox_q4(max(comps, key=lambda c: (c.area, tuple(-v for v in c.bbox))).bbox_region)
 
 
 def _asserted_region(ev: Evaluated, cand_lm: Mapping[str, tuple[int, int]]) -> tuple[str, tuple] | None:
@@ -1552,24 +1580,6 @@ def scripted_flow(doc: Mapping[str, Any], flow_id: str, script: RigScript) -> Ma
     return {**doc, "steps": steps}
 
 
-class _LiveTeardown(dict):
-    """A flow document whose teardown is read when it runs (`run_unit` reads `doc.get("teardown")` then): a
-    `close_dialog` or `clear_ticket` whose dialog is not open has nothing to close, so it runs as the target-less
-    teardown action (`SimUnitPorts.teardown_action`, no input) instead of a click the ladder cannot place (2.6.1)."""
-
-    def __init__(self, doc: Mapping[str, Any], rig: SimulatedRig):
-        super().__init__(doc)
-        self.rig = rig
-
-    def get(self, key: str, default: Any = None) -> Any:
-        value = super().get(key, default)
-        if key != "teardown" or self.rig.dialog_open:
-            return value
-        return [{k: v for k, v in st.items() if k != "target"}
-                if st.get("action") in ("close_dialog", "clear_ticket") and st.get("target") else st
-                for st in value or ()]
-
-
 def _spec_step(spec: Any) -> str | None:
     """The step a finding spec of the emitter names in its JSON detail (`locator_failure`), if any."""
     try:
@@ -1759,6 +1769,10 @@ class _ShardWork:
         self.shown: set[tuple[str, str]] = set()             # the scenario's popups already on screen
         self.lags: dict[str, list[float]] = {}               # the base rig's scripted lockstep lags left (3.1)
         self.pair_filled: set[str] = set()                   # lockstep pair checkpoints a gate stop filled
+        self.writer: _Writer | None = None                   # stores the registry probes' screenshots (8.4)
+        self.validations: list[tuple[_Shard, validation.ValidationReport, dict[str, StoredArtifact]]] = []
+        self.validation_stamps: dict[str, tuple[dict[str, str], int]] = {}   # shard -> paper stamp, session (6.4)
+        self.removed_cps: dict[str, tuple[CheckpointOutcome, str]] = {}   # removed entries' census visits (2.2.3)
         self.reuse = BaseReuseState.empty(cfg, scenario.base.build_id, out)   # 3.1: run_pipeline sets the stored bases
 
     # -- the shards -------------------------------------------------------------------------------------
@@ -1807,6 +1821,7 @@ class _ShardWork:
 
         hooks = {"provisioned": lambda o: self._fp_provisioned(holder[0]),
                  "settings_attested": lambda o: self._fp_build(holder[0]),
+                 "canary_flow_passed": lambda o: self._validate(holder[0]),
                  "relaunched": lambda o: self._fp_relaunched(holder[0])}
         rig.g5 = lambda: self._g5(holder[0])
         orch = self.orchestrator(rig, ctx, sink, clock, hb, sim, listener, policy=policy, life=life, hooks=hooks)
@@ -1889,6 +1904,163 @@ class _ShardWork:
                              config_tarball_sha256="sha256:" + sha, allowlist_sha256="sha256:" + st.ctx.allowlist.sha256,
                              diff_params=self.run.params)
 
+    # -- registry validation at entry to running (2.2.3, SD-15) --------------------------------------------------
+    def _validate(self, st: _Shard) -> ControlResult | None:
+        """The `canary_flow_passed` hook (SD-15): registry validation once per shard, in its first tier A workspace,
+        on both builds (`validation.validate_all` over the rig's `read_probe` lists, each probe screenshot stored).
+        The OCR calibration panel's failure at `canary_flow_passed` leaves every probe `harness_error
+        (ocr_calibration)`. A pair's base side, a shard with no tier A workspace and a relaunch (which passes the
+        gate again) do not validate, nor a shard whose workspace another shard validated. The report's records,
+        renames, input B and maintenance are read later (`validation_records`, `_target`, `_validation_b`,
+        `validation_maintenance`); its control result is applied here, and its health lines join run health."""
+        if st.side == "base" or any(s is st for s, _, _ in self.validations):
+            return None
+        tier_a = {w.id: w for w in self.cfg.workspaces if str(w.tier).upper() == "A"}
+        ws = next((cp.workspace_id for cp in st.cps if cp.workspace_id in tier_a), None)
+        if ws is None or any(rep.probes[0].record.checkpoint.workspace_id == ws for _, rep, _ in self.validations):
+            return None                            # a workspace another shard validated: its probe rows are written
+        stamp = st.orch.paper_stamp()              # 6.4, L-OUT-06: no screenshot without a passing assertion; the
+        if stamp is None:                          # shard's first capture then trips the kill switch
+            return None
+        persona = tier_a[ws].persona or next(cp.persona for cp in st.cps if cp.workspace_id == ws)
+        calibrated = not any(sub.selector == "ocr_assertion" and sub.outcome.reason == "ocr_calibration"
+                             for r in st.orch.results for sub in r.outcomes)
+        shots: dict[str, StoredArtifact] = {}
+        listings = {}
+        for probe in validation.PROBES:
+            pair = []
+            for side in ("candidate", "base"):
+                raw = st.rig.read_probe(probe, side)
+                art = self._probe_shot(probe, side, ws, raw)
+                if art is not None:
+                    shots[art.sha256] = art
+                    raw = dataclasses.replace(raw, screenshot=art.sha256)
+                pair.append(raw)
+            listings[probe] = (pair[0], pair[1])
+        rep = validation.validate_all(listings, self.cfg.surfaces, self.cfg.entitlements, self.run.manifest,
+                                      workspace_id=ws, persona=persona, ocr_calibrated=calibrated)
+        self.validations.append((st, rep, shots))
+        self.validation_stamps[st.shard_id] = (stamp, len(st.sessions) - 1)
+        self.health_rows += [["Registry validation", line] for line in rep.health
+                             if ["Registry validation", line] not in self.health_rows]
+        return rep.control()
+
+    def _probe_shot(self, probe: str, side: str, ws: str, listing: Any) -> StoredArtifact | None:
+        """The probe screenshot of one build (2.2.3: the crops of the removed and unregistered rows): the simulated
+        app draws the list the probe read, one label per row, stored like a capture (8.4); None without a writer."""
+        if self.writer is None:
+            return None
+        rows = list(listing.labels) or (["(anchor not found)"] if not listing.located else [])
+        img = np.full((24 + 22 * len(rows), 360, 3), 236, dtype=np.uint8)
+        for k, label in enumerate(rows):
+            cv2.putText(img, label[:40], (8, 26 + 22 * k), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (32, 32, 32), 1,
+                        cv2.LINE_AA)
+        return self.writer._put(img, f"{probe.lower()}-{side}", side, validation.probe_checkpoint_id(probe, ws),
+                                side, tag="registry-validation")
+
+    def _validation_b(self, cp: PlannedCheckpoint) -> BInput | None:
+        """Input B registry validation set for `cp` (`ValidationReport.b_input`, 2.2.3, 3.11), or None."""
+        return next((b for _, rep, _ in self.validations if (b := rep.b_input(cp)) is not None), None)
+
+    def _removed_visit(self, st: _Shard, cp: PlannedCheckpoint) -> None:
+        """A census visit of an entry the candidate no longer lists (2.2.3): the census does not attempt its path;
+        3.11 decides the outcome with input B `removed` (row 26 `collateral` when no loaded manifest entry declares the
+        removal, rows 24 to 25a otherwise), and the two probe screenshots replace `diff`."""
+        att = self.plan.attribution.get(cp.surface_id)
+        facts = Facts(base="removed", manifest=self.plan.x_input(cp.surface_id),
+                      primitive=att.primitive if att else None, manifest_entry_ref=att.entry_id if att else None,
+                      manifest_entries=self.run.entries, manifest_tickets=self.run.tickets,
+                      build_pair_id=self.run.pair_id)
+        c = classify(facts)
+        probe = next((p.probe for _, rep, _ in self.validations for p in rep.probes if cp.surface_id in p.removed), "")
+        rec = next(p.record for _, rep, _ in self.validations for p in rep.probes if p.probe == probe)
+        base = self.bare_outcome(cp, Outcome("not_run", "scope"))
+        self.removed_cps[cp.checkpoint_id] = (dataclasses.replace(
+            base, **{**c.fields(), "artifacts": dict(rec.artifacts) or None, "gate": None,
+                     "paper_assertion": st.orch.paper_stamp(), "cand_rig_id": st.rig_id, "base_rig_id": st.rig_id}),
+            st.shard_id)
+        st.sink.done.add(cp.checkpoint_id)
+
+    def _target(self, name: str) -> dict[str, Any]:
+        """`ExecContext.resolve_target`: the desk's 5.5 target, its OCR rung renamed to the candidate's label when
+        registry validation paired the entry with a rename candidate (`validation.substitute_label`, 2.2.3)."""
+        target = self.desk.target(name)
+        renames = [r for _, rep, _ in self.validations for r in rep.renames]
+        return validation.substitute_label(target, renames) if renames else target
+
+    def validation_scope(self) -> list[ScopeEntry]:
+        """The checkpoints registry validation wrote outcomes on: each probe's census checkpoint and each
+        unregistered label's synthetic one (8.3 `checkpoints`, registered before their rows)."""
+        seen: dict[str, ScopeEntry] = {}
+        for _, rep, _ in self.validations:
+            for rec in rep.records:
+                cp = rec.checkpoint
+                seen.setdefault(cp.checkpoint_id, ScopeEntry(cp.checkpoint_id, cp.workspace_id, cp.persona, cp.tier,
+                                                             cp.data_mode))
+        return list(seen.values())
+
+    def validation_records(self, at: str
+                           ) -> list[tuple[CheckpointOutcome, list[Finding], list[StoredArtifact], str | None]]:
+        """Registry validation's rows (2.2.3): each probe's census checkpoint outcome and each unregistered label's
+        `unregistered_surface` record with its finding (the stub or alias PR payload in `evidence.raw_values`), with
+        their probe screenshots and the shard that read them; then the census visits of removed entries
+        (`_removed_visit`)."""
+        sc = self.scenario
+        out: list[tuple[CheckpointOutcome, list[Finding], list[StoredArtifact], str | None]] = []
+        for st, rep, shots in self.validations:
+            stamp, session = self.validation_stamps[st.shard_id]
+            if 0 <= session < len(st.sessions):      # L-OUT-06: the stamp is one of its session's assertions
+                self.store.set_session_context(st.shard_id, {account_id_sha256(a) for a in st.ctx.allowlist.entries},
+                                               st.sessions[session])
+            props = {(p.probe, p.label): p for p in rep.proposals}
+            unreg = {u.record.checkpoint.checkpoint_id: u for u in rep.unregistered}
+            for rec in rep.records:
+                cp = rec.checkpoint
+                detail = rec.outcome.detail
+                if rec.outcome.outcome == "harness_error":
+                    detail = f"watchdog_event: {_event_id(self.run, cp)}; {detail}"
+                o = rec.to_outcome(sc.run_id, detail=detail, fingerprint_id=self.run.fp_ids.get(st.shard_id,
+                                                                                                 self.run.fp_id),
+                                   data_epoch_id=self.run.epoch, recorded_at=at,
+                                   outcome_id=self.run.next_outcome_id(), pair_id=self.run.pair_id,
+                                   profile_id=profile_of(self.cfg, cp), cand_rig_id=st.rig_id,
+                                   base_rig_id=st.rig_id, paper_assertion=stamp)
+                stored = [shots[s] for s in rec.artifacts.values() if s in shots]
+                fs: list[Finding] = []
+                u = unreg.get(cp.checkpoint_id)
+                if u is not None:
+                    p = props.get((u.probe, u.label))
+                    raw = {"registry_pr": p.kind, "registry_pr_path": p.path,
+                           "registry_pr_document": canonical_json(dict(p.document))} if p else {}
+                    fs.append(u.finding().to_finding(
+                        f"fnd-{sc.run_id}-val-{len(out) + 1:03d}", sc.run_id, checkpoint_id=cp.checkpoint_id,
+                        region_id=None, created_at=at,
+                        evidence={"artifacts": sorted(rec.artifacts.values()), "raw_values": raw}))
+                out.append((o, fs, stored, st.shard_id))
+        shots_all = {s: a for _, _, sh in self.validations for s, a in sh.items()}
+        for cid, (o, sid) in sorted(self.removed_cps.items()):
+            out.append((dataclasses.replace(o, recorded_at=at),
+                        [], [shots_all[s] for s in (o.artifacts or {}).values() if s in shots_all], sid))
+        return out
+
+    def validation_maintenance(self, at: str) -> list[MaintenanceItem]:
+        """The entry owners' tasks for `registry_entry_not_found` (2.2.3, 11.5), once per entry."""
+        items: dict[str, MaintenanceItem] = {}
+        for _, rep, _ in self.validations:
+            for m in rep.maintenance(at, self.scenario.run_id):
+                items.setdefault(m.ref, m)
+        return list(items.values())
+
+    def validation_proposals(self) -> list[dict[str, Any]]:
+        """The registry stub and alias PR payloads for the Reporter (2.2.3), once per proposed file."""
+        seen: dict[tuple[str, str], dict[str, Any]] = {}
+        for _, rep, _ in self.validations:
+            for p in rep.proposals:
+                seen.setdefault((p.kind, p.surface_id), {"kind": p.kind, "probe": p.probe, "label": p.label,
+                                                         "surface_id": p.surface_id, "path": p.path,
+                                                         "document": dict(p.document)})
+        return list(seen.values())
+
     def _g5(self, st: _Shard) -> str:
         """12.7 G5 at `provisioned`: the halves' OS-class fields compared (`fingerprint.g5`). Both halves run on the
         shard's one rig back to back (7.4): the second half's OS fields are the rig's, read once for both. An
@@ -1957,7 +2129,25 @@ class _ShardWork:
             self.reuse.key_for(st.shard_id, fps["base"])
         r = rig_spec_check(own, rig_kind="vm", display_config=self._display_config(st),
                            allowlist_sha256=harness["allowlist_sha256"])
-        return r or (pair_check(fps["candidate"], fps["base"]) if st.side != "base" else None)
+        if r is None and st.side != "base":
+            r = pair_check(fps["candidate"], fps["base"]) or self._g5_calibration(fps)
+        return r
+
+    def _g5_calibration(self, fps: Mapping[str, Fingerprint]) -> ControlResult | None:
+        """12.7 G5's calibration half, once both fingerprints are whole (fingerprint choice 4): `fingerprint.g5` with
+        the store's `calibrated_keys` (a key this fingerprint may carry floors over to counts, L-FPR-04). A missing
+        Calibration queues one for the key and tells on-call, once per run (10.7 "either way on-call is alerted",
+        gates choice 7); the run goes on with its own A/A floors and `calibration_queued` names the request (7.13)."""
+        if self.run.g5_calibration is not None:
+            return None
+        cand = fps["candidate"]
+        self.run.g5_calibration = g5(cand, fps["base"], calibrated_keys(self.store, cand.match))
+        if self.run.g5_calibration != NO_CALIBRATION:
+            return None
+        return ControlResult("fingerprint", True, "settings_attested", actions=("queue_calibration",),
+                             alert=env_error_route(), evidence={"G5": NO_CALIBRATION,
+                                                                "calibration_key": calibration_key(cand.match)},
+                             detail="no calibration for this fingerprint: a Calibration run is queued (12.7 G5, 7.13)")
 
     def _display_config(self, st: _Shard) -> Mapping[str, Any] | None:
         """The shard's workspace display configuration (`configs/allowed.yaml` entry it names, 7.1)."""
@@ -2000,7 +2190,7 @@ class _ShardWork:
         st.exec = ExecContext(sc.run_id, st.shard_id, st.clock, ledger=self.ledger, budgets=st.orch.budgets,
                               side="candidate", agent_available=st.orch.model.agent_available and self.agent_allowed,
                               dr07_branch_b=Branches.from_doc(self.branches_doc).computer_use == "B",
-                              heartbeat=st.policy, life=st.life, audit=st.drainer, resolve_target=self.desk.target,
+                              heartbeat=st.policy, life=st.life, audit=st.drainer, resolve_target=self._target,
                               next_seq=lambda: next(st.seq))
         lctx = LadderContext("", "", self.rescue_cap, retry=lambda: WindowCapture.from_frame(self.desk.frame(rig)),
                              flag=rig.poll_flag, templates=self.desk.templates,
@@ -2113,7 +2303,9 @@ class _ShardWork:
         if selector.startswith("workspace:"):     # 2.4: the shard's remaining census visits in that workspace
             ws = selector.split(":", 1)[1]
             return [cp for cp in todo if cp.test_kind == "census" and cp.workspace_id == ws]
-        return []        # account_state, probe:<Pn>, explorer_stage, drill, ...: no checkpoint of a PR shard's scope
+        if validation.handles(selector):          # 2.2.3: every checkpoint of one surface
+            return validation.select_subset(selector, todo)
+        return []        # account_state, explorer_stage, drill, ...: no checkpoint of a PR shard's scope
 
     def _subsets(self, st: _Shard, r: ControlResult, current: PlannedCheckpoint | None = None,
                  rest: Sequence[PlannedCheckpoint] = ()) -> None:
@@ -2284,8 +2476,7 @@ class _ShardWork:
             st.last_flow = u.unit_id
         hooks = UnitHooks(before_step=lambda step: self._before_step(st, u, step),
                           after_step=lambda step: self._after_step(st))
-        live = dataclasses.replace(u, doc=_LiveTeardown(u.doc, st.rig))
-        r = run_unit(live, st.ports, st.ladder, planner, st.exec, hooks=hooks, failures=st.failures, faults=self.faults,
+        r = run_unit(u, st.ports, st.ladder, planner, st.exec, hooks=hooks, failures=st.failures, faults=self.faults,
                      streak=st.streak if u.kind == "census" and cps and cps[0].test_kind == "census" else None)
         self._absorb(st, u, r, cps)
 
@@ -2455,6 +2646,10 @@ class _ShardWork:
         if self._sweep(st, cp.step_id or "visit", cp.flow_id, at_capture=True, census=cp.test_kind == "census",
                        checkpoint_id=cid) is not None or cid in st.sink.done:
             return None
+        b_input = self._validation_b(cp)                 # 2.2.3, 3.11 input B from registry validation
+        if b_input is not None and b_input.b == "removed":
+            self._removed_visit(st, cp)
+            return None
         window = self._window(st, cp, rest)
         if window is None:
             return None
@@ -2464,6 +2659,8 @@ class _ShardWork:
         base_cap: Capture | None = self.run.capture(cp, "base", tick=1 if live else 0)
         cand_cap = self.run.capture(cp, "candidate", tick=2 if live else 0)
         source, absent = None, None
+        if b_input is not None and b_input.b == "absent":    # an entry on the candidate only: no base (new_surface)
+            base_cap, absent = None, b_input.reason
         if cp.base_source_run_id and st.fp and "base" in st.fp:     # 3.1: the plan reuses a stored frozen base
             base_cap, source = self.reuse.base(cp, st.shard_id, st.fp["base"], base_cap)
             absent = None if base_cap is not None else "reuse_missing"
@@ -2547,8 +2744,8 @@ class _ShardWork:
                 st.clock.advance(float(ev["wait_timeout_ms"]) / 1000.0)
                 r = st.popups.wait_over(hit, ctx, cleared=hit.window.hwnd not in {w.hwnd for w in
                                                                                   rig.enumerate_windows()})
-            if r is None or (r.passed and not r.outcomes and r.run is None):
-                continue
+            if r is None or (r.passed and not r.outcomes and r.run is None and not r.findings):
+                continue                       # a dismissal's findings (POP-11 memory_warning, POP-07 fixture) stay
             r = st.orch.apply(r)
             cp = next((c for c in st.cps if c.checkpoint_id == checkpoint_id), None)
             self._note(st, r, checkpoint=cp, flow_id=flow_id)
@@ -3089,6 +3286,63 @@ def run_start(repo: Repo, candidate: str, today: date) -> RunStart:
                     [v.line() for v in found] if bad else [], not bad)
 
 
+_SEEDABLE = ("decision_id", "signature", "action", "verdict", "decided_by", "role", "source", "decided_at", "run_id",
+             "ticket", "reason", "expires_at", "status", "build_id", "confirmed_by")
+
+
+def seed_decisions(store: Store, cfg: SentinelConfig) -> list[str]:
+    """The simulated Central Store's decision history: every decision of the config's `decisions/` export (the 4.14
+    shape `store.lifecycle.export_decisions` writes) that the store does not hold yet, written through
+    `Store.record_decision`, so every write rule applies (L-DEC-01 against the roster, L-DEC-03, L-DEC-04, L-DEC-07
+    and the 8.3 CHECKs): a decision by a service identity or outside the triage roster is refused, never seeded. The
+    run a decision names becomes a finished history run of the store (empty scope, ended at the decision) and its
+    checkpoint is registered from the registry (`planned_for`). Only a plain active decision is seeded: one that
+    names a finding, a baseline, a fix build or a decision it supersedes needs rows the export does not carry, and
+    raises ValueError naming why. The masks' run-start check (L-MSK-01, `diffmode.store_rules`) then reads the store
+    as production does. Returns the ids written."""
+    written: list[str] = []
+    for exported in cfg.repo.of("decision"):                  # lint/repo.py LAYOUT: decisions/*.yaml
+        doc = exported.data
+        if not isinstance(doc, dict) or store.get_decision(str(doc.get("decision_id"))) is not None:
+            continue
+        extra = sorted(k for k in doc if k not in _SEEDABLE)
+        if extra or doc.get("status", "active") != "active":
+            raise ValueError(f"{exported.rel}: only a plain active decision is seeded; "
+                             f"{', '.join(extra) or 'status ' + str(doc.get('status'))} needs rows the export does not "
+                             "carry (a finding, a baseline, a fix build or a superseded decision)")
+        sig = doc["signature"]
+        box = sig.get("bbox_q4")
+        d = Decision(str(doc["decision_id"]), str(doc["action"]), str(doc["verdict"]),
+                     Signature(str(sig["checkpoint_id"]), str(sig["region_id"]), str(sig["phash"]),
+                               str(sig["category"])),
+                     decided_by=str(doc["decided_by"]), hamming_tolerance=sig.get("hamming_tolerance"),
+                     ticket=doc.get("ticket"), source=str(doc.get("source", "report_ui")), reason=str(doc["reason"]),
+                     decided_at=str(doc["decided_at"]), expires_at=doc.get("expires_at"), role=doc.get("role"),
+                     confirmed_by=doc.get("confirmed_by"),
+                     bbox_q4=None if box is None else (int(box["x"]), int(box["y"]), int(box["w"]), int(box["h"])))
+        run_id, at = str(doc["run_id"]), str(doc["decided_at"])
+        if not store.query("SELECT 1 FROM runs WHERE run_id = ?", (run_id,)):
+            kind = re.match(r"^run-\d{4}-\d{2}-\d{2}-([a-z]+)-", run_id)
+            run_type = kind.group(1) if kind and kind.group(1) in ("pr", "merge", "rc", "nightly") else "merge"
+            store.begin_run(_run_plan(run_id, run_type, cfg.root, (), (), at, None, None, None))
+            store.end_run(RunOutcome(run_id, run_type, "complete", "teardown", started_at=at, ended_at=at))
+        cp = planned_for(cfg, d.signature.checkpoint_id)
+        store.register_checkpoints([ScopeEntry(cp.checkpoint_id, cp.workspace_id, cp.persona, cp.tier, cp.data_mode,
+                                               flow_class=_flow_class(cfg, cp), recapturable=_recapturable(cfg, cp))],
+                                   config_commit=tree_sha256(cfg.root)[:12])
+        written.append(store.record_decision(d, run_id=run_id, build_id=doc.get("build_id")).decision_id)
+    return written
+
+
+def store_start(store: Store, cfg: SentinelConfig, *, seed: bool) -> list[Violation]:
+    """4.1 at run start, against the Central Store (L-MSK-01, `diffmode.store_rules`): each mask's `decision_ref`
+    is a human's `request_mask` decision in the triage roster. With `seed` the simulated store first takes the
+    config's decision export (`seed_decisions`). Any error is `config_invalid`."""
+    if seed:
+        seed_decisions(store, cfg)
+    return [v for v in store_rules(cfg.repo, store) if v.severity == "error"]
+
+
 def calibration_rows(store: Store, run: _Run, evals: Sequence[Evaluated], run_id: str, today: date) -> list[list[str]]:
     """Run health's calibration rows (3.9 step 6, 3.5, 7.13): the open fix list of the key the floors came from
     (`fix_list_lines`), each `settle_regression` finding (written here: a checkpoint whose time to settle is more
@@ -3177,6 +3431,10 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
             rules = sorted({v.rule for v in start.errors})
             return _abort_config(store, scenario, cfg_root, errs, rules, out, today, started, expiring=start.expiring)
         cfg = SentinelConfig.load(cfg_root)
+        held = store_start(store, cfg, seed=scenario.seed_decisions)    # L-MSK-01 against the store (4.8)
+        if held:
+            return _abort_config(store, scenario, cfg_root, [v.line() for v in held], sorted({v.rule for v in held}),
+                                 out, today, started, expiring=start.expiring)
         if missing is not None:                          # 1.7 T+0:00: no base build, nothing is captured (4.2)
             return _abort_base(store, scenario, cfg, missing, out, today, started)
         try:
@@ -3262,7 +3520,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         redaction = repo.one("redaction")
         load_config_mirror(store, commit, cfg.regions, cfg.masks, redaction.data if redaction is not None else None)
         work = _ShardWork(run, cfg, scenario, out, oracle, store, planned, plan, today)
-        work.reuse = reuse
+        work.reuse, work.writer = reuse, writer
         rev = reviewer or SimulatedReviewer()
         gate = egress_gate(cfg.root, store, scenario.run_id)   # 6.10: one gate per run for every outbound call
         if live is None and live_factory is not None:
@@ -3341,6 +3599,12 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         for f in [f for fs in by_cp.values() for f in fs]:
             if uploads(f.to_dict(), f"finding {f.finding_id}"):
                 store.write_finding(f)
+        store.register_checkpoints(work.validation_scope(), config_commit=commit)   # 2.2.3: outside the plan
+        for rec, fs, stored, sid in work.validation_records(started):
+            if uploads([rec.to_dict(), [f.to_dict() for f in fs]], rec.checkpoint_id):
+                work.write_record(rec, findings=fs, artifacts=stored, shard_id=sid)
+        for m in work.validation_maintenance(started):     # 2.2.3, 11.5: the entry owners' tasks
+            store.write_maintenance_item(m)
         for s, sid in work.steps:                         # each with its gateway_event (8.3 gate_* columns)
             if uploads(s.to_dict(), f"step {s.flow_id}/{s.step_id}"):
                 store.write_steps([s], shard_id=sid, side="candidate")
@@ -3410,6 +3674,8 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                 s["calibration_queued"] = queued
             if health_rows:
                 s["health_rows"] = list(health_rows)
+            if proposals := work.validation_proposals():  # 2.2.3: the registry stub and alias PRs, for the Reporter
+                s["registry_proposals"] = proposals
             return s
 
         summary = full_summary()
@@ -3818,6 +4084,7 @@ class NightlyScenario:
     merge_builds: Mapping[str, SimBuild] = field(default_factory=dict)   # the day's merge run's builds, by build id
     aa_pass: bool = True                              # False: the calibration weekend's Nightly (canaries only, 1.6)
     probes_unread: tuple[str, ...] = ()               # registry probes whose anchor the rig cannot locate (2.2.3)
+    seed_decisions: bool = True                       # the store holds the config's decisions/ export
 
 
 NOT_SIMULATED: dict[str, str] = {}      # every catalog mutant renders and scores in the simulated app (`sim`)
@@ -4188,19 +4455,30 @@ def _fill_stopped(store: Store, run_id: str, stop: ControlResult | None, verdict
 NIGHTLY_WORKSPACE, NIGHTLY_PERSONA = "ws.tier-a.swing-trader", "swing_trader"   # the Nightly shard's session
 
 
-def _probe_listings(cfg: SentinelConfig, unread: Iterable[str] = ()) -> dict[str, tuple[validation.ProbeListing,
-                                                                                    validation.ProbeListing]]:
-    """What probes P1 to P8 read on the main build (2.2.3), on both sides of the Nightly's A/A build pair: the
-    simulated app lists every registry entry a probe enumerates under its title, in entry id order; a probe in
-    `unread` did not locate its anchor (`ProbeListing.located` false)."""
-    gone = set(unread)
-    out = {}
-    for probe in validation.PROBES:
-        labels = tuple(str(doc.get("title") or sid) for sid, doc in sorted(cfg.surfaces.items())
-                       if str(doc.get("enumerable_by") or "none") == probe)
-        listing = validation.ProbeListing(labels, located=probe not in gone)
-        out[probe] = (listing, listing)
-    return out
+def _probe_listings(rig: SimulatedRig) -> dict[str, tuple[validation.ProbeListing, validation.ProbeListing]]:
+    """What probes P1 to P8 read on both sides of the Nightly's A/A build pair (2.2.3), through the rig's
+    `read_probe` (`ports.RegistryProbes`): the simulated app lists every registry entry a probe enumerates under its
+    title, in entry id order; a probe of `NightlyScenario.probes_unread` did not locate its anchor."""
+    return {p: (rig.read_probe(p, "candidate"), rig.read_probe(p, "base")) for p in validation.PROBES}
+
+
+GATEWAY_CANARY_TARGET = "trade.order-entry.stock.confirm-and-send"   # M28's region_ref control (12.5, 4.11)
+
+
+def _gateway_canary(rig: SimulatedRig, desk: SimDesk, m: cn.Mutant) -> str:
+    """M28 (10.3 `gateway`, SD-44): the canary flow's step on the control whose template the mutant swapped for a
+    non-matching image, through the rig's real gateway (`SimulatedRig.send_input`: the slow half of 5.4.3 stage 4,
+    then the hook of 5.4.4). The resolver names the control, but what is under the point reads as the mirrored image
+    (the mutant's `mismatch_template`), so the name is ambiguous. A refusal, or no event the hook let through, is
+    `blocked_by_gateway` with no click emitted; an emitted click is `passed`, and the canary is missed."""
+    c = desk.controls[GATEWAY_CANARY_TARGET]
+    under = c.label[::-1]                                  # the mirrored text OCR reads off the swapped image
+    point = (c.rect.x + c.rect.w // 2, c.rect.y + c.rect.h // 2)
+    res = rig.send_input(Action("click", profile="scripted", point=point, resolved_name=c.label,
+                                under_point_text=under, flow_class="canary",
+                                ambiguous=validation.normalize_label(under) != validation.normalize_label(c.label)))
+    emitted = [d for d in res.decisions if d is not None and d.allowed]
+    return "blocked_by_gateway" if res.refused is not None or not emitted else "passed"
 
 
 def _self_test_row(store: Store, run: _Run, rec: validation.ValidationRecord, at: str) -> None:
@@ -4280,6 +4558,15 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
             return _abort_config(store, sc, cfg_root, [v.line() for v in lrep.errors],
                                  sorted({v.rule for v in lrep.errors}), out, today, started)
         cfg = SentinelConfig.load(cfg_root)
+        oncall = cfg.repo.one("oncall")
+        if oncall is not None and isinstance(oncall.data, dict):        # L-DEC-01: who may decide (ops/oncall.yaml)
+            store.set_roster(Roster.from_oncall(oncall.data))
+        held = store_start(store, cfg, seed=scenario.seed_decisions)    # L-MSK-01 against the store (4.8)
+        if held:
+            sc = Scenario(scenario.name, scenario.run_id, scenario.build, scenario.build, run_type="nightly",
+                          clock=scenario.clock)
+            return _abort_config(store, sc, cfg_root, [v.line() for v in held], sorted({v.rule for v in held}), out,
+                                 today, started)
         assert cfg.catalog is not None
         wanted = set(scenario.mutants or (e.mutant_id for e in cfg.catalog.entries))
         entries = [e for e in cfg.catalog.entries if e.mutant_id in wanted]
@@ -4329,7 +4616,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         clock = ManualClock(start=now.astimezone(timezone.utc))
         ctx, sim = shard_setup(cfg, run_id=scenario.run_id, run_type="nightly", shard_id=f"{scenario.run_id}/1",
                                shard_no=1, build_id=scenario.build.build_id, workspace_id=NIGHTLY_WORKSPACE,
-                               script=RigScript())
+                               script=RigScript(probe_unlocated=tuple((p, side) for p in scenario.probes_unread
+                                                                      for side in ("candidate", "base"))))
         nrig = SimulatedRig(sim, clock=clock)
         holder: list[_Shard] = []
         # 7.4, 12.7 G5: the shard's fingerprint as on a PR shard; the run's floors are keyed by its calibration key
@@ -4399,8 +4687,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                 rec, _, stored = writer.records(ev, synthetic=True, tag=m.mutant_id)
                 arts_by_sha.update({a.sha256: a for a in stored})
                 step_status = None
-                if m.defect_class == "gateway":
-                    step_status = "blocked_by_gateway"       # the simulated gateway refuses the unmatched Send template
+                if m.defect_class == "gateway":              # 10.3, SD-44: the mutated step through the rig's gateway
+                    step_status = _gateway_canary(nrig, work.desk, m)
                 masks, floors = _absorbers(run, ev)
                 hit = run.redaction_canary(cp, approved[m.checkpoint_id], m) if m.defect_class == "redaction" else None
                 results.append(cn.MutantResult(m, rec, absorbed_by=cn.absorbed_by(m, rec, masks=masks, floors=floors),
@@ -4427,7 +4715,7 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
             for res in done["safety"].results:      # 6.5, 1.10: a drill that placed an order stops the shard through
                 orch.apply(res)                     # the kill switch, `aborted_safety (drill_order_placed)`
             if orch.stop is None:                     # 10.3, G1: the registry validation self-test on recorded lists
-                selftest = validation.self_test(cfg.surfaces, _probe_listings(cfg, scenario.probes_unread), None,
+                selftest = validation.self_test(cfg.surfaces, _probe_listings(nrig), None,
                                                 entitlements=cfg.entitlements, workspace_id=NIGHTLY_WORKSPACE,
                                                 persona=NIGHTLY_PERSONA, validator=validation.validate_all)
                 done["self_test"] = selftest

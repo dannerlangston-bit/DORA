@@ -6,8 +6,9 @@ build, 3 unstable outcomes in 7 days or 2 verdict flips on one build (reason `fl
 aa_drift)` on 3 consecutive Nightly runs (`aa_drift`); a fix-list item on a frozen checkpoint open past 5 business
 days (`aa_floor`). A flow is quarantined whole when its 30-day agent-fallback rate exceeds 5 percent
 (`fallback_rate`, 11.5), and by the safety controls that already took it out of service (`gateway_drops`,
-`kill_switch`, `fire_drill`, `safety_canary`: the open `safety_quarantines` rows of W1, decided by the gateway, the
-kill switch, the drill and the safety canaries; this module does not re-count their thresholds). Drill and
+`kill_switch`, `fire_drill`, `safety_canary`, `unknown_popup`: the open `safety_quarantines` rows of W1, decided by
+the gateway, the kill switch, the drill, the safety canaries and the popup sentinel; this module does not re-count
+their thresholds). Drill and
 safety-canary flows (class `canary`, 6.5) are exempt: their triggers are returned as `paged` for the safety routing
 of 9.10, never proposed. The record is opened by the Orchestrator as a PR to `sentinel-config` and merged by the
 system owner; nothing here un-quarantines anything.

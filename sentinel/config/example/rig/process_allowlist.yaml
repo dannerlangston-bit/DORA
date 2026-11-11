@@ -1,0 +1,42 @@
+# The running-process allowlist of 7.1 and 7.12 (4.16): the harness processes, the elevated helper service, the
+# thinkorswim process tree and the golden image's Windows baseline. A placeholder until Phase 0 reads the golden image;
+# any other process at gate provisioned is env_error (gate: provisioned, reason: rig_spec_mismatch) naming it.
+schema_version: 1
+image_id: base-os.g1
+harness:                       # Orchestrator, Gateway hook host, Watchdog (5.1) and the elevated helper service (7.11)
+  - sentinel-orchestrator.exe
+  - sentinel-hookhost.exe
+  - sentinel-watchdog.exe
+  - sentinel-helper.exe
+app_tree:
+  - thinkorswim.exe
+windows_baseline:
+  - System Idle Process
+  - System
+  - Registry
+  - Memory Compression
+  - smss.exe
+  - csrss.exe
+  - wininit.exe
+  - winlogon.exe
+  - services.exe
+  - lsass.exe
+  - svchost.exe
+  - fontdrvhost.exe
+  - dwm.exe
+  - explorer.exe
+  - sihost.exe
+  - taskhostw.exe
+  - ctfmon.exe
+  - RuntimeBroker.exe
+  - StartMenuExperienceHost.exe
+  - ShellExperienceHost.exe
+  - TextInputHost.exe
+  - SearchHost.exe
+  - conhost.exe
+  - dllhost.exe
+  - WmiPrvSE.exe
+  - MsMpEng.exe
+  - NisSrv.exe
+  - SecurityHealthService.exe
+  - vmtoolsd.exe

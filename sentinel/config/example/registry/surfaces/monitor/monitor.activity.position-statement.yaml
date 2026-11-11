@@ -7,12 +7,12 @@ owner: tos-monitor-ui
 smoke: true
 path:
   - {id: p1, type: wait_for, anchor: {landmark: lm.position-statement-header}, timeout_ms: 8000}
-primitives: [Theme]
+primitives: [ColumnModel, Docking, QuoteStream, Theme, FontMetrics]   # 12.4
 roots: ["com.tos.desktop.monitor.positions"]
 personas: [active_trader, options_trader, futures_trader, swing_trader, beginner]
 entitlements: [margin]
 enumerable_by: P2
-resizable: false
+resizable: false                       # deviation: 12.4 sweeps it (S yes); the example's sweep harness does not host it
 target_window: {kind: main}
 data_mode: masked_live                # marks and P/L by rule R08 on the golden account (12.4)
 account_state: true

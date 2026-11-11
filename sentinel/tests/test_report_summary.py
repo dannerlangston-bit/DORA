@@ -209,6 +209,33 @@ def test_the_seven_day_owner_warnings_and_the_expired_records_are_run_health_row
     assert "Expired records" not in render_pr_comment(**sample())
 
 
+def test_a_calibration_runs_own_summary_is_its_run_health():
+    """3.9 step 6, 11.2: the fix list, its routes by owner, the overdue items and the sessions of a Calibration
+    run (`summary["calibration"]`, written by calibration_run.run_calibration) are run-health rows."""
+    cal = {"build_id": "main-1998.3.0-2c91ae4", "checkpoints": 8, "calibrated": 7, "keys": ["sha256:" + "a" * 64],
+           "files": ["aaaa.yaml"],
+           "sessions": [{"shard_id": "cal/1", "rig": "rig-04", "night": 1, "status": "complete", "reason": None,
+                         "last_gate": "teardown"},
+                        {"shard_id": "cal/2", "rig": "rig-05", "night": 2, "status": "complete_with_env_errors",
+                         "reason": "rig_spec_mismatch", "last_gate": "provisioned"}],
+           "fix_list": ["census/x rgn.clock: tooltip (owner tos-ui, open 6 business days)"],
+           "fix_routes": {"tos-ui": ["census/x rgn.clock: tooltip"], "sentinel-ops": ["a", "b"]},
+           "overdue": ["census/x rgn.clock"]}
+    text = render_pr_comment(**sample(), summary={"calibration": cal})
+    assert health_row(text, "Calibration") == (
+        f"| Calibration | 7 of 8 checkpoints calibrated on main-1998.3.0-2c91ae4; keys sha256:{'a' * 64}; "
+        "exported aaaa.yaml |")
+    assert health_row(text, "Calibration sessions") == (
+        "| Calibration sessions | rig-04 night 1 complete; rig-05 night 2 complete_with_env_errors at provisioned "
+        "(rig_spec_mismatch) |")
+    assert health_row(text, "Fix list") == \
+        "| Fix list | census/x rgn.clock: tooltip (owner tos-ui, open 6 business days) |"
+    assert health_row(text, "Fix list by owner") == "| Fix list by owner | sentinel-ops: 2 items; tos-ui: 1 item |"
+    assert health_row(text, "Fix items overdue") == "| Fix items overdue | census/x rgn.clock |"
+    assert "Fix list" not in render_pr_comment(**sample(), summary={"calibration": {**cal, "fix_list": [],
+                                                                                    "fix_routes": {}, "overdue": []}})
+
+
 def redaction_miss(fid: str, *, candidate_only: bool, tier: int | None = 2) -> Finding:
     cid = "census/charts.main/ws.tier-a.active-trader"
     return Finding(fid, RUN_ID, "redaction_miss", f"the OCR sweep found an account id outside the anchors ({fid})",

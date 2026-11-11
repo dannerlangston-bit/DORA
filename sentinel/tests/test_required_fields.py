@@ -46,8 +46,9 @@ VALID = {
 
 
 def rec(outcome, **kw):
-    return CheckpointOutcome(run_id=RUN, checkpoint_id=CENSUS, outcome=outcome, workspace_id=WS,
-                             persona="active_trader", data_mode="frozen", **kw)
+    kw.setdefault("checkpoint_id", CENSUS)
+    return CheckpointOutcome(run_id=RUN, outcome=outcome, workspace_id=WS, persona="active_trader",
+                             data_mode="frozen", **kw)
 
 
 def errs(r):
@@ -118,6 +119,22 @@ def test_decision_forms_of_noise_and_intended():
                     decision_ref="dec-000002", classification=Classification("intended", "rule"))) == []
     assert errs(rec("intended", diff=D, manifest_entry_ref="tos-1",
                     classification=Classification("intended", "reviewer")))   # a reviewer call without confidence
+
+
+def test_a_probe_checkpoint_is_decided_from_its_two_probe_screenshots():
+    """2.2.3: a registry validation probe's census checkpoint has no pixel diff; its screenshots stand in for it, and
+    its `intended` and `collateral` are rule classifications (validation choice 5)."""
+    shots = {"base": "b" * 64, "candidate": CAND}
+    probe = dict(checkpoint_id="census/registry.validation-p2/ws.tier-a.active-trader",
+                 surface_id="registry.validation-p2", test_kind="census", artifacts=shots, **PROV)
+    rule = Classification("intended", "rule")
+    assert errs(rec("identical", **probe)) == []
+    assert errs(rec("intended", classification=rule, manifest_entry_ref="tos-1-1", **probe)) == []
+    assert errs(rec("collateral", classification=Classification("collateral", "rule"), **probe)) == []
+    assert errs(rec("intended", classification=rule, **probe)) == [
+        "intended: manifest_entry_ref (4.13 required fields, L-OUT-02)"]
+    assert errs(rec("identical", **{**probe, "artifacts": {"candidate": CAND}}))
+    assert errs(rec("identical", artifacts=shots, **PROV))                        # any other checkpoint: a diff
 
 
 def test_collateral_manifest_missing_and_the_removed_surface():

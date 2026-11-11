@@ -1,0 +1,15 @@
+# The operating day, the named quiet windows and the known maintenance windows of 7.10 (4.16), America/New_York.
+# The scheduler resolves them from the exchange calendar (sentinel.calendar), never from wall-clock cron.
+schema_version: 1
+operating_day: {start: "06:00", end: "22:00"}    # PR, merge and RC runs only; Nightly and Calibration exempt (SD-76)
+windows:
+  all_quiet:        # equities, futures, forex closed; crypto futures excluded by profile
+    start: {calendar: XNYS, weekday: Fri, time: "20:00"}
+    end: {weekday: Sun, time: "17:00"}           # forex 17:00, Globex 18:00, 24/5 equities 20:00
+  equities_quiet:   # only for symbols absent from the 24-hour list read this run (7.4)
+    rule: "XNYS closed and symbol not in overnight list"
+  futures_break:
+    rule: "CMES daily break 17:00 to 18:00, or CMES weekend close"
+  none: {}          # default for frozen and masked_live checkpoints
+maintenance_windows:  # known backend windows; a preflight N1, N3 or N4 failure inside one reschedules instead of env_error
+  - {weekday: Sat, start: "22:00", end: "02:00", source: "ops calendar 2026-10"}

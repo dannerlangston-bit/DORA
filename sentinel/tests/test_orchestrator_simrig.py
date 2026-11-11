@@ -241,3 +241,19 @@ def test_the_slow_half_context_carries_every_field_the_gateway_reads():
     assert rig.send_input(confirm()).refused is None
     ctx = rig._context(confirm(), rig.clock.monotonic())
     assert ctx.dialog_foreground and ctx.dialog_read and ctx.order_dialog_present and not ctx.recovery_only
+
+
+def test_read_probe_lists_the_base_and_the_candidates_changes():
+    """`ports.RegistryProbes` on the simulated rig (2.2.3): the base lists the registry titles; the candidate adds,
+    drops and renames labels; a hidden label is on neither build; an unlocated anchor lists nothing."""
+    from sentinel.orchestrator.ports import RegistryProbes
+    rig = SimulatedRig(SimScenario(probe_lists={"P2": ("Ladder", "Position Statement", "Watchlist")},
+                                   probe_added=(("P2", "Crypto"),), probe_removed=(("P2", "Watchlist"),),
+                                   probe_renamed=(("P2", "Ladder", "Active Trader"),),
+                                   probe_hidden=(("P2", "Position Statement"),),
+                                   probe_unlocated=(("P3", "base"),)))
+    assert isinstance(rig, RegistryProbes)
+    assert rig.read_probe("P2", "base").labels == ("Ladder", "Watchlist")
+    assert rig.read_probe("P2", "candidate").labels == ("Active Trader", "Crypto")
+    assert rig.read_probe("P3", "candidate").located and not rig.read_probe("P3", "base").located
+    assert rig.read_probe("P5", "base").labels == () and "read_probe:P2:base" in rig.calls

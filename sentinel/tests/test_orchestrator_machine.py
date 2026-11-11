@@ -47,6 +47,25 @@ def filled(sink: MemorySink) -> set:
     return {v[:3] for v in sink.outcomes.values()}
 
 
+def test_registry_validation_runs_at_entry_to_running_after_the_canary_flow():
+    """SD-15: the `canary_flow_passed` hook runs once the canary flow passed, before `running`; its result is applied,
+    and a result that stops the run stops it there."""
+    from sentinel.orchestrator.results import ControlResult, Outcome, RunVerdict, SubsetOutcome
+    seen: list[str] = []
+
+    def validate(o: Orchestrator) -> ControlResult:
+        seen.append(o.results[-1].gate)
+        return ControlResult("registry_validation", True, "running",
+                             outcomes=(SubsetOutcome("all", Outcome("harness_error", "registry_entry_not_found")),))
+    report, _, _, orch = run(work=all_work, gate_hooks={"canary_flow_passed": validate})
+    assert seen == ["canary_flow_passed"] and report.verdict.status == "complete"
+    assert [r.control for r in report.results if r.gate == "running"][:1] == ["registry_validation"]
+    stop = ControlResult("registry_validation", False, "running", run=RunVerdict("aborted_harness", "hook_lost"),
+                         unreached=Outcome("harness_error", "hook_lost"))
+    report, _, sink, _ = run(work=all_work, gate_hooks={"canary_flow_passed": lambda o: stop})
+    assert report.verdict.status == "aborted_harness" and filled(sink) == {("harness_error", "hook_lost", None)}
+
+
 def test_clean_run_passes_every_gate_and_proves_no_orders_sent():
     report, rig, sink, _ = run(work=all_work)
     assert report.verdict.status == "complete" and report.proof.verdict == PROVEN_NONE

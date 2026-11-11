@@ -1,0 +1,8 @@
+# The hard caps of 11.4 (schema in 4.16, SD-94): reviewer items per run type (items beyond the cap are
+# needs_human (reason: reviewer_cap), 3.15), the agent rescue of 5.5 and the three dollar caps. The Explorer's action
+# and time budgets stay in policy/explorer_budget.yaml, whose dollar caps must equal usd here (L-XREF-22). A value
+# above 11.4's needs the system owner in approved_by. Owner: the system owner (CODEOWNERS, L-XREF-26).
+schema_version: 1
+reviewer_items: {pr: 60, merge: 200, rc: 500}
+rescue: {max_actions: 25, max_seconds: 90, max_rescued_steps_per_run: 25}
+usd: {per_explorer_session: 25, per_run: 50, per_week: 500}

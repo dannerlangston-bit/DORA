@@ -66,11 +66,14 @@ Choices (reported):
 10. Buying power (6.6 step 5) is a proof line when both Monitor reads carry it (`orderbook.MonitorBook`); like Net
     Liq (choice 2) a drift beyond the same 0.50 tolerance with no new order row to explain it is UNPROVEN
     `monitor_unreadable`.
-11. A UNPROVEN proof with reason `recovery_login_failed` or `cancel_all_failed` re-sends the 9.10 safety page (the
-    `aborted_safety` row when the run already is, else the UNPROVEN row) with the login owner added, and its detail
-    and evidence carry the account, the Working Orders screenshot and the instruction to cancel by hand (6.6 Cancel
-    All failure). ORDERS SENT with Cancel All failed already pages the login owner; its evidence carries the same
-    three, and its detail stays the VERDICT line, which the one incident page and the report print (choice 7). The
+11. A UNPROVEN proof with reason `recovery_login_failed` or `cancel_all_failed`, or any other UNPROVEN reason with
+    `Cancel All` failed (clicked for a new Working row and not located, or not verified within 60 s, such as an
+    unclean fresh read giving `monitor_unreadable`), re-sends the 9.10 safety page (the `aborted_safety` row when the
+    run already is, else the UNPROVEN row) with the login owner added, and its detail and evidence carry the account,
+    the Working Orders screenshot and the instruction to cancel by hand (6.6 Cancel All failure, which names the
+    failure itself, not a reason, as the trigger). ORDERS SENT with Cancel All failed already pages the login owner;
+    its evidence carries the same three, and its detail stays the VERDICT line, which the one incident page and the
+    report print (choice 7). The
     account is named as the 6.6 proof block prints it (`D-xxxxxxxx`, its allowlist entry and the rig), so a page never
     echoes an account id (6.10).
 12. Every result that blocks the login names the 8.3 `logins.blocked_reason` in `evidence["blocked_reason"]`:
@@ -472,7 +475,7 @@ def proof_result(proof: Proof, *, run_so_far: RunVerdict | None = None, unproven
     if proof.sends:
         ev["sends"] = send_lines(proof.counts)
     keep = run_so_far is not None and run_so_far.status == "aborted_safety"
-    hand_over = proof.reason in HAND_OVER_REASONS or (proof.verdict == ORDERS_SENT and proof.cancel_all == "failed")
+    hand_over = proof.reason in HAND_OVER_REASONS or proof.cancel_all == "failed"     # whatever the reason (choice 11)
     detail = proof.line
     if not proof.proven:
         ev["blocked_reason"] = _blocked_reason(proof, run_so_far)

@@ -298,6 +298,7 @@ finding_kinds:
 - harness_error
 - memory_warning
 - hardening
+- fixture_finding
 triage_states:
 - open
 - confirmed_bug
@@ -348,6 +349,7 @@ quarantine_reasons:
 - kill_switch
 - gateway_drops
 - fallback_rate
+- unknown_popup
 money_roles:
 - qty
 - price

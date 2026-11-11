@@ -1,0 +1,13 @@
+# thinkorswim.vmoptions for a VM rig, written by the Rig Manager at snapshot build from this template (7.3 step 4).
+# The placeholders (heap_min, heap_max, crash_dir) are pinned per rig cell: the heap (7.1 Memory row) and the crash
+# folder the Watchdog collects (10.2).
+# B3 and H10 compare the sha256 of the rendered file (L-XREF-28). Phase 0 check 3 (7.14) confirms every flag against
+# the bundled JDK major and whether the updater or the login-screen Setup dialog rewrites this file.
+-Xms${heap_min}
+-Xmx${heap_max}
+-Dsun.java2d.d3d=false
+-Dsun.java2d.noddraw=true
+-XX:ErrorFile=${crash_dir}\hs_err_pid%p.log
+-XX:+HeapDumpOnOutOfMemoryError
+-XX:HeapDumpPath=${crash_dir}
+-XX:+CreateCoredumpOnCrash

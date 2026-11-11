@@ -55,8 +55,8 @@ the morning banner. Its safety pass (`safety_pass`, 6.5, 6.8, 10.3) then runs th
 secret-scan canaries, the denied-action test and the fire drill (`orchestrator.drill.run_drill` with `SimDrillPort`)
 on the shard's rig; their `canary_results` rows are written, every result goes through `Orchestrator.apply` (a drill
 that placed an order stops the shard through the kill switch, `aborted_safety (drill_order_placed)`), a blind one's
-result is persisted (`apply_safety_actions`), its banner and detector state join the run's (summary `safety`, which later PR runs in the
-store read), and the day's egress rows are reconciled against the allowlist (`egress.reconcile`).
+result is persisted (`apply_safety_actions`), its banner and detector state join the run's (summary `safety`, which
+later PR runs in the store read), and the day's egress rows are reconciled against the allowlist (`egress.reconcile`).
 
 The Orchestrator (5.2): every shard goes through `orchestrator.Orchestrator` on a simulated rig
 (`pipeline.orchestration`): provisioned, launched, authenticated, the paper-mode assertion against
@@ -67,12 +67,13 @@ of the shard, the rate caps, the spend ceiling, the model re-check, the paper-mo
 proactive relaunch), writes a heartbeat at every step and calls `step_boundary` before every flow step and
 every sweep or split step after its ladder's first (the trip-wires, the flow's budget, the assertion before an
 order-stage step or on the two-minute timer), sends each input-bearing flow step through the gateway
-(`Rig.send_input`, the drop ledger of 5.4.8), runs the Watchdog's hang detector (an app failure relaunches through `Orchestrator.relaunch("app_failure")`, every gate again, and
-writes a `relaunch` step event), and captures the checkpoints of every shard in `running` in plan order, each
-stamped with the session's paper-asserted stamp (`paper_stamp`; none means `aborted_safety (paper_mode_mismatch)`
-through the kill switch, and a stamp `may_release` refuses keeps the frame from the Reviewer); then each shard's
-teardown and post-run proof. The session safety state goes to the rig (`safety_listener`), and every record is
-written under its session's L-OUT-06 context (`Store.set_session_context`). A control result that stops
+(`Rig.send_input`, the drop ledger of 5.4.8), runs the Watchdog's hang detector (an app failure relaunches
+through `Orchestrator.relaunch("app_failure")`, every gate again, and writes a `relaunch` step event), and captures
+the checkpoints of every shard in `running` in plan order, each stamped with the session's paper-asserted stamp
+(`paper_stamp`; none means `aborted_safety (paper_mode_mismatch)` through the kill switch, and a stamp
+`may_release` refuses keeps the frame from the Reviewer); then each shard's teardown and post-run proof. The
+session safety state goes to the rig (`safety_listener`), and every record is written under its session's L-OUT-06
+context (`Store.set_session_context`). A control result that stops
 a shard gives its unreached checkpoints the Orchestrator's exact outcome (1.10); the run outcome is the
 worst of the shards' (8.2). The A/A calibration runs once a shard reaches `running`, so a run whose
 shards all stop at a gate captures nothing. Every gateway decision of a shard (the Executor's flow input, the

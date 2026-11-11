@@ -17,8 +17,9 @@ Egress (6.10): the client always sends through an HTTP client whose every reques
 an `egress.EgressGate`: the run's gate checks it against the signed allowlist before connecting and logs it to
 `egress_log` (`sent` with the HTTP status and request id, `failed` without a response, `refused` with the reason
 and a `harness_error` finding). Without a gate the client gets `egress.refuse_all()`, which refuses every request
-(egress choice 6), so no request ever leaves unchecked and unlogged. Redirects are not followed, so no request reaches a host the gate did not see. A refusal is neither
-wrapped nor retried by the SDK and becomes `TransportError("client", "egress refused: ...")`. The purpose of each
+(egress choice 6), so no request ever leaves unchecked and unlogged. Redirects are not followed, so no request
+reaches a host the gate did not see. A refusal is neither wrapped nor retried by the SDK and becomes
+`TransportError("client", "egress refused: ...")`. The purpose of each
 call is `review` (messages), `batch_review` (batches) or `model_check` (models), unless the caller's
 `gate.context(purpose=...)` says otherwise (preflight N2, for example); the model id goes on the row too.
 

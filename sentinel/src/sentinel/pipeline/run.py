@@ -1785,16 +1785,23 @@ def _ledger_size(out: Path) -> int:
 
 
 def _teardown_scan(store: Store, arts: ArtifactStore, out: Path, run_id: str, secrets: Mapping[str, str],
-                   ledger_at: int, files: Sequence[Path] = (), texts: Mapping[str, Any] | None = None) -> ControlResult:
+                   ledger_at: int, leak: ControlResult | None = None, files: Sequence[Path] = (),
+                   texts: Mapping[str, Any] | None = None) -> ControlResult | None:
     """The 6.9 teardown plaintext scan before a run reaches `reported` (`secret_scan.scan_run`): the run's rows (its
     summary among them, so it is written first), its artifact set, its journal, `files`, the results.jsonl lines it
     appended (from `ledger_at`, secret_scan choice 1) and `texts`, what it will publish but has not written yet,
-    each JSON-encoded. A hit quarantines the set to `artifacts/quarantine/<run_id>` (8.4)."""
+    each JSON-encoded. Returns the run's secret result: `leak`, the first upload the mid-run check stopped, else the
+    scan's hit (or `secret_scan_unavailable`), else None. Either hit moves the set to `artifacts/quarantine/<run_id>`
+    (6.9, 8.4): a stopped upload never reached the set, so the scan alone would not."""
     reports: list[Path | FileTail] = [p for p in (out / "journal" / run_id, *files) if p.exists()]
     if (out / "results.jsonl").exists():
         reports.append(FileTail(out / "results.jsonl", ledger_at))
-    return scan_run(store, arts, reports, secrets, run_id=run_id, quarantine_root=out / "artifacts" / "quarantine",
+    quarantine = out / "artifacts" / "quarantine"
+    scan = scan_run(store, arts, reports, secrets, run_id=run_id, quarantine_root=quarantine,
                     texts={k: json.dumps(v, sort_keys=True, default=str).encode() for k, v in (texts or {}).items()})
+    if leak is not None and scan.passed:
+        arts.quarantine(run_id, quarantine, store=store)
+    return leak or (None if scan.passed else scan)
 
 
 class _EvalIndex(abc.Mapping):
@@ -2009,7 +2016,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         # -- T+0:00 to 0:02: the run row, its scope and shards (1.7)
         secrets = run_secrets(RIGS)                       # 6.9: the plaintexts the run's logins used, by reference
         scanner = SecretScanner(secrets)
-        arts = ArtifactStore.at(out / "artifacts", f"runs/{scenario.run_id}", scanner=scanner)    # 8.4: its own dir
+        arts = ArtifactStore.at(out / "artifacts", f"runs/{scenario.run_id}", scanner=scanner)   # 8.4: its own dir
         leak: ControlResult | None = None                 # the first results batch the upload check stopped
         writer = _Writer(run, arts, today, scenario.clock)
         used = sorted({rig_of[cp.checkpoint_id] for cp in planned})
@@ -2144,10 +2151,10 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         store.update_summary(scenario.run_id, summary)      # 6.9: a row of this run, and a ledger line, for the scan
         ctx = _report_context(scenario, cfg.root)
         # 6.9 teardown: the plaintext scan of everything the run wrote or will publish, before anything is reported
-        scan = _teardown_scan(store, arts, out, scenario.run_id, secrets, ledger_at, [out / "reviewer-calls.json"],
-                              {"report inputs": [dataclasses.asdict(ctx), as_dict(mdoc) if mdoc else None],
-                               "alerts.json and orchestrator.json": work.entries()})
-        secret = leak or (scan if not scan.passed else None)
+        secret = _teardown_scan(store, arts, out, scenario.run_id, secrets, ledger_at, leak,
+                                [out / "reviewer-calls.json"],
+                                {"report inputs": [dataclasses.asdict(ctx), as_dict(mdoc) if mdoc else None],
+                                 "alerts.json and orchestrator.json": work.entries()})
         if secret is not None:
             v = worse(RunVerdict(status, reason), secret.run)
             status, reason, last_gate = v.status, v.reason, secret.gate or "teardown"
@@ -2177,8 +2184,8 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         else:
             result = _report(store, plan, scenario, runrec, mdoc, out, ctx)
             late = _teardown_scan(store, arts, out, scenario.run_id, secrets, ledger_at,
-                                  [out / n for n in ("report.html", "pr-comment.md", "commit-status.json")])
-            if not late.passed:        # 6.9: text only the rendered report holds (rows of other runs); not published
+                                  files=[out / n for n in ("report.html", "pr-comment.md", "commit-status.json")])
+            if late is not None:       # 6.9: text only the rendered report holds (rows of other runs); not published
                 work.alerts += [a for a in [alert_entry(scenario.run_id, None, late)] if a is not None]
                 store.update_summary(scenario.run_id, {"secret_scan": {"result": late.run_reason, "detail": late.detail,
                                                                        "report_withheld": True}})

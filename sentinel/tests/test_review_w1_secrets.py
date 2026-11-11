@@ -311,6 +311,7 @@ def test_secrets_8_the_flagged_batch_and_every_later_one_are_not_uploaded(tmp_pa
         cps = {o.checkpoint_id for o in withheld}
         assert not [f for f in store.findings(sc.run_id) if f.checkpoint_id in cps]
         assert not store.query("SELECT 1 FROM shards WHERE run_id = ? AND state = 'imported'", (sc.run_id,))
+    assert (tmp_path / "artifacts" / "quarantine" / sc.run_id).is_dir()   # 6.9: the run's objects are quarantined
 
 
 # == secrets:6: the teardown scan covers the summary, the report's inputs and results.jsonl =========================

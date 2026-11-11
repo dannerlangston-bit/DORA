@@ -183,7 +183,8 @@ class EgressGate:
 
     @contextlib.contextmanager
     def context(self, **fields: Any) -> Iterator[None]:
-        """Row fields for the requests made inside the block; an inner value wins over an outer one."""
+        """Row fields for the requests made inside the block, in this thread or task (a context variable); an inner
+        value wins over an outer one."""
         bad = set(fields) - set(ROW_FIELDS)
         if bad:
             raise ValueError(f"unknown egress row fields {sorted(bad)}")

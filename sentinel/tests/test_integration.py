@@ -166,7 +166,9 @@ def test_clean_runs_pass_every_gate_page_nobody_and_prove_no_orders_sent(runs):
                                                           "workspace", "fixture", "canary_flow"] for s in run["shards"])
     assert all(any(g["control"] == "build_reread" for g in s["gates"]) for s in run["shards"])
     assert (out / "heartbeat" / "shard-1.json").exists()
-    assert "paper mode asserted 4 times" in (out / "pr-comment.md").read_text()
+    # once at each shard's gate and again before every unit of work (6.4 Schedule, flow_boundary)
+    asserted = sum(1 for s in run["shards"] for g in s["gates"] if g["control"] == "paper_mode" and g["passed"])
+    assert asserted > 4 and f"paper mode asserted {asserted} times" in (out / "pr-comment.md").read_text()
 
 
 # -- the five scenarios -------------------------------------------------------------------------------------
@@ -299,8 +301,16 @@ def test_app_crash_fails_app_alive_skips_the_ladder_and_resumes_after_a_relaunch
     assert crash.checkpoint_id == FREEZE_AT and crash.tier == 1
     shard = next(s for s in orchestrator(out)[0]["shards"] if FREEZE_AT in json.dumps(s) or s["rig"] == "rig-04")
     controls = [g["control"] for g in shard["gates"]]
-    assert controls.count("launch") == 2 and controls.count("login") == 2 and controls.count("paper_mode") == 2
+    # Orchestrator.relaunch("app_failure"): every gate again (launch, login, paper mode, attestation, ...); paper mode
+    # is also asserted before every unit of work (6.4)
+    assert controls.count("launch") == 2 and controls.count("login") == 2 and controls.count("attestation") == 2
+    assert controls.count("relaunch") == 1 and controls.count("canary_flow") == 2
     assert "watchdog" in controls and shard["verdict"] == "complete"
+    with Store(out / "sentinel.db") as store:                      # the relaunch is a run-health step event (10.2)
+        (ev,) = store.query("SELECT reason, app_restart_count, source, mode FROM step_events WHERE run_id = ? AND "
+                            "action = 'relaunch'", (r.run_id,))
+    assert ev["reason"].startswith("cause app_failure; budget app_relaunch") and ev["app_restart_count"] == 1
+    assert (ev["source"], ev["mode"]) == ("orchestrator", "system")
     resumed = [o for o in outs if o.test_kind == "census" and o.checkpoint_id.startswith("census/trade.")]
     assert resumed and {o.outcome for o in resumed} == {"identical"}     # the units after the ladder ran
     assert r.status == "complete" and r.commit_status["state"] == "failure"

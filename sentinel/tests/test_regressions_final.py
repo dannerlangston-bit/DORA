@@ -248,11 +248,12 @@ def test_the_pipeline_writes_one_proof_per_shard_and_the_report_reads_them_back(
     (sent,) = [p for p in rows if p.verdict == "orders_sent"]
     assert sent.counts["undeclared"] == ["sim-order-1"] and sent.cancel_all == "performed_verified"
     assert {p.verdict for p in rows if p is not sent} == {"proven_no_sends"}
-    assert all(p.login_alias in aliases and p.send_policy_ref == "OPEN" and p.paper_mode_assertions == 1
+    # paper mode is asserted at the gate and again before every unit of work (6.4 Schedule, flow_boundary)
+    assert all(p.login_alias in aliases and p.send_policy_ref == "OPEN" and p.paper_mode_assertions > 1
                and p.start_snapshot_sha256 and p.end_snapshot_sha256 for p in rows)
     line = proof_line(sent.verdict, sent.reason, sent.counts["undeclared"], sent.cancel_all)
     assert line == r.proof == "ORDERS SENT: undeclared rows (sim-order-1); Cancel All verified"
-    assert f"Post-run proof: {line}" in r.comment and f"Cancel All verified, proof {line}" in r.comment
+    assert f"Post-run proof: {line}" in r.comment and f"Cancel All verified, proof {line}; shard " in r.comment
     assert re.search(r"an order reached the account: login rig-0\d paper login blocked and rig disabled", r.comment)
     assert "vault" not in r.comment + (tmp_path / "report.html").read_text()
 

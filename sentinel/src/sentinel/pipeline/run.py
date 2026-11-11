@@ -47,10 +47,18 @@ the morning banner.
 The Orchestrator (5.2): every shard goes through `orchestrator.Orchestrator` on a simulated rig
 (`pipeline.orchestration`): provisioned, launched, authenticated, the paper-mode assertion against
 the example allowlist, settings attestation, workspace, fixture verification and the canary flow, then
-`running`, where the Executor (`_ShardWork`) re-reads the build id before each flow, writes a heartbeat
-at every step, sends each input-bearing flow step through the gateway (`Rig.send_input`, the drop
-ledger of 5.4.8), runs the Watchdog's hang detector, and captures the checkpoints of every shard in
-`running` in plan order; then each shard's teardown and post-run proof. A control result that stops
+`running`, where the Executor (`_ShardWork`) re-reads the build id before each unit of work, then calls
+`Orchestrator.flow_boundary` (the kill channels and trip-wires, the Watchdog, free space, the 11.2 wall budget
+of the shard, the rate caps, the spend ceiling, the model re-check, the paper-mode assertion of 6.4 and the
+proactive relaunch), writes a heartbeat at every step and calls `step_boundary` before every flow step (the
+trip-wires, the flow's budget, the assertion before an order-stage step or on the two-minute timer), sends each
+input-bearing flow step through the gateway (`Rig.send_input`, the drop ledger of 5.4.8), runs the Watchdog's
+hang detector (an app failure relaunches through `Orchestrator.relaunch("app_failure")`, every gate again, and
+writes a `relaunch` step event), and captures the checkpoints of every shard in `running` in plan order, each
+stamped with the session's paper-asserted stamp (`paper_stamp`; none means `aborted_safety (paper_mode_mismatch)`
+through the kill switch, and a stamp `may_release` refuses keeps the frame from the Reviewer); then each shard's
+teardown and post-run proof. The session safety state goes to the rig (`safety_listener`), and every record is
+written under its session's L-OUT-06 context (`Store.set_session_context`). A control result that stops
 a shard gives its unreached checkpoints the Orchestrator's exact outcome (1.10); the run outcome is the
 worst of the shards' (8.2). The A/A calibration runs once a shard reaches `running`, so a run whose
 shards all stop at a gate captures nothing. Every gateway drop or refusal is a `step_events` row in the store with
@@ -75,14 +83,15 @@ Choices (reported):
 from __future__ import annotations
 
 import dataclasses
-from collections import abc
 import hashlib
+import itertools
 import json
 import math
+from collections import abc
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
 import cv2
 import numpy as np
@@ -101,7 +110,7 @@ from ..diff.settle import Recapture, RerunBudget, SettleResult, diff_stability, 
 from ..lint.repo import Repo
 from ..lint.rules import EXPIRY_KINDS, ExpiredRecord, Violation, check_pair
 from ..lint.runstart import expiring_soon, lint_at_run_start, lint_manifest
-from ..records import PERSONAS, CheckpointOutcome, Decision, Finding, RunOutcome, Signature, StepOutcome
+from ..records import PERSONAS, CheckpointOutcome, Decision, Finding, RunOutcome, Signature, StepEvent, StepOutcome
 from ..report import ReportContext, ReportInputs, render_report_markdown, write_run_report
 from ..report.cluster import Member, cluster_members
 from ..report.model import proof_severity, worst_proof
@@ -113,12 +122,15 @@ from ..store.store import PostRunProof, RunPlan, ScopeEntry, ShardPlan
 from ..taxonomy import checkpoint_parts, load
 from ..oracle.assertions import AssertionResult, step_assertions
 from ..oracle.tables import OracleConfigError
-from ..orchestrator.budgets import SESSION_RELEASE_WAIT_S
+from ..orchestrator.boundary import BoundaryObservations
+from ..orchestrator.budgets import RateCounters, WallBudget
 from ..orchestrator.clock import ManualClock
-from ..orchestrator.gates import check_authenticated, check_build_unchanged, check_launched
+from ..orchestrator.degraded import ModelAvailability, SpendTracker
+from ..orchestrator.gates import check_build_unchanged
 from ..orchestrator.gateway import VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB, Action, DropLedger, drain, refusal
-from ..orchestrator.identity import judge_identity
-from ..orchestrator.killswitch import config_invalid_proof, proof_line
+from ..orchestrator.identity import account_id_sha256
+from ..orchestrator.killswitch import TripWires, config_invalid_proof, kill_switch, proof_line
+from ..orchestrator.ports import SessionSafety
 from ..orchestrator.machine import Orchestrator, RunContext, RunReport
 from ..orchestrator.results import ControlResult, Outcome, RunVerdict, worse
 from ..orchestrator.rig import CrashSignal
@@ -192,6 +204,10 @@ class Evaluated:
     settle_ms: int | None = None
     oracle: OracleCheck | None = None              # the candidate's assertion results (flow checkpoints)
     oracle_base: OracleCheck | None = None         # the same assertions on the base build
+    paper: dict[str, str] | None = None            # the 6.4 paper-asserted stamp taken at capture time
+    released: bool = True                          # the stamp was current at capture (Orchestrator.may_release)
+    shard_id: str | None = None                    # the shard that captured it, and its session's index there
+    session: int = -1
 
     @property
     def category(self) -> str:
@@ -798,7 +814,7 @@ class _Writer:
             test_kind=cp.test_kind, tier=cp.tier, flow_id=cp.flow_id, step_id=cp.step_id,
             size_step=dict(cp.size_step) if cp.size_step else None, diff=diff, artifacts=arts,
             recaptures=ev.recaptures, synthetic=synthetic, flow_class=_flow_class(self.run.cfg, cp),
-            fingerprint_id=self.run.fp_id, data_epoch_id=self.run.epoch,
+            fingerprint_id=self.run.fp_id, data_epoch_id=self.run.epoch, paper_assertion=ev.paper,
             captured_at=_ts(self.today, self.clock, 600), recorded_at=_ts(self.today, self.clock, 900), **rec_kw)
         findings: list[Finding] = []
         if synthetic:
@@ -974,6 +990,23 @@ class _Shard:
     ctx: RunContext
     order_stage: bool = False
     noted: set[int] = field(default_factory=set)
+    seen: int = 0                                          # Orchestrator results already noted
+    sessions: list[list[str]] = field(default_factory=list)   # each session's paper-mode assertion times (6.4)
+    session_open: bool = False
+    events: list[StepEvent] = field(default_factory=list)  # the shard's step events for `Store.write_events`
+    seq: Iterator[int] = field(default_factory=lambda: itertools.count(1))   # the shard's step_events seq (8.3)
+
+    def assertion(self, stamp: dict[str, str] | None) -> None:
+        """The Orchestrator pushed a new session safety state (its `safety_listener`): a stamp is a passing paper-mode
+        assertion of the current session, none the session's end (6.4, L-OUT-06)."""
+        if stamp is None:
+            self.session_open = False
+            return
+        if not self.session_open:
+            self.sessions.append([])
+            self.session_open = True
+        if stamp["asserted_at"] not in self.sessions[-1]:
+            self.sessions[-1].append(stamp["asserted_at"])
 
 
 class _ShardWork:
@@ -1021,9 +1054,18 @@ class _ShardWork:
         rig = SimulatedRig(sim, clock=clock)
         sink = ShardSink([cp.checkpoint_id for cp in cps])
         hb = HeartbeatWriter(self.out / "heartbeat" / f"shard-{shard_no}.json", clock)
-        orch = Orchestrator(rig, ctx, sink, clock=clock, ledger=self.ledger, heartbeat=hb,
-                            watchdog_status=lambda: (1.0, True))
+        holder: list[_Shard] = []
+
+        def listener(s: SessionSafety) -> None:
+            """The slow half reads the session safety state (6.2, SD-57); each change is also a session boundary or
+            a passing paper-mode assertion for the store's L-OUT-06 context."""
+            rig.set_session_safety(s)
+            if holder:
+                holder[0].assertion(holder[0].orch.paper_stamp())
+
+        orch = self.orchestrator(rig, ctx, sink, clock, hb, sim, listener)
         st = _Shard(shard_id, rig_id, list(cps), orch, rig, sink, clock, ctx)
+        holder.append(st)
         entered: list[bool] = []
 
         def work(o: Orchestrator) -> None:
@@ -1050,12 +1092,45 @@ class _ShardWork:
                       for r in report.results],
             "unreached_filled": sorted(sink.filled)})
 
+    def orchestrator(self, rig: SimulatedRig, ctx: RunContext, sink: Any, clock: ManualClock,
+                     hb: HeartbeatWriter | None, sim: SimScenario,
+                     listener: Callable[[SessionSafety], None]) -> Orchestrator:
+        """One shard's Orchestrator (5.2) with the run's budgets: the 11.2 wall budget from the shard's start, the
+        spend ceiling, the model availability of preflight N2 and N5 (10.7), the login's 6.4 rate counters (no
+        store helper seeds them yet: a fresh login) and the session safety listener (`rig.set_session_safety`)."""
+        fails = sim.preflight_failures
+        return Orchestrator(rig, ctx, sink, clock=clock, ledger=self.ledger, heartbeat=hb,
+                            wall=WallBudget.for_run(ctx.run_type, clock.monotonic()), spend=SpendTracker(),
+                            model=ModelAvailability.from_preflight("N2" not in fails, "N5" not in fails),
+                            counters=RateCounters(), safety_listener=listener)
+
+    def _note_new(self, st: _Shard, checkpoint: PlannedCheckpoint | None = None, flow_id: str | None = None) -> None:
+        """Note every result the shard's Orchestrator recorded since the last call (a boundary, a relaunch)."""
+        results = st.orch.results
+        for r in results[st.seen:]:
+            self._note(st, r, checkpoint, flow_id)
+        st.seen = len(results)
+
+    def _event(self, st: _Shard, action: str, **fields: Any) -> StepEvent:
+        """One `step_events` row of the shard (8.3), numbered from the shard's seq (`write_events`)."""
+        e = StepEvent(run_id=self.scenario.run_id, shard_id=st.shard_id, side="candidate", seq=next(st.seq),
+                      source="orchestrator", wall_at=st.clock.now().isoformat(),
+                      mono_ms=int(st.clock.monotonic() * 1000), mode="system", action=action, **fields)
+        st.events.append(e)
+        return e
+
     def _note(self, st: _Shard, r: ControlResult, checkpoint: PlannedCheckpoint | None = None,
               flow_id: str | None = None) -> None:
-        """Record a control result once: its 9.10 route, the actions to persist and its findings."""
+        """Record a control result once: its 9.10 route, the actions to persist, its findings and, for a relaunch,
+        its run-health step event (10.2)."""
         if id(r) in st.noted:
             return
         st.noted.add(id(r))
+        if r.control == "relaunch":
+            ev = r.evidence or {}
+            self._event(st, "relaunch", reason=f"cause {ev.get('cause')}; budget {ev.get('budget') or 'none'}; "
+                                               f"flows since launch {ev.get('flows_since_launch')}",
+                        app_restart_count=sum(1 for e in st.events if e.action == "relaunch") + 1)
         sc = self.scenario
         a = alert_entry(sc.run_id, st.shard_id, r)
         if a is not None:
@@ -1122,6 +1197,12 @@ class _ShardWork:
             self._note(st, r)
             if not r.passed:
                 continue
+            flow_id = unit[0].flow_id if unit[0].test_kind == "flow" else None
+            orch.flow_boundary(BoundaryObservations(order_dialog_visible=st.rig.dialog_open), flow_id=flow_id,
+                               p50_s=None)          # 5.2, 6.4, 6.6, 10.2, 11.2; no measured p50 yet: 5 minutes
+            self._note_new(st, flow_id=flow_id)
+            if orch.stop is not None:
+                continue
             if unit[0].test_kind == "flow":
                 self._flow(st, unit)
             else:
@@ -1150,12 +1231,26 @@ class _ShardWork:
         doc = self.cfg.flow_docs.get(flow_id, {})
         want = {cp.step_id: cp for cp in unit}
         cps = list(unit)
-        for step in doc.get("steps") or ():
+        steps = list(doc.get("steps") or ())
+        for i, step in enumerate(steps):
             if st.orch.stop is not None:
                 return
             sid = str(step.get("id"))
             cp = want.get(sid) if step.get("type") == "checkpoint" else None
             self._heartbeat(st, flow_id, sid, cp)
+            # 5.2 step boundary: the trip-wires, the flow's own budget and the paper-mode assertion when due (6.4)
+            r = st.orch.step_boundary(BoundaryObservations(order_dialog_visible=st.rig.dialog_open,
+                                                           tripwires=TripWires(dialog_owned=st.order_stage)),
+                                      order_stage_step=step.get("order_stage") is True)
+            self._note_new(st, checkpoint=cp, flow_id=flow_id)
+            if st.orch.stop is not None:
+                return
+            if r is not None and r.has("end_flow"):        # 11.2: past its budget; the rest not_run (budget)
+                rest = [want[str(s.get("id"))] for s in steps[i:] if str(s.get("id")) in want]
+                self._subsets(st, r, None, rest)
+                break
+            if step.get("type") == "type_fixture" and str(step.get("value_ref") or "").startswith("fixture.symbols."):
+                st.orch.counters.symbol_change(st.clock.now())     # 6.4 rate caps: a symbol-box change
             if cp is not None:
                 if cp in self._todo(st) and not self._capture(st, cp, cps[cps.index(cp) + 1:]):
                     return
@@ -1226,6 +1321,12 @@ class _ShardWork:
         cid = cp.checkpoint_id
         if self.script.freeze_at == cid and cid not in self.frozen:
             return self._freeze(st, cp, rest)
+        stamp = st.orch.paper_stamp()                    # 6.4: taken at capture time, for every record
+        if stamp is None:                                # L-OUT-06: no assertion in this session; nothing captured
+            self._note(st, st.orch.apply(kill_switch("paper_mode_mismatch", gate="running",
+                                                     running_flow=cp.flow_id)), checkpoint=cp, flow_id=cp.flow_id)
+            st.seen = len(st.orch.results)
+            return False
         live = cp.data_mode == "masked_live"
         base_cap = self.run.capture(cp, "base", tick=1 if live else 0)
         cand_cap = self.run.capture(cp, "candidate", tick=2 if live else 0)
@@ -1235,6 +1336,8 @@ class _ShardWork:
                       primitive=att.primitive if att else None, entry_ref=att.entry_id if att else None,
                       recapture=lambda: self.run.capture(cp, "candidate", tick=next(ticks)),
                       recapturable=_recapturable(self.cfg, cp), store=self.store, oracle=self.oracle)
+        ev.paper, ev.released = stamp, st.orch.may_release(stamp)
+        ev.shard_id, ev.session = st.shard_id, len(st.sessions) - 1
         self.evals.append(ev)
         st.sink.done.add(cid)
         return True
@@ -1252,28 +1355,16 @@ class _ShardWork:
         r = st.orch.apply(app_failure(CrashSignal("hang", "screenshot_staleness"), st.orch.budgets, phase="running"))
         self._note(st, r, checkpoint=cp, flow_id=cp.flow_id)
         self._subsets(st, r, cp, rest)
+        st.seen = len(st.orch.results)
         if st.orch.stop is not None:
             return False
-        if r.has("kill_tree"):
+        st.order_stage = False
+        if r.has("relaunch"):        # 7.7, 10.2: kill, reset input, session release wait, every gate again
+            st.orch.relaunch("app_failure")
+            self._note_new(st)
+        elif r.has("kill_tree"):
             st.rig.kill_process_tree()
-            st.order_stage = False
-        if r.has("wait_session_release"):
-            st.clock.sleep(SESSION_RELEASE_WAIT_S)
-        if r.has("relaunch"):
-            self._relaunch(st)
         return False
-
-    def _relaunch(self, st: _Shard) -> None:
-        """Re-enter at `launched` after an app failure (10.2): launch, log in, assert paper mode again."""
-        orch, ctx, rig = st.orch, st.ctx, st.rig
-        for check in (lambda: check_launched(rig.launch(), expected_build=ctx.expected_build, first_launch=False,
-                                             budgets=orch.budgets),
-                      lambda: check_authenticated(rig.login()),
-                      lambda: judge_identity([rig.read_account_selector()], ctx.allowlist)):
-            r = orch.apply(check())
-            self._note(st, r)
-            if not r.passed or orch.stop is not None:
-                return
 
     # -- after every shard ----------------------------------------------------------------------------
     def bare_outcome(self, cp: PlannedCheckpoint, o: Outcome) -> CheckpointOutcome:
@@ -1353,6 +1444,22 @@ class _ShardWork:
                 "paper_mode_asserted": sum(1 for r in results if r.control == "paper_mode" and r.passed),
                 "gateway_drops": self.store.gateway_drops(self.scenario.run_id), "cancel_all": cancel,
                 "proof": proof, "login": logins[0] if len(logins) == 1 else logins}
+
+    def write_events(self) -> None:
+        """Every shard's step events (relaunches, gateway decisions) through `Store.write_events`, before any other
+        step row of the shard: those take MAX(seq) + 1, so the two writers never collide (8.3)."""
+        for st, _ in self.reports:
+            if st.events:
+                self.store.write_events(st.events)
+
+    def session_context(self, ev: Evaluated) -> None:
+        """`Store.set_session_context` for the session that captured `ev` (6.4, L-OUT-06): the allowlisted accounts
+        and every paper-mode assertion of that session, so its stamped record is checked against them."""
+        st = next((s for s, _ in self.reports if s.shard_id == ev.shard_id), None)
+        if st is None or ev.paper is None or not 0 <= ev.session < len(st.sessions):
+            return
+        self.store.set_session_context(st.shard_id, {account_id_sha256(a) for a in st.ctx.allowlist.entries},
+                                       st.sessions[ev.session])
 
     def write(self, extra: Mapping[str, Any] | None = None) -> None:
         """`alerts.json` and `orchestrator.json` in the scenario output (appended to by every run there)."""
@@ -1591,6 +1698,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         # -- 5.2: every shard through the Orchestrator; 5.17 per checkpoint inside `running`
         work.run_shards([(shard_of[r], i, r, [cp for cp in planned if rig_of[cp.checkpoint_id] == r])
                          for i, r in enumerate(used, 1)])
+        work.write_events()                    # first: the shard's seq is then the store's MAX(seq) for later rows
         evals = work.evals
         shift = global_shift_prepass([ev.diff.signal for ev in evals if ev.diff is not None and ev.diff.signal is not None],
                                      params=run.params)
@@ -1610,6 +1718,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
             store.write_finding(f)
         for ev in evals:
             o, fs, stored = writer.records(ev)
+            work.session_context(ev)                     # L-OUT-06: the stamp is one of its session's assertions
             steps = []
             if ev.cp.test_kind == "flow":
                 steps = [StepOutcome(scenario.run_id, ev.cp.flow_id or "", ev.cp.step_id or "", "passed",
@@ -1703,6 +1812,13 @@ def _review_pass(run: _Run, evals: list[Evaluated], rev: ReviewerAdapter, cap: i
         elif all(ev.classified.outcome == "collateral" for ev in evs):
             task = "describe_collateral"
         else:
+            continue
+        held = [ev for ev in evs if not ev.released]     # 6.4: no frame without a current paper-asserted stamp
+        if task == "manifest_match":
+            for ev in held:
+                _with_review(ev, Review("unavailable", cause="paper_assertion_not_current"))
+        evs = [ev for ev in evs if ev.released]
+        if not evs:
             continue
         if len(calls) >= cap:
             if task == "manifest_match":
@@ -1982,9 +2098,10 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         ctx, sim = shard_setup(cfg, run_id=scenario.run_id, run_type="nightly", shard_id=f"{scenario.run_id}/1",
                                shard_no=1, build_id=scenario.build.build_id, workspace_id="ws.tier-a.swing-trader",
                                script=RigScript())
-        orch = Orchestrator(SimulatedRig(sim, clock=clock), ctx, ShardSink(()),
-                            clock=clock, heartbeat=HeartbeatWriter(out / "heartbeat" / f"{scenario.run_id}.json", clock),
-                            watchdog_status=lambda: (1.0, True))
+        nrig = SimulatedRig(sim, clock=clock)
+        orch = work.orchestrator(nrig, ctx, ShardSink(()), clock,
+                                 HeartbeatWriter(out / "heartbeat" / f"{scenario.run_id}.json", clock), sim,
+                                 nrig.set_session_safety)
         done: dict[str, Any] = {}
 
         def canary_pass(_: Orchestrator) -> None:

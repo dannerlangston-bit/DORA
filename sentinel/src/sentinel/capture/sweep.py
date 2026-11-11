@@ -216,6 +216,13 @@ class SizeLadder:
             raise SweepError(f"{checkpoint_id}: the ladder stopped at {self.failed.step_id}; later steps are "
                              f"{self.failed.rest_of_ladder.reason if self.failed.rest_of_ladder else 'not_run'}")
 
+    def needs_retry(self, checkpoint_id: str, first: Size) -> bool:
+        """True when the first measurement of the step did not reach the size: retry the set or drag once, then
+        `measure` with both measurements (2.5.1)."""
+        self._check_open(checkpoint_id)
+        _, requested = self._step(checkpoint_id)
+        return classify_size_step(requested, first, self.reference(requested)) == "not_reached"
+
     def measure(self, checkpoint_id: str, first: Size, retry: Size | None = None) -> SizeStepResult:
         """Classify the step `checkpoint_id` (`sweep/<surface>/<host>/<w>x<h>[-asc]`) from its measurement(s)."""
         self._check_open(checkpoint_id)

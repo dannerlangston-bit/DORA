@@ -93,11 +93,15 @@ def test_reference_is_the_most_recent_smaller_or_equal_request():
 def test_a_drag_that_did_not_take_after_the_minimum_is_found_fails_the_ladder():
     lad = SizeLadder(SURFACE, "flexgrid")
     lad.measure(cid("960x300"), (960, 330))
+    assert not lad.needs_retry(cid("800x300"), (800, 332))
+    assert lad.needs_retry(cid("800x300"), (800, 600))
     r = lad.measure(cid("800x300"), (800, 600), retry=(800, 600))
     assert r.status == "failed" and r.checkpoint.reason == "assertion:size_reached"
     assert lad.blocked() == r.rest_of_ladder and lad.blocked().reason == "step_failed:800x300"
     with pytest.raises(SweepError):
         lad.measure(cid("640x720"), (640, 720))
+    with pytest.raises(SweepError):
+        lad.needs_retry(cid("640x720"), (640, 720))
     assert lad.minimum() == MinSize(SURFACE, "flexgrid", 960, 330, False, True)
 
 

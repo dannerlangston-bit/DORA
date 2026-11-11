@@ -835,7 +835,7 @@ The side and order type come from the fixture's fresh-install order-defaults pro
 | L-FLW-08 | `class: paper_send_ok` requires `policy/send_policy.yaml` with `enabled: true` and a risk-owner signature; otherwise the flow is rejected (OPEN per brief 1.7) | error |
 | L-FLW-09 | `drag.steps >= 10`, `hold_ms <= 2000`; `wheel.notches != 0` | error |
 | L-FLW-10 | `budget.max_duration_s` is within the flow budget rule of 11.2 Cadence and time budgets per run type (3 x measured p50, 5 minutes until measured) | error |
-| L-FLW-11 | assertion `region` ids exist in the regions file of the nearest preceding checkpoint; `since_step` names an earlier checkpoint; `rule_id` is one of R01 to R10 (2.8.3) and its `inputs` match the rule's operand list; a rule whose operand regions are not all declared on the checkpoint fails here, never silently skips | error |
+| L-FLW-11 | assertion `region` ids exist in the regions file of the nearest preceding checkpoint; `since_step` names an earlier checkpoint; `rule_id` is one of R01 to R10 (2.8.3) and its `inputs` match the rule's rows in the operand table of 2.8.3 (every required operand present, each of its type); a rule whose operand regions are not all declared on the checkpoint fails here, never silently skips | error |
 | L-FLW-12 | preconditions include `paper_mode` and `no_modal`; flows whose `surfaces` include an order surface include `working_orders` with `expect: 0` and a `working_orders_check` teardown | error |
 | L-FLW-13 | no step targets a control with `deny: true` or clicks `auto-send-checkbox`; on steps run by the agent or the Explorer profile (agent-rescue goals, `explorer_candidate` flows) no target is on the Explorer deny list of 6.8 (`policy/explorer_deny_list.yaml`) | error |
 | L-FLW-14 | `origin.kind: explorer` flows carry `origin.run_id`, `origin.finding_ref` and `class: explorer_candidate` until a human promotes them; they live under `flows/quarantine/` | error |
@@ -943,7 +943,7 @@ redaction_file:
   schema_version: int = 1
   owner: str                            # the security contact (6.10)
   landmarks: list[{id: id, template: path, confidence_min: num = 0.92, search_rect: {x: int, y: int, w: int, h: int}?}]
-  regions: list[region]                 # every one type: redaction (L-RGN-03)
+  regions: list[region]                 # all of type redaction (L-RGN-03)
 ```
 
 **Threshold source.** A `diff` region carries no threshold of its own. The Calibration Service writes each region's floors and the four thresholds 3.9 derives to `calibration_floors` (8.3), keyed by calibration key, checkpoint and region, and exports them to `calibration/<hex>.yaml`, `<hex>` being the calibration key of the run's fingerprint without its `sha256:` prefix (4.12 Calibration key; one helper computes the name); the Diff Engine reads the region's thresholds from there (3.9 A/A calibration and threshold derivation), so a recalibration never touches a regions file. The record per region is the four derived thresholds of 3.9 (`component_area_min`, `changed_px_min`, `delta_e_min`, `shift_px_min`) plus the measured floors; SSIM is stored for ranking only and has no threshold. Three cases: the calibration exists and has the region, `threshold_source: calibrated`; it exists but lacks the region (a region added since the last Calibration run), the region is diffed at threshold 0, any changed pixel is `needs_human (reason: uncalibrated)`, the record carries `threshold_source: uncalibrated`, and a Calibration run is queued; no calibration exists for the calibration key at all, every region of every checkpoint on it is that same `uncalibrated` case and a Calibration run is queued (3.9 step 6, 4.12 L-FPR-04). The 7.13 rows say which changes invalidate the floors of one checkpoint or one region rather than the whole key. A missing calibration is never `not_comparable`, whose only reasons are `fingerprint_mismatch`, `window_mismatch` and `surface_mismatch`. A non-zero floor on a `frozen` checkpoint is a bug to fix (brief 1.4), so the lint warns on it (L-RGN-06). A `floor_exception` is the only way to loosen a region (3.7 `edge_tolerance_px`), is human-approved with an owner, a ticket, the measured floor and an expiry at most 30 days after approval, and is refused on `money_cell` regions.
@@ -1476,7 +1476,7 @@ finding:
   region_id: id?
   primitive: ref:primitive.id?
   manifest_entry_ref: ref:entry.entry_id?
-  phash: str?                           # 16 hex, the anchored crop
+  phash: str?                           # 16 hex, of the owning region's anchored bounds (9.7)
   category: enum[intended|collateral|noise|needs_human|invariant_violation|assertion_failed]?
   pre_existing: bool = false            # an invariant violation present on both builds, one severity lower (2.7)
   cluster_id: id?                       # the signature cluster of 9.7
@@ -1490,7 +1490,7 @@ finding:
   ticket: str?
   first_seen_run_id: id
   created_at: ts
-  closed_at: ts?                        # when triage_state became closed; starts the 180-day release of its evidence (8.6)
+  closed_at: ts?                        # when triage_state left the states that pin evidence (to closed, noise, agent_mistake or expected_behavior); its evidence is released 180 days later (8.6)
 ```
 
 **Reason vocabulary.** `taxonomy.yaml` lists these codes under `reasons.<outcome>`; a record whose reason code is not in the list for its outcome is refused at write (L-OUT-01). Codes with a parameter take it after a colon.
@@ -1629,7 +1629,7 @@ Under the precedence rule of 1.10 the outcome is `invariant_violation`, not `col
 | L-OUT-02 | the required-fields table above holds for the record's outcome | write refused, Watchdog event, `harness_error (reason: store_write_failed)` on the checkpoint if the Orchestrator cannot repair the record |
 | L-OUT-03 | `classification.by = reviewer` never appears with `invariant_violation` or `assertion_failed`; a `decision_ref` never changes those two outcomes | write refused |
 | L-OUT-04 | `synthetic = true` records are excluded from every metric query and from baseline promotion (query-level test in CI) | error |
-| L-OUT-05 | exactly one `checkpoint_outcome` per `(run_id, checkpoint_id)` (the id already embeds the size step); one `run_outcome` per run; `checkpoint_id` matches the grammar of 4.1 and its kind segment equals `test_kind` | write refused |
+| L-OUT-05 | exactly one `checkpoint_outcome` per `(run_id, checkpoint_id)` (the id already embeds the size step); synthetic mutant outcomes are not checkpoint outcomes of the run and are kept apart, one per `(run_id, mutant_id, checkpoint_id)` (8.3 `synthetic_outcomes`); one `run_outcome` per run; `checkpoint_id` matches the grammar of 4.1 and its kind segment equals `test_kind` | write refused |
 | L-OUT-06 | a record without `paper_assertion` from the current session, or whose `account_id_sha256` is not an allowlisted account's, is refused and the run is `aborted_safety (reason: paper_mode_mismatch)`. Exempt: a record that references no capture artifact (an `env_error` or `harness_error` written before any screen was captured, or `not_run` for a checkpoint never captured), which may also omit `fingerprint_id` and `data_epoch_id` | write refused, run aborted |
 | L-OUT-07 | every scoped checkpoint of a finished run has exactly one record (the Orchestrator writes `not_run`; for what a dead Orchestrator left, the resumed Orchestrator or the control-host import of the Watchdog's JSONL journal writes `harness_error` with the run's abort reason; the Watchdog itself never writes the store, 10.2); such records reference no capture artifact and are exempt from L-OUT-06 | post-run query; a miss is `aborted_harness (reason: taxonomy_check_failed)` and the report is withheld |
 
@@ -1656,7 +1656,7 @@ decision:
   signature:
     checkpoint_id: id
     region_id: id | grid_cell           # region id, or g-<row>-<col> on the 8x8 grid of 9.7 for a diff outside any region
-    phash: str                          # 64-bit perceptual hash of the anchored crop, hex
+    phash: str                          # 64-bit perceptual hash of the owning region's anchored bounds (9.7), hex; component-crop hashes serve clustering only
     hamming_tolerance: int?             # unset: the default applies, 8, or 6 for tier-1 checkpoints; set when written out or lowered by calibration (9.7, L-DEC-03); 6 is also the cross-checkpoint clustering radius (3.7, 9.7)
     bbox_q4: {x: int, y: int, w: int, h: int}?   # the largest component's bounding box quantized to 4 px: the exact-match key when the region falls back to pHash equality (below)
     category: enum[intended|collateral|noise|needs_human|invariant_violation|assertion_failed]

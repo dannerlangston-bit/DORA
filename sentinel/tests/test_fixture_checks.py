@@ -27,8 +27,8 @@ def accounts(**over: Any) -> tuple[AccountState, ...]:
     exp = fc.expectations(FIXTURE)
     out = []
     for aid, e in exp.items():
-        a = AccountState(aid, e.role, dict(e.positions), 0, e.cash, buying_power=e.cash if e.role == "empty" else 90000.0,
-                         alert_count=0)
+        bp = e.cash if e.role == "empty" else 90000.0
+        a = AccountState(aid, e.role, dict(e.positions), 0, e.cash, buying_power=bp, alert_count=0)
         out.append(replace(a, **over.get(e.role, {})))
     return tuple(out)
 
@@ -45,7 +45,8 @@ def good_reads(**over: Any) -> fc.Stage2Reads:
     dataset = fc.EpochRead(last=231.15, bid=231.10, ask=231.20, quote_time="15:30:00")
     base = fc.Stage2Reads(
         accounts=accounts(), ondemand_toolbar=False, delay_badge=DELAYED, connectivity=UP, reconnects_since_launch=0,
-        quote_age_s=1210.0, prices=fc.recompute_prices(FIXTURE, Quotes("api", {"/MESZ26": 6325.10, "AAPL": 231.15}), NOW),
+        quote_age_s=1210.0,
+        prices=fc.recompute_prices(FIXTURE, Quotes("api", {"/MESZ26": 6325.10, "AAPL": 231.15}), NOW),
         symbols=tuple(fc.SymbolFacts(s["id"], True) for s in FIXTURE["symbols"]), pinned=dataset, dataset=dataset)
     return replace(base, **over)
 

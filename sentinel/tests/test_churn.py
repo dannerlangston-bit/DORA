@@ -59,8 +59,10 @@ def test_holiday_skips_the_affected_checkpoints_with_the_event_in_detail(cfg):
 
 def test_reapprove_marks_frozen_baselines_instead_of_scoring(cfg):
     # 4.9, 7.9: a roll date marks the frozen baselines that show the rolled symbol for re-approval.
-    assert churn.reapprove(date(2026, 12, 11), FIXTURE, SCOPE, cfg) == {LADDER.checkpoint_id: "roll 2026-12-11 mes_front"}
-    assert churn.reapprove(date(2026, 11, 20), FIXTURE, SCOPE, cfg) == {CHART.checkpoint_id: "expiration 2026-11-20 spx"}
+    roll = churn.reapprove(date(2026, 12, 11), FIXTURE, SCOPE, cfg)
+    assert roll == {LADDER.checkpoint_id: "roll 2026-12-11 mes_front"}
+    expiry = churn.reapprove(date(2026, 11, 20), FIXTURE, SCOPE, cfg)
+    assert expiry == {CHART.checkpoint_id: "expiration 2026-11-20 spx"}
     no_symbol = {**FIXTURE, "churn_calendar": [{"date": date(2026, 11, 2), "event": "holiday", "action": "reapprove"}]}
     assert set(churn.reapprove(date(2026, 11, 2), no_symbol, SCOPE, cfg)) == {LADDER.checkpoint_id,
                                                                                CHART.checkpoint_id}

@@ -193,7 +193,8 @@ def _next_reseed(fixture: Mapping[str, Any], start: date) -> date | None:
 
 
 def generate(fixture: Mapping[str, Any], *, start: date, holidays: Iterable[date] = (),
-             earnings: Mapping[str, Iterable[date]] | None = None, ex_dividend: Mapping[str, Iterable[date]] | None = None,
+             earnings: Mapping[str, Iterable[date]] | None = None,
+             ex_dividend: Mapping[str, Iterable[date]] | None = None,
              horizon_days: int = HORIZON_DAYS) -> list[ChurnEvent]:
     """The churn calendar from `start` over the horizon (7.9, choices 3 to 5), sorted by date, event and symbol.
     `earnings` and `ex_dividend` map a fixture symbol id to its dates (from the market-data API)."""

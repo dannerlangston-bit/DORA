@@ -265,7 +265,8 @@ def test_workspace_windows_title_regex_and_rects_within_4_px():
     assert exp.sha256 == "w" * 64 and exp.window_count == 2
     assert exp.windows[1] == WindowExpectation("^Active Trader", (100, 200, 400, 600))
     obs = WorkspaceObservation("w" * 64, True, ("Monitor", "Trade"), 2)
-    near = (win("Main@thinkorswim [build 1998.3.0]", (2, -3, 1920, 1044)), win("Active Trader - AAPL", (104, 200, 400, 596), 2))
+    near = (win("Main@thinkorswim [build 1998.3.0]", (2, -3, 1920, 1044)),
+            win("Active Trader - AAPL", (104, 200, 400, 596), 2))
     assert check_workspace(obs, exp, windows=near).passed
     moved = (near[0], win("Active Trader - AAPL", (105, 200, 400, 600), 2))
     r = check_workspace(obs, exp, windows=moved)

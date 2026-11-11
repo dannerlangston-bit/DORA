@@ -194,7 +194,8 @@ def check_launched(obs: LaunchObservation, *, expected_build: str, first_launch:
         ids = {**ev, "build_id": build, "expected_build": expected_build, "launcher_log": launcher_log_sha256}
         if first_launch:
             return _env_fail("launch", "launched", "version_mismatch", evidence=ids, actions=("disable_rig",),
-                             detail=f"build {build!r}, expected {expected_build!r}; the rig is held until a human looks")
+                             detail=f"build {build!r}, expected {expected_build!r}; the rig is held until a "
+                                    "human looks")
         return _env_fail("launch", "launched", "version_changed_mid_run", evidence=ids,
                          detail=f"build {build!r}, expected {expected_build!r}")
     return ControlResult("launch", True, "launched", evidence={**ev, "build_id": build,
@@ -215,7 +216,8 @@ def check_build_unchanged(title_build_id: str | None, expected_build: str, *, ab
                          evidence={"launcher_log": launcher_log_sha256})
     return _env_fail("build_reread", "launched", "version_changed_mid_run",
                      detail=f"build {build!r}, expected {expected_build!r}",
-                     evidence={"build_id": build, "expected_build": expected_build, "launcher_log": launcher_log_sha256})
+                     evidence={"build_id": build, "expected_build": expected_build,
+                               "launcher_log": launcher_log_sha256})
 
 
 # -- authenticated --------------------------------------------------------------------------------------
@@ -431,7 +433,8 @@ def check_fixture(first: Sequence[AccountState], expected: Mapping[str, AccountE
     if golden is not None:
         drift = drift_of(golden, expected[golden.account_id])
         if drift:
-            subsets.append(SubsetOutcome("account_state:golden", Outcome("env_error", "fixture_drift", "fixture_verified")))
+            subsets.append(SubsetOutcome("account_state:golden",
+                                         Outcome("env_error", "fixture_drift", "fixture_verified")))
             acts.append("maintenance_task")
             notes.append("GOLDEN " + "; ".join(drift) + ": re-seed task to the accounts owner")
         elif reseed_due_passed:

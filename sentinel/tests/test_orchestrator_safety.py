@@ -590,6 +590,32 @@ def test_the_recovery_proof_after_a_killed_tree_keeps_the_clean_read_that_found_
     assert (rep.verdict.status, rep.verdict.reason) == ("aborted_safety", "undeclared_order_row")
 
 
+def test_an_order_found_at_teardown_stays_orders_sent_when_the_recovery_login_then_fails():
+    """killswitch:1: the teardown read is clean and finds an order; the kill switch sequence's recovery login fails.
+    The run's proof (the 8.3 row, the report) stays ORDERS SENT with Cancel All failed, and the one page blocks the
+    login for `incident` with the hand-over; the sequence's own UNPROVEN line is kept beside it."""
+    from sentinel.orchestrator.machine import Orchestrator
+    from sentinel.orchestrator.simrig import MemorySink, default_context
+
+    clock = ManualClock()
+    rig = SimulatedRig(SimScenario(recovery_login_fails=1), clock=clock)
+
+    def work(o):
+        o.sink.record("c1", "passed")
+        rig._send()
+
+    rep = Orchestrator(rig, default_context(), MemorySink(["c1", "c2"]), clock=clock).run(work)
+    assert rep.proof.line == "ORDERS SENT: undeclared rows (sim-order-1); Cancel All failed"
+    assert (rep.proof.verdict_code, rep.proof.cancel_all_code) == ("orders_sent", "performed_unverified")
+    assert rep.proof.counts["undeclared"] == ["sim-order-1"]
+    (page,) = [r for r in rep.results if r.alert is not None]
+    assert page.evidence["verdict"] == rep.proof.line and page.evidence["undeclared"] == ["sim-order-1"]
+    assert page.evidence["blocked_reason"] == "incident" and page.evidence["instruction"] == CANCEL_BY_HAND
+    assert page.evidence["kill_switch_proof"] == "UNPROVEN: recovery_login_failed" == rep.kill_switch.proof.line
+    assert page.evidence["teardown_undeclared"] == ["sim-order-1"] and not page.findings
+    assert (rep.verdict.status, rep.verdict.reason) == ("aborted_safety", "undeclared_order_row")
+
+
 def test_the_proof_takes_orders_sent_from_a_clean_found_read_and_names_that_read():
     """killswitch:0: `found` only ever adds undeclared rows, and only from a clean read; its sha is the end read the
     proof compared when the last read was not clean."""

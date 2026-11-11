@@ -50,7 +50,9 @@ Choices (reported):
 7. An undeclared row found by the teardown proof is one incident and gets one page (6.6 step 4, 9.10 safety
    routing): the page is sent after the kill switch sequence, never at the teardown read, so it carries the
    sequence's proof and what `Cancel All` finally did (`teardown_incident`). The teardown read's line ("Cancel All
-   not needed": it clicked nothing) is not paged.
+   not needed": it clicked nothing) is not paged. When the sequence's proof is not ORDERS SENT (its recovery login
+   failed, or no fresh read was clean), the run's proof stays the teardown read's ORDERS SENT with `Cancel All failed`
+   for a Working row (`teardown_proof`), and the sequence's line is kept on the page's evidence.
 8. Every proof carries the sha256 of the start and end Monitor reads it compared (`book_sha256`, 8.3
    `post_run_proofs.start_snapshot_sha256` and `end_snapshot_sha256`), None for a read it did not have; and its
    8.3 row form (`verdict_code`, `cancel_all_code`, `counts`), from which `proof_line` gives the 6.6 text back.
@@ -624,20 +626,37 @@ def execute_kill_switch(rig: Rig, decision: ControlResult, *, clock: Clock, allo
                                                           screenshot_sha256=shot), steps)
 
 
-def teardown_incident(found: Proof, decision: ControlResult, ks: KillSwitchReport) -> ControlResult:
+def teardown_proof(found: Proof, ks: KillSwitchReport) -> Proof:
+    """The run's proof after the teardown read found an undeclared row and the kill switch sequence ran (6.6, choice
+    7): the sequence's own proof when it is ORDERS SENT; otherwise (its recovery login failed, or no fresh read was
+    clean) the teardown read's ORDERS SENT, since that clean read found an order and UNPROVEN would understate it, with
+    `Cancel All` failed when an undeclared row was Working, because no cancel of it was ever verified (6.6 Cancel All
+    failure: `ORDERS SENT: undeclared rows (<rows>); Cancel All failed`)."""
+    if ks.proof.verdict == ORDERS_SENT:
+        return ks.proof
+    working = any(r.grid == "working" for r in found.undeclared)
+    return replace(found, cancel_all="failed" if working else found.cancel_all)
+
+
+def teardown_incident(found: Proof, decision: ControlResult, ks: KillSwitchReport, *, account: str | None = None,
+                      screenshot_sha256: str | None = None) -> ControlResult:
     """The one control result, so the one 9.10 page, of an undeclared row found by the teardown proof (6.6, 9.10).
 
     `found` is the teardown read's ORDERS SENT proof, `decision` its `proof_result` (the `aborted_safety` that ran
     the kill switch sequence) and `ks` what the sequence did. The incident pages once, after the sequence, with what
     `Cancel All` finally did (choice 7): the sequence's own result when its proof is ORDERS SENT; otherwise (the
     recovery login failed, or the fresh Monitor read was unreadable) the decision's safety page, run outcome and
-    unreached outcome, with the sequence's actions and findings added and both reads named in the detail.
+    unreached outcome, with the evidence of the run's proof (`teardown_proof`: its verdict, rows and Cancel All, the
+    login blocked for `incident`, and the hand-over with `account` and the teardown read's `screenshot_sha256` when
+    Cancel All failed), the sequence's own line under `kill_switch_proof`, and both reads named in the detail.
     """
-    final = ks.proof_effect
     if ks.proof.verdict == ORDERS_SENT:
-        return final
+        return ks.proof_effect
+    effect = proof_result(teardown_proof(found, ks), run_so_far=decision.run, account=account,
+                          screenshot_sha256=screenshot_sha256)
     rows = ", ".join(r.key for r in found.undeclared)
-    return replace(decision, actions=tuple(dict.fromkeys(decision.actions + final.actions)),
-                   findings=decision.findings + final.findings,
+    return replace(decision, actions=tuple(dict.fromkeys(decision.actions + effect.actions)),
+                   findings=decision.findings + effect.findings,
                    detail=f"{ORDERS_SENT} ({rows}) at teardown; after the kill switch sequence: {ks.proof.line}",
-                   evidence={**final.evidence, "teardown_undeclared": [r.key for r in found.undeclared]})
+                   evidence={**effect.evidence, "teardown_undeclared": [r.key for r in found.undeclared],
+                             "kill_switch_proof": ks.proof.line})

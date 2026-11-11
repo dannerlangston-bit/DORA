@@ -109,7 +109,7 @@ from .identity import (READ_GAP_S, TIMER_S, Allowlist, assertion_due, deferral_u
                        judge_identity, paper_stamp, readable as selector_readable, stamp_current)
 from .killswitch import (ORDERS_SENT, KillSwitchReport, Proof, ProofInputs, account_ref, cancel_new_working,
                          execute_kill_switch, kill_switch, post_run_proof, proof_result, recovery_login,
-                         teardown_incident)
+                         teardown_incident, teardown_proof)
 from .alerts import AlertRoute
 from .orderbook import MonitorBook
 from .ports import SessionSafety
@@ -661,8 +661,8 @@ class Orchestrator:
                 # 1.10, 6.6: an undeclared row at teardown is an aborted_safety; the kill switch sequence cancels it,
                 # and the incident pages once, after the sequence, with what Cancel All finally did (9.10)
                 ks = self._kill_switch_sequence(effect, effect.run, sends)
-                effect = teardown_incident(proof, effect, ks)
-                proof = ks.proof
+                effect = teardown_incident(proof, effect, ks, account=account, screenshot_sha256=_screenshot(end))
+                proof = teardown_proof(proof, ks)
             self.apply(effect)
         rig.set_hook_phase("between_runs")                  # every run ends with the hook disarmed (6.6, 6.2)
         report = RunReport(ctx.run_id, ctx.run_type, RunVerdict("complete"), last_gate, proof, kill_switch=ks)

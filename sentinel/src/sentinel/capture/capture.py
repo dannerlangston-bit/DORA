@@ -461,10 +461,26 @@ def masked_live_median(frames: Sequence[np.ndarray], times_ms: Sequence[int], *,
 # -- capture metadata (3.3, 5.7, 8.4) -----------------------------------------------------------------------------
 
 def redact_text(text: str, sweep: Sweep) -> str:
-    """`text` with every match of the redaction stage's text patterns replaced by `<redacted:<kind>>` (choice 10)."""
-    for kind, rx in sweep.matchers():
-        text = rx.sub(f"<redacted:{kind}>", text)
-    return text
+    """`text` with every match of the redaction stage's text patterns replaced by `<redacted:<kind>>` (choice 10).
+    All patterns run on the original text; overlapping matches merge into one span named by its widest match, the
+    first in the sweep's order on a tie (a name token inside an email is that email, as in the image sweep)."""
+    hits = sorted((m.start(), m.end(), order, kind) for order, (kind, rx) in enumerate(sweep.matchers())
+                  for m in rx.finditer(text) if m.end() > m.start())
+    spans: list[list[Any]] = []                         # [start, end, rank of the naming match, kind]
+    for start, end, order, kind in hits:
+        rank = (start - end, order)                     # wider first, then sweep order
+        if spans and start < spans[-1][1]:
+            last = spans[-1]
+            last[1] = max(last[1], end)
+            if rank < last[2]:
+                last[2], last[3] = rank, kind
+        else:
+            spans.append([start, end, rank, kind])
+    out, at = [], 0
+    for start, end, _, kind in spans:
+        out += [text[at:start], f"<redacted:{kind}>"]
+        at = end
+    return "".join(out) + text[at:]
 
 
 def capture_meta(*, sha256: str, run_id: str, checkpoint_id: str, side: str, window: WindowInfo, captured_at: str,

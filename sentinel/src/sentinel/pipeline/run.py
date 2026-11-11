@@ -422,15 +422,17 @@ class _Run:
     def redact(self, cp: PlannedCheckpoint, base: Capture | None, cand: Capture, base_img: np.ndarray | None,
                cand_img: np.ndarray) -> RedactionResult:
         """Redact one checkpoint's pair in memory before anything is diffed or stored (`capture.redact_pair`): the
-        simulated OCR reads what synth drew on each side; a capture without a base is redacted against itself."""
-        b_cap, b_img = (base, base_img) if base is not None and base_img is not None else (cand, cand_img)
+        simulated OCR reads what synth drew on each side. A capture without a base frame is redacted against itself,
+        and the result then carries no base image (8.4 `side`: the redacted candidate is never stored as the base)."""
+        alone = base is None or base_img is None
+        b_cap, b_img = (cand, cand_img) if alone else (base, base_img)
         ocr = {"base": SyntheticOcr.from_screen(b_cap.screen), "candidate": SyntheticOcr.from_screen(cand.screen)}
         res = redact_pair(b_img, cand_img, self.anchors, ocr, THEME["bg"], sweep=self.sweep,
                           context=RedactionContext(self.run_id, cp.checkpoint_id, cp.tier), params=self.params)
         if res.terminal is None:
-            for side in ("base", "candidate") if base is not None else ("candidate",):
+            for side in ("candidate",) if alone else ("base", "candidate"):
                 self.redaction_counts[side] += int(res.counts.get(side, 0))
-        return res
+        return dataclasses.replace(res, base=None) if alone else res
 
     def redaction_canary(self, cp: PlannedCheckpoint, base: Capture, m: cn.Mutant) -> bool:
         """M19 (12.5, 6.10): the mutant leaves a synthetic account id unredacted in the candidate frame; the redaction

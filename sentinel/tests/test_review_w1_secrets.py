@@ -469,6 +469,24 @@ def test_secrets_10_text_starting_with_bm_is_scanned_and_a_real_bmp_is_still_an_
     assert not has_image_magic(data[:32])
 
 
+# == secrets:11: a pair redacted without its base stores no base ===============================================
+
+def test_secrets_11_an_unsettled_base_is_not_stored_as_a_copy_of_the_candidate(tmp_path):
+    """8.4 `side`, 3.6: when the redaction stage ran on the candidate alone (the base did not settle), no artifact
+    labelled `base` is stored; before, the redacted candidate was stored under side `base`."""
+    import dataclasses
+
+    from sentinel.pipeline.sim import SimBuild
+    targets = frozenset(f"census/charts.flexible-grid.chart-cell/ws.tier-a.{w}"
+                        for w in ("swing-trader", "beginner", "options-trader", "futures-trader"))
+    sc = clean_scenario(TODAY)
+    sc = dataclasses.replace(sc, base=SimBuild(sc.base.build_id, sc.base.changes, unsettled=targets))
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    hit = [o for o in r.outcomes if o.checkpoint_id in targets]
+    assert hit and {(o.outcome, o.reason) for o in hit} == {("needs_baseline", "base_not_settled")}
+    assert all(o.artifacts and o.artifacts.get("candidate") and "base" not in o.artifacts for o in hit)
+
+
 def test_secrets_6_scan_run_reads_a_ledger_tail_and_in_memory_texts(tmp_path):
     """6.9 choice 1: a shared results.jsonl is scanned from the offset where this run began (an earlier run's lines
     are not this run's), and text the run has not written yet (the report's inputs) is scanned from memory."""

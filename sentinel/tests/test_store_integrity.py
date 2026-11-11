@@ -331,7 +331,7 @@ FAR = "fedcba9876543210"                    # 64 bits from PH: outside every tol
 
 
 def test_supersedes_names_a_decision_on_the_same_signature(store):
-    # store:2, 9.7: Supersede replaces the active row of THIS signature; SD-79: fixed_in_build supersedes its confirm_bug
+    # store:2, 9.7: Supersede replaces the active row of THIS signature; SD-79: fixed_in_build supersedes confirm_bug
     finding(store, "F-1")
     decide(store, "dec-000001", by="alice", finding_ref="F-1")
     decide(store, "dec-000002", by="carol", region="rgn.unrelated")
@@ -365,15 +365,51 @@ def test_superseding_your_own_decision_writes_a_new_row(store):
     assert store.get_finding("F-1").ticket == "TOS-2" and not store.get_finding("F-1").contested
 
 
-def test_a_frozen_signature_needs_the_system_owner(tmp_path):
+@pytest.fixture
+def frozen(tmp_path):
+    """A signature with two supersessions within 30 days (9.7), on a store whose system owner is olga."""
     with Store(tmp_path / "f.db", system_owners=["olga"]) as s:
         s.begin_run(plan())
         decide(s, "dec-000001", decided_at="2026-11-01T00:00:00+00:00")
         decide(s, "dec-000002", by="bob", supersedes="dec-000001", decided_at="2026-11-05T00:00:00+00:00")
         decide(s, "dec-000003", by="carl", supersedes="dec-000002", decided_at="2026-11-07T00:00:00+00:00")
-        with pytest.raises(StoreRefused, match="system owner"):
-            decide(s, "dec-000004", "confirm_bug", by="dana", supersedes="dec-000003")
-        assert decide(s, "dec-000004", "confirm_bug", by="olga", supersedes="dec-000003").decided_by == "olga"
+        yield s
+
+
+SIG = Signature(SWEEP, "rgn.ladder.bid-column", PH, "collateral")
+
+
+def test_a_frozen_signature_needs_the_system_owner(frozen):
+    s = frozen
+    assert s.lookup_decisions(SIG, at=TS).frozen
+    with pytest.raises(StoreRefused, match="system owner"):
+        decide(s, "dec-000004", "confirm_bug", by="dana", supersedes="dec-000003")
+    with pytest.raises(StoreRefused, match="system owner"):            # store:4: the role is not a key to the freeze
+        decide(s, "dec-000004", "confirm_bug", by="dana", supersedes="dec-000003", role="system_owner")
+    with pytest.raises(StoreRefused, match="system_owner"):
+        decide(s, "dec-000004", "confirm_bug", by="olga", supersedes="dec-000003", role="flow_owner")
+    owner = decide(s, "dec-000004", "confirm_bug", by="olga", supersedes="dec-000003")
+    assert (owner.decided_by, owner.role) == ("olga", "system_owner")
+    for at in (TS, "2027-06-01T00:00:00+00:00"):                       # store:4: the owner's decision ends the freeze
+        look = s.lookup_decisions(SIG, at=at)
+        assert not look.frozen and look.inherited.decision_id == "dec-000004"
+    decide(s, "dec-000005", "confirm_bug", by="bob", supersedes="dec-000004", decided_at="2026-11-10T00:00:00+00:00")
+    assert not s.lookup_decisions(SIG, at=TS).frozen                   # one supersession since the owner's decision
+    decide(s, "dec-000006", by="carl", supersedes="dec-000005", decided_at="2026-11-12T00:00:00+00:00")
+    assert s.lookup_decisions(SIG, at=TS).frozen                       # two more within 30 days freeze it again
+
+
+def test_a_revoke_does_not_lift_the_freeze(frozen):
+    # store:4, 9.7: the freeze is the signature's; revoking its active row (open to the 9.6 roles) leaves it frozen
+    s = frozen
+    s.revoke_decision("dec-000003", by="dana", reason="disputed", at="2026-11-08T00:00:00+00:00")
+    look = s.lookup_decisions(SIG, at=TS)
+    assert look.frozen and look.applicable == ()
+    with pytest.raises(StoreRefused, match="system owner"):
+        decide(s, "dec-000004", "confirm_bug", by="dana")
+    assert s.get_decision("dec-000004") is None
+    assert decide(s, "dec-000004", "confirm_bug", by="olga").role == "system_owner"
+    assert s.lookup_decisions(SIG, at=TS).inherited.decision_id == "dec-000004"
 
 
 def test_fixed_in_build_is_not_a_contest(store):

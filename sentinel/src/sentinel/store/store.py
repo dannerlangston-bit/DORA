@@ -82,10 +82,13 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   finding (4.14 makes `finding_ref` required; only store-level fixtures and imports write one without), so they
   apply to a decision that names its finding: the same (finding, action, decided_by) on an active row with the same
   verdict, ticket and signature returns that row when the request supersedes nothing (the same click again; a
-  supersession or a changed field is a new request); a plain decision is refused with `ActiveDecisionExists` while an applicable (9.7 scope) active decision
-  matches the signature. approve_baseline and reject_baseline move a baselines row and are not signature
-  decisions. The frozen-signature rule (the next decision needs the system owner) applies to every signature
-  decision; the system owners are the store's configured `system_owners`. A supersession by another human marks the
+  supersession or a changed field is a new request); a plain decision is refused with `ActiveDecisionExists`
+  while an applicable (9.7 scope) active decision matches the signature. approve_baseline and reject_baseline move
+  a baselines row and are not signature decisions. The frozen-signature rule (the next decision needs the system
+  owner) applies to every signature decision; the system owners are the store's configured `system_owners`. The
+  freeze is the signature's: every decision ever made on it counts (a revoke does not lift it), and the system
+  owner's decision, stored with role `system_owner` (a role only a configured system owner may claim), ends it, so
+  only supersessions after it count. A supersession by another human marks the
   findings of both rows contested; fixed_in_build superseding its confirm_bug is the 4.14 lifecycle, not a contest.
   The triage-channel notice to the earlier decider is the Reporter's (an outbox job needs its payload stored).
 - Step outcomes become `step_events` rows with source orchestrator, action `step`, mode `agent` for an agent rung
@@ -769,19 +772,26 @@ def _match(r: sqlite3.Row) -> DecisionMatch:
     return DecisionMatch(d, r["distance"], build_pair_id=d.build_pair_id)
 
 
-def _frozen(conn: sqlite3.Connection, rows: Iterable[sqlite3.Row]) -> bool:
-    """9.7: two supersessions within 30 days on one signature freeze it (S-05). Walks each row's chain."""
-    for row in rows:
-        times, seen = [], set()
-        while row is not None and row["supersedes_decision_id"] is not None and row["decision_id"] not in seen:
-            seen.add(row["decision_id"])
-            times.append(datetime.fromisoformat(row["decided_at"]))
-            row = conn.execute("SELECT decision_id, decided_at, supersedes_decision_id FROM decisions "
-                               "WHERE decision_id = ?", (row["supersedes_decision_id"],)).fetchone()
-        times.sort()
-        if any(b - a <= timedelta(days=FREEZE_DAYS) for a, b in zip(times, times[1:])):
-            return True
-    return False
+# Every decision ever made on the signature, whatever its status now (9.7: the freeze is the signature's).
+_FREEZE_SQL = """SELECT decided_at, supersedes_decision_id, role FROM decisions
+WHERE checkpoint_id = :cp AND region_id = :region AND category = :cat
+  AND action NOT IN ('approve_baseline','reject_baseline')
+  AND hamming(phash, :phash) <= hamming_tolerance
+ORDER BY decided_at, decision_id"""
+
+
+def _frozen(conn: sqlite3.Connection, args: Mapping[str, Any]) -> bool:
+    """9.7: two supersessions within 30 days on one signature freeze it, and the next decision on it needs the
+    system owner (S-05). The freeze belongs to the signature, not to its active row: every decision on it counts,
+    revoked, superseded and expired ones included, so a revoke does not lift it; only supersessions made after the
+    signature's latest decision in the system owner's role count, so that decision ends it."""
+    times: list[datetime] = []
+    for r in conn.execute(_FREEZE_SQL, args):
+        if r["role"] == "system_owner":
+            times = []
+        elif r["supersedes_decision_id"] is not None:
+            times.append(datetime.fromisoformat(r["decided_at"]))
+    return any(b - a <= timedelta(days=FREEZE_DAYS) for a, b in zip(times, times[1:]))
 
 
 def _in_ticket_scope(d: Decision, run_id: str | None, run_pair: str | None, entries: frozenset[str],
@@ -822,7 +832,7 @@ def lookup_decisions(conn: sqlite3.Connection, signature: Signature, *, at: str 
     found = [_match(r) for r in rows]
     outside = [m for m in found if not _in_ticket_scope(m.decision, run_id, pair, entries, tickets)]
     related = [_match(r) for r in conn.execute(RELATED_SQL, args)]
-    return DecisionLookup(tuple(found), tuple(related), frozen=_frozen(conn, rows), out_of_scope=tuple(outside))
+    return DecisionLookup(tuple(found), tuple(related), frozen=_frozen(conn, args), out_of_scope=tuple(outside))
 
 
 def apply_inheritance(outcome: CheckpointOutcome, lookup: DecisionLookup) -> CheckpointOutcome:
@@ -2115,6 +2125,9 @@ class Store:
         self._human(d.decided_by, "decided_by")
         self._human(confirmed_by, "confirmed_by")
         self._human(proposed_by, "proposed_by")
+        if d.role == "system_owner" and d.decided_by not in self.system_owners:
+            raise StoreRefused(f"{d.decided_by} is not a system owner of this store and cannot decide in that role "
+                               "(9.7: the system owner's decision ends a frozen signature)")
         if not d.reason:
             raise StoreRefused("a decision carries its reason (8.3 decisions.reason)")
         if d.status != "active":
@@ -2184,9 +2197,10 @@ class Store:
                   or ("confirmed_bug" if d.verdict == "confirmed_bug" else "open"))   # reject_baseline (4.14)
         self.taxonomy.check_member("triage_states", triage)
         with self._batch("decision") as rows:
+            role = d.role
             if d.action not in BASELINE_ACTIONS:                    # inside the batch: writes serialize (9.7)
-                self._check_signature_free(d, run_id, decided_at, supersedes, source_finding, manifest_entries,
-                                           manifest_tickets)
+                role = self._check_signature_free(d, run_id, decided_at, supersedes, source_finding,
+                                                  manifest_entries, manifest_tickets)
             self._insert(rows, "decisions", {
                 "decision_id": did, "checkpoint_id": d.signature.checkpoint_id, "region_id": d.signature.region_id,
                 "phash": phash_bytes(d.signature.phash), "hamming_tolerance": tolerance,
@@ -2196,7 +2210,7 @@ class Store:
                 "ticket_ref": d.ticket, "mask_ref": mask_ref, "baseline_id": baseline_id,
                 "fixed_in_build_id": fixed_in_build_id, "cluster_id": cluster_id, "expires_at": expires_at,
                 "status": "active", "supersedes_decision_id": decision_int(supersedes),
-                "source_finding_id": source_finding, "role": d.role, "reopen_count": d.reopen_count,
+                "source_finding_id": source_finding, "role": role, "reopen_count": d.reopen_count,
                 "bbox_q4": None if d.bbox_q4 is None else ",".join(map(str, d.bbox_q4))})
             if supersedes is not None:
                 self._update(rows, "decisions", {"decision_id": decision_int(supersedes)}, {"status": "superseded"})
@@ -2214,19 +2228,27 @@ class Store:
 
     def _check_signature_free(self, d: Decision, run_id: str, at: str, supersedes: str | None,
                               source_finding: int | None, manifest_entries: Iterable[str],
-                              manifest_tickets: Iterable[str]) -> None:
-        """9.7 Two humans, one signature: on a frozen signature only a system owner decides; a plain decision made
-        on a finding is refused while an applicable active decision matches the signature."""
+                              manifest_tickets: Iterable[str]) -> str | None:
+        """9.7 Two humans, one signature: on a frozen signature only a system owner decides, in that role (the role
+        to store is returned: `system_owner` there, the decision's own elsewhere); a plain decision made on a
+        finding is refused while an applicable active decision matches the signature."""
         look = lookup_decisions(self._conn, d.signature, at=at, run_id=run_id, manifest_entries=manifest_entries,
                                 manifest_tickets=manifest_tickets)
-        if look.frozen and d.decided_by not in self.system_owners:
-            raise StoreRefused(f"the signature of {d.signature.checkpoint_id} / {d.signature.region_id} is frozen "
-                               "(two supersessions within 30 days): the next decision needs the system owner (9.7)")
+        role = d.role
+        if look.frozen:
+            if d.decided_by not in self.system_owners:
+                raise StoreRefused(f"the signature of {d.signature.checkpoint_id} / {d.signature.region_id} is frozen "
+                                   "(two supersessions within 30 days): the next decision needs the system owner (9.7)")
+            if role not in (None, "system_owner"):
+                raise StoreRefused(f"the decision on a frozen signature is the system owner's: role system_owner, not "
+                                   f"{role} (9.7)")
+            role = "system_owner"
         active = [m.decision for m in look.applicable]
         if supersedes is None and source_finding is not None and active:
             ids = ", ".join(f"{a.decision_id} ({a.action} by {a.decided_by})" for a in active)
             raise ActiveDecisionExists(f"the signature already has an active decision: {ids}; supersede or revoke "
                                        "it (9.7)", active)
+        return role
 
     def revoke_decision(self, decision_id: str, *, by: str, reason: str, at: str | None = None) -> Decision:
         """Revoke a decision: the three revoke fields together and status revoked (8.3, 4.14); the row stays."""

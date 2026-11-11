@@ -429,6 +429,63 @@ def test_probe_never_takes_the_slot_of_a_published_token():
     assert all(token_states(buf)[t.id] == ("consumed", None) for t in tokens)       # never re-armed
 
 
+# -- token lifecycle on drops and expiry (choice 6) ----------------------------------------------------------
+def test_a_click_dropped_under_deny_all_wedges_no_later_move_in_the_segment():
+    """The wedge, read from the bytes: a click dropped `deny_all` left its slot armed, and every later move was
+    dropped `move_outside_allow`. The drop now writes the token `dropped` and names it in the ring record."""
+    g = armed()
+    t = g.issue_click(100, 100, T)
+    g.deny_all = True
+    buf, w = published(g)
+    assert decide_from_segment(buf, ev("button_down", 100, 100), to_ns(T)) == Decision(False, "deny_all", t.id)
+    assert token_states(buf)[t.id] == ("dropped", "deny_all")
+    g.deny_all = False
+    w.publish(g)
+    assert decide_from_segment(buf, ev("move", 5, 5), to_ns(T + 0.1)).allowed
+    assert decide_from_segment(buf, ev("move", 5, 5), to_ns(T + 0.6)).allowed
+    assert decide_from_segment(buf, ev("button_down", 100, 100), to_ns(T + 0.1)).reason == "no_token"
+    recs = RingReader().read(buf)
+    assert [(r.reason, r.token_id) for r in recs] == [("deny_all", t.id), ("no_token", None)]
+
+
+def test_the_hook_hosts_own_latch_and_rule2_spend_tokens_and_keep_their_secret_flag():
+    g = armed()
+    click = g.issue_click(100, 100, T)
+    buf, _ = published(g)
+    d = decide_from_segment(buf, ev("button_down", 100, 100), to_ns(T), deny_all=True)
+    assert d == Decision(False, "deny_all", click.id) and token_states(buf)[click.id] == ("dropped", "deny_all")
+    g = armed(Flag.SET)
+    key = g.issue_key(gw.VK_RETURN, T, secret=True)
+    buf, _ = published(g)
+    assert decide_from_segment(buf, ev("key_down", vk=gw.VK_RETURN), to_ns(T)).token_id == key.id
+    assert token_states(buf)[key.id] == ("dropped", "blocked_key_dialog")
+    rec = RingReader().read(buf)[0]
+    assert (rec.reason, rec.token_id, rec.secret) == ("blocked_key_dialog", key.id, True)   # redacted downstream
+    assert decide_from_segment(buf, ev("move", 5, 5), to_ns(T)).allowed
+
+
+def test_an_expired_armed_slot_blocks_no_move_without_any_republish():
+    g = armed()
+    t = g.issue_click(100, 100, T)
+    buf, _ = published(g)
+    assert decide_from_segment(buf, ev("button_down", 110, 100), to_ns(T)).reason == "token_mismatch_coords"
+    assert decide_from_segment(buf, ev("move", 5, 5), to_ns(T + 0.5)).reason == "move_outside_allow"
+    assert decide_from_segment(buf, ev("move", 5, 5), to_ns(T + 0.6)).allowed       # the hook's own expiry rule
+    assert token_states(buf)[t.id] == ("armed", None)
+
+
+def test_the_segment_reuses_the_slots_of_expired_armed_tokens():
+    g = armed()
+    old = [g.issue_key(0x41, T) for _ in range(16)]
+    buf, w = published(g)
+    new = g.issue_key(0x42, T + 0.6)                                               # the slow half lets the dead go
+    w.publish(g)
+    slots = read_tokens(buf)
+    assert [(s.id, s.state) for s in slots] == [(new.id, sg.ARMED)]
+    assert slots[0].slot < 16 and new.id not in {t.id for t in old}
+    assert decide_from_segment(buf, ev("key_down", vk=0x42), to_ns(T + 0.6)).allowed
+
+
 # -- parity with orchestrator.gateway.hook_decide ------------------------------------------------------------
 class Dual:
     """Runs `hook_decide` and `decide_from_segment` side by side on every call and checks they agree: the
@@ -551,6 +608,75 @@ def test_parity_on_a_seeded_random_corpus():
             dual(g, _random_event(rng), T + rng.choice((0.0, 0.2, 0.5, 0.6, 1.2, 2.5)))
     assert dual.calls > 2000
 
+
+LIFE_POINTS = ((100, 100), (101, 99), (400, 300), (920, 610))
+
+
+def _issue_any(g: GatewayState, rng: random.Random, now: float) -> None:
+    """One token of a random kind at `now`, as the emitter writes them (stage 5); a full segment issues nothing."""
+    x, y = rng.choice(LIFE_POINTS)
+    k = rng.random()
+    try:
+        if k < 0.4:
+            g.issue_click(x, y, now, button=rng.choice(("left", "right")), dialog_ok=rng.random() < 0.6,
+                          hold_ms=rng.choice((None, None, None, 300)))
+        elif k < 0.75:
+            g.issue_key(rng.choice((0x41, 0x0D, 0x20, 0x09, 0x11, 0x70)), now, secret=rng.random() < 0.2)
+        elif k < 0.95:
+            g.issue_wheel(x, y, rng.choice((1, -1)), now)
+        else:
+            g.issue_release(now)
+    except gw.GatewayError:
+        pass
+
+
+def _emitter_event(rng: random.Random) -> InputEvent:
+    """Mostly the emitter's own events at token points, so rule 1 and rule 2 drops meet real tokens."""
+    kind = rng.choice(("move", "button_down", "button_down", "button_up", "wheel", "key_down", "key_down", "key_up"))
+    x, y = rng.choice(LIFE_POINTS + ((5, 5), (110, 100)))
+    kw = {"origin": rng.choice(("emitter",) * 8 + ("foreign_process", "drill")),
+          "mods": rng.choice((frozenset(),) * 3 + (frozenset({"shift"}), frozenset({"ctrl"}), frozenset({"alt"})))}
+    if kind.startswith("button"):
+        kw["button"] = rng.choice(("left", "left", "right"))
+    if kind.startswith("key"):
+        kw["vk"] = rng.choice((0x41, 0x0D, 0x20, 0x09, 0x11, 0x70))
+    if kind == "wheel":
+        kw["delta"] = rng.choice((120, -120))
+    return InputEvent(kind, x, y, **kw)
+
+
+def test_parity_on_a_seeded_random_corpus_with_expiry_and_spent_tokens():
+    """Choice 6 and orchestrator.gateway choice 17 at random: tokens issued as time runs, the hook armed and disarmed,
+    deny-all and the flag toggled, events dropped under rules 1 and 2 that spend their tokens, and time run past
+    expiry. Both halves decide alike throughout, and once every token has expired with none half consumed, the
+    emitter's move is allowed: a dead token never wedges input."""
+    rng = random.Random(20261112)
+    dual = Dual()
+    unwedged, spent = 0, set()
+    for _ in range(300):
+        g = GatewayState(armed=True)
+        now = T
+        g.stamp_watcher(Flag.CLEAR, now)
+        for _ in range(rng.randint(6, 30)):
+            k = rng.random()
+            if k < 0.25:
+                _issue_any(g, rng, now)
+            elif k < 0.33:
+                g.deny_all, g.armed = rng.random() < 0.3, rng.random() < 0.85
+            elif k < 0.43:
+                g.stamp_watcher(rng.choice(list(Flag)), now)
+            elif k < 0.55:
+                now += rng.choice((0.1, 0.3, 0.6, 2.5))
+            else:
+                d = dual(g, _emitter_event(rng), now)
+                if d.token_id is not None and g.tokens[d.token_id].drop_reason == d.reason:
+                    spent.add(d.reason)
+            dead = all(t.state != "half_consumed" and now > t.expires for t in g.tokens.values())
+            if dead and g.armed and not g.deny_all:
+                assert dual(g, InputEvent("move", 5, 5), now).allowed
+                unwedged += 1
+    assert dual.calls > 3000 and unwedged > 600
+    assert {"deny_all", "not_armed", "blocked_key_dialog", "blocked_chord_dialog", "shift_click_dialog"} <= spent
 
 
 def test_a_new_send_ok_token_reopens_the_send_rect_once_and_the_writer_never_sets_it():

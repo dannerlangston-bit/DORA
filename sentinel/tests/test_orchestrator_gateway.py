@@ -170,6 +170,96 @@ def test_half_consumed_token_with_no_up_triggers_reset_after_2s():
     assert len(g.overdue_half_consumed(T + 2.6)) == 1
 
 
+# -- token lifecycle on drops and expiry (choice 17) --------------------------------------------------------
+def test_a_click_dropped_under_deny_all_wedges_no_later_move():
+    """The wedge: a click dropped `deny_all` left its token armed forever, so every later move was dropped
+    `move_outside_allow` until `reset_input_state`. The drop now spends the token (5.4.3 stage 7 reads it)."""
+    g = armed()
+    t = g.issue_click(100, 100, T)
+    g.deny_all = True
+    d = hook_decide(g, ev("button_down", 100, 100), T)
+    assert (d.allowed, d.reason, d.token_id) == (False, "deny_all", t.id)
+    assert (t.state, t.drop_reason) == ("dropped", "deny_all")
+    assert hook_decide(g, ev("button_up", 100, 100), T).reason == "deny_all"
+    g.deny_all = False
+    assert hook_decide(g, ev("move", 5, 5), T + 0.1).allowed
+    assert hook_decide(g, ev("move", 5, 5), T + 0.6).allowed                     # after expiry as well
+    assert hook_decide(g, ev("button_down", 100, 100), T + 0.1).reason == "no_token"   # spent: never usable again
+
+
+@pytest.mark.parametrize("case", ["deny_all", "not_armed", "blocked_key_dialog", "blocked_chord_dialog",
+                                  "shift_click_dialog", "wheel_deny_all"])
+def test_rule1_and_rule2_drops_spend_the_token_the_event_would_have_used(case):
+    g = armed(Flag.CLEAR if case in ("deny_all", "not_armed", "wheel_deny_all") else Flag.SET)
+    other = g.issue_key(ord("Q"), T)                       # a pending token the event does not match
+    if case in ("deny_all", "wheel_deny_all"):
+        g.deny_all = True
+    elif case == "not_armed":
+        g.armed = False
+    if case == "wheel_deny_all":
+        t, e = g.issue_wheel(50, 50, 1, T), ev("wheel", 51, 50, delta=120)
+    elif case in ("deny_all", "not_armed", "blocked_key_dialog"):
+        t, e = g.issue_key(VK_RETURN, T), ev("key_down", vk=VK_RETURN)
+    elif case == "blocked_chord_dialog":
+        t, e = g.issue_key(ord("S"), T), ev("key_down", vk=ord("S"), mods=frozenset({"alt"}))
+    else:
+        t, e = g.issue_click(50, 50, T, dialog_ok=True), ev("button_down", 51, 49, mods=frozenset({"shift"}))
+    reason = "deny_all" if case == "wheel_deny_all" else case
+    d = hook_decide(g, e, T)
+    assert (d.allowed, d.reason, d.token_id) == (False, reason, t.id)
+    assert (t.state, t.drop_reason) == ("dropped", reason)
+    assert (other.state, other.drop_reason) == ("armed", None)
+
+
+def test_a_drop_of_another_origins_event_or_of_an_up_spends_no_token():
+    g = armed()
+    t = g.issue_click(100, 100, T)
+    g.deny_all = True
+    assert hook_decide(g, ev("button_down", 100, 100, origin="drill"), T).token_id is None
+    assert hook_decide(g, ev("button_down", 100, 100, origin="foreign_process"), T).token_id is None
+    assert t.state == "armed"
+    g.deny_all = False
+    assert hook_decide(g, ev("button_down", 100, 100), T).allowed
+    g.deny_all = True
+    assert hook_decide(g, ev("button_up", 100, 100), T).token_id is None
+    assert t.state == "half_consumed"                      # still owed its up; reset_input_state covers it (5.4.5)
+
+
+def test_an_unused_armed_token_blocks_moves_only_until_it_expires():
+    g = armed()
+    click = g.issue_click(100, 100, T)
+    assert hook_decide(g, ev("button_down", 110, 100), T).reason == "token_mismatch_coords"
+    key = g.issue_key(ord("A"), T)
+    assert hook_decide(g, ev("key_down", vk=ord("B")), T).reason == "no_token"
+    assert hook_decide(g, ev("move", 5, 5), T + 0.2).reason == "move_outside_allow"   # still pending
+    assert hook_decide(g, ev("move", 5, 5), T + 0.5).reason == "move_outside_allow"   # expires is inclusive
+    assert hook_decide(g, ev("move", 5, 5), T + 0.6).allowed                          # dead: blocks nothing
+    assert (click.state, key.state) == ("armed", "armed")                             # the hook wrote nothing
+    assert hook_decide(g, ev("button_down", 100, 100), T + 0.6).reason == "token_expired"   # matching unchanged
+
+
+def test_a_half_consumed_token_keeps_blocking_moves_past_expiry_until_its_up():
+    g = armed()
+    g.issue_click(100, 100, T)
+    assert hook_decide(g, ev("button_down", 100, 100), T).allowed
+    assert hook_decide(g, ev("move", 5, 5), T + 0.9).reason == "move_outside_allow"   # 5.4.5: the up is owed
+    assert hook_decide(g, ev("button_up", 100, 100), T + 1.0).late_up
+    assert hook_decide(g, ev("move", 5, 5), T + 1.0).allowed
+
+
+def test_slots_of_expired_armed_tokens_are_reused_and_half_consumed_ones_kept():
+    g = armed()
+    held = g.issue_click(100, 100, T)
+    assert hook_decide(g, ev("button_down", 100, 100), T).allowed
+    old = [g.issue_key(ord("A"), T) for _ in range(15)]
+    with pytest.raises(GatewayError):
+        g.issue_key(ord("A"), T + 0.4)                     # every slot still live
+    fresh = [g.issue_key(ord("B"), T + 0.6) for _ in range(15)]
+    assert set(g.tokens) == {held.id} | {t.id for t in fresh} and not set(g.tokens) & {t.id for t in old}
+    with pytest.raises(GatewayError):
+        g.issue_key(ord("B"), T + 0.6)                     # the half consumed token keeps its slot
+
+
 def test_wheel_tokens_match_point_and_sign():
     g = armed()
     g.issue_wheel(300, 300, -1, T)

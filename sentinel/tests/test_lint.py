@@ -11,6 +11,7 @@ import pytest
 
 from sentinel.lint import RULES, Repo, lint
 from sentinel.lint.cli import main
+from sentinel.lint import rules as R
 from sentinel.lint.repo import LAYOUT
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "config" / "example"
@@ -47,7 +48,8 @@ def test_skipped_rules_carry_reasons():
     report = lint(EXAMPLE, today=TODAY)
     for rid in ("L-MAN-09", "L-MAN-10", "L-SRF-12", "L-FIX-08", "L-XREF-10", "L-XREF-16", "L-FPR-02"):
         assert report.skipped[rid]
-    assert set(report.skipped) == {rid for rid, r in RULES.items() if r.skipped}
+    implemented = {i for m in R.check_modules() for i in m.RULE_IDS}   # pending rows a checks module now implements
+    assert set(report.skipped) == {rid for rid, r in RULES.items() if r.skipped and rid not in implemented}
     assert all(r.severity in ("error", "warn") for r in RULES.values())
 
 

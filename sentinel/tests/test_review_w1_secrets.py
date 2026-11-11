@@ -237,3 +237,45 @@ def test_secrets_3_split_identifiers_and_the_title_are_scrubbed():
     assert b._title(ev) == f"thinkorswim - {REDACTED} - Main"
     ev.redaction = NS(boxes=[NS(rect=RRect(300, 2, 80, 12))])                # a filled box on the title bar
     assert b._title(ev) == REDACTED
+
+
+# == secrets:4: every run's artifacts are their own set, and quarantine moves only that set ======================
+
+def _object_files(root: Path) -> set[Path]:
+    return {p for p in root.rglob("*") if p.is_file() and p.suffix == ".png"}
+
+
+def test_secrets_4_one_runs_quarantine_leaves_the_other_runs_artifacts_alone(tmp_path, monkeypatch):
+    """8.4: each run's set lives in its own directory and quarantine/<run_id> outside all of them, so a leak in one
+    run moves only that run's objects; an earlier run's objects stay where its rows say, and later runs store."""
+    import sentinel.pipeline.run as pr
+    from sentinel.store import ArtifactStore
+    one, two = clean_scenario(TODAY), clean_scenario(TODAY, seq=2)
+    r1 = run_pipeline(EXAMPLE, one, tmp_path, today=TODAY)
+    assert r1.status == "complete"
+    before = _object_files(tmp_path / "artifacts")
+    assert before
+    monkeypatch.setattr(pr, "SIM_SECRET", f"{two.run_id}/1")              # a value run 2's records carry
+    r2 = run_pipeline(EXAMPLE, two, tmp_path, today=TODAY)
+    assert (r2.status, r2.reason) == ("aborted_harness", "secret_leaked")
+    assert before <= _object_files(tmp_path / "artifacts") - _object_files(tmp_path / "artifacts" / "quarantine")
+    with Store(tmp_path / "sentinel.db") as store:
+        shas = {o.artifacts["candidate"] for o in store.outcomes(one.run_id) if o.artifacts}
+    first = ArtifactStore.at(tmp_path / "artifacts", f"runs/{one.run_id}")
+    assert shas and first.quarantined is None and all(first.verify(s) for s in shas)
+    later = ArtifactStore.at(tmp_path / "artifacts", "runs/run-2026-11-10-pr-4823-03")
+    later.put(b"{}", name="x.json", kind="request", media_type="application/json")   # not blocked by run 2's marker
+
+
+def test_secrets_4_quarantine_refuses_a_quarantine_root_inside_the_set(tmp_path):
+    """8.4: quarantine/ is a sibling of the sets; a quarantine root inside the set's directory is refused, nothing
+    moved."""
+    import pytest
+
+    from sentinel.store import ArtifactStore
+    from sentinel.store.artifacts import ArtifactError
+    arts = ArtifactStore(tmp_path / "artifacts", "runs/r1")
+    a = arts.put(b"{}", name="x.json", kind="request", media_type="application/json")
+    with pytest.raises(ArtifactError, match="outside every set"):
+        arts.quarantine("r1", tmp_path / "artifacts" / "quarantine")
+    assert arts.quarantined is None and arts.verify(a.sha256)

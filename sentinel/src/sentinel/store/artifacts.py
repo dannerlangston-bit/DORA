@@ -25,6 +25,9 @@ Choices where 8.4 is silent:
   redaction-version header of the 8.2 `PUT /v1/artifacts/{sha256}` request.
 - Text artifacts (logs, exports, ledgers, reviewer requests) are accepted without a redaction header: 8.4 sends
   them through the plaintext scan instead (6.9). Their redaction version is recorded when given.
+- Every set has its own directory (`ArtifactStore.at(root, set_path)` opens `<root>/<set_path>/`), so a set's
+  root holds that set alone, and `quarantine/` lies outside every set: `quarantine` refuses a quarantine root
+  inside the set it moves.
 - Quarantine moves every file of the set (objects, manifest, ledgers under `shards/`), since a leaked secret can
   sit in a ledger as well as in an object. A file already in the quarantine directory with the same bytes is
   dropped; one with other bytes keeps both, the moved copy under the next free `<name>.<n>`.
@@ -200,6 +203,12 @@ class ArtifactStore:
     plaintext check of every non-image put (6.9).
     """
 
+    @classmethod
+    def at(cls, root: str | os.PathLike, set_path: str, *, scanner: TextScanner | None = None) -> "ArtifactStore":
+        """The set `set_path` in its own directory under an artifact root, `<root>/<set_path>/` (8.4: the control
+        host's `runs/<run_id>/`), so one set's quarantine never moves or blocks another set's files."""
+        return cls(Path(root) / set_path, set_path, scanner=scanner)
+
     def __init__(self, root: str | os.PathLike, set_path: str, *, scanner: TextScanner | None = None):
         self.root = Path(root)
         self.set_path = set_path
@@ -338,8 +347,12 @@ class ArtifactStore:
 
         The marker is written first, so puts and reads are refused from that moment even if the move stops half
         way. With `store`, every `artifact_sets` row of this set not yet quarantined gets `quarantined_at` (8.4,
-        SD-82). Returns the quarantine directory; quarantining a quarantined set moves whatever is left.
+        SD-82). Returns the quarantine directory; quarantining a quarantined set moves whatever is left. Raises
+        ArtifactError, moving nothing, when `quarantine_root` lies inside this set's root (8.4: a sibling of the sets).
         """
+        if Path(quarantine_root).resolve().is_relative_to(self.root.resolve()):
+            raise ArtifactError(f"quarantine root {quarantine_root} lies inside set {self.set_path}'s directory "
+                                f"{self.root}; quarantine/ is outside every set (8.4)")
         ts = datetime.fromisoformat(at or now())
         stamp = (ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).isoformat(
             timespec="seconds")

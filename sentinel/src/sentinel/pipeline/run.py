@@ -1850,7 +1850,7 @@ def _render(store: Store, run_id: str, mdict: dict | None, ctx: ReportContext, o
     status = _status_json(rep.status)
     (out / "pr-comment.md").write_text(comment, encoding="utf-8")
     (out / "commit-status.json").write_text(json.dumps(status, indent=2) + "\n")
-    write_run_report(rep, out / "report.html", objects_dir=out / "artifacts" / "objects", embed=True)
+    write_run_report(rep, out / "report.html", objects_dir=out / "artifacts" / "runs" / run_id / "objects", embed=True)
     return comment, status
 
 
@@ -1929,7 +1929,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
     with `live` (a `reviewer.ReviewerJob`, `pipeline.live.live_job`; or `live_factory`, which builds it over the
     run's `egress.EgressGate`, 6.10) the real adapter `ModelReviewer`, else
     the offline `SimulatedReviewer`. Writes into `out_dir`:
-    `config/<run_id>/`, `sentinel.db` (shared by every run of the directory), `artifacts/`,
+    `config/<run_id>/`, `sentinel.db` (shared by every run of the directory), `artifacts/runs/<run_id>/` (8.4),
     `calibration/`, `heartbeat/`, `pr-comment.md`, `commit-status.json`, `report.html`,
     `reviewer-calls.json`, and appends to `alerts.json` and `orchestrator.json`. Raises `PairRefused`, before
     anything is written to the store, when run creation refuses the candidate's build pair (4.2)."""
@@ -1984,7 +1984,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         # -- T+0:00 to 0:02: the run row, its scope and shards (1.7)
         secrets = run_secrets(RIGS)                       # 6.9: the plaintexts the run's logins used, by reference
         scanner = SecretScanner(secrets)
-        arts = ArtifactStore(out / "artifacts", f"runs/{scenario.run_id}", scanner=scanner)
+        arts = ArtifactStore.at(out / "artifacts", f"runs/{scenario.run_id}", scanner=scanner)    # 8.4: its own dir
         leak: ControlResult | None = None                 # the first results batch the upload check stopped
         writer = _Writer(run, arts, today, scenario.clock)
         used = sorted({rig_of[cp.checkpoint_id] for cp in planned})
@@ -2612,7 +2612,7 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
             gen = cn.generate(entries, {cid: c.screen.image for cid, c in approved.items()}, boxes)
             results: list[cn.MutantResult] = []
             produced: dict[str, CheckpointOutcome] = {}
-            writer = _Writer(run, ArtifactStore(out / "artifacts", f"runs/{scenario.run_id}"), today, scenario.clock)
+            writer = _Writer(run, ArtifactStore.at(out / "artifacts", f"runs/{scenario.run_id}"), today, scenario.clock)
             rows_meta = []
             arts_by_sha: dict[str, StoredArtifact] = {}
             for m in gen.mutants:

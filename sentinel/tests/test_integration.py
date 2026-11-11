@@ -466,7 +466,7 @@ def test_the_live_adapter_reviews_with_crops_from_the_artifact_store(tmp_path):
         {("intended", "reviewer", "claude-opus-5-5")}
     images = [b for b in t.calls[0]["messages"][-1]["content"] if b.get("type") == "image"]
     assert len(images) == 3                                     # base, candidate and heatmap crops at 1:1
-    manifest = json.loads((tmp_path / "artifacts" / "manifest.json").read_text())
+    manifest = json.loads((tmp_path / "artifacts" / "runs" / r.run_id / "manifest.json").read_text())   # 8.4
     assert any(e["name"].endswith("/review/candidate.png") and e["kind"] == "capture"
                for e in manifest.get("entries", manifest.get("artifacts", [])))
 

@@ -47,7 +47,7 @@ def assert_legal(outcomes: list[CheckpointOutcome]) -> None:
 def assert_outputs(out: Path) -> str:
     for f in FILES:
         assert (out / f).exists(), f
-    assert (out / "artifacts" / "manifest.json").exists()
+    assert list((out / "artifacts" / "runs").glob("*/manifest.json"))      # 8.4: one set per run
     status = json.loads((out / "commit-status.json").read_text())
     assert status["context"] == "sentinel/pr-run" and status["state"] in ("success", "failure", "error")
     assert "SIMULATED run" in (out / "summary.txt").read_text()

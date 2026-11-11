@@ -60,8 +60,9 @@ Choices where the spec is ambiguous or silent (reported):
    hyphens and spaces are ignored. The self-test runs at gate `provisioned`, before any capture (10.8).
 8. Crops. A window partly off the frame is cropped to the part on the frame; a window wholly off it, or without
    bounds, has no crop. The composite pastes each window's redacted crop over its rect and fills a window with no
-   redacted crop with the fill colour, so no unredacted window pixel reaches it; the redaction stage still
-   sweeps the composite before it is stored (the artifact store refuses an image without a redaction header).
+   redacted crop with the fill colour, so no unredacted window pixel reaches it, and writes the titles redacted
+   as in choice 10; the redaction stage still sweeps the composite before it is stored (the artifact store
+   refuses an image without a redaction header).
    Frames follow `ports.Frame` (BGR), so the JPEG is encoded as given.
 9. masked_live (7.9, 3.5, 5.7). The frames start at the settle frame (the first of the settled triple) and are
    `settle.masked_live.interval_ms` apart. The parameters are valid when the count is 3 to 5, the span is 1 to
@@ -369,9 +370,10 @@ def crop_windows(frame: Frame, windows: Sequence[WindowInfo]) -> dict[int, np.nd
 
 
 def composite(frame: Frame, windows: Sequence[WindowInfo], redacted: Mapping[int, np.ndarray],
-              fill: tuple[int, int, int]) -> np.ndarray:
+              fill: tuple[int, int, int], sweep: Sweep | None = None) -> np.ndarray:
     """The report composite (5.7): the frame with each window replaced by its redacted crop (filled when it has
-    none), its rect drawn and its title written (choice 8)."""
+    none), its rect drawn and its title, redacted as the metadata's is, written (choices 8, 10)."""
+    sweep = sweep or Sweep()
     img = np.array(frame.image, dtype=np.uint8, copy=True)
     ox, oy = frame.origin
     for w in windows:
@@ -388,8 +390,8 @@ def composite(frame: Frame, windows: Sequence[WindowInfo], redacted: Mapping[int
         else:
             img[y0:y1, x0:x1] = crop[..., :3]
         cv2.rectangle(img, (x0, y0), (x1 - 1, y1 - 1), OUTLINE_BGR, 2)
-        cv2.putText(img, (w.title or UNTITLED)[:80], (x0 + 4, y0 + 16), cv2.FONT_HERSHEY_SIMPLEX, TITLE_SCALE,
-                    OUTLINE_BGR, 1, cv2.LINE_AA)
+        cv2.putText(img, redact_text(w.title or UNTITLED, sweep)[:80], (x0 + 4, y0 + 16), cv2.FONT_HERSHEY_SIMPLEX,
+                    TITLE_SCALE, OUTLINE_BGR, 1, cv2.LINE_AA)
     return img
 
 

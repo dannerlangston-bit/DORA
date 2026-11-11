@@ -248,6 +248,10 @@ def test_composite_pastes_redacted_crops_fills_the_rest_and_encodes_jpeg():
     assert np.array_equal(img[300, 200], (1, 2, 3))                   # no redacted crop: filled
     assert np.array_equal(img[0, 400], (0, 255, 255))                 # the rect outline
     assert np.array_equal(img[1070, 10], frame.image[1070, 10])       # outside every window: the grab
+    leaky = win(1, title="thinkorswim - Jane Doe")
+    shown = composite(frame, [win(1, title="thinkorswim - <redacted:display_name>")], red, fill=(1, 2, 3))
+    assert np.array_equal(composite(frame, [leaky], red, fill=(1, 2, 3), sweep=Sweep(display_name="Jane Doe")),
+                          shown)                                            # the name is never drawn
     jpg = composite_jpeg(img)
     assert jpg[:2] == b"\xff\xd8" and cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR).shape == img.shape
     with pytest.raises(CaptureError):

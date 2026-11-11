@@ -298,7 +298,7 @@ Most checkpoints need no quiet window: frozen ones are deterministic by construc
 
 Why wall-clock rules are wrong (America/New_York throughout):
 
-- Schwab's 24/5 overnight session covers 1,100 or more securities as of July 2025 (S&P 500 and Nasdaq-100 stocks and hundreds of ETFs), quotes moving Sunday 20:00 to Friday 20:00 (consistent across sources, not confirmed verbatim). The list changes, so it is re-read each run from the Public > 24 Hour Trading watchlist and its hash stored in the epoch as a record field.
+- Schwab's 24/5 overnight session covers 1,100 or more securities as of July 2025 (S&P 500 and Nasdaq-100 stocks and hundreds of ETFs), quotes moving Sunday 20:00 to Friday 20:00 (consistent across sources, not confirmed verbatim). The list changes, so it is re-read each run from the Public > 24 Hour Trading watchlist and its hash stored as the fingerprint's record field `trading_24h_list_sha256` (7.4), outside the epoch.
 - Extended-hours order sessions are reported as 7:00 to 9:25 and 16:05 to 20:00, not 4:00 and 16:00; verify against Schwab's current page before coding windows.
 - CME Globex equity index futures: Sunday 18:00 to Friday 17:00 with a daily 17:00 to 18:00 break. Forex: 24/5, Sunday 17:00 to Friday 17:00.
 - CME crypto futures and options: 24/7 since June 2026 with only a Saturday 2:00 to 4:00 CT maintenance break, so /BTC and /MBT have no quiet window; they get an always-live profile with `rule` regions and no pixel-diffed quote cell.
@@ -313,7 +313,7 @@ windows:
   all_quiet:        # equities, futures, forex closed; crypto futures excluded by profile
     start: {calendar: XNYS, weekday: Fri, time: "20:00"}
     end:   {weekday: Sun, time: "17:00"}   # forex 17:00, Globex 18:00, 24/5 equities 20:00
-  equities_quiet:   # only for symbols absent from the 24-hour list hash in the epoch
+  equities_quiet:   # only for symbols absent from the 24-hour list read this run (7.4)
     rule: "XNYS closed and symbol not in overnight list"
   futures_break:
     rule: "CMES daily break 17:00 to 18:00, or CMES weekend close"

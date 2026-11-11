@@ -11,7 +11,11 @@ the post-run proof follow. The shard's checkpoints are the Executor's work in `r
 - `RigScript`: what a scenario makes the rig do (a live-format account id in the selector, a scripted
   Enter on the open Order Confirmation dialog, an EDT freeze during a checkpoint);
 - `shard_setup`: the `RunContext` of one shard and the `SimScenario` its rig observes, from the config
-  (the rig launches the build under test, so the Executor's build re-read before each flow sees it);
+  (the rig launches the build under test, so the Executor's build re-read before each flow sees it; with
+  `kill_root` its file flag is `<kill_root>/<rig>/run/kill.flag`, so `sentinel stop --root` reaches it); the default
+  order chords come from `gateway/default_order_hotkeys.yaml` (`gateway_config.load_default_order_hotkeys`, 5.4.7):
+  a file that is missing or breaks L-XREF-17 is returned as the `GatewayConfigError` whose result fails the shard
+  closed at `settings_attested`;
 - `ShardSink`: the Orchestrator's `OutcomeSink` for one shard. The store's `fill_unreached` fills the
   whole run, so a shard's unreached outcomes are held here and written with the shard's other records;
 - `alert_entry`, `persisted_actions`: the 9.10 route of every control result for `alerts.json`, and
@@ -52,7 +56,8 @@ from typing import Any, Mapping, Sequence
 from ..orchestrator.alerts import AlertRoute
 from ..orchestrator.attestation import AttestationProfile
 from ..orchestrator.gates import AccountExpectation, WorkspaceExpectation
-from ..orchestrator.gateway import Chord
+from ..orchestrator.gateway_config import (DEFAULT_ORDER_HOTKEYS_PATH, DefaultOrderHotkeys, GatewayConfigError,
+                                           load_default_order_hotkeys)
 from ..orchestrator.identity import load_allowlist
 from ..orchestrator.machine import RunContext
 from ..orchestrator.results import ControlResult, Outcome
@@ -61,7 +66,6 @@ from ..orchestrator.simrig import TABS, SimScenario, default_settings
 from .config import SentinelConfig
 
 LAUNCHES = 8                    # the first launch, three relaunches (10.2) and room for a recovery login
-DEFAULT_CHORDS = ("Shift+B", "Shift+S")          # the order hot keys the profile pins as unassigned (A6)
 # Actions a control result asks for that the Orchestrator does not perform on the rig itself (results.ACTIONS)
 PERSISTED = {
     "quarantine_flow": "quarantine record for the flow (5.4.8, 6.6)",
@@ -83,6 +87,7 @@ class RigScript:
     selector_text: str | None = None                 # each shard's first account selector read (6.4)
     enter_after: tuple[str, str] | None = None       # (flow id, step id): a scripted Enter on the open dialog after it
     freeze_at: str | None = None                     # checkpoint id: the app's EDT freezes while it is captured
+    stop_at: str | None = None                       # checkpoint id: an operator runs `sentinel stop` on its rig then
 
 
 class ShardSink:
@@ -118,9 +123,21 @@ def _accounts(fixture: Mapping[str, Any]) -> tuple[dict[str, AccountExpectation]
     return expected, tuple(states)
 
 
+def order_hotkeys(cfg: SentinelConfig) -> tuple[DefaultOrderHotkeys | None, GatewayConfigError | None]:
+    """The pinned build's default order chords (5.4.7): the loaded file, or the error whose `result` fails the shard
+    closed at `settings_attested` (L-XREF-17)."""
+    try:
+        return load_default_order_hotkeys(cfg.root / DEFAULT_ORDER_HOTKEYS_PATH), None
+    except GatewayConfigError as err:
+        return None, err
+
+
 def shard_setup(cfg: SentinelConfig, *, run_id: str, run_type: str, shard_id: str, shard_no: int, build_id: str,
-                workspace_id: str, script: RigScript) -> tuple[RunContext, SimScenario]:
-    """The `RunContext` of one shard and the `SimScenario` its simulated rig observes (module docstring)."""
+                workspace_id: str, script: RigScript, rig_id: str | None = None,
+                kill_root: Path | None = None) -> tuple[RunContext, SimScenario]:
+    """The `RunContext` of one shard and the `SimScenario` its simulated rig observes (module docstring). The
+    context carries the default order chords file when it loads (`order_hotkeys`); the caller applies the load
+    error's result otherwise."""
     fx = cfg.fixture
     rig = str(fx.get("rig", "rig-01"))
     allowlist = load_allowlist(cfg.root / "gateway" / "allowlist.yaml", rig)
@@ -135,16 +152,18 @@ def shard_setup(cfg: SentinelConfig, *, run_id: str, run_type: str, shard_id: st
     profile = AttestationProfile.from_settings(prof_doc.get("settings") or {}, panels=panels,
                                                sha256=_sha(prof_path) if prof_path.is_file() else None)
     ws_sha = str(entry.get("file_sha256", "")).removeprefix("sha256:") or hashlib.sha256(workspace_id.encode()).hexdigest()
+    hotkeys, _ = order_hotkeys(cfg)
     ctx = RunContext(run_id=run_id, run_type=run_type, shard_id=shard_id, expected_build=build_id,
                      allowlist=allowlist, fixture_account=empty, profile=profile, fixture=expected,
                      workspace=WorkspaceExpectation(ws_sha, TABS, 1),
-                     default_order_chords=tuple(Chord.parse(c) for c in DEFAULT_CHORDS), shard=shard_no)
+                     default_order_chords=hotkeys.chords if hotkeys else (), shard=shard_no, order_hotkeys=hotkeys)
     settings = dict(default_settings(), A7={p: False for p in panels})
     reads = [SelectorRead(script.selector_text, crop_sha256=hashlib.sha256(script.selector_text.encode()).hexdigest())
              ] if script.selector_text else []
     scenario = SimScenario(launches=[LaunchObservation(True, build_id, waited_s=40.0)] * LAUNCHES,
                            selector_reads=reads, selected=empty, settings=settings,
-                           workspace=WorkspaceObservation(ws_sha, True, TABS, 1), accounts=states)
+                           workspace=WorkspaceObservation(ws_sha, True, TABS, 1), accounts=states,
+                           rig_id=rig_id or rig, kill_root=kill_root)
     return ctx, scenario
 
 
@@ -161,14 +180,18 @@ def login_label(rig: str) -> str:
 
 
 # -- what the run writes besides the store ----------------------------------------------------------------
-def alert_entry(run_id: str, shard_id: str, r: ControlResult) -> dict | None:
+def alert_entry(run_id: str, shard_id: str | None, r: ControlResult) -> dict | None:
     """One `alerts.json` entry: the 9.10 route of a control result, or None when it pages nobody."""
     a: AlertRoute | None = r.alert
     if a is None:
         return None
-    return {"run_id": run_id, "shard_id": shard_id, "rule": a.rule, "priority": a.priority, "paged": list(a.paged),
-            "notified": list(a.notified), "safety_table": a.is_safety, "control": r.control, "gate": r.gate,
-            "incident": r.incident, "run_outcome": r.run_status, "run_reason": r.run_reason, "detail": r.detail}
+    entry = {"run_id": run_id, "shard_id": shard_id, "rule": a.rule, "priority": a.priority, "paged": list(a.paged),
+             "notified": list(a.notified), "safety_table": a.is_safety, "control": r.control, "gate": r.gate,
+             "incident": r.incident, "run_outcome": r.run_status, "run_reason": r.run_reason, "detail": r.detail}
+    for k in ("account", "working_orders_screenshot", "instruction"):     # the 6.6 Cancel All failure hand-over
+        if (r.evidence or {}).get(k):
+            entry[k] = r.evidence[k]
+    return entry
 
 
 def persisted_actions(run_id: str, shard_id: str, rig: str, r: ControlResult, flow_id: str | None) -> list[dict]:

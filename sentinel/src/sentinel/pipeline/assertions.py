@@ -23,6 +23,14 @@ What the Oracle is given (4.7, 2.8.1):
 - the rule tables: `fixtures/margin_rules.yaml` through `RuleConfig.load` (the config is invalid
   without it, 4.1).
 
+Rule regions (4.8, 2.8.2, SD-29): every `type: rule` region of the checkpoint's regions file is checked by the
+run's `oracle.RegionRuleChecker` (its field format, pattern, decimals, range, rows and the time-based checks against
+the previous read on the same side; the exchange calendar is the XNYS regular session, `oracle.RegularSession`, the
+example pinning no holidays): on a flow checkpoint after its `expect` assertions (`check`; a checkpoint with rule
+regions and no `expect` still runs), on a census, sweep or split checkpoint as its only Oracle checks
+(`check_census`, `oracle.checks_for`). The time-based checks compare with one `RegionHistory` per flow and side, or
+per census checkpoint and side.
+
 An `OracleConfigError` at run time (a flow the lint accepted but the Oracle cannot evaluate) is a
 harness fault, `harness_error (reason: exception:OracleConfigError)`, never a pass or a product failure.
 
@@ -39,6 +47,8 @@ from typing import Any, Mapping
 from .. import oracle
 from ..diff.regions import RegionsFile
 from ..oracle.assertions import AssertionResult, OracleVerdict, step_assertions
+from ..oracle.census import checks_for
+from ..oracle.region_rules import RegionHistory, RegionRuleChecker, RegularSession, rule_regions
 from ..oracle.sources import Extraction, GroundTruthReader, extract
 from ..oracle.tables import EvalContext, OracleConfigError, RuleConfig, resolve_ref
 from .config import SentinelConfig
@@ -60,12 +70,15 @@ class OracleCheck:
 
 @dataclass
 class FlowOracle:
-    """The Oracle for one run: rule tables, fixture, and the extractions of earlier checkpoints per flow."""
+    """The Oracle for one run: rule tables, fixture, the rule-region checker, and the extractions of earlier
+    checkpoints per flow."""
 
     cfg: SentinelConfig
     rules: RuleConfig
     capture_time: datetime
     previous: dict[tuple[str, str], dict[str, dict[str, Extraction]]] = field(default_factory=dict)
+    checker: RegionRuleChecker | None = None
+    histories: dict[tuple[str, str], RegionHistory] = field(default_factory=dict)
 
     @classmethod
     def load(cls, cfg: SentinelConfig, capture_time: datetime) -> "FlowOracle":
@@ -73,7 +86,30 @@ class FlowOracle:
         path = cfg.root / "fixtures" / "margin_rules.yaml"
         if not path.is_file():
             raise OracleConfigError("fixtures/margin_rules.yaml is missing (4.1); R02 has no brackets")
-        return cls(cfg, RuleConfig.load(path), capture_time)
+        rules = RuleConfig.load(path)
+        return cls(cfg, rules, capture_time,
+                   checker=RegionRuleChecker(fixture=cfg.fixture, config=rules, calendar=RegularSession()))
+
+    def _rule_results(self, scope: str, checkpoint_id: str, side: str, reg: RegionsFile,
+                      sources: Mapping[str, Any], ctx: EvalContext) -> list[AssertionResult]:
+        """The checkpoint's rule regions on one side's capture (2.8.2); `scope` keys the history (a flow, or the
+        census checkpoint itself)."""
+        if self.checker is None or not rule_regions(reg, checkpoint_id):
+            return []
+        history = self.histories.setdefault((side, scope), RegionHistory())
+        return self.checker.check(checkpoint_id, side, reg, sources, history, self.capture_time, context=ctx)
+
+    def check_census(self, checkpoint_id: str, data_mode: str, capture: Capture, reg: RegionsFile,
+                     located: Mapping[str, tuple[int, int]], side: str) -> OracleCheck | None:
+        """A census, sweep or split checkpoint's Oracle checks on one side (SD-29: every rule region of its regions
+        file, `oracle.checks_for`); None when it has none."""
+        if not checks_for(checkpoint_id, reg).rules:
+            return None
+        values = region_values(capture.screen, reg, located)
+        sources: dict[str, Any] = {"ocr": GroundTruthReader(values, confidence=OCR_CONFIDENCE)}
+        ctx = EvalContext(data_mode=data_mode, capture_time=self.capture_time)
+        results = self._rule_results(checkpoint_id, checkpoint_id, side, reg, sources, ctx)
+        return OracleCheck(oracle.summarize(results), values)
 
     # -- the context of one checkpoint -----------------------------------------------------------
     def context(self, flow_id: str, step: Mapping[str, Any], data_mode: str) -> EvalContext:
@@ -94,15 +130,19 @@ class FlowOracle:
     # -- one checkpoint, one side ----------------------------------------------------------------
     def check(self, flow_id: str, step_id: str, data_mode: str, capture: Capture, reg: RegionsFile,
               located: Mapping[str, tuple[int, int]], side: str) -> OracleCheck | None:
-        """The step's assertions on one side's capture; None when the step declares none."""
+        """The step's assertions, then the checkpoint's rule regions, on one side's capture; None when it has
+        neither."""
         step = self.cfg.flow_step(flow_id, step_id)
-        if not step_assertions(step):
+        has_rules = self.checker is not None and bool(rule_regions(reg, reg.checkpoint_id))
+        if not step_assertions(step) and not has_rules:
             return None
         values = region_values(capture.screen, reg, located)
         sources: dict[str, Any] = {"ocr": GroundTruthReader(values, confidence=OCR_CONFIDENCE)}
         prev = self.previous.setdefault((side, flow_id), {})
         ctx = self.context(flow_id, step, data_mode)
-        results = oracle.evaluate_assertions(step, sources, prev, self.cfg.fixture, self.rules, context=ctx)
+        results = oracle.evaluate_assertions(step, sources, prev, self.cfg.fixture, self.rules, context=ctx) \
+            if step_assertions(step) else []
+        results += self._rule_results(flow_id, reg.checkpoint_id, side, reg, sources, ctx)
         reads = {rid: extract(rid, "text", {"ocr": sources["ocr"]}, "ocr") for rid in values}
         for r in results:
             for ext in r.operands.values():

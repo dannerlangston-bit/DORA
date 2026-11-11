@@ -22,8 +22,14 @@ and its calibration):
   the run is `aborted_safety (reason: attempted_send)` and the proof shows no order went out.
 - `app-crash`: the app freezes during a sweep step; `assertion_failed (assertion: app_alive)`, the rest
   of the ladder `not_run (reason: app_crash)`, a relaunch, and the run goes on.
-- `config-invalid`: the run date is past the first mask's expiry; preflight G1 (config lint) fails and
-  the run is `aborted_harness (reason: config_invalid)`.
+- `config-invalid`: a regions file names a mask record that does not exist (L-RGN-03); preflight G1 (the
+  run-start lint) fails and the run is `aborted_harness (reason: config_invalid)`.
+- `expired-mask`: the run date is past the first mask's expiry; the mask stops applying at run start, run health
+  lists it, a `mask_expired` finding is stored and the run completes (4.1, 4.8).
+- `operator-stop`: `sentinel stop` writes a rig's file flag mid-run; the next boundary trips the kill switch, the
+  run is `aborted_safety (reason: kill_switch)` and the proof reads PROVEN: no orders sent (6.6).
+- `redaction-miss`: the candidate echoes an account id outside the redaction anchors; the redaction stage masks it
+  and stores a tier-1 `redaction_miss` finding; the check still passes (3.6, 6.10).
 
 `sentinel demo all` runs every scenario, prints one line each and writes `DIR/index.html`, a page that
 links each scenario's report, PR comment, summary and alerts with what to check.
@@ -52,19 +58,21 @@ import yaml
 from . import synth
 from .pipeline.orchestration import RigScript
 from .pipeline.reviewer import SIMULATED_MODEL_ID
-from .pipeline.run import (DEFAULT_TODAY, NOT_SIMULATED, NightlyScenario, RunResult, Scenario, record_decisions,
-                           run_nightly, run_pipeline)
+from .pipeline.run import (DEFAULT_TODAY, NOT_SIMULATED, NightlyScenario, PairRefused, RunResult, Scenario,
+                           record_decisions, run_nightly, run_pipeline)
 from .pipeline.sim import SimBuild
 from .store import Store
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "example"
 SCENARIOS = ("flexgrid-ladder", "clean-pr", "backend-only", "ui-no-manifest", "nightly-canary", "decision-inheritance",
-             "wrong-number", "paper-mode-mismatch", "attempted-send", "app-crash", "config-invalid")
+             "wrong-number", "paper-mode-mismatch", "attempted-send", "app-crash", "config-invalid", "expired-mask",
+             "operator-stop", "redaction-miss")
 AT = "charts.flexible-grid.active-trader-cell"
 LADDER = "trade.active-trader.ladder"
 STOCK_FLOW = "flow.trade.order-ticket.stock.limit"
 LIVE_ACCOUNT = "12345678SCHW"                    # the live account id format of 6.13 item 5: eight digits, then SCHW
 FREEZE_AT = f"sweep/{AT}/flexgrid/640x480"
+PS_CENSUS = "census/monitor.activity.position-statement/ws.tier-a.active-trader"
 BASE_ID = "main-1998.3.0-2c91ae4"
 GRID_SRC = "desktop/ui/grid/src/main/java/com/tos/desktop/ui/grid"
 GRID_INDEX = {
@@ -299,8 +307,28 @@ entries:
                     depends_on={}, rig=RigScript(freeze_at=FREEZE_AT))
 
 
+PS_REGIONS = "regions/census/monitor.activity.position-statement/ws.tier-a.active-trader.yaml"
+
+
+def broken_ref_overlay(config_dir: Path) -> dict[str, str]:
+    """A config edit the lint refuses at run start: the Position Statement's regions file renames its mask reference
+    to `msk.ps.last-update-02`, a mask record that does not exist (L-RGN-03, a broken reference)."""
+    text = (Path(config_dir) / PS_REGIONS).read_text(encoding="utf-8")
+    old = "mask_ref: msk.ps.last-update-01}"
+    if old not in text:
+        raise ValueError(f"{PS_REGIONS} does not carry the example's mask reference")
+    return {PS_REGIONS: text.replace(old, "mask_ref: msk.ps.last-update-02}")}
+
+
+def config_invalid_scenario(today: date, config_dir: Path = EXAMPLE) -> Scenario:
+    """PR 4823 (the chart header change) on a config whose regions file names a mask record that does not exist."""
+    sc = clean_scenario(today)
+    return replace(sc, name="config-invalid", overlay=dict(sc.overlay, **broken_ref_overlay(config_dir)))
+
+
 def mask_expiry(config_dir: Path) -> date:
-    """The earliest `expires_at` of the config's masks: the first day after it, the config no longer lints."""
+    """The earliest `expires_at` of the config's masks: from the first day after it the mask stops applying at run
+    start (4.8 L-MSK-02: an error in CI, ignored at run start), and the run goes on without it."""
     dates = []
     for p in sorted((config_dir / "masks").rglob("*.yaml")):
         doc = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
@@ -316,8 +344,31 @@ PR_SCENARIOS: dict[str, Callable[[date], Scenario]] = {
     "flexgrid-ladder": lambda d: flexgrid_scenario(d), "clean-pr": lambda d: clean_scenario(d),
     "backend-only": backend_scenario, "ui-no-manifest": ui_no_manifest_scenario, "wrong-number": wrong_number_scenario,
     "paper-mode-mismatch": paper_mode_scenario, "attempted-send": attempted_send_scenario,
-    "app-crash": app_crash_scenario,
+    "app-crash": app_crash_scenario, "operator-stop": lambda d: operator_stop_scenario(d),
+    "redaction-miss": lambda d: redaction_miss_scenario(d),
 }
+
+S03_CHECKPOINT = f"flow/trade.order-entry.stock/{STOCK_FLOW}/s03"
+
+
+def operator_stop_scenario(today: date) -> Scenario:
+    """PR 4856: a backend change with no visible effect; while the stock ticket flow's s03 is captured, an operator
+    runs `sentinel stop` on that shard's rig."""
+    cand, overlay, paths = _backend_pr("d4c8b21", 4856, "chore/TOS-48356-quote-cache",
+                                       "desktop/trade/quotes/src/main/resources/quotes/cache.properties")
+    return Scenario("operator-stop", f"run-{today.isoformat()}-pr-4856-01", SimBuild(cand), SimBuild(BASE_ID),
+                    pr=4856, author="okafor", overlay=overlay, changed_paths=paths, depends_on={},
+                    rig=RigScript(stop_at=S03_CHECKPOINT))
+
+
+def redaction_miss_scenario(today: date) -> Scenario:
+    """PR 4857: a logging change echoes the selected account id on the Order Confirmation, outside the redaction
+    anchors, on the candidate only."""
+    cand, overlay, paths = _backend_pr("e7f3a90", 4857, "chore/TOS-48357-confirm-logging",
+                                       "desktop/trade/orders/src/main/resources/orders/confirm-logging.properties")
+    return Scenario("redaction-miss", f"run-{today.isoformat()}-pr-4857-01",
+                    SimBuild(cand, frozenset({"confirm-account-echo"})), SimBuild(BASE_ID), pr=4857, author="pchen",
+                    overlay=overlay, changed_paths=paths, depends_on={})
 
 S07 = "regions/flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07.yaml"
 S07_MASK = "masks/flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07/msk.confirm.clock-01.yaml"
@@ -325,9 +376,10 @@ S07_MASK = "masks/flow/dialog.order-confirmation/flow.trade.order-ticket.stock.l
 
 def blind_overlay(config_dir: Path) -> dict[str, str]:
     """A config edit that lint accepts and the canary catches: the Buying Power Effect region loses its
-    money_cell flag and the dialog's clock mask is pasted with that cell's offset (rect dx 24, dy 120)."""
+    money_cell flag and its money_role (SD-28) and the dialog's clock mask is pasted with that cell's offset (rect
+    dx 24, dy 120)."""
     text = (config_dir / S07).read_text(encoding="utf-8")
-    old = "rect: {dx: 24, dy: 120, w: 200, h: 20}, money_cell: true}"
+    old = "rect: {dx: 24, dy: 120, w: 200, h: 20}, money_cell: true, money_role: bp_effect}"
     if old not in text:
         raise ValueError(f"{S07} does not carry the example's bp-effect line")
     text = text.replace(old, "rect: {dx: 24, dy: 120, w: 200, h: 20}}")
@@ -438,8 +490,9 @@ def _write_summary(out: Path, title: str, story: list[str], results: list[RunRes
     if not abort_expected and any(r.reason == "config_invalid" for r in results):
         lines += ["NOTE: a run below stopped at T+0:00 because config lint failed (1.7): it ended",
                   "aborted_harness (reason: config_invalid) and its PR comment carries the abort block. With the",
-                  "default --today 2026-11-10 the example config lints clean; a later date expires its mask and the",
-                  "front-month future. The story below is what the scenario shows when the config is valid.", ""]
+                  "default --today 2026-11-10 the example config lints clean; a later date rolls its front-month",
+                  "future (an expired mask only stops applying). The story below is what the scenario shows when the",
+                  "config is valid.", ""]
     lines += story + ["", "What happened", "-" * 13]
     for r in results:
         lines += _run_block(r) + [""]
@@ -762,21 +815,86 @@ def demo_app_crash(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPL
 
 def demo_config_invalid(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
                         ) -> list[RunResult]:
-    day = mask_expiry(Path(config)) + timedelta(days=1)
-    r = run_pipeline(config, clean_scenario(day), out, day, **_rev(reviewer))
+    r = run_pipeline(config, config_invalid_scenario(today, Path(config)), out, today, **_rev(reviewer))
     story = [
-        f"PR 4823's run on {day.isoformat()}, the day after the example config's first mask expires (--today past",
-        "the mask expiry). Config lint is preflight item G1 (12.7): with an expired mask it fails (L-MSK-02), the",
-        "Orchestrator stops at the provisioned gate and the run ends aborted_harness (reason: config_invalid)",
-        "before any product action: no launch, no login, nothing captured, no scope.",
+        "PR 4823's run on a config where someone renamed the Position Statement's mask reference to",
+        "msk.ps.last-update-02 in its regions file, but no such mask record exists under masks/: a broken reference.",
+        "The run-start lint is preflight item G1 (12.7): it fails (L-RGN-03), the Orchestrator stops at the",
+        "provisioned gate and the run ends aborted_harness (reason: config_invalid) before any product action: no",
+        "launch, no login, nothing captured, no scope.",
         "",
         "- The PR comment carries the abort block with the failing lint rules; the check is error.",
         "- aborted_harness pages the harness on-call at P1 (9.10); see alerts.json.",
-        "- The post-run proof is PROVEN: no session established: the app was never started, so nothing could",
-        "  have been sent, and no login is blocked.",
+        "- No shard started, so the run's one post-run proof is the run-level row (SD-61): PROVEN: no session",
+        "  established: the app was never started, so nothing could have been sent, and no login is blocked.",
+        "- An expired mask no longer does this: it only stops applying (see the expired-mask scenario).",
     ]
-    _write_summary(out, "Scenario config-invalid: an expired mask stops the run at preflight", story, [r],
+    _write_summary(out, "Scenario config-invalid: a broken reference stops the run at preflight", story, [r],
                    _safety_lines(r), abort_expected=True)
+    return [r]
+
+
+def demo_expired_mask(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                      ) -> list[RunResult]:
+    day = mask_expiry(Path(config)) + timedelta(days=1)
+    r = run_pipeline(config, replace(clean_scenario(day), name="expired-mask"), out, day, **_rev(reviewer))
+    ps = [o for o in r.outcomes if o.checkpoint_id == PS_CENSUS]
+    story = [
+        f"PR 4823's run on {day.isoformat()}, the day after the example config's first mask (msk.ps.last-update-01,",
+        "the Position Statement's last-update clock) expires. In CI that is a lint error (L-MSK-02); at run start it",
+        "is not (4.1, 4.8): the run-start lint lists the mask as an expired record, the mask stops applying and the",
+        "run goes on.",
+        "",
+        "- The run is not config_invalid: it plans, captures and reports as on any other day.",
+        "- Run health lists the record (\"Expired records: mask expired: msk.ps.last-update-01\") and the run stores a",
+        "  mask_expired finding for its owner.",
+        "- Without the mask the clock's pixels diff as the enclosing region: the Position Statement census checkpoint "
+        + (f"ends {ps[0].outcome}" + (f" ({ps[0].reason})" if ps[0].reason else "") + "." if ps else "is not planned."),
+    ]
+    _write_summary(out, "Scenario expired-mask: an expired mask stops applying and the run goes on", story, [r],
+                   _safety_lines(r))
+    return [r]
+
+
+def demo_operator_stop(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                       ) -> list[RunResult]:
+    r = run_pipeline(config, operator_stop_scenario(today), out, today, **_rev(reviewer))
+    story = [
+        "PR 4856 changes a backend cache setting (no visible effect, no manifest), so the smoke flows run. While the",
+        "stock ticket flow's s03 is captured, an operator who sees an unexpected dialog on the rig's console runs",
+        f"`sentinel stop <rig> --root {out / 'rigs'}`: the command writes the rig's file flag (6.6).",
+        "",
+        "- The Orchestrator polls the kill channels first at every step and flow boundary (killflag.check): at the next",
+        "  step the flag trips the kill switch, aborted_safety (reason: kill_switch), with the request (who, why, the",
+        "  cli channel) on the result. The checkpoints not yet reached are env_error (gate running, reason kill_switch).",
+        "- The 6.6 sequence runs: deny-all, the tree killed, a recovery login, Cancel All, the proof, the revert; the",
+        "  request is acknowledged (the flag removed). The proof reads PROVEN: no orders sent.",
+        "- store.safety persists what the kill switch decided: an S2 incident, the flow quarantined and the rig",
+        "  disabled until a person re-enables it (`sentinel reenable`). The other shards finish normally.",
+    ]
+    _write_summary(out, "Scenario operator-stop: `sentinel stop` trips the kill switch mid-run", story, [r],
+                   _safety_lines(r))
+    return [r]
+
+
+def demo_redaction_miss(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                        ) -> list[RunResult]:
+    r = run_pipeline(config, redaction_miss_scenario(today), out, today, **_rev(reviewer))
+    misses = [f for f in r.findings if f.kind == "redaction_miss"]
+    story = [
+        "PR 4857 changes an order logging setting. The candidate build echoes the selected account id in the Order",
+        "Confirmation's top row, right of the account fields the redaction anchors cover (redaction/anchors.yaml).",
+        "",
+        "- Capture's redaction stage (3.6, 6.10) runs before anything is diffed or stored: the anchored boxes, then an",
+        "  OCR sweep for the fixture's account ids and the id patterns. The sweep finds the echoed id outside every",
+        "  anchor and fills it on both captures in the theme's background, so nothing unredacted is stored or sent.",
+        f"- The miss is recorded: {len(misses)} redaction_miss finding(s), on the candidate only, so ranked tier 1 as a",
+        "  suspected identifier leak; the finding names the place and the pattern, never the id itself.",
+        "- A redaction miss never fails the check by itself (3.6): the anchor list needs the new field. Run health's",
+        "  Redaction row counts the boxes per side and the misses.",
+    ]
+    _write_summary(out, "Scenario redaction-miss: an account id outside the anchors is masked and reported", story,
+                   [r], _safety_lines(r))
     return [r]
 
 
@@ -785,7 +903,8 @@ DEMOS: dict[str, Callable[..., list[RunResult]]] = {
     "ui-no-manifest": demo_ui_no_manifest, "nightly-canary": demo_nightly_canary,
     "decision-inheritance": demo_decision_inheritance, "wrong-number": demo_wrong_number,
     "paper-mode-mismatch": demo_paper_mode_mismatch, "attempted-send": demo_attempted_send,
-    "app-crash": demo_app_crash, "config-invalid": demo_config_invalid,
+    "app-crash": demo_app_crash, "config-invalid": demo_config_invalid, "expired-mask": demo_expired_mask,
+    "operator-stop": demo_operator_stop, "redaction-miss": demo_redaction_miss,
 }
 
 # One sentence per scenario for out/index.html: what it demonstrates, and what a tester should check.
@@ -822,19 +941,30 @@ INDEX = {
                   "that step is assertion_failed (assertion: app_alive) with an app_crash finding, the rest of the "
                   "ladder is not_run (app_crash), counted under the Coverage table as \"Checkpoints not run: 7 "
                   "app_crash\", and the census checkpoints after it were still compared."),
-    "config-invalid": ("An expired mask fails config lint at preflight G1 and the run ends before any product action.",
-                       "the run is aborted_harness (config_invalid), the comment's abort block names L-MSK-02 and "
+    "config-invalid": ("A broken reference in the config (a mask record that does not exist) fails the run-start "
+                       "lint at preflight G1 and the run ends before any product action.",
+                       "the run is aborted_harness (config_invalid), the comment's abort block names L-RGN-03 and "
                        "alerts.json has the P1 aborted_harness page."),
+    "operator-stop": ("An operator runs `sentinel stop` on a rig mid-run; the kill switch runs and proves no order "
+                      "was sent (6.6).",
+                      "the run is aborted_safety (kill_switch), the request (who, why, channel cli) is on the kill "
+                      "switch result in orchestrator.json, and the proof reads PROVEN: no orders sent."),
+    "redaction-miss": ("An account id appears outside the redaction anchors on the candidate only (3.6, 6.10).",
+                       "the redaction stage masks it and stores a tier-1 redaction_miss finding (candidate only), the "
+                       "Run health row counts the boxes, and the check still passes."),
+    "expired-mask": ("An expired mask stops applying at run start and the run goes on (4.1, 4.8).",
+                     "the run is complete, Run health lists \"mask expired: msk.ps.last-update-01\" and the store "
+                     "holds a mask_expired finding."),
 }
 
 
 def _rev(reviewer: Any) -> dict:
     """`run_pipeline` keyword arguments for the Reviewer: none (the simulated one) or a live job."""
-    return {} if reviewer is None else {"live": reviewer()}
+    return {} if reviewer is None else {"live_factory": reviewer}       # built per run over its egress gate (6.10)
 
 
 def run_demo(name: str, out_root: str | Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE,
-             reviewer: Callable[[], Any] | None = None) -> list[RunResult]:
+             reviewer: Callable[..., Any] | None = None) -> list[RunResult]:
     """Run one scenario into `out_root/<name>/`, replacing what a previous run left there. `reviewer` makes
     the live Reviewer's job for a run (`pipeline.live.live_job`); None keeps the offline simulated one."""
     if name not in DEMOS:
@@ -913,11 +1043,15 @@ def main(argv: list[str] | None = None) -> int:
         except NetworkNotAllowed as exc:
             print(f"sentinel demo: --reviewer live: {exc}", file=sys.stderr)
             return 2
-        factory = lambda: live_job(config=settings)     # noqa: E731 - one job per run
+        factory = lambda gate=None: live_job(config=settings, gate=gate)     # noqa: E731 - one job per run
     names = SCENARIOS if a.scenario == "all" else (a.scenario,)
     done: dict[str, list[RunResult]] = {}
     for name in names:
-        done[name] = run_demo(name, a.out, a.today, Path(a.config), factory)
+        try:
+            done[name] = run_demo(name, a.out, a.today, Path(a.config), factory)
+        except PairRefused as exc:                      # 4.2: the run is never created; the rule ids go back
+            print(f"sentinel demo: {name}: {exc} (rules {', '.join(exc.rule_ids)})", file=sys.stderr)
+            return 2
         print(_line(name, done[name][-1], Path(a.out) / name))
     if a.scenario == "all":
         print(f"index: {write_index(a.out, done)}")

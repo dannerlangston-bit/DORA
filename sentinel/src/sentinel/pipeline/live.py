@@ -31,6 +31,7 @@ import cv2
 import numpy as np
 import yaml
 
+from ..egress import EgressGate
 from ..reviewer import ConfigError, ReviewerConfig, ReviewerJob
 from ..reviewer.images import crop_box
 from ..reviewer.prompt import DependencyEdge, DiffMetrics, FlowContext, ManifestEntryRef, ReviewItem, StepCrops
@@ -53,10 +54,13 @@ def load_reviewer_config(path: str | Path | None) -> ReviewerConfig:
     return ReviewerConfig.from_mapping(block)
 
 
-def live_job(env: Mapping[str, str] | None = None, config: ReviewerConfig | None = None) -> ReviewerJob:
-    """A PR-run `ReviewerJob` over the real API; raises `NetworkNotAllowed` unless `ANTHROPIC_API_KEY` is set."""
+def live_job(env: Mapping[str, str] | None = None, config: ReviewerConfig | None = None,
+             gate: EgressGate | None = None) -> ReviewerJob:
+    """A PR-run `ReviewerJob` over the real API; raises `NetworkNotAllowed` unless `ANTHROPIC_API_KEY` is set. With
+    `gate` (the run's `egress.EgressGate`, built by `run.run_pipeline`) every request is checked against the signed
+    allowlist and logged to `egress_log` (6.10)."""
     cfg = config or ReviewerConfig()
-    transport = AnthropicTransport.from_env(allow_network=True, env=env, base_url=cfg.endpoint_base_url)
+    transport = AnthropicTransport.from_env(allow_network=True, env=env, base_url=cfg.endpoint_base_url, gate=gate)
     return ReviewerJob(cfg, transport, "pr")
 
 
@@ -98,8 +102,9 @@ class ItemBuilder:
 
     def _step(self, ev: Any, region_id: str | None, size_step: str | None) -> tuple[StepCrops, Box, list[Box]]:
         cid = ev.cp.checkpoint_id
-        base = self._stored(ev.base.screen.image, cid, "base")
-        cand = self._stored(ev.cand.screen.image, cid, "candidate")
+        bimg, cimg = ev.images()                     # the redacted pair (3.6): nothing unredacted is sent
+        base = self._stored(bimg if bimg is not None else cimg, cid, "base")
+        cand = self._stored(cimg, cid, "candidate")
         region = self._region(ev, region_id, cand.shape)
         comps = [tuple(c.bbox) for c in (ev.diff.summary.components if ev.diff is not None else ())]
         rx, ry, rw, rh = region

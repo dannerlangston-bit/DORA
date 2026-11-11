@@ -8,18 +8,19 @@ from datetime import date
 import pytest
 
 from sentinel import invariants as inv
-from sentinel.demo import EXAMPLE, clean_scenario
+from sentinel.demo import EXAMPLE, clean_scenario, config_invalid_scenario
 from sentinel.diff.settle import settle
 from sentinel.pipeline.config import SentinelConfig
 from sentinel.pipeline.reviewer import (SIMULATED_MODEL_ID, ModelReviewerAdapter, ReviewRequest, SimulatedReviewer,
                                         to_review, validate)
-from sentinel.pipeline.run import run_pipeline
+from sentinel.pipeline.run import PairRefused, run_pipeline
 from sentinel.pipeline.sim import Observation, SimApp, SimBuild, observe
 from sentinel.scope import PlannedCheckpoint, Rig, compute_scope
 from sentinel.store import Store
 
 AT = "charts.flexible-grid.active-trader-cell"
-S07 = "flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07"
+TODAY = date(2026, 11, 10)
+S07 ="flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07"
 
 
 @pytest.fixture(scope="module")
@@ -133,17 +134,107 @@ def test_observations_name_what_moved():
 
 
 def test_a_lint_error_aborts_the_run_config_invalid(tmp_path):
-    sc = clean_scenario(date(2026, 12, 20))
-    r = run_pipeline(EXAMPLE, sc, tmp_path, today=date(2026, 12, 20))
+    """A broken reference is a run-start lint error (4.1): preflight G1, `config_invalid`, and the run-level proof of
+    a run that started no shard (SD-61)."""
+    sc = config_invalid_scenario(TODAY)
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
     assert (r.status, r.reason) == ("aborted_harness", "config_invalid")
-    assert any("L-MSK-02" in e for e in r.lint_errors)
+    assert any("L-RGN-03" in e for e in r.lint_errors)
     text = (tmp_path / "pr-comment.md").read_text()
-    assert "**Abort**" in text and "`config_invalid`" in text and "L-MSK-02" in text
+    assert "**Abort**" in text and "`config_invalid`" in text and "L-RGN-03" in text
     assert r.commit_status["state"] == "error"
     with Store(tmp_path / "sentinel.db") as store:
         run = store.run_outcome(sc.run_id)
         assert (run.status, run.reason, run.last_gate) == ("aborted_harness", "config_invalid", "provisioned")
         assert store.outcomes(sc.run_id) == []
+        (proof,) = store.post_run_proofs(sc.run_id)
+        assert (proof.shard_id, proof.verdict) == (None, "proven_no_session")
+        assert store.run_summary(sc.run_id)["abort"]["rule_ids"] == ["L-RGN-03"]
+
+
+def test_an_expired_mask_stops_applying_and_the_run_completes(tmp_path):
+    """4.1, 4.8 L-MSK-02: at run start an expired mask is not `config_invalid`; it stops applying, run health lists it
+    and the run stores a `mask_expired` finding (the date lies before the /MES roll, so nothing else fails)."""
+    day = date(2026, 12, 8)
+    sc = clean_scenario(day)
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=day)
+    assert r.status == "complete" and r.reason is None
+    (f,) = [f for f in r.findings if f.kind == "mask_expired"]
+    assert f.evidence["raw_values"]["record_id"] == "msk.ps.last-update-01" and f.checkpoint_id is None
+    with Store(tmp_path / "sentinel.db") as store:
+        health = store.run_summary(sc.run_id)["health"]
+    assert health["expired"] == ["mask expired: msk.ps.last-update-01"]
+    assert "mask expired: msk.ps.last-update-01" in (tmp_path / "pr-comment.md").read_text()
+
+
+def test_a_mask_expiring_within_seven_days_warns_its_owner(tmp_path):
+    """3.8: the Reporter warns the owner seven days before a mask expires (`expiring_soon` into the summary)."""
+    day = date(2026, 12, 1)
+    sc = clean_scenario(day)
+    run_pipeline(EXAMPLE, sc, tmp_path, today=day)
+    with Store(tmp_path / "sentinel.db") as store:
+        expiring = store.run_summary(sc.run_id)["expiring"]
+    assert expiring == ["mask msk.ps.last-update-01 expires in 4 days (2026-12-05T15:20:00-05:00); owner tos-monitor-ui"]
+    assert "Masks expiring within 7 days" in (tmp_path / "pr-comment.md").read_text()
+
+
+def test_a_manifest_that_fails_its_lint_is_treated_as_missing(tmp_path):
+    """4.3: the run's manifest is linted on its own (`lint_manifest`); an error (here L-MAN-09, a candidate that is
+    not the pair's) makes it missing for the run, and its lint lines go to the summary and the Intended section."""
+    sc = clean_scenario(TODAY)
+    cand = sc.candidate.build_id
+    rel = f"manifests/{cand}.yaml"
+    bad = sc.overlay[rel].replace(f"candidate: {cand}", "candidate: branch-1998.3.0-0000000")
+    sc = replace(sc, overlay=dict(sc.overlay, **{rel: bad}))
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    assert r.status == "complete" and r.manifest is None
+    with Store(tmp_path / "sentinel.db") as store:
+        lines = store.run_summary(sc.run_id)["manifest_lint"]
+    assert any(line.startswith("L-MAN-09 error") for line in lines)
+    assert "L-MAN-09" in (tmp_path / "pr-comment.md").read_text()
+    assert {o.outcome for o in r.outcomes if o.surface_id == "charts.flexible-grid.chart-cell"} != {"intended"}
+
+
+def test_run_creation_refuses_a_bad_build_pair_and_writes_no_run(tmp_path):
+    """4.2: `check_pair` at run creation; a refused pair is never queued (no run row), with its rule ids."""
+    sc = clean_scenario(TODAY)
+    cand = sc.candidate.build_id
+    rel = f"builds/{cand}.yaml"
+    sc = replace(sc, overlay=dict(sc.overlay, **{rel: sc.overlay[rel].replace("base_rule: merge_base_main",
+                                                                              "base_rule: last_green_main")}))
+    with pytest.raises(PairRefused) as exc:
+        run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    assert exc.value.rule_ids == ["L-BLD-04"]
+    assert not (tmp_path / "sentinel.db").exists()
+
+
+def test_registry_invariant_exceptions_reach_the_checker_and_expired_ones_drop(tmp_path):
+    """4.5 `invariant_exceptions` load with the surface's rules; at run start an expired one is dropped (L-SRF-11,
+    `invariants.active_exceptions`) and the run writes its `invariant_exception_expired` finding."""
+    from sentinel.pipeline.config import materialize
+    rel = "registry/surfaces/charts/charts.flexible-grid.chart-cell.yaml"
+    text = (EXAMPLE / rel).read_text() + (
+        "invariant_exceptions:\n"
+        "  - {invariant_id: INV-06, owner: tos-charts-ui, reason: the plot scrolls by design, expires_at: "
+        "'2026-12-31T00:00:00Z'}\n"
+        "  - {invariant_id: INV-04, owner: tos-charts-ui, reason: a legacy ellipsis, expires_at: "
+        "'2026-11-01T00:00:00Z'}\n")
+    root = materialize(EXAMPLE, {rel: text}, tmp_path / "cfg")
+    rules = SentinelConfig.load(root).rules("charts.flexible-grid.chart-cell", "frozen")
+    assert [x.invariant_id for x in rules.exceptions] == ["INV-06", "INV-04"]
+    sc = replace(clean_scenario(TODAY), overlay=dict(clean_scenario(TODAY).overlay, **{rel: text}))
+    r = run_pipeline(EXAMPLE, sc, tmp_path / "out", today=TODAY)
+    assert r.status == "complete"
+    (f,) = [f for f in r.findings if f.kind == "invariant_exception_expired"]
+    assert f.evidence["raw_values"] == {"record_id": "INV-04", "scope": "charts.flexible-grid.chart-cell",
+                                        "run_health": "invariant exception expired: INV-04"}
+
+
+def test_a_scope_config_error_names_its_own_rule():
+    """SD-01: a ScopeConfigError carries the rule its message names (the smoke cap is L-SRF-15, not L-SRF-10)."""
+    from sentinel.scope import ScopeConfigError
+    assert ScopeConfigError("41 surfaces carry smoke: true; the cap is 40 (2.2.4, L-SRF-15)").rule_ids == ("L-SRF-15",)
+    assert ScopeConfigError("a run needs at least one rig").rule_ids == ()
 
 
 def test_case_b_adds_the_smoke_flows_only_when_the_change_scope_is_empty(cfg):

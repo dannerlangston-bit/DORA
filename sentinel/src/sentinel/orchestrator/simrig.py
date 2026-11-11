@@ -58,7 +58,7 @@ builds the `RunContext` that matches the default scenario (the example config's 
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
@@ -242,6 +242,7 @@ class SimulatedRig(Rig):
         self.drops = 0
         self.refusals = 0
         self.sent_orders = 0
+        self.on_input: Callable[[Action, EmitResult], None] | None = None    # an observer of every decision
 
     def _configuration(self) -> tuple[frozenset[str], tuple[DenyEntry, ...]]:
         """The dismiss allowlist and Explorer deny list the gateway enforces (choice 1)."""
@@ -493,6 +494,14 @@ class SimulatedRig(Rig):
             send_gate=self.send_gate, recovery_only=self.recovery_only)
 
     def send_input(self, action: Action, *, events: Sequence[InputEvent] = ()) -> EmitResult:
+        """5.4.3 stages 4 to 7 for one action (or raw `events`); `on_input`, when set, sees every decision, the LOGIN
+        flow's and Cancel All's included (the pipeline's drop-log drainer, 5.4.8)."""
+        res = self._send_input(action, events=events)
+        if self.on_input is not None:
+            self.on_input(action, res)
+        return res
+
+    def _send_input(self, action: Action, *, events: Sequence[InputEvent] = ()) -> EmitResult:
         self._watch()
         now = self.clock.monotonic()
         if events:

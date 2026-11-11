@@ -9,10 +9,12 @@ offsets from a landmark. Every pixel of the target window belongs to exactly one
   excludes those pixels;
 - pixels no declared region covers belong to the implicit `diff` region `_rest` (`REST_ID`).
 
-Money cells (Qty, Price, Buying Power Effect, Max Loss, Send, Cancel, Delete; a closed list, F58)
-are always `diff` or `freeze` with a zero floor and never carry a `floor_exception` (L-RGN-04,
-F41). Identity fields (account number, account holder name) are redaction boxes, never regions,
-excluded from the mask budget (F33).
+Money cells (Qty, Price, Buying Power Effect, Max Loss, Send, Cancel, Delete; a closed list, F58,
+SD-28) name their role with `money_role` (`taxonomy.yaml` `money_roles`). On a flow checkpoint a money
+cell is always `diff` or `freeze` with a zero floor; on a census, sweep or split checkpoint it may also
+be a `rule` region, which the Oracle asserts (SD-29, the census half of L-RGN-04); it is never a mask
+and never carries a `floor_exception` (L-RGN-04, F41). Identity fields (account number, account holder
+name) are redaction boxes, never regions, excluded from the mask budget (F33).
 
 Choices where the spec is silent (reported to the coordinator):
 
@@ -38,6 +40,7 @@ import numpy as np
 KINDS = ("freeze", "rule", "mask", "diff")
 PIXEL_DIFFED = ("diff", "freeze")
 PANELS = ("order_confirmation", "order_ticket", "position_statement", "account_info", "other")
+MONEY_ROLES = ("qty", "price", "bp_effect", "max_loss", "send", "cancel", "delete")    # 4.8 money_role, SD-28
 REST_ID = "_rest"
 WHOLE_ID = "*"          # the whole window, as `calibration_floors.region_id` names it (8.3)
 SIDES = ("base", "candidate")
@@ -163,6 +166,7 @@ class Region:
     floor_exception: FloorException | None = None
     rule: Mapping[str, Any] | None = None
     mask_ref: str | None = None
+    money_role: str | None = None        # SD-28: qty, price, bp_effect, max_loss, send, cancel, delete
 
     @property
     def pixel_diffed(self) -> bool:
@@ -172,13 +176,14 @@ class Region:
     def from_dict(d: Mapping[str, Any]) -> "Region":
         r = d["rect"]
         fe = d.get("floor_exception")
+        role = d.get("money_role")
         return Region(
             id=str(d["id"]), type=str(d["type"]), landmark=str(d["landmark"]),
             rect=Rect(int(r["dx"]), int(r["dy"]), int(r["w"]), int(r["h"])),
             panel=str(d.get("panel", "other")), money_cell=bool(d.get("money_cell", False)),
             fixture_dependency=d.get("fixture_dependency"),
             floor_exception=FloorException.from_dict(fe) if fe else None,
-            rule=d.get("rule"), mask_ref=d.get("mask_ref"),
+            rule=d.get("rule"), mask_ref=d.get("mask_ref"), money_role=str(role) if role is not None else None,
         )
 
 
@@ -301,8 +306,13 @@ class RegionsFile:
                 raise RegionError(f"{r.id}: panel {r.panel!r} is not one of {PANELS}")
             if r.rect.w <= 0 or r.rect.h <= 0:
                 raise RegionError(f"{r.id}: empty rect")
-            if r.money_cell and r.type not in PIXEL_DIFFED:
-                raise RegionError(f"{r.id}: a money cell is always diff or freeze, never {r.type} (L-RGN-04, F41)")
+            census_rule = r.type == "rule" and not self.checkpoint_id.startswith("flow/")
+            if r.money_cell and r.type not in PIXEL_DIFFED and not census_rule:
+                raise RegionError(f"{r.id}: a money cell is diff or freeze (or rule on a census, sweep or split "
+                                  f"checkpoint), never {r.type} (L-RGN-04, F41, SD-29)")
+            if r.money_role is not None and (not r.money_cell or r.money_role not in MONEY_ROLES):
+                raise RegionError(f"{r.id}: money_role {r.money_role!r} needs money_cell and one of {MONEY_ROLES} "
+                                  "(L-RGN-08, SD-28)")
             if r.money_cell and r.floor_exception is not None:
                 raise RegionError(f"{r.id}: a money cell keeps a zero floor; floor_exception refused (L-RGN-04)")
             if (r.rule is not None) != (r.type == "rule"):

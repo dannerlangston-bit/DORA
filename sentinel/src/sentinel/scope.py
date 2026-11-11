@@ -39,9 +39,10 @@ Choices where the spec is ambiguous (each is reported to the coordinator):
    fingerprint of the rig the item is placed on; a `masked_live` item costs its per-side duration
    on each rig of its pair. Session startups are not modelled. The budget is the pseudocode's B
    (PR 45 min, merge 3 h, RC 8 h - 10 min - 90 min) unless overridden.
-8. Ladder F's ascending pass revisits six grid sizes whose checkpoint ids the grammar of 4.1 cannot
-   tell apart from the descending pass; the plan lists each id once. Ladder overrides
-   (`size_ladder`), the streaming-surface exclusion and the chart rule under DR-02 branch B of 2.5.3
+8. Ladder F's ascending pass revisits six grid sizes; its steps take the ids `sweep/<surface>/<host>/<w>x<h>-asc`
+   (SD-04) and are planned after the descending pass, in ladder order. Every census, sweep and split id and the
+   merge and RC census visits come from `sentinel.checkpoints`, the one enumeration the lint shares. Ladder
+   overrides (`size_ladder`), the streaming-surface exclusion and the chart rule under DR-02 branch B of 2.5.3
    carry no registry field here and are not applied.
 9. Static impact (2.10.2): depth 0 is the changed class itself. A surface reached only through its
    own roots is not a map gap (no primitive is involved); a changed class owned by another surface
@@ -56,17 +57,23 @@ Choices where the spec is ambiguous (each is reported to the coordinator):
     `invariant_violation`, `assertion_failed`, `needs_human`, `landmark_missing`.
 11. Finding ids are `fnd-<run_id>-scope-<nnn>` and `fnd-<run_id>-merge-<nnn>`; gap details go in
     `evidence.raw_values` (4.13 carries no reason on a finding).
+12. Attribution of a surface the static step reaches through its own roots (no primitive owns the changed
+    class): 4.13 requires a `collateral` record to name a primitive, so the attribution names the surface's
+    hosting primitive, the first non-global primitive whose Dependency Map edge reaches the surface (the Level II
+    cell's FlexibleGrid); none when the map routes no primitive to it.
 """
 from __future__ import annotations
 
 import fnmatch
 import hashlib
 import itertools
+import re
 from dataclasses import dataclass, field, replace
 from typing import Iterable, Iterator, Mapping, Sequence
 
+from . import checkpoints as cps
 from .records import DATA_MODES, PERSONAS, CheckpointOutcome, Finding
-from .taxonomy import SWEEP_HOSTS, is_checkpoint_id
+from .taxonomy import is_checkpoint_id
 
 SMOKE_CAP = 40                                   # 2.2.4, L-SRF-15
 STATIC_MAX_DEPTH = 6                             # 2.10.2
@@ -77,15 +84,23 @@ SOAK_CYCLES = 24                                 # 1.9, 10.11
 SOAK_CYCLE_S = 6 * 3600 / SOAK_CYCLES
 LADDER_S = tuple((w, h) for w in (960, 640, 480, 320) for h in (720, 480, 360))               # 2.5.2
 LADDER_F_GRID = tuple((w, h) for w in (960, 800, 640, 480, 400, 320) for h in (720, 600, 480, 420, 360, 300))
-FULL_FRACTIONS = (0.00, 0.15, 0.30, 0.50, 0.70, 0.85, 1.00)
-SHORT_FRACTIONS = (0.15, 0.50, 0.85)
-GLOBAL_KINDS = frozenset({"tab", "subtab", "menu", "settings_page", "dialog"})
+LADDER_F_ASCENDING = tuple((w, 480) for w in (320, 400, 480, 640, 800, 960))                  # 2.5.2, SD-04
+GLOBAL_KINDS = cps.GLOBAL_KINDS
 KIND_ORDER = {"soak": 0, "flow": 0, "sweep": 1, "split": 2, "census": 3}
 MISSABLE_KINDS = frozenset({"collateral", "invariant_violation", "assertion_failed", "needs_human", "landmark_missing"})
 
 
 class ScopeConfigError(ValueError):
-    """An input lint should have refused (2.2.4, 4.15); the run ends aborted_harness (config_invalid)."""
+    """An input lint should have refused (2.2.4, 4.15); the run ends aborted_harness (config_invalid) with the rule
+    ids the message names (`rule_ids`, e.g. L-SRF-15 for the smoke cap, SD-01), none when the message names none."""
+
+    @property
+    def rule_ids(self) -> tuple[str, ...]:
+        """The lint rule ids this error names, in order of appearance (the abort block's `rule_ids`, 4.15)."""
+        return tuple(dict.fromkeys(_RULE_ID.findall(str(self))))
+
+
+_RULE_ID = re.compile(r"\bL-[A-Z]+-\d+\b")
 
 
 # -- matching ---------------------------------------------------------------------------------
@@ -139,13 +154,9 @@ class Splitter:
     collapsible: bool = False
 
     def steps(self, full: bool) -> tuple[float, ...]:
-        """The short or full fraction set of 2.5.2 narrowed by `fractions`; 0.00 and 1.00 only when collapsible."""
-        base = FULL_FRACTIONS if full else SHORT_FRACTIONS
-        keep = [f for f in base if self.collapsible or f not in (0.0, 1.0)]
-        if self.fractions is not None:
-            allowed = {round(f, 2) for f in self.fractions}
-            keep = [f for f in keep if round(f, 2) in allowed]
-        return tuple(keep)
+        """The short or full fraction set of 2.5.2 narrowed by `fractions`; 0.00 and 1.00 only when collapsible
+        (`checkpoints.split_fractions`)."""
+        return cps.split_fractions(self.fractions, self.collapsible, full=full)
 
 
 @dataclass(frozen=True)
@@ -771,31 +782,29 @@ def _census_items(ctx: _Ctx, s: Surface, workspace_ids: Iterable[str]) -> list[P
     for wid in workspace_ids:
         w = ctx.workspace(wid)
         base = f"census/{s.id}/{w.id}"
-        if s.tier == 1 and s.census_dimensions and w.tier == "A":
-            names = [k for k, _ in s.census_dimensions]
-            combos = itertools.product(*(vs for _, vs in s.census_dimensions))
-            ids = [base + "/" + ",".join(f"{k}={v}" for k, v in zip(names, combo)) for combo in combos]
-        else:
-            ids = [base]
-        cps = [ctx.checkpoint(cid, s, "census", w, s.data_mode) for cid in ids]
+        ids = cps.census_ids(s.id, w.id, surface_tier=s.tier, workspace_tier=w.tier,
+                             dimensions=dict(s.census_dimensions))
+        planned = [ctx.checkpoint(cid, s, "census", w, s.data_mode) for cid in ids]
         est = sum(ctx.duration(cid, "census") for cid in ids)
-        out.append(ctx.item(base, "census", s.tier, cps, s.data_mode, base, s.id in ctx.protected_surfaces, est))
+        out.append(ctx.item(base, "census", s.tier, planned, s.data_mode, base, s.id in ctx.protected_surfaces, est))
     return out
 
 
-def _ladder(s: Surface, ctx: _Ctx) -> tuple[tuple[tuple[int, int], ...], bool | None]:
-    """2.5.3: (sizes, full splitter set?) for a resizable surface in this run type; no sweep -> ((), None)."""
+def _ladder(s: Surface, ctx: _Ctx) -> tuple[tuple[cps.SweepStep, ...], bool | None]:
+    """2.5.3: (steps, full splitter set?) for a resizable surface in this run type; no sweep -> ((), None). Ladder F
+    ends with its ascending pass, whose steps take the `-asc` ids (SD-04)."""
+    def steps(sizes: Iterable[tuple[int, int]], ascending: bool = False) -> tuple[cps.SweepStep, ...]:
+        return tuple(cps.SweepStep(w, h, ascending) for w, h in dict.fromkeys(sizes))
     if ctx.run_type == "pr":
-        return (LADDER_S, False) if s.tier == 1 else ((), None)
+        return (steps(LADDER_S), False) if s.tier == 1 else ((), None)
     if ctx.run_type == "merge":
-        return (LADDER_S, False) if s.tier <= 2 else ((), None)
+        return (steps(LADDER_S), False) if s.tier <= 2 else ((), None)
     if s.tier <= 2:
         maxw, maxh = ctx.max_client
         corners = ((240, 160), (240, maxh), (maxw, 160), (maxw, maxh))
-        ascending = tuple((w, 480) for w in (320, 400, 480, 640, 800, 960))
-        sizes = LADDER_F_GRID + corners + tuple(ctx.corpus_sizes.get(s.id, ())) + ascending
-        return tuple(dict.fromkeys(sizes)), True
-    return LADDER_S, None
+        descending = steps(LADDER_F_GRID + corners + tuple(ctx.corpus_sizes.get(s.id, ())))
+        return descending + steps(LADDER_F_ASCENDING, ascending=True), True
+    return steps(LADDER_S), None
 
 
 def _sweep_items(ctx: _Ctx, s: Surface) -> list[PlanItem]:
@@ -807,18 +816,17 @@ def _sweep_items(ctx: _Ctx, s: Surface) -> list[PlanItem]:
     w = ctx.harness()
     protected = s.id in ctx.protected_surfaces
     out = []
-    for host in s.hosts:
-        if host not in SWEEP_HOSTS:          # SD-05: tab and sidebar hosts are swept through their splitters only
-            continue
-        for (wd, ht) in sizes:
-            cid = f"sweep/{s.id}/{host}/{wd}x{ht}"
+    for host in cps.sweep_hosts(s.hosts):    # SD-05: tab and sidebar hosts are swept through their splitters only
+        for st in sizes:
+            wd, ht = st.w, st.h
+            cid = cps.sweep_id(s.id, host, wd, ht, ascending=st.ascending)
             cp = ctx.checkpoint(cid, s, "sweep", w, s.data_mode, size_step=(("host", host), ("w", wd), ("h", ht)))
             out.append(ctx.item(cid, "sweep", s.tier, [cp], s.data_mode, f"sweep:{s.id}:{host}", protected,
                                 ctx.duration(cid, "sweep")))
     if full is not None:
         for sp in s.splitters:
             for frac in sp.steps(full):
-                cid = f"split/{s.id}/{sp.id}/{frac:.2f}"
+                cid = cps.split_id(s.id, sp.id, frac)
                 cp = ctx.checkpoint(cid, s, "split", w, s.data_mode, size_step=(("splitter", sp.id), ("fraction", frac)))
                 out.append(ctx.item(cid, "split", s.tier, [cp], s.data_mode, f"split:{s.id}:{sp.id}", protected,
                                     ctx.duration(cid, "split")))
@@ -961,6 +969,9 @@ def _attribution(registry: Registry, dep_map: DependencyMap, manifest: Manifest 
     if impact:
         for sid, path in impact.paths.items():
             prims = sorted(dep_map.owning_primitives(path[0]))
+            if not prims:      # choice 12: reached through the surface's own roots; its hosting primitive on the map
+                prims = sorted(p for p, d in dep_map.primitives.items()
+                               if not d.is_global and sid in dep_map.surfaces_of(p, registry))
             p = prims[0] if prims else None
             entry = manifest.entry_touching(p) if manifest and p else None
             out.setdefault(sid, Attribution(p, entry.entry_id if entry else None))
@@ -1086,13 +1097,12 @@ def compute_scope(run_type: str, manifest: Manifest | None, dep_map: DependencyM
                      or (manifest_state == "no_manifest_nonui" and f.flow_class == "standard"
                          and set(f.surfaces) & smoke))]          # case (b): smoke flows still check moved values
     else:
-        tiers = ("A",) if run_type == "merge" else ("A", "B")
-        pass_ws = sorted(w.id for w in wmap.values() if w.tier in tiers)
+        pass_ws = sorted(w.id for w in wmap.values() if w.tier in cps.PASS_TIERS[run_type])
         for s in registry:
             if s.census_enabled:
                 for wid in pass_ws:
                     w = wmap[wid]
-                    if s.id in w.gadgets_present or wid in s.census_workspaces or s.is_global:
+                    if cps.pass_visits(s.id, s.kind, s.census_workspaces, wid, w.gadgets_present):
                         items += _census_items(ctx, s, [wid])
                     else:
                         cp = ctx.checkpoint(f"census/{s.id}/{wid}", s, "census", w, s.data_mode)

@@ -55,8 +55,9 @@ def test_example_rule_regions_parse_from_mappings_and_regions_files():
     census = yaml.safe_load((EXAMPLE / "census/monitor.activity.position-statement/ws.tier-a.active-trader.yaml")
                             .read_text())
     mark, pl = rule_regions(census, CENSUS)
-    assert (mark.region_id, mark.field, mark.decimals, mark.min, mark.min_rows) == ("rgn.ps.mark", "price", 2, 0, 1)
-    assert mark.checks == ("field", "decimals", "min", "min_rows")
+    # the mark column mixes stock, future and forex ticks, so the example declares no decimals (2.8.2)
+    assert (mark.region_id, mark.field, mark.decimals, mark.min, mark.min_rows) == ("rgn.ps.mark", "price", None, 0, 1)
+    assert mark.checks == ("field", "min", "min_rows")
     assert pl.checks == ("field", "decimals") and pl.assertion_id("decimals") == "rule.rgn.ps.pl-open.decimals"
     s07 = yaml.safe_load((EXAMPLE / "flow/dialog.order-confirmation/flow.trade.order-ticket.stock.limit/s07.yaml")
                          .read_text())

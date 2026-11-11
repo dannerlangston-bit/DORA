@@ -630,6 +630,23 @@ def test_late_rows_replace_the_dead_man_run(store):
         store.replace_dead_man_run(RUN, rows, outcome=RunOutcome(RUN, "pr", "complete", "reported"))
 
 
+def test_a_partial_late_arrival_is_refused(store):
+    # store:5, 10.2 and 1.10: harness_error (dead_man) belongs only to an aborted_harness (dead_man) run, so the late
+    # arrival replaces every placeholder or none; the run stays dead_man until all its rows arrive
+    dead_man(store)
+    for status in ("complete", "complete_with_env_errors"):
+        with pytest.raises(StoreRefused, match="every dead_man placeholder"):
+            store.replace_dead_man_run(RUN, [out(CENSUS, diff=D)], outcome=RunOutcome(RUN, "pr", status, "reported"),
+                                       arrived_at="2026-11-09T16:05:00+00:00")
+    run = store.run_outcome(RUN)
+    assert (run.status, run.reason) == ("aborted_harness", "dead_man")
+    assert {o.reason for o in store.outcomes(RUN)} == {"dead_man"}
+    assert store.conn.execute("SELECT count(*) FROM outcomes_superseded").fetchone()[0] == 0
+    rows = [out(cid, diff=D) for cid in (CENSUS, SWEEP, FLOW)]
+    assert store.replace_dead_man_run(RUN, rows, outcome=RunOutcome(RUN, "pr", "complete", "reported")).status == \
+        "complete"
+
+
 def test_a_run_that_did_not_end_dead_man_is_not_replaced(store):
     store.fill_unreached(RUN, "harness_error", "watchdog_dead", detail="watchdog_event: wd-41")
     store.end_run(RunOutcome(RUN, "pr", "aborted_harness", "running", reason="watchdog_dead"))
@@ -641,7 +658,7 @@ def test_a_refused_late_row_leaves_the_dead_man_run_as_it_was(store):
     dead_man(store)
     bad = out(SWEEP, diff=D, artifacts={"candidate": "e" * 64})           # names an artifact nobody stored
     with pytest.raises(StoreRefused, match="not stored"):
-        store.replace_dead_man_run(RUN, [out(CENSUS, diff=D), bad],
+        store.replace_dead_man_run(RUN, [out(CENSUS, diff=D), bad, out(FLOW, diff=D)],
                                    outcome=RunOutcome(RUN, "pr", "complete", "reported"))
     run = store.run_outcome(RUN)
     assert (run.status, run.reason) == ("aborted_harness", "dead_man")

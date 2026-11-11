@@ -1766,7 +1766,9 @@ class Store:
         """10.2 crash during teardown, late arrival: the run the control host ended `aborted_harness (reason:
         dead_man)` at the deadline takes its real rows and outcome when they arrive.
 
-        In one batch: the `harness_error (reason: dead_man)` placeholders of the checkpoints `rows` cover move to
+        `rows` cover every `harness_error (reason: dead_man)` placeholder of the run, or nothing is replaced: that
+        reason belongs only to an `aborted_harness (reason: dead_man)` run (1.10), so the run keeps it until all its
+        rows have arrived. In one batch: the placeholders move to
         `outcomes_superseded` (kept for diagnosis, never counted, 8.3); `rows`, their `artifacts` and `findings`
         are written with every write-time check; the run is ended `outcome` with the late arrival in its summary
         (`late_arrival` with the deadline, the arrival and the delay in seconds, also under `health`, and the
@@ -1791,12 +1793,16 @@ class Store:
         late = {"dead_man_at": run["finished_at"], "arrived_at": at, "delay_s": delay}
         extra = {"late_arrival": late, "health": {**old.get("health", {}), "late_arrival": late},
                  "alerts": [*old.get("alerts", []), {"alert": "dead_man", "closed_as": "late arrival", "at": at}]}
-        ids = [o.checkpoint_id for o in rows]
-        marks = ",".join("?" * len(ids))
+        ids = {o.checkpoint_id for o in rows}
+        every = {c for (c,) in self._conn.execute(
+            "SELECT checkpoint_id FROM outcomes WHERE run_id = ? AND synthetic = 0 AND outcome = 'harness_error' "
+            "AND reason = 'dead_man'", (run_id,))}
+        if uncovered := sorted(every - ids):
+            # 1.10: harness_error (dead_man) is only an aborted_harness (dead_man) run's; all rows or none (10.2)
+            raise StoreRefused(f"a late arrival replaces every dead_man placeholder of run {run_id}; {len(uncovered)} "
+                               f"not covered, first {uncovered[0]} (10.2, 1.10)")
+        placeholders = sorted(every & ids)
         with self._batch("late_arrival") as batch:
-            placeholders = [c for (c,) in self._conn.execute(
-                f"SELECT checkpoint_id FROM outcomes WHERE run_id = ? AND checkpoint_id IN ({marks}) AND synthetic = 0 "
-                "AND outcome = 'harness_error' AND reason = 'dead_man'", (run_id, *ids))]
             if placeholders:
                 pm = ",".join("?" * len(placeholders))
                 self._conn.execute(f"INSERT INTO outcomes_superseded SELECT o.*, 1 FROM outcomes o WHERE o.run_id = ? "

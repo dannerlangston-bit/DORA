@@ -8,19 +8,24 @@ scoped checkpoint through the `OutcomeSink` (1.10, L-OUT-07).
 
 Inside `running` the Executor calls, in this order (boundary.py has the check sequences):
 
-- `flow_boundary(obs, now=..., flow_id=..., p50_s=...)` before every flow, census visit or sweep ladder: the trip-wires,
-  the Watchdog's reverse heartbeat, free space, the run budgets, the spend ceiling, the model re-check, the
-  paper-mode assertion and the proactive relaunch; it returns the result that stopped the run, or None;
-- `step_boundary(obs, now=..., order_stage_step=..., session_dialog=...)` before every step of a flow: the trip-wires,
-  the flow's own budget (a returned result with `end_flow` ends the flow, the run continues) and the paper-mode
-  assertion when due;
+- `flow_boundary(obs, now=..., flow_id=..., p50_s=...)` before every flow, census visit or sweep ladder: the
+  trip-wires, the Watchdog's reverse heartbeat, free space, the run budgets, the spend ceiling, the model re-check,
+  the paper-mode assertion and the proactive relaunch; it returns the result that stopped the run, or None;
+- `step_boundary(obs, now=..., order_stage_step=..., session_dialog=...)` before every step of a flow: the
+  trip-wires, the flow's own budget (a returned result with `end_flow` ends the flow, the run continues) and the
+  paper-mode assertion when due;
 - `relaunch(cause)` after a POP-05 dialog (`environment_relogin`, budget K), an app failure (`app_failure`, the
   relaunch `watchdog.app_failure` already charged) or a hook host restart (`hook_host`); the proactive relaunch is
   `flow_boundary`'s own. It kills the tree, waits `session_release_wait` and re-enters at `launched`, passing every
   gate again (LOGIN, paper-mode assertion with A2, attestation with A9 and the chord reload, workspace, fixture,
   canary flow), then `running` (7.7 Re-login flow, 10.2, SD-66);
 - `paper_stamp()` for every capture and outcome record, and `may_release(stamp)` before a frame goes to the
-  Reviewer, the agent or a report (6.4 Schedule); `counters` takes the staged orders and symbol changes (6.4).
+  Reviewer, the agent or a report (6.4 Schedule).
+
+The 6.4 rate caps count through `counters` (budgets.RateCounters): every login attempt the Orchestrator makes (the
+LOGIN flow, a relaunch login, a recovery login), every A9 drill ticket and every order-stage step a `step_boundary`
+lets run count themselves; the caller adds symbol changes (`counters.symbol_change`) and seeds earlier runs'
+events from the store.
 
 The session's safety state is a `ports.SessionSafety` (`safety`, pushed to `safety_listener` on every change): the
 attestation stage `a3_a8` before the A9 click and `a3_a9` once the gate passed (SD-57), and the last passing

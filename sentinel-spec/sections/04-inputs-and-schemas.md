@@ -1771,3 +1771,281 @@ The per-file rules above catch local errors. The cross-file rules below run afte
 | Explorer candidate flow | `sentinel lint --file` with `class: explorer_candidate` | a failing candidate is kept as an `explorer_candidate` finding with `replayed: lint_failed` and the lint output, never replayed |
 
 Lint output is one JSON line per violation (`rule`, `severity`, `file`, `path`, `message`); the same binary, pinned by the harness commit in the fingerprint, runs in CI and on the rig.
+
+### 4.16 Safety and operations files
+
+The files below hold the policies, rosters, calendars, measurements and Phase 0 reads that the safety model (section 6), the scheduler (7.10), the Diff Engine and the Reporter depend on. Each lives in `sentinel-config` at the path its 4.1 row gives, carries `schema_version`, is validated against its schema by `sentinel lint`, and changes only by a pull request that passes it; CODEOWNERS routes each to the owner its 4.1 row names (L-XREF-26). A file that section 6 says is signed carries the signature fields shown. The cross-file rules are in 4.15: L-XREF-13 and L-XREF-15 to L-XREF-30. The vmoptions template is plain text, checked by L-XREF-28, and has no schema.
+
+**Gateway and safety files.** The dismiss allowlist is the exact set of labels the gateway may click while an order dialog is in front (6.2, 5.4.3). It stays empty until Phase 0 reads the Order Confirmation dialog, so no dialog click is tokened before then (6.13 item 10). The default order hotkeys are the pinned build's default order-action chords, read once in Phase 0; the gateway loads them at `settings_attested` and fire drill item 3 injects each one (5.4.7, 6.5).
+
+```yaml
+# schemas/dismiss-allowlist.schema.json  (gateway/dismiss_allowlist.yaml)
+dismiss_allowlist:
+  schema_version: int = 1
+  labels: list[str]                     # exact labels: Delete, plus Edit only when Phase 0 observes it; empty until read
+  read_on_build: ref:build.build_id?    # the build whose Order Confirmation dialog Phase 0 read
+  read_by: str?
+  read_at: ts?
+
+# schemas/default-order-hotkeys.schema.json  (gateway/default_order_hotkeys.yaml)
+default_order_hotkeys:
+  schema_version: int = 1
+  build: ref:build.build_id             # the pinned build whose default hotkey table was read
+  verified: bool = false                # false while the chords are placeholders before the Phase 0 read
+  read_by: str?
+  read_at: ts?
+  chords: list[{chord: str, action: str}]   # e.g. "ctrl+shift+b" and the order action the default table binds to it
+```
+
+The Explorer deny list implements the table of 6.8, one entry per denied thing, each detected by window title, by label, by a registered control (its geometry recomputed per build from its landmark) or by a whole surface. It applies to steps run under the agent and Explorer profiles (L-FLW-13), and the nightly denied-action test drives every entry (6.8).
+
+```yaml
+# schemas/explorer-deny-list.schema.json  (policy/explorer_deny_list.yaml)
+explorer_deny_list:
+  schema_version: int = 1
+  approved_by: str                      # the Explorer owner (6.8)
+  entries: list[deny_entry]
+
+deny_entry:
+  id: id
+  denied: str                           # the 6.8 table row it implements, e.g. "Share and tos.mx links"
+  why: str
+  window_title_regex: str?              # a matching window is closed with a tokened Escape
+  label_regex: str?                     # matched against the resolved control name and the under-point OCR label
+  control: ref:control?                 # <surface id>.<control id>
+  surface: ref:surface.id?              # every control of the surface
+  order_path: bool = false              # a drag that starts or ends here is denied as an order path (6.2)
+```
+
+The egress allowlist is the signed list of hosts the harness HTTP client may reach (6.10); anything else is refused before connecting. The computer-use ruling is the security contact's current answer to DR-07 (6.11), read and validated at preflight G1: `status: ruled` needs `endpoint`, `retention`, `approved_model_tiers` and `signed_by`; branch A (`computer_use_covered: true`) also needs `model_ids` and `toolset_schema_version`; a ruling that covers the Reviewer without computer use is branch B with the Reviewer on; `status: open` is branch B with zero model calls. A ruling that fails these checks fails G1, `aborted_harness (reason: config_invalid)` (12.7).
+
+```yaml
+# schemas/egress-allowlist.schema.json  (policy/egress_allowlist.yaml)
+egress_allowlist:
+  schema_version: int = 1
+  hosts: list[{host: str, port: int = 443, purposes: list[str]}]   # exact host names; purposes from the egress_log purpose list of 6.10
+  signed_by: str                        # the security contact (6.10, 6.12)
+  signed_at: ts
+  signature: str
+
+# schemas/computer-use-ruling.schema.json  (policy/computer_use_ruling.yaml)
+computer_use_ruling:
+  schema_version: int = 1
+  status: enum[open|ruled]              # open until security answers DR-07
+  endpoint: str?                        # the approved model endpoint host
+  retention: enum[zero_data_retention|standard]?
+  approved_model_tiers: list[str]?
+  model_ids: list[str]?                 # the pinned model ids the ruling covers
+  toolset_schema_version: str?          # the harness toolset schema version (5.6)
+  reviewer_covered: bool = false        # the Reviewer's model is approved
+  computer_use_covered: bool = false    # agent mode and the Explorer are approved: branch A
+  signed_by: str?                       # the security contact
+  signed_at: ts?
+  ticket: str?
+```
+
+The authorization of 6.12 is a signed document, `authorization/<version>.md`, with a machine-readable record beside it that the lint and preflight check. Any change is a new version; the gated send branch is such a change (6.7).
+
+```yaml
+# schemas/authorization.schema.json  (authorization/<version>.yaml)
+authorization:
+  schema_version: int = 1
+  version: str                          # equals <version> in both file names
+  document_sha256: sha256               # of authorization/<version>.md
+  signatures: list[{role: enum[platform_owner|security_contact|compliance_contact], name: str, signed_at: ts}]
+  account_ids: list[str]                # the allowlisted paper account ids
+  rig_hostnames: list[str]
+  automation: list[str]                 # processes, injection, hooks, capture, the drill injector
+  model_endpoint: str
+  model_terms: str
+  data_classes: list[str]               # the data classes that may leave the rig
+  rate_caps: {logins_per_day: int, symbol_changes_per_hour: int, staged_orders_per_hour: int, staged_orders_per_day: int}   # 6.4: 40, 600, 60 and 300
+  send_policy_branch: enum[default|gated]
+  supersedes: str?                      # the previous version
+```
+
+**Budgets, release gate and reporting.** `policy/budgets.yaml` holds the hard caps of 11.4; the Explorer's action and time budgets stay in `policy/explorer_budget.yaml`. `policy/release_gate.yaml` holds N and the train dates; with no file, N = 3 and an RC cut at G-7 are assumed and printed in the RC report header (11.2). `policy/reporting.yaml` holds what 9.9 says is set in configuration.
+
+```yaml
+# schemas/budgets.schema.json  (policy/budgets.yaml)
+budgets:
+  schema_version: int = 1
+  reviewer_items: {pr: int = 60, merge: int = 200, rc: int = 500}   # 3.15; items beyond are needs_human (reason: reviewer_cap)
+  rescue: {max_actions: int = 25, max_seconds: int = 90, max_rescued_steps_per_run: int = 25}   # 5.5; past a limit the rescue ends and the step fails
+  usd: {per_explorer_session: num = 25, per_run: num = 50, per_week: num = 500}   # 11.4; only per_run ends a run (aborted_budget, reason: dollar_cap)
+  approved_by: str?                     # the system owner, for a value above 11.4's
+
+# schemas/release-gate.schema.json  (policy/release_gate.yaml)
+release_gate:
+  schema_version: int = 1
+  default_business_days: int = 3        # N, PA-14 of 11.1
+  trains: list[{train: str, ga_date: date, rc_cut_date: date, business_days: int?}]   # business_days overrides N for the train
+  owner: str                            # the release manager (9.12)
+
+# schemas/reporting.schema.json  (policy/reporting.yaml)
+reporting:
+  schema_version: int = 1
+  check_mode_history: list[{mode: enum[informational|blocking], since: date, by: str}]   # the commit status mode of 9.2; every change dated and announced in the release channel
+  jira: {product_project: str, harness_project: str}
+  slack: {on_call: str, triage: str, release: str, safety: str}   # the four channels of 9.9
+  paging: {service: str, escalation_policy: str?}
+  email: list[str]?                     # digest recipients
+  auto_file: {tier1: bool = false, tier2: bool = false, tier3: bool = false}   # auto-filing of collateral per tier, off by default (9.9)
+```
+
+**Schedule and people.** `schedule/windows.yaml` is the configuration block of 7.10. PR, merge and RC runs start only inside the operating day, and one triggered outside it waits until 06:00; Nightly and Calibration runs are exempt (7.10, 11.2). `ops/oncall.yaml` names every role holder and deputy, the flow owner per tier, the weekly triage and harness on-call rotations and the triage roster the decision rules read. `ops/credential_rotation.yaml` is the rotation calendar of 7.7: a run scheduled inside a rotation window is held, not started, with a run-health line.
+
+```yaml
+# schemas/windows.schema.json  (schedule/windows.yaml)
+windows_file:
+  schema_version: int = 1
+  operating_day: {start: str, end: str}   # "06:00" and "22:00", America/New_York
+  windows: {all_quiet: quiet_window, equities_quiet: quiet_window, futures_break: quiet_window, none: quiet_window}
+  maintenance_windows: list[{weekday: enum[Mon|Tue|Wed|Thu|Fri|Sat|Sun], start: str, end: str, source: str}]   # a preflight N1, N3 or N4 failure inside one reschedules the run once (7.11)
+
+quiet_window:
+  start: {calendar: enum[XNYS|CMES]?, weekday: enum[Mon|Tue|Wed|Thu|Fri|Sat|Sun], time: str}?
+  end: {calendar: enum[XNYS|CMES]?, weekday: enum[Mon|Tue|Wed|Thu|Fri|Sat|Sun], time: str}?
+  rule: str?                            # a calendar rule in words that the scheduler resolves (equities_quiet, futures_break)
+
+# schemas/oncall.schema.json  (ops/oncall.yaml)
+oncall:
+  schema_version: int = 1
+  roles: list[{role: enum[system_owner|accountable_owner|risk_owner|security_contact|explorer_owner|accounts_owner|release_manager|registry_owner], person: str, deputy: str}]   # 6.12, 11.6
+  flow_owners: list[{tier: enum[1|2|3], person: str, deputy: str}]
+  rotations: list[{rotation: enum[triage|harness_oncall], person: str, from: date, to: date}]   # one person per week each (9.12)
+  triage_roster: list[str]              # the logins that may decide findings (L-MSK-01, L-DEC-01, L-DEC-06)
+
+# schemas/credential-rotation.schema.json  (ops/credential_rotation.yaml)
+credential_rotation:
+  schema_version: int = 1
+  logins: list[{login_ref: str, owner: str, backup_owner: str, sms_device: str?}]   # login_ref as in gateway/allowlist.yaml; sms_device: the team-owned device under DR-03 branch B
+  rotations: list[{login_ref: str, kind: enum[password|vault_token], window: {start: ts, end: ts}, owner: str, validating_run_id: id?}]   # validating_run_id: the login-only canary run of 6.9
+```
+
+**Rig files.** The process allowlist is the running-process rule of 7.1: a process outside it at gate `provisioned` is `env_error (gate: provisioned, reason: rig_spec_mismatch)` naming the process.
+
+```yaml
+# schemas/process-allowlist.schema.json  (rig/process_allowlist.yaml)
+process_allowlist:
+  schema_version: int = 1
+  image_id: str                         # the golden image the baseline was read from (7.2)
+  harness: list[str]                    # image names of the Orchestrator, the Gateway hook host, the Watchdog and the elevated helper service (5.1)
+  app_tree: list[str]                   # the thinkorswim process tree
+  windows_baseline: list[str]           # the golden image's Windows processes
+```
+
+**Measurements and outputs.** These files are written by the harness or by a Phase 0 read and reviewed by a human in the pull request: the corpus sizes of Ladder F, the INV-15 palette per theme, the soak budgets, the calibration export, the quarantine records and the reviewer eval reports. `corpus/measured_sizes.yaml` comes from probe P8 on the first validated run; a surface without sizes there has its Ladder F corpus steps `not_run (reason: scope)`, with a run-health line (2.5.2).
+
+```yaml
+# schemas/measured-sizes.schema.json  (corpus/measured_sizes.yaml)
+measured_sizes:
+  schema_version: int = 1
+  measured_on_run: id                   # the first validated run whose probe P8 measured them
+  sizes: list[{surface: ref:surface.id, workspace: ref:workspace.id, host: enum[flexgrid|detached|dialog], w: int, h: int}]
+
+# schemas/palette.schema.json  (palettes/<theme>.yaml)
+palette:
+  schema_version: int = 1
+  theme: enum[dark|light]               # equals <theme> in the file name
+  colors: {positive: str, negative: str, neutral: str}   # "#rrggbb", read from the pinned build in Phase 0
+  tolerance: num = 60                   # largest RGB distance at which a cell color counts as an entry; a color farther from every entry is not judged (INV-15)
+
+# schemas/soak.schema.json  (soak.yaml)
+soak:
+  schema_version: int = 1
+  calibrated_from: id?                  # the lineage soak run the budgets were calibrated from (10.11)
+  budgets:                              # one per soak.<metric> assertion of 10.11; the values shown are the defaults
+    working_set: {growth_pct_max: num = 25, growth_mb_max: num = 1536}
+    growth_slope: {window_h: num = 3, mb_per_h_max: num = 60}
+    gdi_objects: {max: int = 9000}
+    handles: {within_pct: num = 20}
+    threads: {within_pct: num = 20}
+    heap: {pct_of_xmx_max: num = 80}
+    freezes: {max: int = 0}
+    relaunches: {max: int = 0}
+    render_latency: {tick_window_s: int = 2, windows_pct_min: num = 99}
+```
+
+The calibration export is written by the Calibration Service from `calibration_floors` (8.3) and never edited by hand; its record per region is what 4.8 Threshold source reads.
+
+```yaml
+# schemas/calibration.schema.json  (calibration/<hex>.yaml)
+calibration_file:
+  schema_version: int = 1
+  calibration_key: sha256               # the key of 4.12; <hex> in the file name is this without its sha256: prefix
+  fingerprint_id: sha256                # the fingerprint the Calibration run captured on
+  calibration_run_id: id
+  exported_at: ts
+  checkpoints: list[{checkpoint_id: id, settle_p50_ms: int, regions: list[calibration_region]}]
+
+calibration_region:
+  region_id: str                        # a region id, or _rest
+  floors: {changed_px: int, component_area: int, delta_e: num, shift_px: int}   # the maximum over the 15 A/A pairs (3.9 step 4)
+  thresholds: {component_area_min: int, changed_px_min: int, delta_e_min: num, shift_px_min: int}   # derived by 3.9
+  ssim_min: num?                        # ranking only; no threshold
+  noise_spread: int?                    # inputs of the tolerance rule of 9.7 and 4.14
+  fault_separation: int?
+  hamming_tolerance: int?
+  exact_fallback: bool = false
+  floor_exception: bool = false         # thresholds derived from a non-zero floor under a floor_exception (4.8)
+```
+
+A quarantine record names exactly one checkpoint or one flow; its reason is one of the quarantine reasons of 10.5 (`quarantine_reasons` in `taxonomy.yaml`), and `detail` carries what tripped it (the canary, the drill item, the rate).
+
+```yaml
+# schemas/quarantine.schema.json  (quarantine.yaml)
+quarantine_file:
+  schema_version: int = 1
+  records: list[quarantine_record]
+
+quarantine_record:
+  checkpoint: id?                       # exactly one of checkpoint and flow
+  flow: ref:flow.flow_id?
+  owner: str
+  ticket: str
+  entered: date
+  reason: enum[flake|aa_drift|aa_floor|maintenance_budget|fire_drill|safety_canary|kill_switch|gateway_drops|fallback_rate]
+  detail: str?
+```
+
+An eval report records one run of the eval set's held-out split for one reviewer version tuple of 3.15, with every gate of 3.14; L-XREF-29 requires a passing one for the tuple in force.
+
+```yaml
+# schemas/eval-report.schema.json  (eval/reports/<hex>.yaml)
+eval_report:
+  schema_version: int = 1
+  reviewer_version: {model_id: str, prompt_sha256: sha256, schema_version: int, few_shot_ids: list[str], effort: str, request_settings: map[str, any], crop_policy_version: str, redaction_version: str}   # the tuple of 3.15
+  reviewer_version_sha256: sha256       # over the canonical JSON of reviewer_version; <hex> in the file name
+  eval_set_version: str                 # eval/<eval_set_version>/labels.jsonl
+  split: enum[held_out]
+  run_at: ts
+  gates: list[{gate: str, value: num, threshold: num, passed: bool}]   # every gate of 3.14
+  canary_run_id: id?                    # the mutant catalog re-run of 3.15 before the first product run on the tuple
+```
+
+**Phase 0 reads.** `phase0/branches.yaml` records the branch chosen for each of the seven decision records of 11.8 and the Phase 0 reads other files depend on. An undecided branch carries its deadline; the files that depend on a branch must agree with it (L-XREF-15).
+
+```yaml
+# schemas/branches.schema.json  (phase0/branches.yaml)
+branches:
+  schema_version: int = 1
+  jab: branch_choice                    # DR-01 Java Access Bridge exposure
+  data_fixture: branch_choice           # DR-02 deterministic data fixture
+  login_mfa: branch_choice              # DR-03 login and MFA
+  pinned_install: branch_choice         # DR-04 pinned build install; carries title_regex once read
+  aa_floor: branch_choice               # DR-05 A/A noise floor
+  session_rule: branch_choice           # DR-06 session rule (7.7)
+  computer_use: branch_choice           # DR-07; the ruling itself is policy/computer_use_ruling.yaml
+  batch_api: enum[on|off|undecided] = undecided   # 3.15: off while the ruling requires zero data retention
+  reviewer: {model_id: str?}            # the pinned model id (3.15)
+  version_read: {title_regex: str?, about_regex: str?}   # how the build's version is read (4.2, 7.3)
+  safety: list[{item: int, result: enum[confirmed|different|undecided], observed: list[str]?, note: str?, read_on_build: ref:build.build_id?}]   # the ten Phase 0 assumptions of 6.13; item 10 lists the dialog labels observed
+
+branch_choice:
+  branch: enum[A|B|undecided]
+  decided_by: str?
+  decided_at: date?
+  deadline: date?                       # required while undecided (11.8)
+  title_regex: str?                     # pinned_install only
+```

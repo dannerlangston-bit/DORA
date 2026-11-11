@@ -1364,7 +1364,7 @@ Kinds and sources: capture (Capture, one per checkpoint per side); crop, heatmap
 The `sentinel-config` repository holds everything that tells a run what to do; its layout and lint are owned by 4.1 Conventions, repository layout and the lint, and the paths below are that layout plus the files this section adds. Baseline images do not live in git; a manifest naming them does. The harness, its generated JSON Schemas (`schemas/` of the `sentinel` repository, 4.1) and `sentinel lint` live in the `sentinel` repository.
 
 ```
-taxonomy.yaml                                  outcome enums, reasons, finding kinds, triage states, quarantine reasons; the source of every CHECK and lookup row
+taxonomy.yaml                                  every closed vocabulary of 4.1: outcome enums, reasons, gates, finding kinds, triage states, decision actions and verdicts, canary states and kinds, reviewer verdicts, quarantine reasons, money roles, popup actions; the source of every CHECK and lookup row
 builds/*.yaml                                  build identity and build pairs
 manifests/<build_id>.yaml, manifests/mocks/    change manifests
 registry/surfaces/<area>/*.yaml                Surface Registry
@@ -1372,6 +1372,7 @@ registry/dependency-map.yaml                   primitive -> surfaces
 registry/ladders.yaml                          size-sweep ladders S and F
 corpus/workspaces/<id>/                        Workspace Corpus entries and workspace files
 corpus/measured_sizes.yaml                     per-workspace gadget sizes from probe P8, the Ladder F corpus sizes; written by the Reporter's registry PR, owned by the registry owner (2.5.2)
+corpus/odd-inputs.yaml                         the versioned odd-input corpus with its sampling seed, referenced by type_fixture steps (4.1)
 flows/<tier>/*.yaml, flows/RENAMES.yaml        flows; checkpoint rename map
 flows/quarantine/<finding-id>.yaml             Explorer candidate flows awaiting promotion (2.9)
 regions/<checkpoint_id>.yaml                   Region Registry: freeze, rule, mask, diff, redaction regions and landmarks
@@ -1380,32 +1381,38 @@ redaction/anchors.yaml                         the one global redaction list in 
 palettes/<theme>.yaml                          INV-15 sign colors per app theme, owned by the registry owner (2.7)
 masks/<checkpoint_id>/*.yaml                   mask records
 fixtures/*.yaml, profiles/*.yaml               account and data fixtures; pinned settings profiles
+fixtures/margin_rules.yaml                     the per-asset-class buying power brackets of rule R02, pinned in Phase 0 (2.8.3, 4.9)
 popups/catalog.yaml                            popup catalog
 canaries/mutants.yaml                          the one mutant catalog: M01 to M33 as 12.5 tables them, then M34 on in sequence, classes of 10.3, money_cell flag, seed 20260101 (12.5, 10.3)
 gateway/allowlist.yaml                         exact paper account ids per rig, hashed into the fingerprint (6.4)
 gateway/default_order_hotkeys.yaml             default order-action chords of the pinned build, read once in Phase 0 (6.2)
 gateway/dismiss_allowlist.yaml                 the dismiss allowlist of 6.2
+rig/process_allowlist.yaml                     the running-process allowlist of 7.1 (4.16)
+rig/thinkorswim.vmoptions.template             the vmoptions template the Rig Manager writes thinkorswim.vmoptions from; B3 and H10 compare its hash (7.3, L-XREF-28)
 configs/allowed.yaml                           display configurations, each its own fingerprint, with the work_area that gives Ladder F's MAXW and MAXH (7.1, 2.5.2)
 diff_engine.yaml                               Diff Engine parameters (3.7)
 soak.yaml                                      soak budgets (10.11)
 schedule/windows.yaml                          operating day, named quiet windows, maintenance windows and holiday rules (7.10)
-ops/oncall.yaml                                weekly triage rotation and harness on-call roster (11.6)
+ops/oncall.yaml                                role holders and deputies, the triage roster and the triage and harness on-call rotations (6.12, 9.12, 11.6)
 ops/credential_rotation.yaml                   credential rotation calendar (7.7)
 model_deprecations.yaml                        vendor deprecation notices the system owner records (10.7)
 policy/budgets.yaml                            dollar caps per Explorer session, per run and per week, and reviewer call caps (11.4)
-policy/release_gate.yaml                       sign-off lead N per release train (11.1)
+policy/explorer_budget.yaml                    Explorer session budgets; a change needs the Explorer owner's approval (6.8)
+policy/release_gate.yaml                       N business days before GA per release train, default 3, with GA and RC cut dates per train (11.2, 10.9)
 policy/explorer_deny_list.yaml                 the Explorer deny list (6.8)
 policy/egress_allowlist.yaml                   hosts that artifacts and messages may leave for (6.10)
 policy/computer_use_ruling.yaml                the DR-07 computer-use ruling, read and validated at preflight G1 (6.11)
-calibration/<hex>.yaml                         per-region A/A floors, exported by the Calibration Service from calibration_floors; <hex> is fingerprint_id without its sha256: prefix (4.1)
+policy/reporting.yaml                          the Reporter's settings: commit status mode history, Jira keys, Slack channels, paging, auto-filing switches (9.9)
+calibration/<hex>.yaml                         per-region A/A floors and thresholds for one calibration key, exported by the Calibration Service from calibration_floors; <hex> is the calibration key of 4.12 without its sha256: prefix (4.1, 4.16)
 quarantine.yaml                                quarantine records: exactly one of checkpoint or flow, owner, ticket, entered, reason from the 10.5 table
 policy/send_policy.yaml                        the OPEN paper_send_ok switch, signed by the risk owner
-phase0/branches.yaml                           the chosen branch for each unknown
+phase0/branches.yaml                           the chosen branch for each unknown, plus the Phase 0 reads other files depend on (4.16)
 eval/<eval_set_version>/labels.jsonl           reviewer eval labels; images live in the artifact store
+eval/reports/<hex>.yaml                        one eval report per reviewer version tuple of 3.15, <hex> the tuple hash without its prefix (4.16)
 baselines/<lineage>/<build_id>/manifest.json   committed by the sign-off bot at RC sign-off
 authorization/<version>.md                     the signed authorization of 6.12, referenced by every run
 authorization/<version>.yaml                   the machine-readable form of that authorization (6.12)
-CODEOWNERS                                     flow owner per surface tier approves flows/ and registry/
+CODEOWNERS                                     routes flows/ and registry/ to the tier's flow owner and each file of 4.16 to the owner its 4.1 row names (11.5, L-XREF-26)
 ```
 
 Pinning. At run creation the Orchestrator on the control host side of the Scheduler resolves one commit of `sentinel-config` (HEAD of main, or the commit a config smoke lane names), records it as the run's config commit, builds a tarball of that tree, records its hash, and the Rig Manager ships the same tarball to every shard. Alongside it goes a read-only snapshot of the Central Store's decisions, baselines, regions, masks, calibration floors and quarantine records as of run creation, hashed into `snapshot_set_sha256`, so every shard applies the same inheritance and the run can name the decision set it used. Both sides of a build pair run the same registry, flows, masks, corpus and catalogs, and no run reads a moving branch. The workspace hash in the environment fingerprint is computed from the corpus files in that tarball, so a corpus change produces a new fingerprint and invalidates calibration (7.13 What invalidates calibration). The `regions` and `masks` tables are loaded from the same commit, which is how the Reporter shows mask growth by commit. Harness code is pinned separately as the run's harness commit, installed by the Rig Manager at snapshot build. Run health prints both commits, the tarball hash and the snapshot hash.

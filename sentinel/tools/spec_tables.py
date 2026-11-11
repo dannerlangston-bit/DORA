@@ -156,6 +156,28 @@ def outcome_lists(text: str | None = None) -> dict[str, list[str]]:
     return {"checkpoint_outcomes": lists[0], "step_outcomes": lists[1], "run_outcomes": lists[2]}
 
 
+# -- verbatim copies (12.2, 12.3, 12.6, 12.8) -------------------------------------------------------
+
+def table_block(text: str, header: str, nth: int = 0) -> str:
+    """The exact text of the `nth` markdown table whose header row starts with `header`, header to last row."""
+    lines = text.splitlines(keepends=True)
+    starts = [i for i, ln in enumerate(lines) if ln.startswith(header)]
+    i = starts[nth]
+    j = i
+    while j < len(lines) and lines[j].lstrip().startswith("|"):
+        j += 1
+    return "".join(lines[i:j])
+
+
+def outcome_taxonomy_block(text: str) -> str:
+    """From the `Precedence.` paragraph through the last row of the per-run outcome table: the part of 1.10
+    that 12.2 copies verbatim."""
+    start = text.index("\nPrecedence.") + 1
+    last = table_block(text, "| Outcome | Definition |", nth=2)
+    end = text.index(last, start) + len(last)
+    return text[start:end]
+
+
 # -- 4.1 taxonomy key table -------------------------------------------------------------------------
 
 def taxonomy_key_table() -> dict[str, str]:

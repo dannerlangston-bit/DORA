@@ -85,6 +85,22 @@ send is `aborted_safety`. The default order chords come from `gateway/default_or
 control result's 9.10 route goes to `alerts.json`; the shards, their gates and proofs (`Proof.line`, 6.6), the
 gateway events and the actions the Orchestrator does not perform itself go to `orchestrator.json`.
 
+The Executor (5.4.3, 5.5, 2.4, 2.6.1, 4.7, 10.1, 10.2): each unit of work runs through `executor.flow.run_unit` on
+the shard's simulated rig (`pipeline.simports`): a flow as its 4.7 document, a census visit, sweep step or split
+step as `executor.flow.census_unit` (`reset_input_state`, the 2.4 preconditions, the surface's path, the checkpoint).
+Input steps go through `executor.emitter.emit` (stages 1 to 8) with `executor.primitives.Planner` and the locator
+ladder (`executor.locator.Ladder` over the simulated desk); the step boundary is `UnitHooks.before_step`, an app
+failure seen inside a step ends the unit through `after_step`; the heartbeat is the shard's
+`executor.heartbeat.HeartbeatPolicy` (the Orchestrator's gates write through it too) and the app's age its
+`AppLife` (`app_uptime_s`, `app_restart_count` on every capture and step row); exceptions are the 10.1 rows of
+`executor.failures.guard` with the shard's `FailureLedger` (an artifact write that failed twice ends the run
+`aborted_harness (artifact_persist_failed)` at teardown); three env_error census visits in one workspace mark its
+remaining visits (`workspace:<id>`). Every step is one 8.3 step outcome row with its action and the ladder's rung;
+the emitter's own action rows keep their rung, point, label and crop while the gateway decision is the drainer's
+row (`ExecContext.audit`), so the run's drop count counts each decision once. The LOGIN secret is a leased
+`secret` step (`executor.secret.run_secret_step` over `simports.SimVault`); every lease's value joins the teardown
+plaintext scan and is then released (6.9).
+
 The Oracle (2.8, `pipeline.assertions`): every flow checkpoint that declares assertions or rule regions, and
 every census, sweep or split checkpoint whose regions file has rule regions (SD-29, `oracle.checks_for`), is
 evaluated on both builds; the candidate's verdict feeds `classify.Facts` (3.11 G and H), the failed
@@ -165,7 +181,7 @@ from ..orchestrator.budgets import RateCounters, WallBudget
 from ..orchestrator.clock import ManualClock
 from ..orchestrator.degraded import ModelAvailability, SpendTracker
 from ..orchestrator.gates import check_build_unchanged
-from ..orchestrator.gateway import VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB, Action, DropLedger, drain, refusal
+from ..orchestrator.gateway import Action, DropLedger
 from ..orchestrator.identity import account_id_sha256
 from ..orchestrator.killflag import main as stop_main
 from ..orchestrator.killswitch import TripWires, config_invalid_proof, kill_switch, proof_line
@@ -176,9 +192,8 @@ from ..orchestrator.ports import SessionSafety
 from ..orchestrator.machine import Orchestrator, RunContext, RunReport
 from ..orchestrator.results import ControlResult, Outcome, RunVerdict, worse
 from ..orchestrator.rig import CrashSignal
-from ..orchestrator.simrig import CONFIRM_POINT, DELETE_POINT, SimScenario, SimulatedRig, default_context
-from ..orchestrator.watchdog import (HANG_FLOOR_S, Heartbeat, HeartbeatUnwritable, HeartbeatWriter, app_failure,
-                                     edt_frozen, heartbeat_failed)
+from ..orchestrator.simrig import SimScenario, SimulatedRig, default_context
+from ..orchestrator.watchdog import HANG_FLOOR_S, HeartbeatWriter, app_failure
 from .assertions import FlowOracle, OracleCheck
 from .config import SentinelConfig, as_dict, materialize, parse_time, tree_sha256
 from ..reviewer.adapter import ModelReviewer, ReviewerUnavailable
@@ -189,6 +204,14 @@ from .orchestration import (RigScript, ShardSink, alert_entry, login_alias, logi
                             persisted_actions, shard_setup)
 from .reviewer import ReviewerAdapter, ReviewRequest, SimulatedReviewer, change_types, to_review, validate
 from .sim import Capture, SimApp, SimBuild, observe
+from .simports import (APPLIED, SimDesk, SimLadder, SimUnitPorts, SimVault, applied as _applied, fixture_values,
+                       step_action)
+from ..executor.emitter import ExecContext
+from ..executor.failures import FailureLedger, faults_from
+from ..executor.flow import Captured, Unit, UnitHooks, UnitResult, WorkspaceStreak, census_unit, run_unit
+from ..executor.heartbeat import AppLife, HeartbeatPolicy
+from ..executor.locator import Branches, LadderContext, RescueCap, WindowCapture
+from ..executor.primitives import Planner
 
 DEFAULT_TODAY = date(2026, 11, 10)
 SAFETY_ACTIONS = ("block_login", "disable_rig", "quarantine_flow", "quarantine_order_stage_flows",
@@ -255,6 +278,8 @@ class Evaluated:
     session: int = -1
     rig_id: str | None = None                      # the rig that captured both sides (one rig per shard)
     redaction: RedactionResult | None = None       # the redaction stage's result (3.6); None: not redacted
+    app_uptime_s: int | None = None                # 10.2: the app's age when the checkpoint was captured
+    app_restart_count: int | None = None
 
     @property
     def storable(self) -> bool:
@@ -565,7 +590,8 @@ def _event_id(run: _Run, cp: PlannedCheckpoint | None) -> str:
 def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Capture, *, x: str,
              primitive: str | None, entry_ref: str | None, recapture: Callable[[], Capture],
              recapturable: bool = True, store: Store | None = None, synthetic: bool = False,
-             absent_reason: str | None = None, injected: bool = False, oracle: FlowOracle | None = None) -> Evaluated:
+             absent_reason: str | None = None, injected: bool = False, oracle: FlowOracle | None = None,
+             rescued: bool = False) -> Evaluated:
     """5.17 from capture to classification for one checkpoint; PR checkpoints and canary mutants alike.
     An `injected` candidate (a canary mutant, 10.3 Injection) is already a settled capture: the settle
     loop, a capture-time gate, does not run on it. With `oracle`, a flow checkpoint's assertions are
@@ -578,7 +604,8 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
     park = _park(cand)
     spec = SimApp.settle_spec(reg, park)
     fkw: dict[str, Any] = dict(manifest=x, primitive=primitive, manifest_entry_ref=entry_ref,
-                               manifest_entries=run.entries, manifest_tickets=run.tickets, build_pair_id=run.pair_id)
+                               manifest_entries=run.entries, manifest_tickets=run.tickets, build_pair_id=run.pair_id,
+                               rescued=rescued)
     s_c = settle(cand.frames, spec, run.params) if not injected else _as_settled(cand)
     s_b = settle(base.frames, spec, run.params) if base is not None else None
     res, comparison = None, None
@@ -968,7 +995,8 @@ class _Writer:
             outcome_id=self.run.next_outcome_id(), pair_id=self.run.pair_id, profile_id=PROFILE,
             diff_pixels=sum(m.changed_px for m in ev.diff.regions) if diff is not None else None,
             masked_pct=_masked_pct(ev), settle_ms=ev.settle_ms, cand_rig_id=ev.rig_id,
-            base_rig_id=ev.rig_id if ev.base is not None else None, **rec_kw)
+            base_rig_id=ev.rig_id if ev.base is not None else None, app_uptime_s=ev.app_uptime_s,
+            app_restart_count=ev.app_restart_count, **rec_kw)
         findings: list[Finding] = []
         if synthetic:
             return o, findings, stored
@@ -1125,8 +1153,8 @@ def _run_plan(run_id: str, run_type: str, cfg_root: Path, scope: Sequence[ScopeE
               pair_id: int | None = None, flow_docs: Mapping[str, Mapping[str, Any]] | None = None) -> RunPlan:
     """The run row's plan (8.3), with each flow's step ids (`step_failed:<step>` names one, L-OUT-02)."""
     sha = tree_sha256(cfg_root)
-    steps = {f: [str(st.get("id")) for st in (d.get("steps") or ()) + (d.get("teardown") or ())]
-             for f, d in (flow_docs or {}).items()}
+    steps = {f: [str(st.get("id")) for blk in ("preconditions", "steps", "normalize", "teardown")
+                 for st in d.get(blk) or ()] for f, d in (flow_docs or {}).items()}
     return RunPlan(run_id=run_id, run_type=run_type, config_commit=sha[:12], config_tarball_sha256=sha,
                    snapshot_set_sha256=hashlib.sha256(",".join(RIGS).encode()).hexdigest(),
                    harness_sha="sentinel-core-0.1.0-sim", authorization_ref="AUTH-SIM-2026-11",
@@ -1145,11 +1173,45 @@ def _status_json(status) -> dict:
 # The Orchestrator and the Executor (5.2, 5.4, 10.2): one shard through the gate machine
 
 
-FLOW_INPUT_STEPS = ("click_named", "press", "type_fixture")
-NAMED_KEYS = {"enter": VK_RETURN, "return": VK_RETURN, "space": VK_SPACE, "tab": VK_TAB, "escape": VK_ESCAPE}
-GUARDED_KEYS = ("enter", "return", "space")
+SIDED = ("not_settled", "landmark_missing")     # 4.13: outcomes that name the side the Executor ran
 MAX_WAIT_S = 15.0                        # 3.5: the settle loop's maximum wait, the hang detector's max_wait_s
 STEP_S = 2.0                             # simulated seconds per Executor step (heartbeats, token expiry)
+
+
+ENTER_TARGET = "dialog.order-confirmation.send-button"   # the dialog's default button, where a scripted Enter lands
+
+
+def scripted_flow(doc: Mapping[str, Any], flow_id: str, script: RigScript) -> Mapping[str, Any]:
+    """The flow document the Executor runs (and the run plan lists): the scenario's scripted Enter
+    (`RigScript.enter_after`) is a `press: enter` step inserted after the step it names, targeting the open dialog's
+    default button (`ENTER_TARGET`), as a flow that declared it would run it (5.4.3 stage 2, 5.4.7)."""
+    if script.enter_after is None or script.enter_after[0] != flow_id:
+        return doc
+    after = script.enter_after[1]
+    steps: list[Any] = []
+    for step in doc.get("steps") or ():
+        steps.append(step)
+        if str(step.get("id")) == after:
+            steps.append({"id": f"{after}+enter", "type": "press", "key": "enter", "target": ENTER_TARGET})
+    return {**doc, "steps": steps}
+
+
+def _spec_step(spec: Any) -> str | None:
+    """The step a finding spec of the emitter names in its JSON detail (`locator_failure`), if any."""
+    try:
+        detail = json.loads(spec.detail or "")
+    except (TypeError, ValueError):
+        return None
+    return str(detail["step_id"]) if isinstance(detail, dict) and detail.get("step_id") else None
+
+
+def _branches_doc(cfg: SentinelConfig) -> dict:
+    """The parsed `phase0/branches.yaml` (4.16), or nothing when the config has none (every branch undecided)."""
+    path = cfg.root / "phase0" / "branches.yaml"
+    if not path.is_file():
+        return {}
+    import yaml
+    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
 def _units(cps: Sequence[PlannedCheckpoint]) -> list[list[PlannedCheckpoint]]:
@@ -1191,6 +1253,17 @@ class _Shard:
     seq: Iterator[int] = field(default_factory=lambda: itertools.count(1))   # the shard's step_events seq (8.3)
     drainer: Drainer | None = None                         # every gateway decision as a step event (5.4.8)
     last_flow: str | None = None                           # the flow that ran last (a quarantine's target)
+    policy: Any = None                                     # executor.heartbeat.HeartbeatPolicy (10.2)
+    life: AppLife = field(default_factory=AppLife)         # the app's uptime and restart count (10.2)
+    exec: Any = None                                       # executor.emitter.ExecContext
+    ports: Any = None                                      # pipeline.simports.SimUnitPorts
+    ladder: Any = None                                     # pipeline.simports.SimLadder
+    failures: FailureLedger = field(default_factory=FailureLedger)   # 8.9 run taint
+    streak: WorkspaceStreak = field(default_factory=WorkspaceStreak)  # 2.4 census workspace rule
+    emitting: bool = False                                 # the emitter is sending: the rig's observer holds off
+    interrupt: ControlResult | None = None                 # an app failure seen inside a step (`_after_step`)
+    unit: Any = None                                       # the unit in progress
+    rest: list[PlannedCheckpoint] = field(default_factory=list)   # the unit's later checkpoints outside it
 
     def assertion(self, stamp: dict[str, str] | None) -> None:
         """The Orchestrator pushed a new session safety state (its `safety_listener`): a stamp is a passing paper-mode
@@ -1228,6 +1301,13 @@ class _ShardWork:
         self.store_refusals: list[dict] = []                 # L-OUT-02 refusals the repair did not fix
         self.applied: dict[int, AppliedSafety] = {}          # what store.safety persisted, by control result
         self.pending: list[tuple[_Shard, ControlResult, str | None]] = []   # results noted before the run row
+        self.desk = SimDesk(cfg.surfaces)                    # the simulated screen the locator ladder reads (5.5)
+        self.values = fixture_values(cfg.fixture, list(cfg.flow_docs.values()))   # the Planner's typed values
+        self.branches_doc = _branches_doc(cfg)
+        self.rescue_cap = RescueCap()                        # 5.5: rescued steps per run
+        self.faults = faults_from(self.script.faults) if self.script.faults else None
+        self.vault = SimVault(unreachable=self.script.vault_unreachable)   # 6.9: secrets leased at typing time
+        self.sides: dict[str, str] = {}                      # the side the Executor ran for a step-decided outcome
 
     # -- the shards -------------------------------------------------------------------------------------
     def run_shards(self, specs: Sequence[tuple[str, int, str, list[PlannedCheckpoint]]]) -> None:
@@ -1251,9 +1331,12 @@ class _ShardWork:
         ctx, sim = shard_setup(self.cfg, run_id=sc.run_id, run_type="pr", shard_id=shard_id, shard_no=shard_no,
                                build_id=sc.candidate.build_id, workspace_id=cps[0].workspace_id, script=self.script,
                                rig_id=rig_id, kill_root=self.out / "rigs")
+        sim.vault = self.vault                          # the LOGIN secret is a leased secret step (6.9)
         rig = SimulatedRig(sim, clock=clock)
         sink = ShardSink([cp.checkpoint_id for cp in cps])
         hb = HeartbeatWriter(self.out / "heartbeat" / f"shard-{shard_no}.json", clock)
+        life = AppLife()
+        policy = HeartbeatPolicy(hb, clock, run_id=sc.run_id, shard=shard_no, life=life)
         holder: list[_Shard] = []
 
         def listener(s: SessionSafety) -> None:
@@ -1263,12 +1346,13 @@ class _ShardWork:
             if holder:
                 holder[0].assertion(holder[0].orch.paper_stamp())
 
-        orch = self.orchestrator(rig, ctx, sink, clock, hb, sim, listener)
-        st = _Shard(shard_id, rig_id, list(cps), orch, rig, sink, clock, ctx)
+        orch = self.orchestrator(rig, ctx, sink, clock, hb, sim, listener, policy=policy, life=life)
+        st = _Shard(shard_id, rig_id, list(cps), orch, rig, sink, clock, ctx, policy=policy, life=life)
         st.drainer = Drainer(DrainContext(sc.run_id, shard_id, "candidate", mode="scripted"),
                              journal=self.out / "journal" / sc.run_id / f"shard-{shard_no}" / JOURNAL_NAME,
                              next_seq=lambda: next(st.seq), wall_at=wall_from(clock))
         rig.on_input = lambda action, res: self._drain(st, action, res)
+        self._executor(st)
         holder.append(st)
         _, hotkeys_error = order_hotkeys(self.cfg)
         if hotkeys_error is not None:                   # 5.4.7: fails the shard closed at settings_attested
@@ -1301,7 +1385,8 @@ class _ShardWork:
 
     def orchestrator(self, rig: SimulatedRig, ctx: RunContext, sink: Any, clock: ManualClock,
                      hb: HeartbeatWriter | None, sim: SimScenario,
-                     listener: Callable[[SessionSafety], None]) -> Orchestrator:
+                     listener: Callable[[SessionSafety], None], *, policy: HeartbeatPolicy | None = None,
+                     life: AppLife | None = None) -> Orchestrator:
         """One shard's Orchestrator (5.2) with the run's budgets: the 11.2 wall budget from the shard's start, the
         spend ceiling, the model availability of preflight N2 and N5 (10.7), the login's 6.4 rate counters (no
         store helper seeds them yet: a fresh login) and the session safety listener (`rig.set_session_safety`)."""
@@ -1309,7 +1394,27 @@ class _ShardWork:
         return Orchestrator(rig, ctx, sink, clock=clock, ledger=self.ledger, heartbeat=hb,
                             wall=WallBudget.for_run(ctx.run_type, clock.monotonic()), spend=SpendTracker(),
                             model=ModelAvailability.from_preflight("N2" not in fails, "N5" not in fails),
-                            counters=RateCounters(), safety_listener=listener)
+                            counters=RateCounters(), safety_listener=listener, heartbeat_policy=policy, life=life)
+
+    def _executor(self, st: _Shard) -> None:
+        """The shard's Executor (5.4.3, 5.5, 10.2): its `ExecContext` (the run's drop ledger, the shard's budgets, the
+        heartbeat policy, the app's age, the drainer as the audit sink, the shard's step-event seq), the simulated
+        rig's ports and the locator ladder over the desk."""
+        sc, rig = self.scenario, st.rig
+        st.exec = ExecContext(sc.run_id, st.shard_id, st.clock, ledger=self.ledger, budgets=st.orch.budgets,
+                              side="candidate", agent_available=st.orch.model.agent_available,
+                              dr07_branch_b=Branches.from_doc(self.branches_doc).computer_use == "B",
+                              heartbeat=st.policy, life=st.life, audit=st.drainer, resolve_target=self.desk.target,
+                              next_seq=lambda: next(st.seq))
+        lctx = LadderContext("", "", self.rescue_cap, retry=lambda: WindowCapture.from_frame(self.desk.frame(rig)),
+                             flag=rig.poll_flag, templates=self.desk.templates,
+                             agent_available=st.orch.model.agent_available)
+        st.ladder = SimLadder(self.desk, rig, lctx, dict(self.script.locator_miss), branches=self.branches_doc)
+        st.ports = SimUnitPorts(rig, self.desk, orch=st.orch, capture=lambda step, rescued: self._capture_step(
+            st, step, rescued), hold_observer=lambda on: setattr(st, "emitting", on),
+            precondition_fail=dict(self.script.precondition_fail), wait_timeout=self.script.wait_timeout,
+            postcondition_fail=self.script.postcondition_fail)
+        st.ports.ladder = st.ladder
 
     def persist(self, st: _Shard, r: ControlResult, flow_id: str | None) -> None:
         """6.4 to 6.12: persist what a safety control result decided (`store.safety.apply_safety_actions`: the login
@@ -1401,6 +1506,9 @@ class _ShardWork:
             return [cp for cp in rest if cp in todo]
         if selector == "first_unreached":
             return todo[:1]
+        if selector.startswith("workspace:"):     # 2.4: the shard's remaining census visits in that workspace
+            ws = selector.split(":", 1)[1]
+            return [cp for cp in todo if cp.test_kind == "census" and cp.workspace_id == ws]
         return []        # account_state, probe:<Pn>, explorer_stage, drill, ...: no checkpoint of a PR shard's scope
 
     def _subsets(self, st: _Shard, r: ControlResult, current: PlannedCheckpoint | None = None,
@@ -1436,137 +1544,139 @@ class _ShardWork:
             self._note_new(st, flow_id=flow_id)
             if orch.stop is not None:
                 continue
-            if unit[0].test_kind == "flow":
-                st.last_flow = unit[0].flow_id
-                self._flow(st, unit)
-            else:
-                for i, cp in enumerate(unit):
-                    self._heartbeat(st, None, None, cp)
-                    if not self._capture(st, cp, unit[i + 1:]) or orch.stop is not None:
-                        break
+            self._run_unit(st, unit)
+        for st in self._running:                        # 8.9: a persist that failed twice taints the run
+            r = st.failures.at_teardown(st.orch.stop.run if st.orch.stop is not None else None)
+            if r is not None:
+                self._note(st, st.orch.apply(r))
 
-    def _heartbeat(self, st: _Shard, flow_id: str | None, step_id: str | None, cp: PlannedCheckpoint | None) -> None:
-        """10.2: a heartbeat at every step start; a write failing twice ends the run (watchdog.heartbeat_failed)."""
-        st.clock.advance(STEP_S)
-        hb = st.orch.heartbeat
-        if hb is None:
+    def _run_unit(self, st: _Shard, unit: Sequence[PlannedCheckpoint]) -> None:
+        """One unit through the Executor (`executor.flow.run_unit`, module docstring): a flow as its 4.7 document, a
+        census visit, sweep step or split step as a census visit (`census_unit`: `reset_input_state`, the 2.4
+        preconditions, the surface's path, the checkpoint), each step input through the emitter, the planner and the
+        locator ladder on the shard's simulated rig (`pipeline.simports`)."""
+        first = unit[0]
+        todo = [cp for cp in unit if cp in self._todo(st)]
+        if first.test_kind == "flow":
+            doc = scripted_flow(self.cfg.flow_docs.get(first.flow_id or "", {}), first.flow_id or "", self.script)
+            self._execute(st, Unit("flow", first.flow_id or "", doc, tuple(cp.checkpoint_id for cp in todo),
+                                   first.workspace_id), todo, ())
             return
-        try:
-            hb.write(Heartbeat(self.scenario.run_id, st.ctx.shard, st.ctx.attempt, "running", st.clock.now().isoformat(),
-                               st.clock.monotonic(), flow_id=flow_id, step_id=step_id,
-                               checkpoint_id=cp.checkpoint_id if cp else None, max_wait_s=MAX_WAIT_S))
-        except HeartbeatUnwritable as e:
-            self._note(st, st.orch.apply(heartbeat_failed(e)))
-
-    def _flow(self, st: _Shard, unit: Sequence[PlannedCheckpoint]) -> None:
-        """One flow: its steps in order, input steps through the gateway, its checkpoints captured, then its
-        teardown input (5.4.3, 4.7). Preconditions and normalize steps send no input here."""
-        flow_id = unit[0].flow_id or ""
-        doc = self.cfg.flow_docs.get(flow_id, {})
-        want = {cp.step_id: cp for cp in unit}
-        cps = list(unit)
-        steps = list(doc.get("steps") or ())
-        for i, step in enumerate(steps):
+        for i, cp in enumerate(unit):
             if st.orch.stop is not None:
                 return
-            sid = str(step.get("id"))
-            cp = want.get(sid) if step.get("type") == "checkpoint" else None
-            self._heartbeat(st, flow_id, sid, cp)
-            # 5.2 step boundary: the trip-wires, the flow's own budget and the paper-mode assertion when due (6.4)
-            r = st.orch.step_boundary(BoundaryObservations(order_dialog_visible=st.rig.dialog_open,
-                                                           tripwires=TripWires(dialog_owned=st.order_stage)),
-                                      order_stage_step=step.get("order_stage") is True)
-            self._note_new(st, checkpoint=cp, flow_id=flow_id)
-            if st.orch.stop is not None:
-                return
-            if r is not None and r.has("end_flow"):        # 11.2: past its budget; the rest not_run (budget)
-                rest = [want[str(s.get("id"))] for s in steps[i:] if str(s.get("id")) in want]
-                self._subsets(st, r, None, rest)
-                break
-            if step.get("type") == "type_fixture" and str(step.get("value_ref") or "").startswith("fixture.symbols."):
-                st.orch.counters.symbol_change(st.clock.now())     # 6.4 rate caps: a symbol-box change
-            rest = [want[str(s.get("id"))] for s in steps[i + 1:] if str(s.get("id")) in want]
-            if cp is not None:
-                if cp in self._todo(st) and not self._capture(st, cp, cps[cps.index(cp) + 1:]):
-                    return
-            elif step.get("type") in FLOW_INPUT_STEPS and not self._input(st, flow_id, step, doc, rest):
-                return
-            if self.script.enter_after == (flow_id, sid):     # the scenario's scripted Enter on the open dialog
-                if not self._send(st, Action("press", keys=(VK_RETURN,), declared_guarded=True,
-                                             flow_class=str(doc.get("class", "standard"))),
-                                  flow_id, f"{sid}+enter", rest):
-                    return
-        for step in doc.get("teardown") or ():
-            if st.orch.stop is not None:
-                return
-            self._heartbeat(st, flow_id, str(step.get("id")), None)
-            if step.get("action") == "close_dialog" and st.rig.dialog_open:
-                # the Order Confirmation's dismiss allowlist (6.2): Delete closes the dialog, Send never
-                self._send(st, Action("click", point=DELETE_POINT, resolved_name="Delete", under_point_text="Delete",
-                                      teardown_action="close_dialog", flow_class=str(doc.get("class"))),
-                           flow_id, str(step.get("id")))
-                st.order_stage = st.rig.dialog_open
+            if cp not in self._todo(st):
+                continue
+            path = list((self.cfg.surfaces.get(cp.surface_id) or {}).get("path") or ())
+            self._execute(st, census_unit(cp.checkpoint_id, [s for s in path if s.get("type") == "wait_for"],
+                                          workspace_id=cp.workspace_id), [cp], unit[i + 1:])
 
-    def _label(self, target: str) -> str:
-        """A step target's control text from the Surface Registry (`<surface>.<control id>`)."""
-        for sid in sorted(self.cfg.surfaces, key=len, reverse=True):
-            if target.startswith(sid + "."):
-                cid = target[len(sid) + 1:]
-                for c in self.cfg.surfaces[sid].get("controls") or ():
-                    if str(c.get("id")) == cid:
-                        return str(c.get("ocr_text") or cid)
-                return cid
-        return target
+    def _execute(self, st: _Shard, u: Unit, cps: Sequence[PlannedCheckpoint], rest: Sequence[PlannedCheckpoint]) -> None:
+        """Run one unit and take what it decided (`_absorb`)."""
+        st.rest = list(rest)
+        st.unit = u
+        doc = u.doc
+        planner = Planner(self.values, "scripted", flow_class=str(doc.get("class", "standard")),
+                          account_role=doc.get("account_role"))
+        st.ladder.ctx = dataclasses.replace(st.ladder.ctx, flow_class=str(doc.get("class", "standard")),
+                                            flow_agent_fallback=str(doc.get("agent_fallback", "allowed")),
+                                            agent_available=st.orch.model.agent_available)
+        st.exec.agent_available = st.orch.model.agent_available
+        if u.kind == "flow":
+            st.last_flow = u.unit_id
+        hooks = UnitHooks(before_step=lambda step: self._before_step(st, u, step),
+                          after_step=lambda step: self._after_step(st))
+        r = run_unit(u, st.ports, st.ladder, planner, st.exec, hooks=hooks, failures=st.failures, faults=self.faults,
+                     streak=st.streak if u.kind == "census" and cps and cps[0].test_kind == "census" else None)
+        self._absorb(st, u, r, cps)
 
-    def _input(self, st: _Shard, flow_id: str, step: Mapping[str, Any], doc: Mapping[str, Any],
-               rest: Sequence[PlannedCheckpoint]) -> bool:
-        """One input-bearing flow step as the gateway's `Action` (5.4.3 stages 1 to 3 resolved here); `rest` are the
-        flow's checkpoints after it."""
-        kind, cls = step.get("type"), str(doc.get("class", "standard"))
-        if kind == "click_named":
-            label = self._label(str(step.get("target", "")))
-            stage = step.get("order_stage") is True
-            ok = self._send(st, Action("click", point=CONFIRM_POINT if label.casefold() == "confirm and send" else (40, 40),
-                                       resolved_name=label, under_point_text=label, order_stage_step=stage,
-                                       flow_class=cls), flow_id, str(step.get("id")), rest)
-            st.order_stage = st.order_stage or (stage and st.rig.dialog_open)
-            return ok
-        key = str(step.get("key") if kind == "press" else step.get("commit") or "").casefold()
-        if key not in NAMED_KEYS:
-            return True
-        return self._send(st, Action(kind if kind == "press" else "type_fixture", keys=(NAMED_KEYS[key],),
-                                     declared_guarded=key in GUARDED_KEYS, flow_class=cls), flow_id, str(step.get("id")),
-                          rest)
+    def _before_step(self, st: _Shard, u: Unit, step: Mapping[str, Any]) -> ControlResult | None:
+        """`UnitHooks.before_step`: the step's simulated time, and for a flow step the Orchestrator's `step_boundary`
+        (5.2: the trip-wires, the flow's own budget, the paper-mode assertion when due, 6.4) and the symbol-change
+        count of the 6.4 rate caps. A result that stopped the run, or the flow budget's `end_flow`, ends the unit;
+        it was applied already, so it comes back marked (`APPLIED`)."""
+        st.clock.advance(STEP_S)
+        sid, kind = str(step.get("id")), str(step.get("type"))
+        st.ladder.ctx = dataclasses.replace(st.ladder.ctx, step_id=sid, step_type=kind, teardown=False)
+        if u.kind != "flow":
+            return None
+        cp = next((c for c in self.planned if c.checkpoint_id == step.get("checkpoint_id")), None) \
+            if kind == "checkpoint" else None
+        r = st.orch.step_boundary(BoundaryObservations(order_dialog_visible=st.rig.dialog_open,
+                                                       tripwires=TripWires(dialog_owned=st.exec.order_stage)),
+                                  order_stage_step=step.get("order_stage") is True)
+        self._note_new(st, checkpoint=cp, flow_id=u.unit_id)
+        if st.orch.stop is not None:
+            return _applied(st.orch.stop)
+        if r is not None and r.has("end_flow"):
+            return _applied(r)
+        if kind == "type_fixture" and str(step.get("value_ref") or "").startswith("fixture.symbols."):
+            st.orch.counters.symbol_change(st.clock.now())     # 6.4 rate caps: a symbol-box change
+        return None
 
-    def _send(self, st: _Shard, action: Action, flow_id: str, step_id: str,
-              rest: Sequence[PlannedCheckpoint] = ()) -> bool:
-        """`Rig.send_input`, the shard's drainer and the drop ledger of 5.4.8: every gateway decision is a step
-        event (`Drainer`, written with `Store.write_events`); a refusal or a hook drop is also the step's outcome,
-        and the ledger's result may end the flow (its rest `not_run (reason: step_failed:<step>)`), restart the
-        hook host with a relaunch, or end the run (an attempted send is `aborted_safety`)."""
-        if st.drainer is not None:                   # the drainer's rows name the flow step (5.4.8)
-            st.drainer.set_context(flow_id=flow_id, step_id=step_id)
-        res = st.rig.send_input(action)
-        if st.drainer is not None:
-            st.drainer.set_context(flow_id=None, step_id=None)
-        drops = [refusal(res.refused)] if res.refused is not None else []
-        drops += [drain(d, e) for e, d in zip(res.events, res.decisions) if not d.allowed]
-        for drop in drops:
-            r = st.orch.apply(self.ledger.record(drop, unit=flow_id, step_id=step_id, order_stage=st.order_stage,
-                                                 budgets=st.orch.budgets))
-            self._note(st, r, flow_id=flow_id)
-            self._subsets(st, r, None, rest)
-            st.seen = len(st.orch.results)
-            self.steps.append((StepOutcome(self.scenario.run_id, flow_id, step_id, r.step or "blocked_by_gateway",
-                                           shard_id=st.shard_id, reason=drop.reason, action="gateway_decision",
-                                           recorded_at=_ts(self.today, self.scenario.clock, 600)), st.shard_id))
-            if st.orch.stop is None and (r.has("relaunch") or r.has("kill_tree")):
-                st.order_stage = False      # 5.4.2: the hook host restarts; the app relaunches through every gate
+    def _after_step(self, st: _Shard) -> ControlResult | None:
+        """`UnitHooks.after_step`: the Watchdog's app failure seen during the step (`_freeze`) ends the unit with the
+        tree gone (its checkpoints were decided there)."""
+        r, st.interrupt = st.interrupt, None
+        return r
+
+    def _absorb(self, st: _Shard, u: Unit, r: UnitResult, cps: Sequence[PlannedCheckpoint]) -> None:
+        """What one unit decided, into the shard (module docstring): its step events (the emitter's action rows keep
+        their rung, point, label and crop while the gateway decision is the drainer's row, 5.4.8, so the run's drop
+        count counts each decision once), a flow's step outcome rows with their 8.3 action, the unit's findings,
+        its consequences through `Orchestrator.apply` (a hook host death relaunches through every gate, 5.4.2) and
+        the outcomes its steps decided."""
+        by = {cp.checkpoint_id: cp for cp in cps}
+        for e in r.events:
+            if e.action != "gateway_decision" and (e.gate_decision != "none" or e.step_outcome is not None):
+                e = dataclasses.replace(e, gate_decision="none", gate_reason=None, gate_class=None, step_outcome=None)
+            elif e.step_outcome is not None:
+                e = dataclasses.replace(e, step_outcome=None)
+            st.events.append(e)
+        flow_id = u.unit_id if u.kind == "flow" else None
+        steps = {str(x.get("id")): x for blk in ("steps", "normalize", "teardown") for x in u.doc.get(blk) or ()}
+        for sr in r.steps + r.teardown:
+            so = sr.to_step_outcome(self.scenario.run_id, u.unit_id, shard_id=st.shard_id, side="candidate",
+                                    mode="scripted")
+            gw = dict(sr.gateway_event or {})
+            self.steps.append((dataclasses.replace(
+                so, action=step_action(steps.get(sr.step_id, {}), sr.status, sr.gateway_event), gateway_event=None,
+                reason=so.reason or gw.get("reason"), recorded_at=_ts(self.today, self.scenario.clock, 600)),
+                st.shard_id))
+        flow_steps = list(u.doc.get("steps") or ())
+        ids = [str(x.get("id")) for x in flow_steps]
+        for spec in r.findings:                         # locator_failure, gateway_integrity (5.5, 5.4.3 stage 7)
+            n = len(self.findings) + 1
+            sid = _spec_step(spec) or r.ended_by
+            start = ids.index(sid) if sid in ids else len(ids)      # the checkpoint the step led to, if any
+            led = next((str(x.get("checkpoint_id")) for x in flow_steps[start:] if x.get("type") == "checkpoint"
+                        and str(x.get("checkpoint_id")) in by), None)
+            self.findings.append(spec.to_finding(f"fnd-{self.scenario.run_id}-exe-{n:03d}", self.scenario.run_id,
+                                                 created_at=_ts(self.today, self.scenario.clock, 900),
+                                                 checkpoint_id=led, step_id=sid))
+        for c in r.consequences:
+            if c.control.startswith(APPLIED):
+                continue
+            c = st.orch.apply(c)
+            self._note(st, c, flow_id=flow_id)
+            self._subsets(st, c)
+            if st.orch.stop is None and (c.has("relaunch") or c.has("kill_tree")):
+                st.exec.order_stage = False  # 5.4.2: the hook host restarts; the app relaunches through every gate
                 st.orch.relaunch("hook_host")
                 self._note_new(st)
-            if st.orch.stop is not None:
-                break
-        return not drops and st.orch.stop is None
+        st.seen = len(st.orch.results)
+        failed = next((sr for sr in r.steps if sr.led_to is not None and not sr.passed), None)
+        for cid, o in r.outcomes.items():
+            if cid in by and cid not in st.sink.done:
+                if o.outcome in SIDED and not o.detail and failed is not None and failed.led_to == o:
+                    # 4.13: the anchor or landmark, and the wait used, from the step that decided it
+                    kind = str(steps.get(failed.step_id, {}).get("type"))
+                    o = dataclasses.replace(o, detail=f"wait_for {failed.step_id}: {o.reason} after "
+                                            f"{steps.get(failed.step_id, {}).get('timeout_ms', 5000)} ms"
+                                            if kind == "wait_for" else f"{kind} {failed.step_id}: {failed.detail}")
+                self.bare[cid] = (by[cid], o)
+                self.sides[cid] = r.side
+                st.sink.done.add(cid)
 
     def _drain(self, st: _Shard, action: Action, res: Any) -> None:
         """Every decision of one `send_input` as the shard's step-event rows (5.4.8, 6.2 Audit trail), the LOGIN
@@ -1574,7 +1684,7 @@ class _ShardWork:
         and each event's ring record (`segment.record_for`; the simulated rig has no shared segment) with the token
         it consumed, under the drainer's context (the flow step `_send` names, none for the rig's own input)."""
         d = st.drainer
-        if d is None:
+        if d is None or st.emitting:         # the Executor's emitter feeds the drainer itself (ExecContext.audit)
             return
         flow_id, step_id = d.ctx.flow_id, d.ctx.step_id
         now_ns = int(st.clock.monotonic() * 1e9)
@@ -1595,11 +1705,30 @@ class _ShardWork:
                 records.append(rec)
         st.events += d.drain(records)
 
-    def _capture(self, st: _Shard, cp: PlannedCheckpoint, rest: Sequence[PlannedCheckpoint]) -> bool:
-        """Capture and evaluate one checkpoint; False when the unit ends here (an app failure, 10.2)."""
+    def _capture_step(self, st: _Shard, step: Mapping[str, Any], rescued: bool) -> Captured:
+        """`SimUnitPorts.capture`: the checkpoint the step names, through `_capture`; its candidate capture's sha256,
+        or the outcome the capture decided (an app failure)."""
+        cid = str(step.get("checkpoint_id"))
+        cp = next(c for c in st.cps if c.checkpoint_id == cid)
+        if self.faults is not None:                      # 8.4: the capture's artifact write (FaultInjector)
+            self.faults.check("artifact_put", cid)
+        unit = list(st.unit.checkpoints) if st.unit is not None else [cid]
+        rest = [c for c in st.cps if c.checkpoint_id in unit[unit.index(cid) + 1:]] if cid in unit else []
+        ev = self._capture(st, cp, rest + list(st.rest), rescued=rescued)
+        if cid in self.bare and cid in st.sink.done and ev is None:
+            return Captured(outcome=self.bare[cid][1])
+        if ev is None:
+            return Captured()
+        return Captured(hashlib.sha256(np.ascontiguousarray(ev.cand.screen.image).tobytes()).hexdigest())
+
+    def _capture(self, st: _Shard, cp: PlannedCheckpoint, rest: Sequence[PlannedCheckpoint], *,
+                 rescued: bool = False) -> Evaluated | None:
+        """Capture and evaluate one checkpoint; None when nothing was evaluated (an app failure, 10.2, or no
+        paper-mode stamp, 6.4)."""
         cid = cp.checkpoint_id
         if self.script.freeze_at == cid and cid not in self.frozen:
-            return self._freeze(st, cp, rest)
+            self._freeze(st, cp, rest)
+            return None
         if self.script.stop_at == cid and cid not in self.frozen:      # an operator stops the rig (6.6)
             self.frozen.add(cid)
             stop_main([st.rig_id, "--root", str(self.out / "rigs"), "--by", "asmith",
@@ -1609,7 +1738,7 @@ class _ShardWork:
             self._note(st, st.orch.apply(kill_switch("paper_mode_mismatch", gate="running",
                                                      running_flow=cp.flow_id)), checkpoint=cp, flow_id=cp.flow_id)
             st.seen = len(st.orch.results)
-            return False
+            return None
         live = cp.data_mode == "masked_live"
         base_cap = self.run.capture(cp, "base", tick=1 if live else 0)
         cand_cap = self.run.capture(cp, "candidate", tick=2 if live else 0)
@@ -1618,36 +1747,41 @@ class _ShardWork:
         ev = evaluate(self.run, cp, base_cap, cand_cap, x=self.plan.x_input(cp.surface_id),
                       primitive=att.primitive if att else None, entry_ref=att.entry_id if att else None,
                       recapture=lambda: self.run.capture(cp, "candidate", tick=next(ticks)),
-                      recapturable=_recapturable(self.cfg, cp), store=self.store, oracle=self.oracle)
+                      recapturable=_recapturable(self.cfg, cp), store=self.store, oracle=self.oracle, rescued=rescued)
         ev.paper, ev.released = stamp, st.orch.may_release(stamp)
         ev.shard_id, ev.session, ev.rig_id = st.shard_id, len(st.sessions) - 1, st.rig_id
+        ev.app_uptime_s, ev.app_restart_count = st.life.tags(st.clock.monotonic())     # 10.2
         self.evals.append(ev)
         st.sink.done.add(cid)
-        return True
+        return ev
 
-    def _freeze(self, st: _Shard, cp: PlannedCheckpoint, rest: Sequence[PlannedCheckpoint]) -> bool:
-        """The app's EDT freezes while `cp` is captured: the screenshot-staleness detector fires after
-        max(2 x max wait, 60 s), `app_failure` decides, and the Executor kills, relaunches and logs in again
-        before the next unit (10.2 sampling 5, F62)."""
+    def _freeze(self, st: _Shard, cp: PlannedCheckpoint, rest: Sequence[PlannedCheckpoint]) -> None:
+        """The app's EDT freezes while `cp` is captured: the Watchdog's screenshot-staleness detector, read over the
+        heartbeat as the policy wrote it (`HeartbeatPolicy.hang_detected`), fires after max(2 x max wait, 60 s),
+        `app_failure` decides, and the Executor kills, relaunches and logs in again before the next unit (10.2
+        sampling 5, F62). The unit ends there with the tree gone (`_after_step`)."""
         self.frozen.add(cp.checkpoint_id)
+        pol = st.policy
+        pol.expect_screen_change()
+        pol.step_start(cp.flow_id, cp.step_id or "visit", checkpoint_id=cp.checkpoint_id, max_wait_s=MAX_WAIT_S)
         since = st.clock.monotonic()
         st.clock.advance(max(2 * MAX_WAIT_S, HANG_FLOOR_S))
-        if not edt_frozen(now=st.clock.monotonic(), expect_change_since=since, last_hash_change=since - STEP_S,
-                          max_wait_s=MAX_WAIT_S, anti_anchor=False, capture_suspended=False):
+        if not pol.hang_detected(now=st.clock.monotonic(), last_hash_change=since - STEP_S, anti_anchor=False):
             raise RuntimeError("the hang detector did not fire on a frozen screen")
         r = st.orch.apply(app_failure(CrashSignal("hang", "screenshot_staleness"), st.orch.budgets, phase="running"))
         self._note(st, r, checkpoint=cp, flow_id=cp.flow_id)
         self._subsets(st, r, cp, rest)
         st.seen = len(st.orch.results)
+        st.interrupt = ControlResult(APPLIED + "app_failure", False, "running", actions=("end_flow", "kill_tree"),
+                                     detail="the app failed during the step; its checkpoints were decided")
         if st.orch.stop is not None:
-            return False
-        st.order_stage = False
+            return
+        st.exec.order_stage = False
         if r.has("relaunch"):        # 7.7, 10.2: kill, reset input, session release wait, every gate again
             st.orch.relaunch("app_failure")
             self._note_new(st)
         elif r.has("kill_tree"):
             st.rig.kill_process_tree()
-        return False
 
     # -- after every shard ----------------------------------------------------------------------------
     def bare_outcome(self, cp: PlannedCheckpoint, o: Outcome) -> CheckpointOutcome:
@@ -1659,7 +1793,8 @@ class _ShardWork:
             detail = f"watchdog_event: {_event_id(self.run, cp)}" + (f"; {detail}" if detail else "")
         return CheckpointOutcome(
             run_id=sc.run_id, checkpoint_id=cp.checkpoint_id, outcome=o.outcome, reason=o.reason, detail=detail,
-            gate=o.gate, workspace_id=cp.workspace_id, persona=cp.persona, data_mode=cp.data_mode,
+            gate=o.gate, side=self.sides.get(cp.checkpoint_id) if o.outcome in SIDED else None,
+            workspace_id=cp.workspace_id, persona=cp.persona, data_mode=cp.data_mode,
             surface_id=cp.surface_id, test_kind=cp.test_kind, tier=cp.tier, flow_id=cp.flow_id, step_id=cp.step_id,
             size_step=dict(cp.size_step) if cp.size_step else None, flow_class=_flow_class(self.cfg, cp),
             fingerprint_id=self.run.fp_id, data_epoch_id=self.run.epoch, recorded_at=_ts(self.today, sc.clock, 900),
@@ -1680,6 +1815,17 @@ class _ShardWork:
         for _, rep in self.reports:
             v = worse(v, rep.verdict)
         return v or RunVerdict("complete")
+
+    def leased_secrets(self) -> dict[str, str]:
+        """6.9 Plaintext scan at teardown: the value under every secret step's vault lease (the LOGIN flows'), by
+        lease; each lease is released once read (`VaultPort.release`, "at teardown")."""
+        out: dict[str, str] = {}
+        for st, _ in self.reports:
+            for lease in st.rig.leases:
+                out[f"{lease.alias}#{lease.lease_id}"] = self.vault.secret(lease)
+                self.vault.release(lease)
+            st.rig.leases.clear()
+        return out
 
     def write_proofs(self) -> None:
         """One 8.3 `post_run_proofs` row per shard proof (6.6), through the store, keyed by the shard's login alias;
@@ -1998,7 +2144,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         run.pair_id = str(pair_id) if pair_id is not None else None
         store.begin_run(_run_plan(scenario.run_id, "pr", cfg.root, scope_entries, shards, started,
                                   mtext.read_text() if mtext.exists() else None, scenario.pr, scenario.author, pair_id,
-                                  cfg.flow_docs))
+                                  {f: scripted_flow(d, f, scenario.rig) for f, d in cfg.flow_docs.items()}))
         work = _ShardWork(run, cfg, scenario, out, oracle, store, planned, plan, today)
         rev = reviewer or SimulatedReviewer()
         gate = egress_gate(cfg.root, store, scenario.run_id)   # 6.10: one gate per run for every outbound call
@@ -2037,13 +2183,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                 batch = json.dumps([o.to_dict(), [f.to_dict() for f in fs]], sort_keys=True, default=str).encode()
                 leak = check_upload(scanner, batch, location=f"results batch {ev.cp.checkpoint_id}")
             work.session_context(ev)                     # L-OUT-06: the stamp is one of its session's assertions
-            steps = []
-            if ev.cp.test_kind == "flow":
-                steps = [StepOutcome(scenario.run_id, ev.cp.flow_id or "", ev.cp.step_id or "", "passed",
-                                     locator_rung="image", duration_ms=ev.settle_ms or 750, action="capture",
-                                     recorded_at=_ts(today, scenario.clock, 600))]
-            work.write_record(o, findings=fs, artifacts=stored, shard_id=shard_of[rig_of[ev.cp.checkpoint_id]],
-                              steps=steps)
+            work.write_record(o, findings=fs, artifacts=stored, shard_id=shard_of[rig_of[ev.cp.checkpoint_id]])
             for side, chk in (("candidate", ev.oracle), ("base", ev.oracle_base)):   # SD-09: every extraction
                 if chk is not None:
                     store.write_extractions(to_rows(chk.verdict.results, run_id=scenario.run_id,
@@ -2090,6 +2230,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         (out / "reviewer-calls.json").write_text(json.dumps(calls, indent=1, sort_keys=True, default=str) + "\n")
         # 6.9 teardown: the plaintext scan of everything the run wrote, before anything is reported
         written = [p for p in (out / "journal" / scenario.run_id, out / "reviewer-calls.json") if p.exists()]
+        secrets.update(work.leased_secrets())         # every secret step's lease, read under it, then released
         scan = scan_run(store, arts, written, secrets, run_id=scenario.run_id,
                         quarantine_root=out / "artifacts" / "quarantine")
         secret = leak or (scan if not scan.passed else None)
@@ -2343,7 +2484,7 @@ def safety_pass(cfg: SentinelConfig, orch: Orchestrator, rig: SimulatedRig, ctx:
     return SafetyPass(canaries, drill, tuple(c.row for c in canaries) + tuple(sc_mod.drill_rows(drill, chords)))
 
 
-SIM_SECRET = "sim-paper-login-secret-4b7e19"     # the stand-in plaintext of every simulated login's password (6.9)
+SIM_SECRET = SimVault.SECRET                      # the stand-in plaintext of every simulated login's password (6.9)
 
 
 def run_secrets(rigs: Iterable[str]) -> dict[str, str]:

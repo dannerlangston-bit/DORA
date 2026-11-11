@@ -86,12 +86,20 @@ relaunch, which precedes its login (7.7 "before any relaunch login"); `reset_inp
 `WallBudget` (its window end is a calendar time). The chords loaded at `settings_attested` are the A6 bindings and the
 pinned defaults (`gateway_config.order_hotkey_list`, from `RunContext.order_hotkeys` or the chords given alone); more
 than sixteen fail the run closed there (`aborted_harness (reason: config_invalid)`, 5.4.7).
+
+The Executor's heartbeat policy and the app's age (10.2): with `heartbeat_policy` (an
+`executor.heartbeat.HeartbeatPolicy`) every gate is written through `policy.gate(state)`, so gate heartbeats carry the
+PIDs and the fields step heartbeats carry, and a write that fails twice is the policy's one `heartbeat_failed` result;
+with `life` (an `executor.heartbeat.AppLife`) every pass of the `launched` gate is recorded, the first as the launch and
+every later one (a relaunch of any cause, a launch retry) as a relaunch, so captures and step rows carry the uptime
+and the restart count. Both are duck-typed here: the executor imports this package's modules.
 """
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime
+from typing import Any
 
 from ..records import DeclaredSend, RunOutcome
 from . import killflag
@@ -200,7 +208,8 @@ class Orchestrator:
                  watchdog_status: Callable[[], tuple[float, bool]] | None = None, wall: WallBudget | None = None,
                  spend: SpendTracker | None = None, model: ModelAvailability | None = None,
                  counters: RateCounters | None = None,
-                 safety_listener: Callable[[SessionSafety], None] | None = None):
+                 safety_listener: Callable[[SessionSafety], None] | None = None,
+                 heartbeat_policy: Any = None, life: Any = None):
         self.rig = rig
         self.ctx = ctx
         self.sink = sink
@@ -209,6 +218,8 @@ class Orchestrator:
         self.relogin = relogin or ReloginBudget()
         self.ledger = ledger or DropLedger()
         self.heartbeat = heartbeat
+        self.heartbeat_policy = heartbeat_policy     # executor.heartbeat.HeartbeatPolicy: gate writes carry its fields
+        self.life = life                             # executor.heartbeat.AppLife: uptime and restart count (10.2)
         self.watchdog_status = watchdog_status or rig.watchdog_status
         self.kill_flag, self.kill_pipe = rig.kill_channels()
         self.wall = wall if wall is not None else WallBudget.for_run(ctx.run_type, self.clock.monotonic())
@@ -257,7 +268,12 @@ class Orchestrator:
     def _gate(self, state: str) -> bool:
         """Enter a gate: heartbeat and the Watchdog's reverse heartbeat (5.2, 10.2). False when either stops the run."""
         self.state = state
-        if self.heartbeat is not None:
+        if self.heartbeat_policy is not None:
+            failed = self.heartbeat_policy.gate(state)
+            if failed is not None:
+                self.apply(failed)
+                return self.stop is None
+        elif self.heartbeat is not None:
             try:
                 self.heartbeat.write(Heartbeat(self.ctx.run_id, self.ctx.shard, self.ctx.attempt, state,
                                                self.clock.now().isoformat(), self.clock.monotonic()))
@@ -339,6 +355,11 @@ class Orchestrator:
                 return False
             break
         self.launched_mono = self.clock.monotonic()
+        if self.life is not None:                          # 10.2: every capture carries the app's age
+            if self.life.launched_mono is None:
+                self.life.launched(self.launched_mono)
+            else:
+                self.life.relaunched(self.launched_mono)
         self.flows_since_launch = 0
         rig.set_hook_phase("running")
         if not self._gate("authenticated"):

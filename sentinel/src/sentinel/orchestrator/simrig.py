@@ -50,7 +50,14 @@ Choices (reported):
    has no OS key state to release.
 6. The login's typing is a click on the paperMoney switch, the login id, the secret (stand-in keys, never a value)
    and a click on `Log In`, all of class `login`; when the gateway stops any of it, the login dialog stays and the
-   main window never appears (`timeout`).
+   main window never appears (`timeout`). With a `vault` (`SimScenario.vault`, a `ports.VaultPort`) the secret is a
+   4.7 `secret` step run by `executor.secret.run_secret_step`: leased at typing time, typed as `VK_PACKET` pairs
+   with `secret` tokens, its lease kept in `leases` for the teardown plaintext scan; a lease that fails twice types
+   nothing and the login reports `vault_lease: false` (6.9, 7.7).
+7. Input planned by the Executor (`executor.primitives.PlannedAction`) runs unit by unit through the hook exactly as
+   5.4.10 tabulates (double clicks, drags, wheels, chords, typed characters, the `reset_input_state` releases); the
+   simulated app reacts to the pointer events and to Enter or Space on the open dialog as before. A click labelled
+   `Close` on the open Order Confirmation is its title-bar close: the dialog goes away and nothing is sent.
 
 `MemorySink` is an in-memory `OutcomeSink` over a list of scoped checkpoint ids, and `default_context`
 builds the `RunContext` that matches the default scenario (the example config's rig-01 accounts).
@@ -200,6 +207,8 @@ class SimScenario:
     extra_windows: tuple[str, ...] = ()              # titles of other app windows shown (an order_event window)
     capture_fails: bool = False                      # every grab fails: the flag is unknown (5.4.6)
     titles: TitleSets = SIM_TITLES                   # the Watcher's title regexes (the popup catalog's sets, 7.8)
+    vault: Any = None                                # a ports.VaultPort: the LOGIN secret is a leased secret step
+    secret_ref: str = "login.password"               # the LOGIN flow's secret step vault_ref (4.7)
 
 
 class SimulatedRig(Rig):
@@ -243,6 +252,8 @@ class SimulatedRig(Rig):
         self.refusals = 0
         self.sent_orders = 0
         self.on_input: Callable[[Action, EmitResult], None] | None = None    # an observer of every decision
+        self.leases: list[Any] = []               # the secret steps' vault leases, for the teardown scan (6.9)
+        self.secret_results: list[Any] = []       # every LOGIN secret step's executor.secret.SecretResult
 
     def _configuration(self) -> tuple[frozenset[str], tuple[DenyEntry, ...]]:
         """The dismiss allowlist and Explorer deny list the gateway enforces (choice 1)."""
@@ -294,8 +305,11 @@ class SimulatedRig(Rig):
         a failed recovery login while `recovery_login_fails` lasts, or a clean one."""
         self._log("login")
         self._logins += 1
+        n = len(self.secret_results)
         if not self._type_login():
-            return LoginObservation(main_window_s=None, post_login_anchor=False, login_dialog_gone=False)
+            vault_failed = len(self.secret_results) > n and self.secret_results[-1].consequence is not None
+            return LoginObservation(vault_lease=not vault_failed, main_window_s=None, post_login_anchor=False,
+                                    login_dialog_gone=False)
         if self._logins == 1:
             return self.s.login
         if self._logins - 1 <= self.s.recovery_login_fails:
@@ -304,17 +318,44 @@ class SimulatedRig(Rig):
 
     def _type_login(self) -> bool:
         """The LOGIN flow's input, every action of class `login`; True when every event reached the app."""
+        secret = Action("secret", keys=SECRET_KEYS, flow_class="login")
         steps = (Action("click", point=MODE_SWITCH_POINT, resolved_name="paperMoney", under_point_text="paperMoney",
                         flow_class="login"),
                  Action("type_fixture", keys=LOGIN_ID_KEYS, flow_class="login"),
-                 Action("secret", keys=SECRET_KEYS, flow_class="login"),
+                 secret,
                  Action("click", point=LOG_IN_POINT, resolved_name="Log In", under_point_text="Log In",
                         flow_class="login"))
         for a in steps:
+            if a is secret and self.s.vault is not None:
+                if not self._secret_step():
+                    return False
+                continue
             r = self.send_input(a)
             if r.refused is not None or not all(d.allowed for d in r.decisions):
                 return False
         return True
+
+    def _secret_step(self) -> bool:
+        """The LOGIN flow's `secret` step through `executor.secret.run_secret_step` (choice 6): True when every
+        event reached the app; False when the gateway stopped it or the vault lease failed twice (the result's
+        `consequence`, which `login` reports as `vault_lease: false`)."""
+        from ..executor.secret import run_secret_step           # lazy: the executor imports this package's modules
+        step = {"id": "secret", "type": "secret", "target": "login.password-field", "vault_ref": self.s.secret_ref,
+                "commit": "none"}
+        sent: list[bool] = []
+
+        def emit(action: Action) -> str:
+            r = self.send_input(action)
+            ok = r.refused is None and all(d.allowed for d in r.decisions)
+            sent.append(ok)
+            return "passed" if ok else "blocked_by_gateway"
+
+        res = run_secret_step(step, self.s.vault, flow_class="login", emit=emit, capture=_NoCapture(),
+                              now=self.clock.monotonic(), sleep=self.clock.sleep)
+        self.secret_results.append(res)
+        if res.lease is not None:
+            self.leases.append(res.lease)
+        return res.consequence is None and bool(sent) and all(sent)
 
     def read_account_selector(self) -> SelectorRead:
         self._log("read_account_selector")
@@ -388,6 +429,11 @@ class SimulatedRig(Rig):
         if not self.s.hook_dead:
             self.gw.hook_alive_mono_ts = now
 
+    def poll_flag(self) -> Flag:
+        """A fresh Window Watcher poll and the flag it leaves (5.4.6): what the Executor's emitter reads."""
+        self._watch()
+        return self.gw.effective_flag(self.clock.monotonic())
+
     def enumerate_windows(self) -> tuple[WindowInfo, ...]:
         wins: list[WindowInfo] = []
         if self.dialog_open:
@@ -416,7 +462,8 @@ class SimulatedRig(Rig):
         """Stages 5 to 7 for one cleared action: the absolute move (before any token is pending, so the hook's
         move rule allows it), the tokens (a cleared send's click token carries `send_ok`, 6.7), then each event
         through the hook and the app, with a Watcher poll after every event so the hook acts on the flag as the app
-        has just changed it (5.4.6)."""
+        has just changed it (5.4.6). An `executor.primitives.PlannedAction` runs its units in order (choice 7): each
+        unit's lead moves, its token write (`primitives.issue_tokens`), then its events."""
         now = self.clock.monotonic()
         steps: list[InputEvent] = []
         out: list[tuple[InputEvent, Any]] = []
@@ -426,6 +473,19 @@ class SimulatedRig(Rig):
             self._watch()
 
         before = self.gw.tokens_issued
+        units = getattr(a, "units", ())
+        if units:
+            from ..executor.primitives import issue_tokens      # lazy: the executor imports this package's modules
+            for unit in units:
+                for e in unit.lead:
+                    run(e)
+                issue_tokens(unit, self.gw, now, dialog_ok=dialog_ok, send_ok=send_ok and
+                             sum(1 for t in unit.tokens if t.kind == "click") == 1)
+                for em in unit.events:
+                    run(em.event)
+            if a.flow_class != "login":
+                self.session_tokens += self.gw.tokens_issued - before
+            return out
         if a.is_pointer and a.point is not None:
             x, y = a.point
             button = "right" if a.kind == "rclick" else "left"
@@ -458,8 +518,8 @@ class SimulatedRig(Rig):
             if "confirm and send" in label:
                 self.dialog_open = True
                 self._dialog_hwnd += 1                # a new dialog window: its 30 s age starts now
-            elif self.dialog_open and "delete" in label:
-                self.dialog_open = False
+            elif self.dialog_open and ("delete" in label or "close" in label):
+                self.dialog_open = False             # Delete, or the title bar's Close (choice 7): nothing sent
             elif self.dialog_open and (SEND_RECT.contains(e.x, e.y) or "send" in label):
                 self._send()
             elif "cancel all" in label and a.teardown_action == "cancel_all":
@@ -609,6 +669,16 @@ class SimulatedRig(Rig):
 
     def free_bytes(self) -> int:
         return self.s.free_bytes
+
+
+class _NoCapture:
+    """The LOGIN flow runs before any capture: there is nothing to suspend (`executor.secret.CaptureControl`)."""
+
+    def suspend_capture(self) -> None:
+        return None
+
+    def resume_capture(self) -> None:
+        return None
 
 
 class MemorySink:

@@ -41,6 +41,9 @@ Choices (reported):
   text shows on every shard.
 - The fixture account a PR shard selects (A2) is the fixture's empty account, the account order-stage
   flows stage tickets in (6.3, 7.7 step 7).
+- The simulated rig stands for a rig after Phase 0 whose dismiss allowlist record (6.2) lists the Order
+  Confirmation's `Delete` and its title-bar `Close` (`SIM_DISMISS_LABELS`): the stock ticket flow's teardown closes the
+  dialog on `dialog.order-confirmation.title-close`, as 4.7's worked example does, through the Executor's emitter.
 - A login is named by a readable label, `<rig> paper login` (the rig's one scripted paperMoney login, 6.4),
   wherever a person reads it (9.2 "login {alias}", the persisted `block_login` action). Its vault path is a
   `vault://` reference (4.9 `login_ref`, L-FIX-04): the store keys `logins` by it (8.3), and nothing a person
@@ -65,6 +68,7 @@ from ..orchestrator.rig import AccountState, LaunchObservation, SelectorRead, Wo
 from ..orchestrator.simrig import TABS, SimScenario, default_settings
 from .config import SentinelConfig
 
+SIM_DISMISS_LABELS = ("Delete", "Close")   # the Order Confirmation's dismiss labels the simulated rig pins (choice)
 LAUNCHES = 8                    # the first launch, three relaunches (10.2) and room for a recovery login
 # Actions a control result asks for that the Orchestrator does not perform on the rig itself (results.ACTIONS)
 PERSISTED = {
@@ -88,6 +92,15 @@ class RigScript:
     enter_after: tuple[str, str] | None = None       # (flow id, step id): a scripted Enter on the open dialog after it
     freeze_at: str | None = None                     # checkpoint id: the app's EDT freezes while it is captured
     stop_at: str | None = None                       # checkpoint id: an operator runs `sentinel stop` on its rig then
+    # the Executor's simulated failures (pipeline.simports): a registry control hidden from the locator ladder for
+    # that many attempts, a precondition failing for that many reads, wait_for steps that time out, steps whose
+    # declared effect never appears, and the 8.9 and 10.1 faults (`executor.failures.faults_from` triples)
+    locator_miss: tuple[tuple[str, int], ...] = ()
+    precondition_fail: tuple[tuple[str, int], ...] = ()
+    wait_timeout: tuple[str, ...] = ()
+    postcondition_fail: tuple[str, ...] = ()
+    faults: tuple[tuple[str, str | None, str], ...] = ()
+    vault_unreachable: bool = False                  # every vault lease of the LOGIN secret step fails (6.9, 7.7)
 
 
 class ShardSink:
@@ -163,7 +176,7 @@ def shard_setup(cfg: SentinelConfig, *, run_id: str, run_type: str, shard_id: st
     scenario = SimScenario(launches=[LaunchObservation(True, build_id, waited_s=40.0)] * LAUNCHES,
                            selector_reads=reads, selected=empty, settings=settings,
                            workspace=WorkspaceObservation(ws_sha, True, TABS, 1), accounts=states,
-                           rig_id=rig_id or rig, kill_root=kill_root)
+                           rig_id=rig_id or rig, kill_root=kill_root, dismiss_allowlist=SIM_DISMISS_LABELS)
     return ctx, scenario
 
 

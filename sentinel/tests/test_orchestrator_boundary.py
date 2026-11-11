@@ -12,6 +12,7 @@ from sentinel.orchestrator.boundary import (BoundaryObservations, FlowTimer, flo
 from sentinel.orchestrator.budgets import RATE_CAPS, RateCounters, WallBudget
 from sentinel.orchestrator.clock import ManualClock
 from sentinel.orchestrator.degraded import ModelAvailability
+from sentinel.orchestrator.identity import deferral_unreadable, paper_stamp, stamp_current
 from sentinel.orchestrator.killswitch import ORDERS_SENT, PROVEN_NONE, TripWires
 from sentinel.orchestrator.machine import Orchestrator
 from sentinel.orchestrator.ports import SessionSafety
@@ -392,6 +393,20 @@ def test_the_paper_stamp_belongs_to_the_current_session():
         record(orch, *SCOPE)
     report, _, _, orch = run(work)
     assert report.verdict.status == "complete" and orch.paper_stamp() is None and not orch.may_release(None)
+
+
+def test_stamp_helpers_and_the_deferral_result():
+    t = ManualClock().now()
+    stamp = paper_stamp(EMPTY, t)
+    assert stamp_current(stamp, t) and not stamp_current(stamp, t + timedelta(seconds=1))
+    assert not stamp_current(None, t) and not stamp_current(stamp, None)
+    assert not stamp_current({**stamp, "mode": "live"}, t) and not stamp_current({**stamp, "asserted_at": "x"}, t)
+    with pytest.raises(ValueError):
+        paper_stamp(EMPTY, t.replace(tzinfo=None))
+    r = deferral_unreadable(deferred_s=301.0, unreadable_streak=1)
+    assert (r.run_status, r.unreached) == ("complete_with_env_errors",
+                                           Outcome("env_error", "identity_unreadable", "paper_mode_asserted"))
+    assert r.has("deny_all") and r.has("kill_tree") and r.has("block_login") and "301 s" in r.detail
 
 
 def test_session_safety_is_set_through_the_gates_and_cleared_when_the_session_ends():

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from sentinel.orchestrator.budgets import ShardBudgets
+from sentinel.orchestrator.budgets import SESSION_RELEASE_WAIT_S, ShardBudgets, session_kicked
 from sentinel.orchestrator.clock import ManualClock
 from sentinel.orchestrator.degraded import SpendTracker
 from sentinel.orchestrator.gateway import Action, refusal
@@ -92,6 +92,35 @@ def test_session_kicked_waits_and_logs_in_once_more_for_the_proof():
     report, rig, _, _ = run(SimScenario(login=LoginObservation(session_kicked=True), recovery_login_fails=2))
     assert (report.proof.verdict, report.proof.reason) == (UNPROVEN, "session_unavailable")
     assert rig.calls.count("login") == 3 and report.gate("teardown").has("block_login")
+
+
+def test_a_session_kicked_mid_run_waits_logs_in_once_more_and_proves_normally():
+    seen = {}
+
+    def work(orch: Orchestrator) -> None:
+        orch.sink.record(SCOPE[0], "identical")
+        seen["t0"], seen["calls"] = orch.clock.monotonic(), len(orch.rig.calls)
+        orch.apply(session_kicked())                              # POP-04 during a flow
+    report, rig, sink, orch = run(work=work)
+    assert orch.session == "kicked" and orch.safety.session_kicked
+    assert report.verdict.status == "complete_with_env_errors" and report.proof.verdict == PROVEN_NONE
+    assert {sink.outcomes[c][:3] for c in SCOPE[1:]} == {("env_error", "session_kicked", "authenticated")}
+    after = rig.calls[seen["calls"]:]
+    assert after[:3] == ["kill_process_tree", "launch", "login"] and "teardown" not in after
+    assert orch.clock.monotonic() - seen["t0"] >= SESSION_RELEASE_WAIT_S
+    report, rig, _, _ = run(SimScenario(recovery_login_fails=2), work=work)
+    assert (report.proof.verdict, report.proof.reason) == (UNPROVEN, "session_unavailable")
+    assert rig.calls.count("login") == 3 and report.gate("teardown").has("block_login")
+
+
+def test_an_unreadable_read_after_a2_selects_the_account_takes_the_identity_unreadable_path():
+    blind = SelectorRead(None, landmark_found=False)
+    golden = SelectorRead(GOLDEN, crop_sha256="crop-a1")
+    report, rig, sink, _ = run(SimScenario(selected=GOLDEN, selector_reads=[golden, blind, blind]))
+    assert filled(sink) == {("env_error", "identity_unreadable", "paper_mode_asserted")}
+    assert report.verdict.status == "complete_with_env_errors" and "set_hook_state:True:True" in rig.calls
+    report, _, _, _ = run(SimScenario(selected=GOLDEN, selector_reads=[golden, blind]), work=all_work)
+    assert report.verdict.status == "complete"                   # the second read 1 s later is readable
 
 
 def test_live_identity_runs_the_kill_switch_and_stays_aborted_safety():

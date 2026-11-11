@@ -8,8 +8,9 @@
   host or Slack (6.10: only text and links go there) is refused before connecting: a `refused` row with its
   reason is written to `egress_log`, a `harness_error` finding (S3) is raised on the run, and `EgressRefused` is
   raised. Otherwise the request is sent and one `sent` row (with the HTTP status and request id) or `failed` row
-  (no response) is written. `context(...)` sets row fields (checkpoint, artifact hash, redaction version, model
-  id, purpose) for the requests made inside it, so a transport that cannot see them still logs them.
+  (no response) is written. `context(...)` (or `row_context(...)`, without a gate at hand) sets row fields
+  (checkpoint, artifact hash, redaction version, model id, purpose, image) for the requests made inside it, so a
+  transport that cannot see them still logs them and the gate applies its image checks.
 - `reconcile(rows, allowlist, firewall_log)` is the pure Nightly comparison: a `sent` row to a host outside the
   allowlist, or a firewall-permitted connection from a harness process with no matching row, is S1 and re-marks
   the runs concerned `aborted_harness (reason: egress_unlogged)`; a firewall block of a harness process is a
@@ -60,6 +61,20 @@ TEXT_ONLY_PURPOSES = frozenset({"pr_comment", "slack"})          # 6.10, 8.7: im
 ROW_FIELDS = ("purpose", "checkpoint_id", "artifact_sha256", "redaction_version", "model_id", "image")
 _CONTEXT: contextvars.ContextVar[Mapping[str, Any]] = contextvars.ContextVar("sentinel_egress_context", default={})
 log = logging.getLogger(__name__)
+
+
+@contextlib.contextmanager
+def row_context(**fields: Any) -> Iterator[None]:
+    """Row fields for the requests made inside the block, in this thread or task (a context variable), whatever gate
+    sends them; an inner value wins over an outer one, and None leaves the outer value."""
+    bad = set(fields) - set(ROW_FIELDS)
+    if bad:
+        raise ValueError(f"unknown egress row fields {sorted(bad)}")
+    token = _CONTEXT.set({**_CONTEXT.get(), **{k: v for k, v in fields.items() if v is not None}})
+    try:
+        yield
+    finally:
+        _CONTEXT.reset(token)
 
 
 class AllowlistError(ValueError):
@@ -215,16 +230,9 @@ class EgressGate:
 
     @contextlib.contextmanager
     def context(self, **fields: Any) -> Iterator[None]:
-        """Row fields for the requests made inside the block, in this thread or task (a context variable); an inner
-        value wins over an outer one."""
-        bad = set(fields) - set(ROW_FIELDS)
-        if bad:
-            raise ValueError(f"unknown egress row fields {sorted(bad)}")
-        token = _CONTEXT.set({**_CONTEXT.get(), **{k: v for k, v in fields.items() if v is not None}})
-        try:
+        """Row fields for the requests made inside the block (`row_context`)."""
+        with row_context(**fields):
             yield
-        finally:
-            _CONTEXT.reset(token)
 
     @contextlib.contextmanager
     def default_context(self, **fields: Any) -> Iterator[None]:
@@ -374,4 +382,4 @@ def reconcile(rows: Sequence[EgressRow], allowlist: EgressAllowlist, firewall_lo
 
 __all__ = ["AllowedHost", "AllowlistError", "EgressAllowlist", "EgressGate", "EgressRefused", "EgressSink",
            "FirewallEntry", "LogSink", "MODEL_PURPOSES", "Reconciliation", "allowlist_problems", "normalize_host",
-           "reconcile", "refuse_all"]
+           "reconcile", "refuse_all", "row_context"]

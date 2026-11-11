@@ -487,6 +487,47 @@ def test_secrets_11_an_unsettled_base_is_not_stored_as_a_copy_of_the_candidate(t
     assert all(o.artifacts and o.artifacts.get("candidate") and "base" not in o.artifacts for o in hit)
 
 
+# == secrets:12: a Reviewer request's egress row names the artifact that left, as an image ========================
+
+def test_secrets_12_review_rows_name_the_stored_capture_the_crops_came_from(tmp_path, monkeypatch):
+    """6.10, 8.3: each `review` row records the redacted artifact that left: the stored capture the item's
+    candidate crop was cut from, an object of the run's artifact set."""
+    import json
+
+    monkeypatch.setattr("anthropic._base_client.time.sleep", lambda s: None)
+    sent: list = []
+
+    def factory(gate):
+        t = AnthropicTransport.from_env(allow_network=True, env=KEY, gate=gate, http_transport=_recording(sent))
+        return ReviewerJob(ReviewerConfig(sync_concurrency=1), t, "pr")
+    sc = clean_scenario(TODAY)
+    run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY, live_factory=factory)
+    db = sqlite3.connect(tmp_path / "sentinel.db")
+    rows = db.execute("SELECT artifact_sha256 FROM egress_log WHERE run_id = ? AND purpose = 'review'",
+                      (sc.run_id,)).fetchall()
+    manifest = json.loads((tmp_path / "artifacts" / "runs" / sc.run_id / "manifest.json").read_text())
+    captures = {e["sha256"] for e in manifest["entries"] if e["name"].endswith("/review/candidate.png")}
+    assert sent and rows and all(r[0] in captures for r in rows)
+
+
+def test_secrets_12_an_item_without_a_redaction_version_is_refused_as_an_image():
+    """8.9, 6.10: the job marks each item's request as an image, so the gate's check applies: an item with crops and
+    no redaction version is refused before connecting and logged `refused`."""
+    import dataclasses
+
+    from test_reviewer import make_item
+    from test_reviewer_ops import ALLOW, Sink
+
+    from sentinel.egress import EgressGate
+    sent, sink = [], Sink()
+    t = AnthropicTransport.from_env(allow_network=True, env=KEY, gate=EgressGate(ALLOW, sink, run_id="run-9"),
+                                    http_transport=_recording(sent))
+    item = dataclasses.replace(make_item(), redaction_version="")
+    v = ReviewerJob(ReviewerConfig(sync_concurrency=1), t, "pr").review_now(item)
+    assert v.state != "answered" and sent == []
+    assert [(r.status, r.refusal_reason) for r in sink.rows] == [("refused", "redaction version missing")]
+
+
 def test_secrets_6_scan_run_reads_a_ledger_tail_and_in_memory_texts(tmp_path):
     """6.9 choice 1: a shared results.jsonl is scanned from the offset where this run began (an earlier run's lines
     are not this run's), and text the run has not written yet (the report's inputs) is scanned from memory."""

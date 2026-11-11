@@ -134,11 +134,11 @@ class ItemBuilder:
             title = rx.sub(REDACTED, title)
         return title
 
-    def _stored(self, img: np.ndarray, cid: str, side: str) -> np.ndarray:
-        """The capture as the artifact store holds it (written once, read back)."""
+    def _stored(self, img: np.ndarray, cid: str, side: str) -> tuple[np.ndarray, str]:
+        """The capture as the artifact store holds it (written once, read back), and its sha256."""
         a = self.arts.put(_png(img), name=f"{self.run_id}/{cid}/review/{side}.png", kind="capture",
                           media_type="image/png", redaction=self.redaction, checkpoint_id=cid, side=side)
-        return _decode(self.arts.get(a.sha256))
+        return _decode(self.arts.get(a.sha256)), a.sha256
 
     def _region(self, ev: Any, region_id: str | None, shape: tuple[int, ...]) -> Box:
         h, w = shape[:2]
@@ -151,11 +151,12 @@ class ItemBuilder:
                             max(1, min(h, r.rect.y + lm[1] + r.rect.h) - y0))
         return (0, 0, w, h)
 
-    def _step(self, ev: Any, region_id: str | None, size_step: str | None) -> tuple[StepCrops, Box, list[Box]]:
+    def _step(self, ev: Any, region_id: str | None, size_step: str | None
+              ) -> tuple[StepCrops, Box, list[Box], str]:
         cid = ev.cp.checkpoint_id
         bimg, cimg = ev.images()                     # the redacted pair (3.6): nothing unredacted is sent
-        base = self._stored(bimg if bimg is not None else cimg, cid, "base")
-        cand = self._stored(cimg, cid, "candidate")
+        base, _ = self._stored(bimg if bimg is not None else cimg, cid, "base")
+        cand, sha = self._stored(cimg, cid, "candidate")
         region = self._region(ev, region_id, cand.shape)
         comps = [tuple(c.bbox) for c in (ev.diff.summary.components if ev.diff is not None else ())]
         rx, ry, rw, rh = region
@@ -172,7 +173,7 @@ class ItemBuilder:
                           heat[y:y + h, x:x + w].copy())
         local = [(max(c[0], x) - x, max(c[1], y) - y, min(c[0] + c[2], x + w) - max(c[0], x),
                   min(c[1] + c[3], y + h) - max(c[1], y)) for c in inside]
-        return crops, box, [c for c in local if c[2] > 0 and c[3] > 0]
+        return crops, box, [c for c in local if c[2] > 0 and c[3] > 0], sha
 
     def _flow(self, ev: Any) -> FlowContext:
         cp = ev.cp
@@ -192,7 +193,7 @@ class ItemBuilder:
         ends = [evs[0], evs[-1]] if len(evs) > 1 and req.sizes else [evs[0]]
         sizes = list(req.sizes) if len(ends) == 2 else [None]
         built = [self._step(ev, req.region_id, size) for ev, size in zip(ends, sizes)]
-        rep, (_, box, comps) = ends[0], built[0]
+        rep, (_, box, comps, capture) = ends[0], built[0]
         words = self._visible_words(rep, box)
         entry = edge = None
         if req.entry is not None:
@@ -206,8 +207,8 @@ class ItemBuilder:
         if req.edge is not None:
             edge = DependencyEdge(str(req.edge["primitive"]), str(req.edge["entry_id"]))
         title = self._title(rep)
-        hashes = [hashlib.sha256(s.base.tobytes()).hexdigest() for s, _, _ in built]
-        chashes = [hashlib.sha256(s.candidate.tobytes()).hexdigest() for s, _, _ in built]
+        hashes = [hashlib.sha256(s.base.tobytes()).hexdigest() for s, _, _, _ in built]
+        chashes = [hashlib.sha256(s.candidate.tobytes()).hexdigest() for s, _, _, _ in built]
         masks = ",".join(sorted(str(r.mask_ref) for r in rep.registry.regions if r.mask_ref))
         registry = hashlib.sha256("|".join(f"{r.id}:{r.rect}" for r in rep.registry.regions).encode()).hexdigest()[:16]
         return ReviewItem(
@@ -216,9 +217,10 @@ class ItemBuilder:
             data_mode=req.data_mode, data_epoch=self.epoch, workspace_id=req.workspace_id, window_title=title,
             diff=DiffMetrics(int(req.diff.get("changed_px", 0)), tuple(comps),
                              tuple(int(v) for v in req.diff.get("shift", (0, 0)))),
-            flow=self._flow(rep), steps=tuple(s for s, _, _ in built), entry=entry, edge=edge,
+            flow=self._flow(rep), steps=tuple(s for s, _, _, _ in built), entry=entry, edge=edge,
             ocr_text=tuple(words), base_hash="|".join(hashes), candidate_hash="|".join(chashes),
-            mask_version=masks or "none", redaction_version=self.redaction.version, registry_version=registry)
+            mask_version=masks or "none", redaction_version=self.redaction.version, registry_version=registry,
+            artifact_sha256=capture)
 
 
 class CollectingReviewer:

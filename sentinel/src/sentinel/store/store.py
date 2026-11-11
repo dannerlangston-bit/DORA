@@ -34,8 +34,9 @@ Enforced here and, where SQL can say it, again by the schema:
   shard, no shard that ended worse than complete and every outcome-named artifact stored (1.10, 8.1, 8.2, 8.3, 8.9);
   no run ends with a scoped checkpoint silent (L-OUT-07), or less severe than its worst shard (8.2). An outcome that
   names an artifact the store has no row for is refused at write (8.2); an artifact row needs bytes on disk that
-  hash to its name, and an image its redaction version (8.3, 8.4); a `decision:<id>` reason needs an active decision
-  with the outcome's verdict (4.13).
+  hash to its name, and an image its redaction version (8.3, 8.4); a `decision:<id>` reason needs an active,
+  unexpired decision on the record's checkpoint with the outcome's verdict and an action that acts through the
+  signature (4.13, 9.7).
 - L-OUT-06: once `set_session_context` names a shard, a record written for it that references a capture needs the
   session's paper-mode stamp from an allowlisted account (`PaperAssertionMissing`; SD-48 exempts records without a
   capture). L-OUT-02: a `strict_records` store refuses a record the 4.13 required-fields table refuses
@@ -193,6 +194,10 @@ PENDING_REASONS = ("reviewer_unavailable", "global_shift")      # 4.13: pending 
 RUN_SEVERITY = ("complete", "complete_with_env_errors", "aborted_budget", "aborted_harness", "aborted_safety")
 # 4.13 required fields: the verdict a `decision:<id>` reason names, by outcome.
 DECISION_REASON_VERDICT = {"noise": "noise", "intended": "intended", "collateral": "confirmed_bug"}
+# The actions whose decision a `decision:<id>` reason may name: the ones that act on a later checkpoint outcome
+# through the signature, as the lookup reads them (request_mask once its mask_ref is set; 4.13, 4.14, 8.3).
+DECISION_REASON_ACTIONS = {"noise": ("noise_signature", "request_mask"), "intended": ("mark_intended",),
+                           "collateral": ("confirm_bug", "fixed_in_build")}
 LOCATOR_LEVELS = ("jab", "image", "ocr", "agent")
 GATEWAY_EVENT_KEYS = frozenset({"decision", "reason", "class"})   # 4.13 step_outcome.gateway_event
 # 8.3 post_run_proofs CHECKs (6.6): the five verdicts and what Cancel All did
@@ -1551,16 +1556,32 @@ class Store:
             raise ImportConflict(f"finding {f.finding_id} is already recorded with other content (8.2)")
 
     def _check_decision_reason(self, o: CheckpointOutcome, code: str | None) -> None:
-        """4.13 required fields: `decision:<id>` names an active (or reopened) decision whose verdict is the one the
-        outcome claims (noise, intended, or confirmed_bug for a known-bug collateral); a decision_ref exists."""
+        """4.13 required fields: `decision:<id>` names a decision the lookup could have matched for this record: active
+        (or reopened), not expired at the record's `recorded_at` (now when unset), on the record's checkpoint, with
+        the verdict the outcome claims (noise, intended, or confirmed_bug for a known-bug collateral) and an action
+        that acts through the signature (`DECISION_REASON_ACTIONS`; 9.7); a decision_ref exists."""
         did = None
         if code == "decision":
             did = self._split_reason(o.outcome, o.reason)[1]
             want = DECISION_REASON_VERDICT.get(o.outcome)
-            row = self._one("SELECT status, verdict FROM decisions WHERE decision_id = ?", (decision_int(did),))
-            if row is None or row["status"] not in ("active", "reopened") or row["verdict"] != want:
-                raise StoreRefused(f"{o.outcome} (reason: decision:{did}) needs an active decision {did} with verdict "
-                                   f"{want} (4.13)")
+            row = self._one("SELECT status, verdict, action, mask_ref, checkpoint_id, expires_at FROM decisions "
+                            "WHERE decision_id = ?", (decision_int(did),))
+            at = datetime.fromisoformat(utc(o.recorded_at) or now())
+            why = None
+            if row is None or row["status"] not in ("active", "reopened"):
+                why = "is not an active decision"
+            elif row["verdict"] != want:
+                why = f"has verdict {row['verdict']}"
+            elif (row["action"] not in DECISION_REASON_ACTIONS.get(o.outcome, ())
+                  or (row["action"] == "request_mask" and row["mask_ref"] is None)):
+                why = f"is a {row['action']} decision, which acts on no checkpoint outcome through the signature"
+            elif row["checkpoint_id"] != o.checkpoint_id:
+                why = f"is on checkpoint {row['checkpoint_id']}"
+            elif row["expires_at"] is not None and datetime.fromisoformat(row["expires_at"]) <= at:
+                why = f"expired at {row['expires_at']}"
+            if why is not None:
+                raise StoreRefused(f"{o.outcome} (reason: decision:{did}) needs an active {want} decision on "
+                                   f"{o.checkpoint_id} that acts through the signature; {did} {why} (4.13, 9.7)")
         if o.decision_ref and o.decision_ref != did and self._one(
                 "SELECT 1 FROM decisions WHERE decision_id = ?", (decision_int(o.decision_ref),)) is None:
             raise StoreRefused(f"{o.checkpoint_id} names unknown decision {o.decision_ref} (4.13 decision_ref)")

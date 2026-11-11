@@ -423,6 +423,38 @@ def test_fixed_in_build_is_not_a_contest(store):
     assert not store.get_finding("F-1").contested
 
 
+def by_decision(cid, outcome, did, **kw):
+    return out(cid, outcome, reason=f"decision:{did}", decision_ref=did, diff=D, recorded_at=TS, **kw)
+
+
+def test_a_decision_reason_names_a_live_decision_that_acts_on_this_checkpoint(store):
+    # store:8, 4.13 required fields: "decision:<id> and a decision_ref to an approved noise signature or an active
+    # mask decision"; 9.7: a decision matches its own signature only and noise_signature ends after 30 days
+    decide(store, "dec-000001", decided_at="2026-09-01T00:00:00+00:00", expires_at="2026-10-01T00:00:00+00:00")
+    decide(store, "dec-000002", region="rgn.b")
+    refused = {"dec-000001": "expired", "dec-000002": "checkpoint"}
+    for n, action in enumerate(("agent_mistake", "expected_behavior", "request_mask"), start=3):
+        decide(store, f"dec-00000{n}", action, region=f"rgn.{n}")
+        refused[f"dec-00000{n}"] = action
+    for did, why in refused.items():
+        with pytest.raises(StoreRefused, match=why):
+            store.write_checkpoint(by_decision(CENSUS if did == "dec-000002" else SWEEP, "noise", did))
+    store.record_decision(Decision("dec-000006", "reject_baseline", "confirmed_bug",
+                                   Signature(SWEEP, "rgn.6", PH, "collateral"), decided_by="alice", ticket="TOS-6",
+                                   reason="because", decided_at=TS), run_id=RUN, baseline_id=1)
+    with pytest.raises(StoreRefused, match="reject_baseline"):            # it moves a baseline, not the signature
+        store.write_checkpoint(by_decision(SWEEP, "collateral", "dec-000006", primitive="ladder"))
+    assert store.outcomes(RUN) == []
+    store.set_mask_ref("dec-000005", "mask-1")                              # the mask merged: it acts now
+    store.write_checkpoint(by_decision(SWEEP, "noise", "dec-000005"))
+    decide(store, "dec-000007", "confirm_bug", region="rgn.7")
+    decide(store, "dec-000008", "mark_intended", region="rgn.8")
+    for run_id, outcome, did in (("run-02", "collateral", "dec-000007"), ("run-03", "intended", "dec-000008")):
+        store.begin_run(plan(run_id=run_id))
+        store.write_checkpoint(by_decision(SWEEP, outcome, did, run_id=run_id))
+        assert store.get_outcome(run_id, SWEEP).reason == f"decision:{did}"
+
+
 # -- the run summary, review state and late verdicts (8.3, 8.7, 4.13, SD-23) ----------------------------------------
 
 def review(cid, mapped="intended", verdict="matches_manifest", diff_hash="h1", confidence=0.93):

@@ -311,3 +311,80 @@ def test_secrets_8_the_flagged_batch_and_every_later_one_are_not_uploaded(tmp_pa
         cps = {o.checkpoint_id for o in withheld}
         assert not [f for f in store.findings(sc.run_id) if f.checkpoint_id in cps]
         assert not store.query("SELECT 1 FROM shards WHERE run_id = ? AND state = 'imported'", (sc.run_id,))
+
+
+# == secrets:6: the teardown scan covers the summary, the report's inputs and results.jsonl =========================
+
+def _published(out: Path, secret: str) -> list[str]:
+    return sorted(p.name for p in out.glob("*") if p.is_file() and p.suffix in (".md", ".html", ".json")
+                  and secret.encode() in p.read_bytes())
+
+
+def test_secrets_6_a_plaintext_only_in_the_report_inputs_withholds_the_report(tmp_path):
+    """6.9: teardown scans the report HTML before `reported`; a plaintext that only the report would carry (here the
+    detector banner) ends the run `aborted_harness (secret_leaked)` and nothing is published."""
+    import dataclasses
+
+    import sentinel.pipeline.run as pr
+    sc = dataclasses.replace(clean_scenario(TODAY), detector_banner=f"Detector note: {pr.SIM_SECRET}")
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    assert (r.status, r.reason) == ("aborted_harness", "secret_leaked")
+    assert not (tmp_path / "report.html").exists() and not (tmp_path / "pr-comment.md").exists()
+    assert _published(tmp_path, pr.SIM_SECRET) == []
+
+
+def test_secrets_6_a_plaintext_in_the_run_summary_is_found(tmp_path):
+    """6.9: `runs.summary_json` and its results.jsonl line are scanned too: a plaintext in a summary input (the
+    canary note) ends the run `aborted_harness (secret_leaked)` with the report withheld."""
+    import dataclasses
+
+    import sentinel.pipeline.run as pr
+    sc = dataclasses.replace(clean_scenario(TODAY), canary={"note": f"canary {pr.SIM_SECRET}"})
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    assert (r.status, r.reason) == ("aborted_harness", "secret_leaked")
+    assert not (tmp_path / "report.html").exists()
+    with Store(tmp_path / "sentinel.db") as store:
+        assert store.run_summary(sc.run_id)["secret_scan"]["report_withheld"] is True
+
+
+def test_secrets_6_the_rendered_report_is_scanned_before_it_is_published(tmp_path, monkeypatch):
+    """6.9: the rendered report files are scanned too; text that only they hold (here a renderer that adds it) is
+    withheld: the comment and report page are removed and the summary records the scan."""
+    import sentinel.pipeline.run as pr
+    real = pr.render_report_markdown
+    monkeypatch.setattr(pr, "render_report_markdown", lambda rep: real(rep) + f"\n{pr.SIM_SECRET}\n")
+    sc = clean_scenario(TODAY)
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    assert not (tmp_path / "pr-comment.md").exists() and not (tmp_path / "report.html").exists()
+    assert r.commit_status["state"] == "error" and _published(tmp_path, pr.SIM_SECRET) == []
+    with Store(tmp_path / "sentinel.db") as store:
+        assert store.run_summary(sc.run_id)["secret_scan"]["report_withheld"] is True
+
+
+def _nightly(out: Path, run_id: str = "run-2026-11-10-nightly-01"):
+    from sentinel.demo import BASE_ID, _main_build
+    from sentinel.pipeline.run import NightlyScenario, run_nightly
+    from sentinel.pipeline.sim import SimBuild
+    return run_nightly(EXAMPLE, NightlyScenario("nightly", run_id, SimBuild(BASE_ID), overlay=dict([_main_build()]),
+                                                mutants=("M01",)), out)
+
+
+def test_secrets_6_scan_run_reads_a_ledger_tail_and_in_memory_texts(tmp_path):
+    """6.9 choice 1: a shared results.jsonl is scanned from the offset where this run began (an earlier run's lines
+    are not this run's), and text the run has not written yet (the report's inputs) is scanned from memory."""
+    from sentinel.store import ArtifactStore
+    from sentinel.store.secret_scan import FileTail, scan_run
+    secrets = {"vault://x#password": "hunter2-Pa55"}
+    ledger = tmp_path / "results.jsonl"
+    ledger.write_text('{"rows": ["earlier run: hunter2-Pa55"]}\n')
+    start = ledger.stat().st_size
+    with open(ledger, "a") as f:
+        f.write('{"rows": ["this run"]}\n')
+    arts = ArtifactStore(tmp_path / "set", "runs/r2")
+    db = sqlite3.connect(":memory:")
+    assert scan_run(db, arts, [FileTail(ledger, start)], secrets, run_id="r2").passed
+    with open(ledger, "a") as f:
+        f.write('{"rows": ["this run: hunter2-Pa55"]}\n')
+    assert scan_run(db, arts, [FileTail(ledger, start)], secrets, run_id="r2").run_reason == "secret_leaked"
+    res = scan_run(db, arts, [], secrets, run_id="r2", texts={"report inputs": b"banner hunter2-Pa55"})
+    assert res.run_reason == "secret_leaked" and res.evidence["hits"][0]["location"] == "text:report inputs"

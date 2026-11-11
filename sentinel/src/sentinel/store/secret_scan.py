@@ -8,8 +8,10 @@ each secret the run used is searched for in everything the run wrote.
   artifact is scanned before it is stored or uploaded) and `check_upload` the same check for a results batch.
 - `scan_run(db, artifacts, reports, secrets, run_id=...)` is the teardown scan: the run's SQLite rows (every
   table with a `run_id` or `first_run_id` column, rows of this run; the step event log among them), every file of
-  the run's artifact set (objects, manifest, ledgers and journals) and every file or directory in `reports` (report
-  HTML, results.jsonl, Reviewer requests and agent transcripts, crash files and log slices kept elsewhere). It
+  the run's artifact set (objects, manifest, ledgers and journals), every file or directory in `reports` (report
+  HTML, results.jsonl, Reviewer requests and agent transcripts, crash files and log slices kept elsewhere; a
+  `FileTail` for the part of an append-only file the run wrote, such as a results.jsonl several runs share) and
+  every text in `texts` (what the run will write but has not yet, such as the report's inputs). It
   returns a `ControlResult`: passed; `aborted_harness (reason: secret_leaked)` with the report withheld, the
   credential to rotate, an S1 incident and one `secret_leaked` finding per secret, after moving the set to
   quarantine when a quarantine root is given (8.4); or `aborted_harness (reason: secret_scan_unavailable)` with
@@ -23,7 +25,8 @@ Choices where 6.9 is silent (reported):
 
 1. "SQLite rows written this run" are the rows of every table with a `run_id` (or, for `artifacts`, a
    `first_run_id`) equal to the run; rows of tables without either are covered by the shard ledger
-   (results.jsonl holds every row the shard wrote, 8.4), which the caller passes in `reports` or keeps in the set.
+   (results.jsonl holds every row the shard wrote, 8.4), which the caller passes in `reports` or keeps in the set;
+   a ledger several runs append to is passed as a `FileTail` from the offset where this run began.
 2. Image and video files (recognised by their leading bytes) are not scanned: images pass the redaction stage and
    carry its version (8.4: text artifacts pass the plaintext scan "instead"), and the typed password field is
    masked, so pixels are not the leak path (6.9).
@@ -48,6 +51,13 @@ from .store import StoreError
 
 CHUNK = 8 * 1024 * 1024
 _BYTE_FORMS = ("utf-8", "utf-16-le", "utf-16-be")
+
+
+@dataclass(frozen=True)
+class FileTail:
+    """The bytes of an append-only file from `offset` on: what one run appended to a shared ledger (choice 1)."""
+    path: Path
+    offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -102,11 +112,13 @@ class SecretScanner:
         """The `ArtifactStore` put hook: the references found in `data`, sorted."""
         return tuple(sorted({h.ref for h in self.scan_bytes(data, "")}))
 
-    def scan_file(self, path: str | os.PathLike, location: str) -> list[SecretHit]:
-        """Scan a file in chunks that overlap by the longest search form, so no hit straddles a boundary."""
+    def scan_file(self, path: str | os.PathLike, location: str, offset: int = 0) -> list[SecretHit]:
+        """Scan a file, from byte `offset`, in chunks that overlap by the longest search form, so no hit straddles a
+        boundary."""
         found: dict[tuple[str, str], SecretHit] = {}
         tail = b""
         with open(path, "rb") as f:
+            f.seek(offset)
             while True:
                 chunk = f.read(CHUNK)
                 if not chunk:
@@ -165,17 +177,22 @@ def _files(path: Path) -> Iterator[Path]:
         raise FileNotFoundError(f"{path} does not exist")
 
 
-def _file_hits(scanner: SecretScanner, roots: Sequence[Path]) -> tuple[list[SecretHit], int, int]:
+def _file_hits(scanner: SecretScanner, roots: Sequence[Path | FileTail]) -> tuple[list[SecretHit], int, int]:
     hits: list[SecretHit] = []
     files = size = 0
     for root in roots:
-        for p in _files(root):
+        tail = root if isinstance(root, FileTail) else None
+        for p in [Path(tail.path)] if tail is not None else _files(Path(root)):
+            start = tail.offset if tail is not None else 0
+            if not p.is_file():
+                raise FileNotFoundError(f"{p} does not exist")
             with open(p, "rb") as f:
+                f.seek(start)
                 if has_image_magic(f.read(16)):
                     continue                                    # choice 2
             files += 1
-            size += p.stat().st_size
-            hits += scanner.scan_file(p, f"file:{p}")
+            size += max(0, p.stat().st_size - start)
+            hits += scanner.scan_file(p, f"file:{p}" + (f"@{start}" if start else ""), start)
     return hits, files, size
 
 
@@ -214,13 +231,15 @@ def check_upload(scanner: SecretScanner, data: bytes, *, location: str) -> Contr
     return leak_result(hits) if hits else None
 
 
-def scan_run(db: Any, artifacts: ArtifactStore, reports: Sequence[str | os.PathLike],
+def scan_run(db: Any, artifacts: ArtifactStore, reports: Sequence[str | os.PathLike | FileTail],
              secrets: Mapping[str, str | bytes | bytearray] | None, *, run_id: str,
-             quarantine_root: str | os.PathLike | None = None, at: str | None = None) -> ControlResult:
+             quarantine_root: str | os.PathLike | None = None, at: str | None = None,
+             texts: Mapping[str, bytes] | None = None) -> ControlResult:
     """The teardown plaintext scan of one run (module docstring). `db` is the `store.Store` (or a read connection);
-    `artifacts` the run's set; `reports` further files or directories; `secrets` maps each secret reference used
-    to its plaintext, or is None when no lease can be had. With `quarantine_root`, a hit moves the set there and
-    marks its `artifact_sets` rows (when `db` is the store)."""
+    `artifacts` the run's set; `reports` further files, directories or `FileTail`s; `texts` text artifacts still in
+    memory, by name; `secrets` maps each secret reference used to its plaintext, or is None when no lease can be
+    had. With `quarantine_root`, a hit moves the set there and marks its `artifact_sets` rows (when `db` is the
+    store)."""
     if secrets is None:
         return unavailable_result("no secret could be read under a lease: report withheld until a human runs the "
                                   "scan with a fresh lease")
@@ -228,7 +247,11 @@ def scan_run(db: Any, artifacts: ArtifactStore, reports: Sequence[str | os.PathL
         scanner = SecretScanner(secrets)
         try:
             db_hits, rows = _db_hits(scanner, db, run_id)
-            file_hits, files, size = _file_hits(scanner, [artifacts.root, *map(Path, reports)])
+            file_hits, files, size = _file_hits(scanner, [artifacts.root, *(r if isinstance(r, FileTail) else Path(r)
+                                                                            for r in reports)])
+            for name, data in (texts or {}).items():
+                file_hits += scanner.scan_bytes(data, f"text:{name}")
+                files, size = files + 1, size + len(data)
         except (OSError, sqlite3.Error, StoreError) as e:          # choice 3
             return unavailable_result(f"the scan could not finish ({type(e).__name__}): report withheld until a "
                                       "human runs it")

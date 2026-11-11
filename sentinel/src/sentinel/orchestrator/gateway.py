@@ -16,6 +16,10 @@ and the low-level hooks, live behind `Rig.send_input` (rig.py); the real hook ho
 - `drain` turns a hook decision into the logged drop of 5.4.8 (`untokened_injected`, `foreign_input`,
   the `drill` tag) with its class, and `DropLedger` applies the consequences and thresholds of 5.4.8
   and 6.2 (attempted send, three per flow or session, ten per run).
+- `SafetyContext.session` carries the session's attestation stage and paper-mode assertion into stage 4,
+  `SendClearance` is the gated send's gate (sendgate.py), and `HOOK_STATES` with `recovery_admits` are the
+  hook's state per phase and the recovery-only arm of 6.6. The Window Watcher that feeds the flag and the
+  deny rectangles is windows.py; the two gateway files are read by gateway_config.py.
 
 Choices where the spec is ambiguous (reported):
 
@@ -108,10 +112,10 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, Protocol
 
 from . import alerts
+from .budgets import ShardBudgets
 from .results import ControlResult, FindingSpec, Outcome, SubsetOutcome, safety_abort_outcome
 
-if TYPE_CHECKING:                      # ports and budgets import this module; only the types are needed here
-    from .budgets import ShardBudgets
+if TYPE_CHECKING:                      # ports imports this module; only the type is needed here
     from .ports import SessionSafety
 
 # -- virtual keys (winuser.h) ------------------------------------------------------------------------------

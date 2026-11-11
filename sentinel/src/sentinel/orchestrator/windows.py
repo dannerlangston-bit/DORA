@@ -186,6 +186,8 @@ def _matches(image: np.ndarray, template: np.ndarray, floor: float, scale: float
     """Every top-left at or above `floor` (choice 4), in `image` pixels at full scale, best first. At half scale
     the template is shrunk at each of its four pixel phases, so a control at an odd position still matches."""
     step = round(1 / scale)
+    if image.size == 0:
+        return []
     img, tpl = _shrink(_gray(image), step), _gray(np.asarray(template))
     th, tw = tpl.shape[:2]
     cands: list[tuple[float, int, int]] = []

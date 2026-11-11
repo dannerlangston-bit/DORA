@@ -93,6 +93,7 @@ def test_source_1_locates_send_in_the_dialog_and_never_confirm_and_send():
     found = locate_send_controls(frame(dialog=True), DIALOG_WIN.rect, TEMPLATES)
     assert [(d.rect, d.label) for d in found] == [(send_bounds(), "Send")]
     assert locate_send_controls(frame(dialog=True), MAIN_WIN.rect, TEMPLATES) == ()
+    assert locate_send_controls(frame(dialog=True), (5000, 5000, 320, 170), TEMPLATES) == ()   # off the grab
 
 
 def test_source_2_detects_the_docked_ticket_at_half_scale_and_floor_0_90():

@@ -7,11 +7,12 @@ import sqlite3
 
 import pytest
 
-from sentinel.records import (ACTION_VERDICT, CheckpointOutcome, Decision, DiffSummary, Finding,
-                              RunOutcome, Signature, StepOutcome)
+from sentinel.records import (ACTION_VERDICT, CheckpointOutcome, Decision, DiffSummary, Extraction, Finding,
+                              Fingerprint, RunOutcome, Signature, StepEvent, StepOutcome)
 from sentinel.store import RunPlan, ScopeEntry, ShardPlan, Store, StoreRefused
 from sentinel.store.artifacts import StoredArtifact
-from sentinel.store.store import ActiveDecisionExists, PaperAssertionMissing, RecordIncomplete
+from sentinel.store.store import (ActiveDecisionExists, PaperAssertionMissing, PostRunProof, RecordIncomplete,
+                                  RunNotComplete)
 
 RUN = "run-01"
 WS = "ws.tier-a.active-trader"
@@ -615,7 +616,7 @@ def test_late_rows_replace_the_dead_man_run(store):
     dead_man(store)
     rows = [out(cid, diff=D) for cid in (CENSUS, SWEEP, FLOW)]
     r = store.replace_dead_man_run(RUN, rows, outcome=RunOutcome(RUN, "pr", "complete", "reported"),
-                                   arrived_at="2026-11-09T16:05:00+00:00")
+                                   arrived_at="2026-11-09T16:05:00+00:00", proofs=[late_proof()])
     assert (r.status, r.reason) == ("complete", None) and r.counts["identical"] == 3
     assert {o.outcome for o in store.outcomes(RUN)} == {"identical"}
     kept = store.conn.execute("SELECT checkpoint_id, outcome, reason FROM outcomes_superseded ORDER BY 1").fetchall()
@@ -628,6 +629,68 @@ def test_late_rows_replace_the_dead_man_run(store):
         store.conn.execute("DELETE FROM outcomes WHERE run_id = ?", (RUN,))
     with pytest.raises(StoreRefused, match="dead_man"):                   # once only
         store.replace_dead_man_run(RUN, rows, outcome=RunOutcome(RUN, "pr", "complete", "reported"))
+
+
+def late_proof(shard=SHARD):
+    return PostRunProof(shard_id=shard, run_id=RUN, login_alias="paper-01", verdict="proven_no_sends",
+                        send_policy_ref="p", counts={}, cancel_all="not_needed", paper_mode_assertions=1,
+                        paper_mode_mismatches=0, gateway_events=2, gateway_drops=1, produced_at=TS)
+
+
+def test_the_late_arrival_carries_the_rigs_proof_events_and_each_rows_shard(store):
+    # store:1, 10.2: the rows the rig ships after a dead-man deadline (its post-run proof and step events among them)
+    # arrive in the one late batch, each row under its shard; 1.10: a complete late run needs every shard's proof
+    store.set_session_context(SHARD, [ACCOUNT], [ASSERTED])
+    dead_man(store)
+    store.register_build("b1", channel="branch", source_commit="b1", pipeline_artifact_url="u", installer_sha256="b1")
+    rows = [out(cid, diff=D) for cid in (CENSUS, SWEEP, FLOW)]
+    late = {"outcome": RunOutcome(RUN, "pr", "complete", "reported"), "arrived_at": "2026-11-09T16:05:00+00:00"}
+    with pytest.raises(RunNotComplete, match="post-run proof"):
+        store.replace_dead_man_run(RUN, rows, **late)
+    live, arts = _capture(store, CENSUS, paper_assertion=stamp(account="sha256:deadbeef"))
+    with pytest.raises(PaperAssertionMissing):                      # L-OUT-06 under the row's shard
+        store.replace_dead_man_run(RUN, [live, *rows[1:]], artifacts=arts, proofs=[late_proof()], **late)
+    with pytest.raises(StoreRefused, match="not a shard"):
+        store.replace_dead_man_run(RUN, rows, shard_of={CENSUS: "run-01/9"}, proofs=[late_proof()], **late)
+    assert (store.run_outcome(RUN).status, store.post_run_proofs(RUN)) == ("aborted_harness", [])
+    event = StepEvent(run_id=RUN, shard_id=SHARD, side="candidate", seq=1, source="gateway_hook", wall_at=TS,
+                      mono_ms=4242, mode="scripted", action="click", gate_decision="dropped",
+                      gate_reason="no_token", gate_class="safety")
+    step = StepOutcome(RUN, FLOW_ID, "s07", "passed", shard_id=SHARD)
+    x = Extraction(RUN, CENSUS, "candidate", "rule.rgn.qty.qty", "qty", "ocr", TS, region_id="rgn.qty", text="100",
+                   value="100", confidence=91.5)
+    fp = Fingerprint(RUN, "candidate", "rig-a1", TS, {"build_id": "b1"}, record={}, shard_id=SHARD)
+    r = store.replace_dead_man_run(RUN, rows, proofs=[late_proof()], events=[event], steps=[step], extractions=[x],
+                                   fingerprints=[fp], **late)
+    assert r.status == "complete" and store.post_run_proofs(RUN) == [late_proof()]
+    assert [(e.seq, e.gate_decision) for e in store.step_events(RUN)] == [(1, "dropped"), (2, "none")]
+    assert store.gateway_drops(RUN) == 1 and store.extractions(RUN) == [x] and store.fingerprint(SHARD, "candidate")
+    shards = store.conn.execute("SELECT DISTINCT shard_id FROM outcomes WHERE run_id = ?", (RUN,)).fetchall()
+    assert [row[0] for row in shards] == [SHARD]
+
+
+def test_a_late_row_of_a_run_with_several_shards_names_its_shard(tmp_path):
+    with Store(tmp_path / "two.db") as s:
+        for rig in ("rig-a1", "rig-a2"):
+            s.register_rig(rig, login_alias=f"paper-{rig[-1]}", owner="qa", snapshot_id="snap-1", allowlist_entry=1)
+        two = (f"{RUN}/1", f"{RUN}/2")
+        s.begin_run(plan(shards=(ShardPlan(two[0], "rig-a1"), ShardPlan(two[1], "rig-a2"))))
+        s.fill_unreached(RUN, "harness_error", "dead_man", detail="watchdog_event: wd-40")
+        s.end_run(RunOutcome(RUN, "pr", "aborted_harness", "running", reason="dead_man", ended_at=DEADLINE))
+        for sid in two:
+            s.end_shard(sid, "complete")
+            s.mark_shard_imported(sid)
+        rows = [out(cid, diff=D) for cid in (CENSUS, SWEEP, FLOW)]
+        proofs = [dataclasses.replace(late_proof(sid), login_alias=f"paper-{sid[-1]}") for sid in two]
+        done = RunOutcome(RUN, "pr", "complete", "reported")
+        where = {CENSUS: two[0], SWEEP: two[0], FLOW: two[1]}
+        with pytest.raises(StoreRefused, match="name the shard"):
+            s.replace_dead_man_run(RUN, rows, proofs=proofs, outcome=done)
+        with pytest.raises(RunNotComplete, match="post-run proof"):
+            s.replace_dead_man_run(RUN, rows, proofs=proofs[:1], outcome=done, shard_of=where)
+        s.replace_dead_man_run(RUN, rows, proofs=proofs, outcome=done, shard_of=where)
+        got = s.conn.execute("SELECT checkpoint_id, shard_id FROM outcomes ORDER BY checkpoint_id").fetchall()
+        assert [tuple(g) for g in got] == [(CENSUS, two[0]), (FLOW, two[1]), (SWEEP, two[0])]
 
 
 def test_a_partial_late_arrival_is_refused(store):
@@ -643,8 +706,8 @@ def test_a_partial_late_arrival_is_refused(store):
     assert {o.reason for o in store.outcomes(RUN)} == {"dead_man"}
     assert store.conn.execute("SELECT count(*) FROM outcomes_superseded").fetchone()[0] == 0
     rows = [out(cid, diff=D) for cid in (CENSUS, SWEEP, FLOW)]
-    assert store.replace_dead_man_run(RUN, rows, outcome=RunOutcome(RUN, "pr", "complete", "reported")).status == \
-        "complete"
+    assert store.replace_dead_man_run(RUN, rows, outcome=RunOutcome(RUN, "pr", "complete", "reported"),
+                                      proofs=[late_proof()]).status == "complete"
 
 
 def test_a_run_that_did_not_end_dead_man_is_not_replaced(store):

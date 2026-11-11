@@ -48,7 +48,9 @@ Enforced here and, where SQL can say it, again by the schema:
   produces only intended or needs_human (SD-23).
 - the run row carries its pair (`register_pair`), its teardown summary (`end_run(summary=)`, `update_summary`) and
   its review state (unreviewed, partial, reviewed, recomputed as reviews land). A finished run is final except the
-  10.2 late arrival: `replace_dead_man_run` replaces a dead-man run with its real rows and outcome.
+  10.2 late arrival: `replace_dead_man_run` replaces a dead-man run with its real rows and outcome, all of them in
+  one batch (every placeholder covered; each row under its shard; the shards' events, steps, extractions,
+  fingerprints and post-run proofs with them; a complete outcome only with every shard's proof).
 - every write batch is one `BEGIN IMMEDIATE` transaction, appended to `results.jsonl` before it commits (8.2).
 
 Choices where the spec is ambiguous or silent (reported to the coordinator):
@@ -1724,12 +1726,17 @@ class Store:
                     checkpoint_id: str | None = None) -> None:
         """Write step outcomes as `step_events` rows outside a checkpoint batch (8.3), each under its own shard and
         side, else the call's; a disagreement is refused."""
+        with self._batch("steps") as rows:
+            self._put_steps(rows, steps, shard_id, side, checkpoint_id)
+
+    def _put_steps(self, rows: list[dict], steps: Sequence[StepOutcome], shard_id: str | None, side: str | None,
+                   checkpoint_id: str | None) -> None:
+        """`write_steps` inside a batch (the late arrival's too): its checks, then its rows."""
         placed = [(s, *self._step_place(s, shard_id, side)) for s in map(_revalidate, steps)]
         for s, _, _ in placed:
             self._running(s.run_id)
-        with self._batch("steps") as rows:
-            for s, shard, sd in placed:
-                self._insert(rows, "step_events", self._step_row(s, shard, sd, checkpoint_id))
+        for s, shard, sd in placed:
+            self._insert(rows, "step_events", self._step_row(s, shard, sd, checkpoint_id))
 
     def write_finding(self, finding: Finding, *, synthetic: bool = False) -> None:
         """Write a finding outside a checkpoint batch, e.g. a run-level finding (4.13)."""
@@ -1761,19 +1768,30 @@ class Store:
     _KEEP_TRIGGERS = ("trg_outcome_keep", "trg_outcome_record_keep")
 
     def replace_dead_man_run(self, run_id: str, rows: Sequence[CheckpointOutcome], *, outcome: RunOutcome,
-                             artifacts: Sequence[StoredArtifact] = (), findings: Sequence[Finding] = (),
+                             shard_of: Mapping[str, str] | None = None, artifacts: Sequence[StoredArtifact] = (),
+                             findings: Sequence[Finding] = (), steps: Sequence[StepOutcome] = (),
+                             events: Sequence[StepEvent] = (), extractions: Sequence[Extraction] = (),
+                             fingerprints: Sequence[Fingerprint] = (), proofs: Sequence[PostRunProof] = (),
                              arrived_at: str | None = None) -> RunOutcome:
         """10.2 crash during teardown, late arrival: the run the control host ended `aborted_harness (reason:
         dead_man)` at the deadline takes its real rows and outcome when they arrive.
 
         `rows` cover every `harness_error (reason: dead_man)` placeholder of the run, or nothing is replaced: that
         reason belongs only to an `aborted_harness (reason: dead_man)` run (1.10), so the run keeps it until all its
-        rows have arrived. In one batch: the placeholders move to
-        `outcomes_superseded` (kept for diagnosis, never counted, 8.3); `rows`, their `artifacts` and `findings`
-        are written with every write-time check; the run is ended `outcome` with the late arrival in its summary
-        (`late_arrival` with the deadline, the arrival and the delay in seconds, also under `health`, and the
-        dead-man alert closed as "late arrival" in `alerts`). Refused for a run that did not end dead_man, and with
-        everything rolled back when any row or the outcome is refused. The caller ends and imports the shards first.
+        rows have arrived. Everything else the rigs shipped comes in the same call, since the writers of a finished
+        run refuse it: the shards' step `events` (each with its own seq), `steps`, `extractions`, `fingerprints` and
+        post-run `proofs` (6.6), beside the rows' `artifacts` and `findings`. Each row is written under its shard,
+        `shard_of[checkpoint_id]`, else the run's only shard (a run with several shards names every row's): the row
+        keeps its `shard_id` and that shard's L-OUT-06 session context applies; a step without its own shard takes
+        the run's only shard. A `complete` late outcome needs a post-run proof of every shard (the run-level row of a
+        run without shards): 1.10 "the post-run proof reads PROVEN" (`RunNotComplete`). Every item is of `run_id`.
+
+        In one batch: the placeholders move to `outcomes_superseded` (kept for diagnosis, never counted, 8.3); the
+        run is reopened and every item is written with its own writer's checks; the run is ended `outcome` with the
+        late arrival in its summary (`late_arrival` with the deadline, the arrival and the delay in seconds, also
+        under `health`, and the dead-man alert closed as "late arrival" in `alerts`). Refused for a run that did not
+        end dead_man, and with everything rolled back when any item or the outcome is refused. The caller ends and
+        imports the shards first.
         """
         run = self._one("SELECT * FROM runs WHERE run_id = ?", (run_id,))
         if run is None:
@@ -1785,8 +1803,23 @@ class Store:
         if r.run_id != run_id or (r.status, self._split_reason(r.status, r.reason)[0]) == ("aborted_harness",
                                                                                            "dead_man"):
             raise StoreRefused("the late arrival carries the run's real outcome (10.2)")
-        if not rows or any(o.run_id != run_id for o in rows):
+        if not rows or any(i.run_id != run_id for i in (*rows, *steps, *events, *extractions, *fingerprints,
+                                                         *proofs)):
             raise StoreRefused(f"a late arrival carries rows of run {run_id}, and only of it (10.2)")
+        shards = [sid for (sid,) in self._conn.execute("SELECT shard_id FROM shards WHERE run_id = ? ORDER BY rowid",
+                                                       (run_id,))]
+        only = shards[0] if len(shards) == 1 else None
+        placed = []
+        for o in rows:
+            sid = (shard_of or {}).get(o.checkpoint_id, only)
+            if sid is None and shards:
+                raise StoreRefused(f"{o.checkpoint_id}: name the shard of each late row of a run with {len(shards)} "
+                                   "shards (shard_of; 8.3 outcomes.shard_id)")
+            placed.append((o, sid))
+        for sid in [sid for _, sid in placed if sid is not None] + [s.shard_id or only for s in steps] + [
+                f.shard_id for f in fingerprints]:
+            if sid not in shards:
+                raise StoreRefused(f"{sid} is not a shard of run {run_id} (8.3)")
         at = utc(arrived_at) or now()
         delay = int((datetime.fromisoformat(at) - datetime.fromisoformat(run["finished_at"])).total_seconds())
         old = json.loads(run["summary_json"] or "{}")
@@ -1824,12 +1857,25 @@ class Store:
             for a in artifacts:
                 self._verify_artifact(a)
                 self._put_artifact(batch, a, run_id)
-            for o in rows:
-                p = self._prepare_checkpoint(o, (), (), (), None, None)
+            self._put_events(batch, events)             # before the steps, which take MAX(seq) + 1 (8.3)
+            for o, sid in placed:
+                p = self._prepare_checkpoint(o, (), (), (), sid, None)
                 if p is not None:
                     self._put_checkpoint(batch, p)
+            self._put_steps(batch, steps, only, None, None)
             for f in findings:
                 self._put_finding(batch, _revalidate(f), False)
+            self._put_extractions(batch, extractions)
+            for fp in fingerprints:
+                self._put_fingerprint(batch, fp)
+            for pr in proofs:
+                self._put_proof(batch, pr)
+            if r.status == "complete":
+                have = {sid for (sid,) in self._conn.execute("SELECT shard_id FROM post_run_proofs WHERE run_id = ?",
+                                                             (run_id,))}
+                if lacking := [sid for sid in shards or [None] if sid not in have]:
+                    raise RunNotComplete(f"run {run_id} cannot be complete: no post-run proof of "
+                                         f"{lacking[0] or 'the run'} arrived (1.10, 6.6)")
             reopened = self._one("SELECT * FROM runs WHERE run_id = ?", (run_id,))
             self._update(batch, "runs", {"run_id": run_id}, self._end_change(reopened, r, extra))
         return self.run_outcome(run_id)
@@ -1885,12 +1931,20 @@ class Store:
         """Write a shard's post-run proof (8.3 `post_run_proofs`, 6.6): one per shard, written once, before the run
         ends. Refuses a shard not of the run, an unregistered login and a finished run; the same row again is a
         no-op, a different row for the shard an ImportConflict (8.2)."""
+        with self._batch("post_run_proof") as rows:
+            self._put_proof(rows, proof)
+
+    def _check_shard(self, shard_id: str | None, run_id: str) -> None:
+        shard = self._one("SELECT run_id FROM shards WHERE shard_id = ?", (shard_id,))
+        if shard is None or shard["run_id"] != run_id:
+            raise StoreRefused(f"{shard_id} is not a shard of run {run_id} (8.3)")
+
+    def _put_proof(self, rows: list[dict], proof: PostRunProof) -> None:
+        """`write_proof` inside a batch (the late arrival's too): its checks, then its row (none for a replay)."""
         p = dataclasses.replace(proof)                  # re-validates
         self._running(p.run_id)
         if p.shard_id is not None:
-            shard = self._one("SELECT run_id FROM shards WHERE shard_id = ?", (p.shard_id,))
-            if shard is None or shard["run_id"] != p.run_id:
-                raise StoreRefused(f"{p.shard_id} is not a shard of run {p.run_id} (8.3)")
+            self._check_shard(p.shard_id, p.run_id)
             old = self._one("SELECT * FROM post_run_proofs WHERE shard_id = ?", (p.shard_id,))
         else:
             old = self._one("SELECT * FROM post_run_proofs WHERE run_id = ? AND shard_id IS NULL", (p.run_id,))
@@ -1901,8 +1955,7 @@ class Store:
                 return
             raise ImportConflict(f"{p.shard_id or p.run_id} already has a post-run proof; one per shard (or one "
                                  "run-level row), written once (8.2)")
-        with self._batch("post_run_proof") as rows:
-            self._insert(rows, "post_run_proofs", values)
+        self._insert(rows, "post_run_proofs", values)
 
     def post_run_proofs(self, run_id: str) -> list[PostRunProof]:
         """The run's post-run proofs, one per shard, in shard order (8.3 `post_run_proofs`)."""
@@ -2424,15 +2477,17 @@ class Store:
         """Write `step_events` rows (8.3): inputs, popups, captures, gateway decisions, Watchdog events and
         relaunches, with each event's own seq and mono_ms. Keyed (shard_id, seq): the same event again is a no-op,
         a different one an ImportConflict. Refuses a shard not of the event's run and a finished run."""
+        with self._batch("events") as rows:
+            self._put_events(rows, events)
+
+    def _put_events(self, rows: list[dict], events: Sequence[StepEvent]) -> None:
+        """`write_events` inside a batch (the late arrival's too): its checks, then its rows."""
         evs = [_revalidate(e) for e in events]
         for e in evs:
             self._running(e.run_id)
-            shard = self._one("SELECT run_id FROM shards WHERE shard_id = ?", (e.shard_id,))
-            if shard is None or shard["run_id"] != e.run_id:
-                raise StoreRefused(f"{e.shard_id} is not a shard of run {e.run_id} (8.3)")
-        with self._batch("events") as rows:
-            for e in evs:
-                self._write_once(rows, "step_events", {"shard_id": e.shard_id, "seq": e.seq}, self._event_row(e))
+            self._check_shard(e.shard_id, e.run_id)
+        for e in evs:
+            self._write_once(rows, "step_events", {"shard_id": e.shard_id, "seq": e.seq}, self._event_row(e))
 
     def step_events(self, run_id: str) -> list[StepEvent]:
         """The run's step events in shard and seq order (8.3)."""
@@ -2451,13 +2506,17 @@ class Store:
     def write_extractions(self, extractions: Sequence[Extraction]) -> None:
         """Store every Oracle extraction (2.8.1, 8.3 oracle_extractions); replays are no-ops, a different read for
         the same key an ImportConflict."""
+        with self._batch("extractions") as rows:
+            self._put_extractions(rows, extractions)
+
+    def _put_extractions(self, rows: list[dict], extractions: Sequence[Extraction]) -> None:
+        """`write_extractions` inside a batch (the late arrival's too): its checks, then its rows."""
         xs = [dataclasses.replace(x) for x in extractions]
         for x in xs:
             self._running(x.run_id)
-        with self._batch("extractions") as rows:
-            for x in xs:
-                row = {**dataclasses.asdict(x), "second_pass": int(x.second_pass), "read_at": utc(x.read_at)}
-                self._write_once(rows, "oracle_extractions", {k: row[k] for k in self._EXTRACTION_KEY}, row)
+        for x in xs:
+            row = {**dataclasses.asdict(x), "second_pass": int(x.second_pass), "read_at": utc(x.read_at)}
+            self._write_once(rows, "oracle_extractions", {k: row[k] for k in self._EXTRACTION_KEY}, row)
 
     def extractions(self, run_id: str, checkpoint_id: str | None = None) -> list[Extraction]:
         sql = "SELECT * FROM oracle_extractions WHERE run_id = ?" + (" AND checkpoint_id = ?" if checkpoint_id else "")
@@ -2470,6 +2529,11 @@ class Store:
     def write_fingerprint(self, fp: Fingerprint) -> None:
         """Write one side's fingerprint of a shard (8.3 env_fingerprints), once: the same fingerprint again is a
         no-op, a different one an ImportConflict (8.2). The build and rig must be registered."""
+        with self._batch("fingerprint") as rows:
+            self._put_fingerprint(rows, fp)
+
+    def _put_fingerprint(self, rows: list[dict], fp: Fingerprint) -> None:
+        """`write_fingerprint` inside a batch (the late arrival's too): its checks, then its row."""
         f = dataclasses.replace(fp)                      # re-validates; fingerprint_id recomputes (L-FPR-01)
         if f.shard_id is None:
             raise StoreRefused("a stored fingerprint names its shard (8.3 env_fingerprints.shard_id)")
@@ -2480,8 +2544,7 @@ class Store:
                "fields_json": canonical_json({"schema_version": f.schema_version, "match": f.match,
                                               "record": f.record}),
                "render_probe_hash": phash_bytes(probe) if isinstance(probe, str) and _PHASH_RE.match(probe) else None}
-        with self._batch("fingerprint") as rows:
-            self._write_once(rows, "env_fingerprints", {"shard_id": f.shard_id, "side": f.side}, row)
+        self._write_once(rows, "env_fingerprints", {"shard_id": f.shard_id, "side": f.side}, row)
 
     def fingerprint(self, shard_id: str, side: str) -> Fingerprint | None:
         r = self._one("SELECT * FROM env_fingerprints WHERE shard_id = ? AND side = ?", (shard_id, side))

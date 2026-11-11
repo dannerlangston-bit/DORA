@@ -477,7 +477,8 @@ FILES = """Files in this folder:
   commit-status.json  the sentinel/pr-run commit status (9.2)
   sentinel.db         the SQLite store (8.3): runs, outcomes, findings, decisions, step events (with each
                       gateway block and its reason code), artifacts index
-  artifacts/          content-addressed crops and heatmaps (8.4) with manifest.json
+  artifacts/runs/<run id>/  each run's content-addressed crops and heatmaps (8.4) with its manifest.json;
+                      artifacts/quarantine/<run id>/ holds a set the 6.9 secret scan moved
   calibration/        the A/A calibration file of the run's fingerprint (3.9)
   config/<run id>/    the exact config each run linted and used (the example plus the PR's files)
   reviewer-calls.json every simulated Reviewer request and answer (3.13 shape)

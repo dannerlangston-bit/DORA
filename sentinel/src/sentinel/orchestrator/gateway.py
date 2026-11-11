@@ -509,7 +509,7 @@ def _match(state: GatewayState, e: InputEvent, now: float) -> tuple[str | None, 
 
 def _spend(state: GatewayState, e: InputEvent, now: float, reason: str) -> HookDecision:
     """A rule 1 or rule 2 drop (choice 17): the token the event would have used is spent `dropped` with the
-    reason, so stage 7 reads the safety reason (5.4.3) and the token pends no longer (5.4.4 move rule)."""
+    reason, so stage 7 reads the safety reason (5.4.3) and the token no longer counts as pending (5.4.4 move rule)."""
     return _drop(reason, _match(state, e, now)[1])
 
 

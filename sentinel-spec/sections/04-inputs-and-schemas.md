@@ -161,11 +161,11 @@ The version string in the example is a placeholder pattern. The real format is w
 | L-BLD-01 | `build_id` unique and equal to `<channel>-<version_string>-<first 7 of commit_sha>` | error |
 | L-BLD-02 | `install_method = artifact` requires `artifact.sha256`; `snapshot` requires `snapshot_id` | error |
 | L-BLD-03 | `branch` builds carry `branch` and `merge_base_sha`; other channels do not | error |
-| L-BLD-04 | pair rule table: `pr` requires `merge_base_main` with candidate `branch` and base `main` whose `commit_sha` equals the candidate's `merge_base_sha`; `merge` requires `previous_main`, both `main`; `rc` requires `last_released`, candidate `rc`, base `released`, and `lineage_baseline_set`; `nightly` and `calibration` require `same_build` | error |
+| L-BLD-04 | pair rule table: `pr` requires `merge_base_main` with candidate `branch` and base `main` whose `commit_sha` equals the candidate's merge base with main, or the nearest main ancestor of that merge base that has a build record, at most 20 commits back (distance recorded as `base_commit_distance`); `merge` requires `previous_main`, both `main`; `rc` requires `last_released`, candidate `rc`, base `released`, and `lineage_baseline_set`; `nightly` and `calibration` require `same_build` | error |
 | L-BLD-05 | `candidate != base` unless `base_rule = same_build` | error |
 | L-BLD-06 | `released_at` present if and only if `channel = released` | error |
 
-At run start the Orchestrator reads the title bar after launch, after every relaunch and before each flow. A read that differs from `version_string` is `env_error (gate: launched, reason: version_mismatch)` on every scoped checkpoint of the shard, posted to the on-call channel; a change during the run marks every later checkpoint `env_error (gate: launched, reason: version_changed_mid_run)` and the run ends `complete_with_env_errors`. A missing base artifact (the base build cannot be installed or its capture set is absent) ends the run `aborted_harness (reason: base_build_missing)` before any capture, per 1.10. The pair record itself is linted at run creation: a pair that fails L-BLD-04 or L-BLD-05 is refused at creation, the run is never queued, and the requester (the CI job or the human who asked) gets the rule id; nothing is attributed to a pair that was never valid.
+At run start the Orchestrator reads the title bar after launch, after every relaunch and before each flow. A read that differs from `version_string` is `env_error (gate: launched, reason: version_mismatch)` on every scoped checkpoint of the shard, posted to the on-call channel; a change during the run marks every later checkpoint `env_error (gate: launched, reason: version_changed_mid_run)` and the run ends `complete_with_env_errors`. For a PR run the base is the merge base when main has a build record for it, else the nearest main ancestor of the merge base that has one, at most 20 commits back; the distance is `base_commit_distance` in run health, and the PR manifests merged between that build and the merge base count as declared for the run. No such build within 20 commits, or a missing base artifact (the base build cannot be installed or its capture set is absent), ends the run `aborted_harness (reason: base_build_missing)` before any capture, per 1.10. The pair record itself is linted at run creation: a pair that fails L-BLD-04 or L-BLD-05 is refused at creation, the run is never queued, and the requester (the CI job or the human who asked) gets the rule id; nothing is attributed to a pair that was never valid.
 
 ### 4.3 Change manifest
 
@@ -198,7 +198,7 @@ entry:
   must_be_observed: bool = true         # the Reporter lists entries whose surfaces showed no diff
 ```
 
-`new_surface: true` is what lets a base-side failure become `needs_baseline` instead of an error: a step that fails on the base build only makes its checkpoint `needs_baseline` when the entry that declares the surface carries `new_surface: true`, else `not_run (reason: base_step_failed)` (3.1 Build pair rules). `must_be_observed` drives the manifest coverage table of 2.12: an entry whose declared surfaces show no diff above the floor, or whose visibility check (3.12 task C) returns `not_visible` or `unsure`, raises the run-level finding `intended_change_not_observed` for the feature owner; a finding, never a checkpoint outcome and never a clean report.
+`new_surface: true` is what lets a base-side failure become `needs_baseline` instead of an error: a step that still fails on the base build after its retry makes its checkpoint `needs_baseline (reason: new_surface)` only when the entry that declares the surface carries `new_surface: true`, else `not_run (reason: base_step_failed)`; either way invariants and the Oracle still run on the candidate capture and their findings are listed (2.4, 3.1 Build pair rules). `must_be_observed` drives the manifest coverage table of 2.12: an entry whose declared surfaces show no diff above the floor, or whose visibility check (3.12 task C) returns `not_visible` or `unsure`, raises the run-level finding `intended_change_not_observed` for the feature owner; a finding, never a checkpoint outcome and never a clean report.
 
 Worked example:
 
@@ -263,6 +263,7 @@ The dependency map says which surfaces consume which hosting primitive; it turns
 # schemas/dependency-map.schema.json
 dependency_map:
   schema_version: int = 1
+  first_scan_at: date?                # date of the first Phase 1 bytecode scan; starts the 90-day clock of L-DEP-07
   primitives: list[primitive]
   edges: list[edge]
 
@@ -318,7 +319,7 @@ edges:
      first_seen: 2026-10-01T09:00:00-04:00, last_verified: 2026-11-01T09:00:00-04:00}
 ```
 
-The scope of a PR run (algorithm in 2.11 Scope computation per run type) is the union of the manifest's declared surfaces, every surface reachable from a touched primitive by an edge, and the surfaces the static impact step derives from `changed_paths`. The static impact step (2.10.2) may change the map only through a pull request, and only in these ways: add an edge with `source: static_analysis`, `confirmed_from_source: true`, `confirmed_build` and `evidence`; on an existing edge of either source, set `confirmed_from_source: true`, set `confirmed_build`, raise `confidence` (never lower it) and refresh `last_verified`. It never removes an edge; a declared edge the scan cannot see keeps `confirmed_from_source: false`, keeps its human `reason`, and ages into L-DEP-07. When the scan finds an edge the map does not have, or a changed class under no primitive's and no surface's roots, the run emits a `dependency_map_gap` finding naming the missing edge or the unowned root, opens the pull request, and the map owner (the primitive's `owner`) merges or rejects it; the finding stays open in the report until the PR is closed either way.
+The scope of a PR run (algorithm in 2.11 Scope computation per run type) is the union of the manifest's declared surfaces, every surface reachable from a touched primitive by an edge, and the surfaces the static impact step derives from `changed_paths`. The static impact step (2.10.2) may change the map only through a pull request, and only in these ways: add an edge with `source: static_analysis`, `confirmed_from_source: true`, `confirmed_build` and `evidence`; on an existing edge of either source, set `confirmed_from_source: true`, set `confirmed_build`, raise `confidence` (never lower it) and refresh `last_verified`. It never removes an edge; a declared edge the scan cannot see keeps `confirmed_from_source: false`, keeps its human `reason`, and ages into L-DEP-07. When the scan finds an edge the map does not have, the run emits a `dependency_map_gap` finding naming the missing edge (`detail: missing_edge`); a changed class under no primitive's and no surface's roots is a gap only when it reaches a registered surface, and is then one separate `dependency_map_gap` finding (`detail: unowned_root`, 2.11). Either way the run opens the pull request, and the map owner (the primitive's `owner`) merges or rejects it; the finding stays open in the report until the PR is closed either way.
 
 **Validation rules.**
 
@@ -330,12 +331,12 @@ The scope of a PR run (algorithm in 2.11 Scope computation per run type) is the 
 | L-DEP-04 | no duplicate `(primitive, surface)` pair | error |
 | L-DEP-05 | bidirectional consistency: every primitive a registry entry lists has an edge to that surface, and every non-global edge's surface lists the primitive | error |
 | L-DEP-06 | every registered surface has at least one incoming edge (global edges count) | error |
-| L-DEP-07 | `last_verified` older than 90 days, or `confirmed_from_source: false` on a non-global edge 90 days after the first Phase 1 scan | warn |
+| L-DEP-07 | `last_verified` older than 90 days, or `confirmed_from_source: false` on a non-global edge 90 days after `first_scan_at` (the first Phase 1 scan); no clock runs while `first_scan_at` is absent | warn |
 | L-DEP-08 | the edge `FlexibleGrid -> trade.active-trader.ladder` (or its replacement named in 12.9) exists, because the Phase 1 exit scenario depends on it | error |
 
 ### 4.5 Surface Registry entry
 
-One file per surface. The registry is the coverage universe: every tab, sub-tab, gadget, dialog, settings page, context menu that matters, order ticket variant, Active Trader panel, chart and option chain view. It also hosts the named controls that `click_named` steps reference and the landmarks the Region Registry anchors to.
+One file per surface. The registry is the coverage universe: every tab, sub-tab, gadget, dialog, settings page, context menu that matters, order ticket variant, Active Trader panel, chart and option chain view. It also hosts the named controls that `click_named` steps reference and the landmarks that settle `must_see` checks and locators use. Regions files declare their own landmark templates (4.8); no cross-reference between registry landmarks and regions-file landmarks is required.
 
 ```yaml
 # schemas/surface.schema.json
@@ -348,15 +349,18 @@ surface:
   kind: enum[tab|subtab|section|gadget|panel|dialog|menu|context_menu|settings_page|ticket_variant|chain_layout|active_trader_panel|chart|probe]   # probe: the eight registry validation surfaces of 2.2.3
   tier: enum[1|2|3]                   # 1 = money and orders, 2 = analysis, 3 = everything else
   owner: str
-  smoke: bool = false                 # PR smoke subset membership (rule in 2.11); all tier 1 are smoke
+  smoke: bool = false                 # PR smoke subset membership, flagged by the registry owner, at most 40 (2.11, L-SRF-15); tier 1 does not imply smoke
+  critical: bool = false              # critical surface: its checkpoints need behavioral mutants (L-MUT-03); tier 1 only (L-SRF-16)
+  streaming: bool = false             # the whole surface moves by itself (news, video, chat): excluded from size sweeps (2.5.3) and from tier A and C workspaces (L-WSP-08)
+  reached_after_send: bool = false    # reached only after a sent order (fills, Working to Filled, cancel and replace); requires paper_send (L-SRF-12)
   path: list[step]                    # steps from the canonical workspace to the surface; flow step vocabulary (4.7)
   primitives: list[ref:primitive.id]
   roots: list[str]                    # class or package prefixes implementing the surface; input to the static impact step
-  personas: list[enum[active_trader|options_trader|futures_trader|swing_trader|beginner]]
+  personas: list[enum[active_trader|options_trader|futures_trader|swing_trader|beginner]]   # personas[0] is the primary persona: sweep and split checkpoints count toward it in the matrix (2.12)
   entitlements: list[enum[margin|options_L1|options_L2|options_L3|futures|forex|ira|portfolio_margin|multi_account|paper_send]]
   enumerable_by: enum[P1|P2|P3|P4|P5|P6|P7|P8|none]   # the registry validation probe that lists it (2.2.3)
   resizable: bool                     # set only from probe P8 or a declared in-host splitter
-  hosts: list[enum[tab|sidebar|flexgrid|detached|dialog]]?   # required when resizable; one sweep per host
+  hosts: list[enum[tab|sidebar|flexgrid|detached|dialog]]?   # required when resizable; one w x h sweep per flexgrid, detached or dialog host; tab and sidebar hosts are swept through their splitters only (2.5.1)
   splitters: list[{id: id, template: path, host: enum[tab|sidebar|dialog], fractions: list[num]?, collapsible: bool = false}]?   # in-host splitters for split checkpoints (2.5.2); fractions narrows the ladder set with a stated reason; 0.00 and 1.00 only when collapsible
   size_ladder: ref:ladder.id?         # optional override only: 2.5.3 assigns Ladder S or F by tier and run type
   ladder_reason: str?                 # required with size_ladder
@@ -369,8 +373,15 @@ surface:
   controls: list[control]
   settle: {max_wait_ms: int = 8000}
   census: {enabled: bool = true, workspaces: list[ref:workspace.id], dimensions: map[str, list[str]]?}
-  invariants: list[id]?               # invariant ids beyond the default catalog (2.7 Layout invariants)
+  invariants: surface_invariants?     # the per-surface inputs of the 2.7 catalog (L-XREF-30)
   invariant_exceptions: list[{invariant_id: id, owner: str, reason: str, expires_at: ts}]?
+
+surface_invariants:
+  min_font_px: num?                   # INV-07: minimum legible font height for this surface; default the pinned 9 px
+  overlap_allowlist: list[list[str]]? # INV-01, INV-02, INV-11: pairs [control id, control id] allowed to overlap (tooltips, crosshair, overlay badges); "*" matches any
+  signed_columns: list[str]?          # INV-15: the declared signed columns (P/L, change); the palette is palettes/<theme>.yaml
+  allowed_scrollbars: map[str, {w: int, h: int}]?   # INV-06: container -> the smallest size at which no scrollbar is expected
+  focus_order: list[str]?             # INV-13: control ids in Tab order; keyboard-only ticket and confirm dialog surfaces only
 
 control:
   id: id
@@ -382,7 +393,7 @@ control:
   deny: bool = false                  # on the gateway deny list; no flow may click it
 ```
 
-`census.dimensions` names the declared values the census repeats a tier-1 surface over (for the option chain: `layout: [delta, theo, ...]`, `strikes: [8, 16, all]`); each combination is its own `census` checkpoint with the dimension segment of the id grammar. `invariant_exceptions` is the registry exception of 1.10 for an invariant that is wrong for one surface: owner, reason and expiry, never silent.
+`census.dimensions` names the declared values the census repeats a tier-1 surface over (for the option chain: `layout: [delta, theo, ...]`, `strikes: [8, 16, all]`); each combination is its own `census` checkpoint with the dimension segment of the id grammar. `invariant_exceptions` is the registry exception of 1.10 for an invariant that is wrong for one surface: owner, reason and expiry, never silent. The `invariants` block carries the inputs the 2.7 rows say are declared per surface (the overlap allowlist, allowed scrollbars, signed columns, focus order and a font minimum); a surface without it gets the catalog defaults, so INV-15 checks no column and INV-13 runs on no sequence there. The INV-15 colors come from `palettes/<theme>.yaml` (4.16), selected by the workspace's `display_config.theme`.
 
 Worked example:
 
@@ -434,7 +445,7 @@ census:
 | Rule | Check | Severity |
 |---|---|---|
 | L-SRF-01 | `id` unique across the registry and matches the slug regex; the file name equals the id | error |
-| L-SRF-02 | tier 1 requires `owner`, `smoke: true`, at least one `must_see` landmark, a non-empty `anti_anchors` list, a non-empty `labels` list and at least one `required` control (INV-05 and INV-10 need them) | error |
+| L-SRF-02 | tier 1 requires `owner`, at least one `must_see` landmark, a non-empty `anti_anchors` list, a non-empty `labels` list and at least one `required` control (INV-05 and INV-10 need them) | error |
 | L-SRF-03 | `resizable = true` requires a non-empty `hosts` list; `size_ladder`, when present, exists in `registry/ladders.yaml` and `ladder_reason` is given; `resizable` may be set only when `enumerable_by: P8` or `splitters` is non-empty | error |
 | L-SRF-04 | `kind = dialog` or `target_window.kind` in `dialog`, `detached`, `popup` requires `target_window.title_regex`; `main` forbids it | error |
 | L-SRF-05 | `path` ends with a `wait_for` on a `must_see` landmark of this surface, and every targeting step in `path` resolves on at least two rungs (a `template` plus `jab` or `ocr_text`) | error |
@@ -444,12 +455,13 @@ census:
 | L-SRF-09 | control ids unique within the surface; `jab` present only when `phase0/branches.yaml` says JAB is branch A | error |
 | L-SRF-10 | `census.workspaces` non-empty when `census.enabled`; every `dimensions` value is a slug | error |
 | L-SRF-11 | `parent` exists and the tree has no cycle; `invariant_exceptions` carry owner, reason and a future `expires_at`; an expired exception is dropped at run start and listed in run health, never `config_invalid` | error |
-| L-SRF-12 | `entitlements` includes `paper_send` on every surface reached only after a sent order (fills, Working to Filled, cancel and replace); until the `paper_send_ok` decision such surfaces are `not_run (reason: entitlement)` in every matrix | error |
+| L-SRF-12 | `entitlements` includes `paper_send` on every surface with `reached_after_send: true` (fills, Working to Filled, cancel and replace); until the `paper_send_ok` decision such surfaces are `not_run (reason: entitlement)` in every matrix | error |
 | L-SRF-13 | every `splitters.host` is in `hosts`; `fractions` values are in the full set of 2.5.2 and include 0.00 or 1.00 only when `collapsible: true` | error |
 | L-SRF-14 | every surface is in the derived hosted-surface list (`gadgets_present`, 4.6) of at least one tier A workspace, so the merge census reaches it (2.2.4) | error |
 | L-SRF-15 | at most 40 entries carry `smoke: true` (2.11); the registry owner removes flags, the run never raises the cap | error |
+| L-SRF-16 | `critical: true` requires `tier: 1` | error |
 
-Registry validation at run start (probes P1 to P8 of 2.2.3, enumerating the app's main menu, tab bar, gadget picker and settings tree and diffing against the registry) is runtime behaviour, not lint; a new entry yields `unregistered_surface (reason: probe:<Pn>)` on that run, and a registered entry that no probe lists on either build while its entitlements are present is `harness_error (reason: registry_entry_not_found)` for that surface's checkpoints, posted to the system owner.
+Registry validation at entry to `running`, right after `canary_flow_passed` (probes P1 to P8 of 2.2.3, enumerating the app's main menu, tab bar, gadget picker and settings tree and diffing against the registry) is runtime behaviour, not lint; a new entry yields `unregistered_surface (reason: probe:<Pn>)` on that run, and a registered entry that no probe lists on either build while its entitlements are present is `harness_error (reason: registry_entry_not_found)` for that surface's checkpoints, posted to the system owner.
 
 ### 4.6 Workspace Corpus entry
 
@@ -461,11 +473,14 @@ workspace:
   schema_version: int = 1
   id: id                               # ws.tier-<a|b|c>.<persona or name>, e.g. ws.tier-a.active-trader, ws.tier-c.sweep-harness
   tier: enum[A|B|C]                    # A canonical per persona, B real power-user and migration, C size-sweep harness
-  persona: enum[active_trader|options_trader|futures_trader|swing_trader|beginner]?   # required for tier A
+  persona: enum[active_trader|options_trader|futures_trader|swing_trader|beginner]?   # required for tiers A and B (a tier B entry carries its persona tag, 2.12)
   file: path                           # corpus/workspaces/<id>/<workspace file>
   file_sha256: sha256
   saved_under_build: ref:build.build_id?   # tier B migration workspaces: the released build that saved it
   display_config: {width: int, height: int, scale_percent: int, theme: enum[dark|light], font_size: enum[small|medium|large]}
+  account_role: enum[golden|empty] = golden   # the account the census checkpoints of this workspace select (4.9)
+  tabs: list[str]                      # the top-level tab set in order, as the tab bar shows it; checked at workspace_loaded (7.5)
+  windows: list[{title_regex: str, rect: {x: int, y: int, w: int, h: int}}]   # every top-level window, the main frame first; DWM rects compared within 4 px at workspace_loaded (7.5)
   link_groups: list[{color: str, symbol_ref: ref:fixture.symbols.id}]
   gadgets_present: list[ref:surface.id]   # the source of the derived hosted-surface list (hosted_by, 2.3) the census and scope computation use
   active_trader_panels: list[{panel_id: id, surface: ref:surface.id}]   # each one is attested for Auto Send off
@@ -484,6 +499,9 @@ persona: futures_trader
 file: corpus/workspaces/ws.tier-a.futures-trader/workspace.sentinel-futures
 file_sha256: sha256:5b7d...91c0
 display_config: {width: 1920, height: 1080, scale_percent: 100, theme: dark, font_size: medium}
+tabs: [Monitor, Trade, Analyze, Scan, MarketWatch, Charts, Tools]   # as Phase 0 reads the pinned build's tab bar
+windows:
+  - {title_regex: "thinkorswim", rect: {x: 0, y: 0, w: 1920, h: 1040}}
 link_groups:
   - {color: red, symbol_ref: mes_front}
   - {color: green, symbol_ref: es_continuous}
@@ -499,17 +517,37 @@ owner: tos-trade-ui
 notes: Two-column layout; Active Trader docked left of a 2x2 Flexible Grid of charts.
 ```
 
+`account_role` defaults to `golden` because census checkpoints show the populated account; flows choose their own account with the flow header's `account_role` (4.7). `display_config` must be one entry of `configs/allowed.yaml` (L-WSP-05), whose work area gives the MAXW and MAXH of Ladder F (2.5.2):
+
+```yaml
+# schemas/configs-allowed.schema.json  (configs/allowed.yaml)
+configs_allowed:
+  schema_version: int = 1
+  configs: list[allowed_config]
+
+allowed_config:
+  id: id
+  width: int
+  height: int
+  scale_percent: int
+  theme: enum[dark|light]
+  font_size: enum[small|medium|large]
+  work_area: {w: int, h: int}          # client area of a maximized main window on this configuration: MAXW and MAXH (2.5.2)
+```
+
 **Validation rules.**
 
 | Rule | Check | Severity |
 |---|---|---|
 | L-WSP-01 | `file` exists and its hash equals `file_sha256` | error |
-| L-WSP-02 | tier A: exactly one entry per persona across the corpus; `persona` required | error |
+| L-WSP-02 | tier A: exactly one entry per persona across the corpus; `persona` required on tier A and tier B entries | error |
 | L-WSP-03 | tier B: `saved_under_build` present and its channel is `released` | error |
 | L-WSP-04 | tier C: `size_sweep_cells` present and every `hosts` surface is `resizable` | error |
 | L-WSP-05 | `display_config` is listed in `configs/allowed.yaml` (phase 1: only 1920x1080 at 100 percent) | error |
 | L-WSP-06 | every `gadgets_present` and `active_trader_panels.surface` id exists; every Active Trader surface in `gadgets_present` appears in `active_trader_panels` | error |
 | L-WSP-07 | `link_groups.symbol_ref` exists in the fixture the run uses | error |
+| L-WSP-08 | tier A and tier C entries list no surface with `streaming: true` (news, video and chat gadgets, 2.3) in `gadgets_present` | error |
+| L-WSP-09 | the corpus shape of 2.3: exactly one tier C entry; four to eight tier B entries, at least two of them saved under the previous release (`saved_under_build` is the latest `released` build, the RC run's base) | warn until Phase 3, then error |
 
 ### 4.7 Flow file
 

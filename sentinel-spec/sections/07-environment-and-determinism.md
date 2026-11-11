@@ -322,7 +322,7 @@ maintenance_windows:  # known backend windows; a preflight N1, N3 or N4 failure 
   - {weekday: Sat, start: "22:00", end: "02:00", source: "ops calendar 2026-10"}
 ```
 
-The scheduler reads p95 flow durations from SQLite and refuses to start a windowed flow that cannot finish before the window ends or, in a PR, merge or RC run, before the operating day ends; the refusal is `not_run (reason: budget)` and shows in the coverage matrix. A windowed flow that straddles a window edge because its p95 was wrong is `not_settled (reason: timeout)` at the first checkpoint whose rule fails, never silently kept. Order safety does not depend on any window (6.6 Kill switch, recovery and post-run proof, 6.7 Send policy: both branches): staged tickets are cancelled by each flow's teardown and by the end-of-run Cancel All regardless of the clock.
+The scheduler reads p95 flow durations from SQLite and refuses to start a windowed flow that cannot finish before the window ends or, in a PR, merge or RC run, before the operating day ends; the refusal is `not_run (reason: budget)` and shows in the coverage matrix. A windowed flow that straddles a window edge because its p95 was wrong is `not_settled` at the first checkpoint whose settle rule fails, with the reason of the condition still failing at `max_wait` (3.5), never silently kept. Order safety does not depend on any window (6.6 Kill switch, recovery and post-run proof, 6.7 Send policy: both branches): staged tickets are cancelled by each flow's teardown and by the end-of-run Cancel All regardless of the clock.
 
 ### 7.11 Network preflight and chaos suite
 

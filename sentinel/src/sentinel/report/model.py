@@ -978,7 +978,7 @@ class _Builder:
             if group is None or f.decision_ref:
                 continue
             tier = f.tier
-            if group == REDACTION_MISS and (f.evidence.get("candidate_only") or f.detail == "candidate_only"):
+            if group == REDACTION_MISS and _candidate_only(f):
                 tier = 1                                   # 3.6: a suspected identifier leak ranks tier 1
             key = (tier if tier is not None else 4, group, (1, 0), 0, 0, f.finding_id)
             out.append(Item(0, tier, group, (), [], decided=False, pending=False, reviewer_call=False,

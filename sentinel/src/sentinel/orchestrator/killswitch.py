@@ -98,6 +98,9 @@ Choices (reported):
     stays `aborted_safety (kill_switch)` with the S1 added. After `live_identity` nothing more is read through that
     session: the proof is UNPROVEN `session_unavailable` and the login is blocked for `live_identity` (SD-64), with no
     cancel-by-hand hand-over through it; a `paper_mode_mismatch` or unreadable selector is `recovery_login_failed`.
+19. A recovery login that fails, at authentication or after it (A1 or A2), ends its session before it returns: the hook
+    enters deny-all and the tree is killed (6.4 "an unidentified session must not stay logged in"; 6.6 step 5 "on
+    failure, stop"), so no caller leaves it running and a second attempt (the kicked rule) starts from a fresh tree.
 """
 from __future__ import annotations
 
@@ -574,19 +577,28 @@ def _assert_identity(rig: Rig, allowlist: Allowlist, clock: Clock) -> tuple[Cont
 def recovery_login(rig: Rig, allowlist: Allowlist, clock: Clock, fixture_account: str | None) -> RecoveryLogin:
     """A fresh scripted login with A1 and A2 (6.6 step 5): relaunch, LOGIN, an allowlisted selector, the fixture
     account selected (A1 holds for the selected account too, 6.4). The caller puts the hook in the recovery-only arm
-    first (choice 17): the login's typing goes through the gateway like any other input."""
+    first (choice 17): the login's typing goes through the gateway like any other input. A login that fails leaves no
+    session behind: the hook enters deny-all and the tree is killed before it returns (choice 19)."""
     rig.launch()
     o = rig.login()
     if o.auth_error or o.challenge or o.session_kicked or o.live_selected or not o.vault_lease \
             or o.main_window_s is None or not o.post_login_anchor:
-        return RecoveryLogin(False)
+        return _close(rig, RecoveryLogin(False))
     verdict, read = _assert_identity(rig, allowlist, clock)
     if verdict.passed and fixture_account is not None and read.text != fixture_account:
         rig.select_account(fixture_account)
         verdict, read = _assert_identity(rig, allowlist, clock)
-    if verdict.passed:
-        return RecoveryLogin(fixture_account is None or read.text == fixture_account)
-    return RecoveryLogin(False, verdict if verdict.run_status == "aborted_safety" else None)
+    if verdict.passed and (fixture_account is None or read.text == fixture_account):
+        return RecoveryLogin(True)
+    return _close(rig, RecoveryLogin(False, verdict if verdict.run_status == "aborted_safety" else None))
+
+
+def _close(rig: Rig, login: RecoveryLogin) -> RecoveryLogin:
+    """A failed recovery login's session ends at once (choice 19): deny-all, the tree killed, a fresh gateway."""
+    rig.set_hook_phase("kill_switch")
+    rig.kill_process_tree()
+    rig.reset_input_state()
+    return login
 
 
 def cancel_new_working(rig: Rig, start: OrderBook | None, end: OrderBook, *, clock: Clock,

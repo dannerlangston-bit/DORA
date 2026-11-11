@@ -709,12 +709,12 @@ class Orchestrator:
         any assertion and ends the attempts (killswitch choice 18); after `live_identity` the proof is UNPROVEN
         `session_unavailable` and nothing more is read (SD-64)."""
         rig, ctx = self.rig, self.ctx
-        rig.set_hook_phase("recovery")
         attempts = 2 if kicked else 1
         login = RecoveryLogin(False)
         for _ in range(attempts):
             if kicked:
                 self.clock.sleep(SESSION_RELEASE_WAIT_S)
+            rig.set_hook_phase("recovery")             # a failed attempt left deny-all and no tree (killswitch 19)
             self.counters.login(self.clock.now())
             login = recovery_login(rig, ctx.allowlist, self.clock, ctx.fixture_account)
             if login.identity is not None:

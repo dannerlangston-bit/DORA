@@ -280,8 +280,8 @@ def test_a_leaked_secret_withholds_the_report(tmp_path, monkeypatch):
 
 def test_the_live_reviewer_is_built_over_the_runs_egress_gate(tmp_path):
     """6.10: one egress gate per run, over the signed allowlist, handed to the live Reviewer's job
-    (`live_factory`, `pipeline.live.live_job(gate=)`); it refuses a host the allowlist does not name."""
-    from sentinel.egress import EgressGate, EgressRefused
+    (`live_factory`, `pipeline.live.live_job(gate=)`); its allowlist names the model endpoint and no other host."""
+    from sentinel.egress import EgressGate
     from sentinel.reviewer import ReviewerConfig, ReviewerJob
     from test_integration import FakeTransport
     gates: list = []

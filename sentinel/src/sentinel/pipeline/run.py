@@ -122,7 +122,7 @@ import numpy as np
 
 from .. import canary as cn
 from .. import invariants as inv
-from ..classify import (REVIEWER_ROWS, Classified, Condition, DecisionMatch, Facts, HarnessFailure, Review, classify)
+from ..classify import REVIEWER_ROWS, Classified, Condition, Facts, HarnessFailure, Review, classify
 from ..coverage import Profile, build_matrix
 from ..diff import load_params
 from ..diff.calibration import CalibrationFile, Capture as CalCapture, calibrate_checkpoint
@@ -265,8 +265,7 @@ class Evaluated:
         """(base, candidate) as stored and sent: the redacted pair when the stage ran (3.6), else the screens."""
         r = self.redaction
         if r is not None and r.terminal is None and r.candidate is not None:
-            base = (r.base if self.base is not None else None) if r.base is not None else None
-            return base, r.candidate
+            return (r.base if self.base is not None else None), r.candidate
         return (self.base.screen.image if self.base else None), self.cand.screen.image
 
     @property
@@ -405,8 +404,8 @@ class _Run:
         # 3.6, 6.10: the redaction list and the sweep's literal ids (the fixture's accounts); one version per run
         anchors = cfg.root / "redaction" / "anchors.yaml"
         self.anchors = RedactionList.load(anchors, cfg.root) if anchors.is_file() else RedactionList()
-        self.sweep = Sweep(tuple(str(a["account_id"]) for a in cfg.fixture.get("accounts") or () if a.get("account_id")),
-                           display_name=cfg.fixture.get("display_name"))
+        ids = tuple(str(a["account_id"]) for a in cfg.fixture.get("accounts") or () if a.get("account_id"))
+        self.sweep = Sweep(ids, display_name=cfg.fixture.get("display_name"))
         self.red_header = Redaction(redaction_version(self.anchors, self.sweep))
         self.redaction_counts = {"base": 0, "candidate": 0}
         self.pair_id: str | None = None                  # 8.3 build_pairs.pair_id, set before begin_run
@@ -422,10 +421,9 @@ class _Run:
         """Redact one checkpoint's pair in memory before anything is diffed or stored (`capture.redact_pair`): the
         simulated OCR reads what synth drew on each side; a capture without a base is redacted against itself."""
         b_cap, b_img = (base, base_img) if base is not None and base_img is not None else (cand, cand_img)
-        res = redact_pair(b_img, cand_img, self.anchors,
-                          {"base": SyntheticOcr.from_screen(b_cap.screen), "candidate": SyntheticOcr.from_screen(cand.screen)},
-                          THEME["bg"], sweep=self.sweep, context=RedactionContext(self.run_id, cp.checkpoint_id, cp.tier),
-                          params=self.params)
+        ocr = {"base": SyntheticOcr.from_screen(b_cap.screen), "candidate": SyntheticOcr.from_screen(cand.screen)}
+        res = redact_pair(b_img, cand_img, self.anchors, ocr, THEME["bg"], sweep=self.sweep,
+                          context=RedactionContext(self.run_id, cp.checkpoint_id, cp.tier), params=self.params)
         if res.terminal is None:
             for side in ("base", "candidate") if base is not None else ("candidate",):
                 self.redaction_counts[side] += int(res.counts.get(side, 0))
@@ -440,11 +438,10 @@ class _Run:
             return False
         fx, fy, fw, fh = m.footprint
         h, w = m.image.shape[:2]
-        res = redact_pair(base.screen.image, m.image, self.anchors,
-                          {"base": SyntheticOcr.from_screen(base.screen),
-                           "candidate": SyntheticOcr([("123456789", RedactRect(fx, fy, fw, fh))], (w, h))},
-                          THEME["bg"], sweep=self.sweep, context=RedactionContext(self.run_id, cp.checkpoint_id, cp.tier),
-                          params=self.params)
+        ocr = {"base": SyntheticOcr.from_screen(base.screen),
+               "candidate": SyntheticOcr([("123456789", RedactRect(fx, fy, fw, fh))], (w, h))}
+        res = redact_pair(base.screen.image, m.image, self.anchors, ocr, THEME["bg"], sweep=self.sweep,
+                          context=RedactionContext(self.run_id, cp.checkpoint_id, cp.tier), params=self.params)
         return res.terminal is None and res.masked(RedactRect(fx, fy, fw, fh)) and \
             any(f.kind == "redaction_miss" for f in res.findings)
 
@@ -1739,9 +1736,9 @@ class _ShardWork:
                 "proof": proof, "login": logins[0] if len(logins) == 1 else logins}
 
     def write_record(self, o: CheckpointOutcome, **kw: Any) -> CheckpointOutcome:
-        """One checkpoint's batch under L-OUT-02 (`Store.write_checkpoint_or_repair`, 4.13): a record the required-fields
-        table refuses gets one repair (`repair_record`); one still refused is written `harness_error (reason:
-        store_write_failed)` with the Watchdog event logged here (`store_refusals`)."""
+        """One checkpoint's batch under L-OUT-02 (`Store.write_checkpoint_or_repair`, 4.13): a record the
+        required-fields table refuses gets one repair (`repair_record`); one still refused is written `harness_error
+        (reason: store_write_failed)` with the Watchdog event logged here (`store_refusals`)."""
         def refused(rec: CheckpointOutcome, errors: list[str]) -> str:
             event = "wd-" + hashlib.sha256(f"{rec.run_id}|{rec.checkpoint_id}|store".encode()).hexdigest()[:8]
             self.store_refusals.append({"watchdog_event": event, "checkpoint_id": rec.checkpoint_id,
@@ -2065,7 +2062,8 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         for c in plan.cuts:
             if c.checkpoint is not None:
                 work.write_record(dataclasses.replace(c.outcome(scenario.run_id), recorded_at=started,
-                                               outcome_id=run.next_outcome_id(), pair_id=run.pair_id, profile_id=PROFILE))
+                                                      outcome_id=run.next_outcome_id(), pair_id=run.pair_id,
+                                                      profile_id=PROFILE))
         verdict = work.verdict()
         stop = work.stop()
         reported = {st.shard_id: rep for st, rep in work.reports}
@@ -2118,10 +2116,10 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                                               started_at=started, ended_at=_ts(today, scenario.clock, int(wall))),
                                    summary=summary)
         held = activity_quarantined(open_quarantines(store), "report_publication")      # 6.9: no report publishes
-        if secret is not None or held is not None:
-            why = (secret.detail or secret.run_reason) if secret is not None else f"report publication quarantined " \
-                f"({held.reason}: {held.detail})" if held is not None else ""
-            result = _withheld(store, plan, scenario, runrec, out, str(why))
+        if secret is not None:
+            result = _withheld(store, plan, scenario, runrec, out, str(secret.detail or secret.run_reason))
+        elif held is not None:
+            result = _withheld(store, plan, scenario, runrec, out, f"report publication quarantined ({held.reason})")
         else:
             result = _report(store, plan, scenario, runrec, mdoc, out, cfg.root)
         result.reviewer_calls = calls

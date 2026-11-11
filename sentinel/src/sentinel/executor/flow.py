@@ -203,8 +203,8 @@ class WorkspaceStreak:
         self.marked[workspace_id] = outcome
         return ControlResult("census_workspace", False, "running",
                              outcomes=(SubsetOutcome(f"workspace:{workspace_id}", outcome),), alert=alerts.env_error(),
-                             detail=f"{self.limit} consecutive env_error visits in {workspace_id}: its remaining visits "
-                                    "on this shard are env_error without being attempted",
+                             detail=f"{self.limit} consecutive env_error visits in {workspace_id}: its remaining "
+                                    "visits on this shard are env_error without being attempted",
                              evidence={"workspace_id": workspace_id})
 
     def outcome_for(self, workspace_id: str | None) -> Outcome | None:
@@ -271,7 +271,8 @@ class _Unit:
 
     # -- bookkeeping ----------------------------------------------------------------------------------------------
     def note(self, r: ControlResult | None) -> bool:
-        """Keep a run-level consequence; True when it stops the run (or the tree is gone)."""
+        """Keep a run-level consequence (noting a killed tree, which rules out the flow's teardown); True once the
+        run has stopped."""
         if r is None:
             return self.stopped
         self.consequences.append(r)

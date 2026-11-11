@@ -80,8 +80,7 @@ from ..gateway.drainer import TokenNote
 from ..gateway.segment import record_for
 from ..orchestrator.budgets import ShardBudgets
 from ..orchestrator.clock import Clock
-from ..orchestrator.gateway import (Action, DropLedger, Flag, GatewayDrop, HookDecision, InputEvent, agent_flag_abort,
-                                    drain, refusal)
+from ..orchestrator.gateway import Action, DropLedger, Flag, GatewayDrop, HookDecision, agent_flag_abort, drain, refusal
 from ..orchestrator.ports import Frame, LocateResult, Locator, PrimitivePlanner, WindowInfo
 from ..orchestrator.results import ControlResult, FindingSpec, Outcome, SubsetOutcome, step_failed
 from ..orchestrator.rig import EmitResult
@@ -149,8 +148,8 @@ class Rescue:
 
 
 class AgentRescue(Protocol):
-    """The agent rung (5.5, 5.6): an agent session with the dismiss-free toolset and the goal "click the control
-    named X in window W", within the per-run rescue cap."""
+    """The agent rung (5.5, 5.6): an agent session with the 5.6 toolset and the goal "click the control named X in
+    window W", within the rescue cap (25 actions, 90 s) and the per-run cap of rescued steps."""
 
     def available(self) -> bool:
         """The per-run rescue cap is not spent."""

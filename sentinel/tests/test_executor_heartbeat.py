@@ -37,7 +37,8 @@ class Failing(HeartbeatWriter):
 def policy(tmp_path, clock=None, writer_cls=Recording, **kw):
     clock = clock or ManualClock()
     w = writer_cls(tmp_path / "heartbeat.json", clock)
-    return HeartbeatPolicy(w, clock, run_id="pr-1-1", shard=2, orchestrator_pid=4412, hook_host_pid=4420, **kw), w, clock
+    p = HeartbeatPolicy(w, clock, run_id="pr-1-1", shard=2, orchestrator_pid=4412, hook_host_pid=4420, **kw)
+    return p, w, clock
 
 
 def test_a_step_writes_at_its_start_and_its_end(tmp_path):

@@ -191,8 +191,8 @@ def test_faults_fire_at_their_site_and_key_the_planned_number_of_times():
 
 
 def test_guard_maps_an_injected_fault_and_passes_values_through():
-    inj = faults_from([("store_write", CP1, ""), ("redaction_missing", CP2, ""), ("exception:capture", None, "KeyError"),
-                       ("artifact_persist", "s9", "enospc")])
+    inj = faults_from([("store_write", CP1, ""), ("redaction_missing", CP2, ""),
+                       ("exception:capture", None, "KeyError"), ("artifact_persist", "s9", "enospc")])
     assert guard(lambda: 7, step_id="s1", site="evaluate", faults=inj) == (7, None)
     _, r = guard(lambda: 7, step_id="s06", checkpoint_id=CP1, site="store_write", faults=inj)
     assert r.run_reason == "store_write_failed"

@@ -85,9 +85,10 @@ def test_a_pr_run_past_35_minutes_ends_aborted_budget_wall_clock_at_the_next_flo
 def test_sixty_orders_staged_in_an_hour_end_the_run_rate_cap_and_notify_the_system_owner():
     def work(orch: Orchestrator) -> None:
         now = orch.clock.now()
-        for i in range(59):
+        for i in range(58):                                            # 58, plus A9's drill ticket at the gate
             orch.counters.order_staged(now - timedelta(minutes=50) + timedelta(seconds=i))
         orch.counters.order_staged(now - timedelta(hours=2))          # outside the hour
+        assert orch.counters.counts(now)["orders_staged_per_hour"] == 59
         assert orch.flow_boundary(flow_id="flow.a") is None
         record(orch, SCOPE[0])
         orch.counters.order_staged(orch.clock.now())
@@ -318,13 +319,16 @@ def test_the_two_minute_timer_defers_under_a_modal_and_a_deferral_past_five_minu
 def test_an_order_stage_step_and_a_session_dialog_are_asserted_at_once_and_reads_are_counted():
     def work(orch: Orchestrator) -> None:
         assert orch.flow_boundary(flow_id="flow.a") is None
+        assert len(orch.counters.orders_staged) == 1                            # A9's drill ticket at the gate
         assert orch.step_boundary(order_stage_step=True) is None
+        assert len(orch.counters.orders_staged) == 2                            # the order-stage step about to run
         assert orch.step_boundary(session_dialog=True) is None
         assert orch.step_boundary() is None                                      # timer not due: no read
         record(orch, *SCOPE)
-    report, rig, _, _ = run(work)
+    report, rig, _, orch = run(work)
     passed = [r for r in results(report, "paper_mode") if r.passed]
     assert len(passed) == rig.calls.count("read_account_selector") == 4         # gate, flow, order stage, dialog
+    assert len(orch.counters.orders_staged) == 2
 
 
 def test_an_unreadable_first_read_at_a_boundary_rereads_under_deny_all_then_rearms():

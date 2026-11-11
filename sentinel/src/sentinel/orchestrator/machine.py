@@ -92,7 +92,7 @@ from .killswitch import (ORDERS_SENT, KillSwitchReport, Proof, ProofInputs, canc
 from .alerts import AlertRoute
 from .ports import SessionSafety
 from .results import ControlResult, OutcomeSink, RunVerdict, write_unreached
-from .rig import OrderBook, Rig, SelectorRead
+from .rig import ConfirmationCheck, OrderBook, Rig, SelectorRead
 from .watchdog import (Heartbeat, HeartbeatUnwritable, HeartbeatWriter, disk_check, heartbeat_failed,
                        proactive_relaunch_due, watchdog_check)
 
@@ -407,12 +407,12 @@ class Orchestrator:
             seconds = {i: rig.read_setting(i) for i in bad}
         reads = {i: RowReads(firsts[i], seconds.get(i)) for i in SAFETY_ROWS}
         all_match = all(readable(r.last, ctx.profile) and matches(r.last, ctx.profile) for r in reads.values())
-        checks = []
+        checks: list[ConfirmationCheck] = []
         if all_match:
             self._set_safety(replace(self.safety, attestation_stage="a3_a8"))    # SD-57: the A9 click may run
-            checks.append(rig.confirmation_check())
-            if ctx.profile.a9_runs == 2 and a9_passed(checks[0]):
-                checks.append(rig.confirmation_check())                         # 6.13 item 3: A9 runs twice
+            while len(checks) < ctx.profile.a9_runs and (not checks or a9_passed(checks[-1])):
+                self.counters.order_staged(self.clock.now())   # A9 stages the drill ticket (6.4 rate caps)
+                checks.append(rig.confirmation_check())         # twice when A3 is "absent" (6.13 item 3)
         a9 = checks[0] if checks else None
         a9b = checks[1] if len(checks) > 1 else None
         rc = ctx.run_type == "rc"
@@ -491,10 +491,12 @@ class Orchestrator:
                                                          main_foreground=obs.main_foreground, modal_up=obs.modal_up)
         if due == "now":
             self.assert_paper_mode()
-        elif due == "unreadable":
+        elif due == "unreadable" and last is not None:
             self.rig.set_hook_state(armed=True, deny_all=True)
-            self.apply(deferral_unreadable(deferred_s=now - (last or now) - TIMER_S,
+            self.apply(deferral_unreadable(deferred_s=now - last - TIMER_S,
                                            unreadable_streak=self.ctx.history.identity_unreadable_streak))
+        if order_stage_step and self.stop is None:
+            self.counters.order_staged(self.clock.now())  # the step about to run stages an order (6.4 rate caps)
         return self.stop
 
     def assert_paper_mode(self) -> ControlResult:

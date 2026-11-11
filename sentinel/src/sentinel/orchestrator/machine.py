@@ -25,7 +25,9 @@ Inside `running` the Executor calls, in this order (boundary.py has the check se
 The 6.4 rate caps count through `counters` (budgets.RateCounters): every login attempt the Orchestrator makes (the
 LOGIN flow, a relaunch login, a recovery login), every A9 drill ticket and every order-stage step a `step_boundary`
 lets run count themselves; the caller adds symbol changes (`counters.symbol_change`) and seeds earlier runs'
-events from the store.
+events from the store. The caps are checked at every flow boundary, right before each login, A9 ticket and
+order-stage step (a cap already reached ends the run `aborted_budget (reason: rate_cap)` and the event is not made),
+after a proactive relaunch and once the work returns; the 6.6 recovery logins are never held back.
 
 The session's safety state is a `ports.SessionSafety` (`safety`, pushed to `safety_listener` on every change; the
 caller passes `rig.set_session_safety` there so the slow half reads it): the attestation stage `a3_a8` before the A9
@@ -100,7 +102,8 @@ from . import killflag
 from .attestation import SAFETY_ROWS, AttestationProfile, RowReads, a9_passed, attest, matches, readable
 from .boundary import (BoundaryObservations, DialogTimer, FlowTimer, flow_budget_cut, flow_budget_s, new_order_rows,
                        tripwire_result)
-from .budgets import SESSION_RELEASE_WAIT_S, RateCounters, ReloginBudget, ShardBudgets, WallBudget, run_budget
+from .budgets import (SESSION_RELEASE_WAIT_S, RateCounters, ReloginBudget, ShardBudgets, WallBudget, rate_cap,
+                      run_budget)
 from .clock import Clock, SystemClock
 from .degraded import ModelAvailability, SpendTracker
 from .gateway import Chord, DropLedger
@@ -319,15 +322,29 @@ class Orchestrator:
         return self._finish()
 
     def _end_of_work(self) -> None:
-        """The last check of `running`, once the work returned (6.6 Triggers, killflag choice 5): a human stop request
-        still pending on the kill channels (written after the last boundary, or left in place by fire drill item 5)
-        ends the run `aborted_safety (reason: kill_switch)` like one seen at a boundary."""
+        """The last check of `running`, once the work returned (6.6 Triggers, killflag choice 5; 6.4): a human stop
+        request still pending on the kill channels (written after the last boundary, or left in place by fire drill
+        item 5) ends the run `aborted_safety (reason: kill_switch)` like one seen at a boundary, and a rate cap the
+        last event reached ends it `aborted_budget (reason: rate_cap)`."""
         if self.stop is not None:
             return
         running = self.flow.flow_id if self.flow is not None else self._last_flow
         human = killflag.check(self.kill_flag, self.kill_pipe, gate=self.state, running_flow=running)
         if human is not None:
             self._contain(self.apply(human))
+            return
+        self._rate_cap()
+
+    def _rate_cap(self) -> bool:
+        """6.4: right before an event that counts toward a rate cap (a login, an A9 drill ticket, an order-stage step)
+        and at the end of the work, a cap already reached ends the run `aborted_budget (reason: rate_cap)` and the
+        event is not made; True when it did. The 6.6 recovery logins are never held back, and still count."""
+        if self.stop is not None:
+            return False
+        r = rate_cap(self.counters.counts(self.clock.now()), self.counters.caps)
+        if r is not None:
+            self.apply(r)
+        return r is not None
 
     def _gates(self, start: str = "provisioned") -> bool:
         """The gates from `start` (`provisioned` for the shard, `launched` for a relaunch) to `canary_flow_passed`."""
@@ -357,7 +374,7 @@ class Orchestrator:
         self.launched_mono = self.clock.monotonic()
         self.flows_since_launch = 0
         rig.set_hook_phase("running")
-        if not self._gate("authenticated"):
+        if not self._gate("authenticated") or self._rate_cap():
             return False
         self.counters.login(self.clock.now())
         r = self.apply(check_authenticated(rig.login()))
@@ -458,6 +475,8 @@ class Orchestrator:
         if all_match:
             self._set_safety(replace(self.safety, attestation_stage="a3_a8"))    # SD-57: the A9 click may run
             while len(checks) < ctx.profile.a9_runs and (not checks or a9_passed(checks[-1])):
+                if self._rate_cap():                            # no drill ticket past a reached cap (6.4)
+                    return False
                 self.counters.order_staged(self.clock.now())   # A9 stages the drill ticket (6.4 rate caps)
                 checks.append(rig.confirmation_check())         # twice when A3 is "absent" (6.13 item 3)
         a9 = checks[0] if checks else None
@@ -512,7 +531,7 @@ class Orchestrator:
             return self.stop
         uptime = now - self.launched_mono if self.launched_mono is not None else 0.0
         if proactive_relaunch_due(self.flows_since_launch, uptime, inside_flow=False):
-            if not self.relaunch("proactive"):
+            if not self.relaunch("proactive") or self._rate_cap():     # its login and A9 ticket count too (6.4)
                 return self.stop
             now = self.clock.monotonic()
         if flow_id is not None:
@@ -548,7 +567,7 @@ class Orchestrator:
             self.rig.set_hook_state(armed=True, deny_all=True)
             self.apply(deferral_unreadable(deferred_s=now - last - TIMER_S,
                                            unreadable_streak=self.ctx.history.identity_unreadable_streak))
-        if order_stage_step and self.stop is None:
+        if order_stage_step and self.stop is None and not self._rate_cap():
             self.counters.order_staged(self.clock.now())  # the step about to run stages an order (6.4 rate caps)
         return self.stop
 

@@ -114,6 +114,44 @@ def test_the_runs_own_login_counts_against_forty_logins_a_day():
     assert report.verdict.status == "complete"
 
 
+def test_a_reached_cap_stops_the_login_and_the_a9_ticket_before_they_are_made():
+    """session:3 (a): with 40 logins today the gate makes no 41st login; with 60 staged orders this hour the
+    attestation stages no A9 ticket. Both end the run aborted_budget (rate_cap) at once."""
+    now = ManualClock().now()
+    report, rig, _, orch = run(record, counters=RateCounters(logins=[now - timedelta(minutes=5)] * 40))
+    assert "login" not in rig.calls and len(orch.counters.logins) == 40
+    assert (report.verdict.status, report.verdict.reason) == ("aborted_budget", "rate_cap")
+    assert report.proof.verdict == "PROVEN: no session established"
+    report, rig, _, orch = run(record, counters=RateCounters(orders_staged=[now - timedelta(minutes=5)] * 60))
+    assert "confirmation_check" not in rig.calls and len(orch.counters.orders_staged) == 60
+    assert (report.verdict.status, report.verdict.reason) == ("aborted_budget", "rate_cap")
+
+
+def test_order_stage_steps_inside_a_flow_stop_at_the_cap_and_the_last_event_ends_the_run():
+    """session:3 (b): order-stage steps inside one flow are capped before they run, and a cap the last event of the
+    run reached still ends it aborted_budget (rate_cap), notifying the system owner."""
+    now = ManualClock().now()
+    seen = {}
+
+    def work(orch: Orchestrator) -> None:
+        assert orch.flow_boundary(flow_id="flow.a") is None
+        seen["ran"] = 0
+        for _ in range(20):
+            if orch.step_boundary(order_stage_step=True) is not None:
+                break
+            seen["ran"] += 1
+    report, _, _, orch = run(work, counters=RateCounters(orders_staged=[now - timedelta(minutes=5)] * 50))
+    assert seen["ran"] == 9 and orch.counters.counts(orch.clock.now())["orders_staged_per_hour"] == 60   # 50 + A9 + 9
+    assert (report.verdict.status, report.verdict.reason) == ("aborted_budget", "rate_cap")
+
+    def last(orch: Orchestrator) -> None:
+        assert orch.flow_boundary(flow_id="flow.a") is None and orch.step_boundary(order_stage_step=True) is None
+        record(orch, *SCOPE)
+    report, _, _, _ = run(last, counters=RateCounters(orders_staged=[now - timedelta(minutes=5)] * 58))
+    (cap,) = results(report, "run_budget")
+    assert report.verdict.reason == "rate_cap" and "system_owner" in cap.alert.notified
+
+
 def test_rate_caps_from_the_authorization_document_replace_the_defaults():
     caps = {**RATE_CAPS, "symbol_changes_per_hour": 2}
 

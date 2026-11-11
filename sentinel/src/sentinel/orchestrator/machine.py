@@ -46,7 +46,9 @@ How a run ends, by the result that stopped it:
 - an `aborted_safety` (or any result asking for the kill switch): the 6.6 sequence on the rig, its
   recovery login and the proof (killswitch.execute_kill_switch);
 - a result that killed the tree with a session established (identity unreadable, app or hook budget
-  spent): the recovery login and proof of 6.6 step 5;
+  spent), or a relaunch that killed the session and then stopped at one of its own gates (the session
+  `ended`): the recovery login and proof of 6.6 step 5, except after an authentication error at that relaunch's
+  login, which 6.9 never retries: UNPROVEN `recovery_login_failed` with no second login;
 - the login never authenticated: `PROVEN: no session established` when the gateway issued no session
   token, else the recovery path; a kicked session (at the `authenticated` gate or mid-run, `session_kicked`)
   has its tree killed, waits `session_release_wait` and logs in once more for the proof, UNPROVEN
@@ -122,6 +124,8 @@ from .watchdog import (Heartbeat, HeartbeatUnwritable, HeartbeatWriter, disk_che
 # restart, already charged by the control that asked for the relaunch; nothing for the proactive relaunch
 RELAUNCH_BUDGETS = {"environment_relogin": "relogin_k", "app_failure": "app_relaunch", "hook_host": "hook_host",
                     "proactive": None}
+# login failures 6.9 never retries (lockouts): after one at a relaunch no recovery login is made for the proof
+NEVER_RETRIED = ("authentication_failed", "authentication_challenge")
 
 
 @dataclass(frozen=True)
@@ -626,6 +630,7 @@ class Orchestrator:
                                            "flows_since_launch": self.flows_since_launch}))
         self.rig.set_hook_state(armed=True, deny_all=True)
         self.rig.kill_process_tree()
+        self.session = "ended"                             # until the relaunch's `authenticated` gate passes again
         self.rig.reset_input_state()                       # 7.7: after the kill, before the relaunch
         self._clear_safety()
         self.flow = None
@@ -644,20 +649,26 @@ class Orchestrator:
         kill_switch_path = stop is not None and (stop.run_status == "aborted_safety" or stop.has("kill_switch"))
         sends = rig.declared_sends()                        # the gated branch's declared sends, for every proof (6.7)
         account = account_ref(ctx.allowlist, ctx.fixture_account)
-        if not kill_switch_path and ((stop is not None and stop.has("kill_tree")) or self.session == "kicked"):
+        if not kill_switch_path and ((stop is not None and stop.has("kill_tree")) or self.session in ("kicked",
+                                                                                                       "ended")):
             rig.kill_process_tree()          # a kicked session's tree goes too: the proof's login starts afresh
             rig.reset_input_state()          # as before every relaunch (7.7)
         if kill_switch_path:
             ks = self._kill_switch_sequence(stop, so_far, sends)
             proof = ks.proof
             self.apply(ks.proof_effect)
-        elif self.session == "never" or (self.session == "established" and self.start_book is None
+        elif self.session == "never" or (self.session in ("established", "ended") and self.start_book is None
                                          and rig.gateway_log().tokens_issued == 0):
             tokens = rig.gateway_log().tokens_issued
             proof = post_run_proof(ProofInputs(start=None, end=None, session="never", tokens_issued=tokens))
             self.apply(proof_result(proof, run_so_far=so_far, unproven_streak=streak))
-        elif self.session == "kicked" or (stop is not None and stop.has("kill_tree")):
-            proof, end = self._recovery_proof(kicked=self.session == "kicked", sends=sends)
+        elif self.session in ("kicked", "ended") or (stop is not None and stop.has("kill_tree")):
+            if self.session == "ended" and stop is not None and stop.unreached is not None \
+                    and stop.unreached.reason in NEVER_RETRIED:          # 6.9: no second login after it
+                proof, end = post_run_proof(ProofInputs(start=self.start_book, end=None, recovery_login_ok=False,
+                                                        declared_sends=sends)), None
+            else:
+                proof, end = self._recovery_proof(kicked=self.session == "kicked", sends=sends)
             # the run so far includes a 6.4 mismatch the proof's login applied (the login blocked for it, SD-64)
             self.apply(proof_result(proof, run_so_far=self._run_so_far(), unproven_streak=streak, account=account,
                                     screenshot_sha256=_screenshot(end)))

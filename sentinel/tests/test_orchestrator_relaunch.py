@@ -144,6 +144,41 @@ def test_a_changed_build_at_the_relaunch_is_version_changed_mid_run():
     assert rest(sink, 1) == {("env_error", "version_changed_mid_run", "launched")}
 
 
+RECOVERY = "set_hook_state:True:False:recovery_only"
+
+
+def test_a_relaunch_whose_gates_fail_after_the_kill_proves_through_a_fresh_recovery_login():
+    """session:2: the relaunch killed the session that did the work, then its own gates failed (here the build changed
+    at `launched`). The proof is 6.6 step 5's fresh recovery login, never `teardown` and a Monitor read on an app that
+    never logged in."""
+    seen = {}
+
+    def work(orch: Orchestrator) -> None:
+        orch.sink.record(SCOPE[0], "identical")
+        orch.rig._send()                                   # an order the trip-wires missed, in the killed session
+        seen["calls"] = len(orch.rig.calls)
+        assert not orch.relaunch("app_failure")
+    report, rig, _, _ = run(work, SimScenario(launches=[CLEAN, LaunchObservation(True, "2026.45.0")]))
+    after = rig.calls[seen["calls"]:]
+    assert "teardown" not in after and after.count("login") == 1
+    k = len(after) - 1 - after[::-1].index("kill_process_tree")
+    assert after[k + 1:k + 5] == ["reset_input_state", RECOVERY, "launch", "login"]
+    assert report.proof.verdict == ORDERS_SENT and report.verdict.status == "aborted_safety"
+
+
+def test_a_relaunch_login_that_hits_an_authentication_error_is_never_retried_for_the_proof():
+    """session:2 with 6.9: the relaunch's login failed with an authentication error, which is never retried, so no
+    recovery login follows; the proof is UNPROVEN recovery_login_failed with the hand-over, not a teardown read."""
+    def work(orch: Orchestrator) -> None:
+        orch.sink.record(SCOPE[0], "identical")
+        assert not orch.relaunch("environment_relogin")
+    report, rig, sink, _ = run(work, SimScenario(recovery_login_fails=1))
+    assert rig.calls.count("login") == 2 and "teardown" not in rig.calls
+    assert (report.proof.verdict, report.proof.reason) == ("UNPROVEN", "recovery_login_failed")
+    assert report.gate("teardown").evidence["blocked_reason"] == "recovery_login_failed"
+    assert rest(sink, 1) == {("env_error", "authentication_failed", "authenticated")}
+
+
 def test_relaunch_refuses_an_unknown_cause_and_does_nothing_once_the_run_stopped():
     def work(orch: Orchestrator) -> None:
         with pytest.raises(ValueError):

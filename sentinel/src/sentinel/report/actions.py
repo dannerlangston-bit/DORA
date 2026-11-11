@@ -19,9 +19,17 @@ queue shows it with its 4-business-hour clock (9.12). A confirm writes the decis
 Unexpected with the reason as its triage note.
 
 Config pull requests go through a `ConfigRepo` (the sentinel-config host: read a pull request, merge, close, open).
-Request mask, quarantine and the manifest amendment are outbox jobs (8.3 kinds `mask_pr`, `quarantine_pr`,
-`manifest_pr`) that the outbox worker turns into pull requests; Approve mask merges through the repo directly, and so
-do Promote candidate flow and Accept anchor patch, which have no outbox kind.
+Request mask, quarantine, the manifest amendment, Promote candidate flow and Accept anchor patch are outbox jobs (8.3
+kinds `mask_pr`, `quarantine_pr`, `manifest_pr`, `flow_pr`, `anchor_pr`) that the outbox worker turns into pull
+requests (`report.senders.ConfigPrSender`); Approve mask merges through the repo directly.
+
+Jira (9.9): confirm_bug with a ticket key links the decision to that ticket (`report.jira.link_job`); without one it
+searches the product project for a ticket to link instead (`report.jira.link_candidates`, when the context has a
+Jira client: the offers come back in `ActionResult.offers` and the label collisions go to the run's health,
+`jira_sync.record_collisions`) and queues the product Bug (`report.jira.bug_job`), whose key the outbox's Jira
+sender writes on the decision when it lands (`jira_sync.record`, `Store.fill_ticket_ref`). Mark intended with a
+ticket checks the key against the Jira regex before anything is written and queues the evidence comment
+(`jira_sync.intended_evidence`). Synthetic findings never post.
 
 Choices where the spec is ambiguous or silent (reported to the coordinator):
 - Coordinator decision (9.6, L-DEC-01, L-MSK-01): `request_mask` is a request anyone with report UI access may
@@ -49,8 +57,10 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   tier-2 finding (clause a; the store's L-DEC-06 refuses the row): another flow owner does.
 - "The surface was undeclared" (manifest amendment PR) is a finding with no `manifest_entry` or with category
   `collateral` (3.11: a diff on an undeclared surface).
-- confirm_bug with a ticket key links the open ticket (a `jira_comment` job to it); without one it queues
-  `jira_create`, and `ticket_landed` sets the key on the decision and finding when the job delivers (9.9).
+- confirm_bug with a ticket key links the open ticket (a `jira_comment` job to it, `op: link`); without one it
+  queues the product Bug (`jira_create`, `op: bug`) even when the search offers tickets to link: the person links
+  one by superseding with its key, or the hand link of the Decisions page (`jira_sync.link_ticket`). A Jira that
+  does not answer the search queues the Bug, shown "ticket pending" until it lands (9.9).
 - "Mask requested, PR {n}" is the finding's `triage_note`, written by `mask_pr_opened` when the outbox worker has
   opened the pull request; Approve mask names the pull request and the repo confirms that it carries the decision.
 - Approve mask checks the pull request's lint result and recomputes the panel budget against the head registry
@@ -76,11 +86,12 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Iterable, Mapping, Protocol
 
 from ..canonical import canonical_json, sha256_id
-from ..records import ACTION_VERDICT, DECIDER_ROLES, Decision, OutboxJob, Signature, now
+from ..records import ACTION_VERDICT, DECIDER_ROLES, Decision, Finding, OutboxJob, Signature, now
 from ..store.lifecycle import reconfirm
 from ..store.mirror import MaskBudgetExceeded, link_mask, request_mask_check
 from ..store.store import (SERVICE_IDENTITIES, WAIVER_CATEGORIES, Roster, Store, StoreRefused, decision_int,
                            decision_ref, utc)
+from . import jira, jira_sync
 
 WAIVER_DAYS = 30                    # L-DEC-07, 9.6: a waiver expires at most 30 days out
 MASK_EXPIRY_DAYS = 30               # 9.6: the prefilled mask record expires 30 days out by default
@@ -443,7 +454,7 @@ def authorize(action: str, actor: Actor, target: Target, *, requester: Iterable[
 class PullRequest:
     """A sentinel-config pull request as the Reporter reads it (8.5)."""
     number: int
-    kind: str                                     # mask_pr, manifest_pr, quarantine_pr, flow, anchor_patch
+    kind: str                                     # the outbox kind: mask_pr, manifest_pr, quarantine_pr, flow_pr, anchor_pr
     author: str                                   # the human author (the mask's requester)
     state: str = "open"                           # open | merged | closed
     checks: str = "pending"                       # the lint result: passed | failed | pending
@@ -483,6 +494,8 @@ class ActionContext:
     budgets: Mapping[str, float] | None = None
     rotation: str | None = None                   # this week's triage rotation member (9.12)
     clock: Callable[[], str] = now
+    jira: jira.JiraClient | None = None           # the product-ticket search of confirm_bug (9.9); None: no search
+    report_base: str = "https://sentinel.internal"
 
 
 @dataclass(frozen=True)
@@ -520,6 +533,7 @@ class ActionResult:
     payloads: dict[str, bytes] = field(default_factory=dict)   # payload sha256 id -> canonical JSON bytes
     pr: int | None = None
     note: str | None = None
+    offers: list[str] = field(default_factory=list)            # 9.9: open product tickets confirm_bug may link
 
     def to_dict(self) -> dict:
         d = dataclasses.asdict(self)
@@ -595,22 +609,68 @@ def _need_ticket(req: ActionRequest, clause: str) -> str:
 # ---------------------------------------------------------------------------------------------------------------
 # the finding actions
 
+def _queued(res: ActionResult, q: jira_sync.Queued | None) -> None:
+    """Keep a Jira job `jira_sync` queued: its id and the payload bytes its hash names."""
+    if q is not None:
+        res.jobs.append(q.job_id)
+        res.payloads[q.payload_sha256] = q.payload
+
+
+def _findings_of(store: Store, t: Target) -> list[Finding]:
+    found = store.get_finding(t.finding_id) if t.finding_id else None
+    return [found] if found is not None else []
+
+
+def _build_pair(store: Store, run_id: str | None) -> str:
+    rows = store.query("SELECT p.candidate_build_id, p.base_build_id FROM runs r JOIN build_pairs p ON p.pair_id = "
+                       "r.pair_id WHERE r.run_id = ?", (run_id,)) if run_id else []
+    return f"{rows[0][0]} vs {rows[0][1]}" if rows else "unknown"
+
+
 def _confirm_bug(store: Store, ctx: ActionContext, g: Grant, t: Target, req: ActionRequest, at: str,
-                 res: ActionResult) -> None:
+                 res: ActionResult, *, file_bug: bool = True) -> None:
+    """9.9: link the given ticket, else search for one to offer and queue the product Bug (module docstring); a
+    cluster member (`file_bug` False) leaves the Bug to `_file_bug` for the whole cluster."""
+    if req.ticket and not jira.valid_key(req.ticket):
+        raise ActionRefused("L-MAN-05", f"ticket {req.ticket!r} does not match ^[A-Z][A-Z0-9]+-[0-9]+$")
     d = _decision(store, g, t, req, at, action="confirm_bug", reason=req.reason or "confirmed bug")
     res.decisions.append(d.decision_id)
-    payload = {"action": "confirm_bug", "decision": d.decision_id, "finding": t.finding_id, "run": t.run_id,
-               "checkpoint": t.checkpoint_id, "region": t.region_id, "ticket": req.ticket}
-    with store.batch("action:confirm_bug") as b:
-        if req.ticket:                                            # link to an open ticket (9.9)
-            _job(b, store, res, t.run_id, "jira_comment", req.ticket, payload, at)
-        else:
-            _job(b, store, res, t.run_id, "jira_create", "jira", payload, at)
+    if t.run_id is None:
+        return
+    if req.ticket:                                                 # link to an open ticket (9.9)
+        _queued(res, jira_sync.enqueue(store, jira.link_job(req.ticket, [d], report_base=ctx.report_base, tier=t.tier,
+                                                            linked_by=req.login), run_id=t.run_id, at=at))
+    elif file_bug:
+        _file_bug(store, ctx, t, [d], at, res)
+
+
+def _file_bug(store: Store, ctx: ActionContext, t: Target, decisions: list[Decision], at: str,
+              res: ActionResult) -> None:
+    """The product Bug of confirm_bug decisions, one ticket for a cluster (9.9), after the search for a ticket to
+    offer instead (the offers and the label collisions, module docstring)."""
+    assert t.run_id is not None
+    if ctx.jira is not None and t.checkpoint_id:
+        try:
+            found = jira.link_candidates(ctx.jira, t.checkpoint_id)
+        except jira.JiraUnavailable:
+            found = None                                           # ticket pending until the create lands
+        if found is not None:
+            res.offers = [o.key for o in found.offers]
+            jira_sync.record_collisions(store, t.run_id, t.checkpoint_id, found.collisions)
+    run = store.query("SELECT pr_ref FROM runs WHERE run_id = ?", (t.run_id,))
+    pr = run[0][0] if run else None
+    tc = jira.TicketContext(ctx.report_base, _build_pair(store, t.run_id),
+                            pr=int(str(pr).split()[-1]) if pr and str(pr).split()[-1].isdigit() else None)
+    findings = [f for d in decisions for f in ([store.get_finding(d.finding_ref)] if d.finding_ref else [])
+                if f is not None] or _findings_of(store, t)
+    _queued(res, jira_sync.enqueue(store, jira.bug_job(decisions, findings, tc), run_id=t.run_id, at=at))
 
 
 def _mark_intended(store: Store, ctx: ActionContext, g: Grant, t: Target, req: ActionRequest, at: str,
                    res: ActionResult, *, proposer: str | None = None, confirmed_by: str | None = None) -> None:
     ticket = _need_ticket(req, g.rule.clause)
+    if not jira.valid_key(ticket):                                 # 9.9: the key is checked at once
+        raise ActionRefused("L-MAN-05", f"ticket {ticket!r} does not match ^[A-Z][A-Z0-9]+-[0-9]+$")
     reason = req.reason or "intended"
     if proposer:
         reason = f"proposed by {proposer}: {reason}"
@@ -619,10 +679,10 @@ def _mark_intended(store: Store, ctx: ActionContext, g: Grant, t: Target, req: A
         kw, confirmed_by = {"proposed_by": proposer}, req.login
     d = _decision(store, g, t, req, at, action="mark_intended", reason=reason, confirmed_by=confirmed_by, **kw)
     res.decisions.append(d.decision_id)
+    if t.run_id is not None:                                       # the evidence comment (9.9)
+        _queued(res, jira_sync.intended_evidence(store, d, _findings_of(store, t), run_id=t.run_id,
+                                                 report_base=ctx.report_base, at=at))
     with store.batch("action:mark_intended") as b:
-        _job(b, store, res, t.run_id, "jira_comment", ticket,
-             {"action": "mark_intended", "decision": d.decision_id, "finding": t.finding_id, "run": t.run_id,
-              "evidence": "intended", "ticket": ticket}, at)
         if not t.waiver and (t.manifest_entry is None or t.category == "collateral"):
             surface = t.checkpoint_id.split("/")[1] if t.checkpoint_id and "/" in t.checkpoint_id else None
             _job(b, store, res, t.run_id, "manifest_pr", CONFIG_REPO,
@@ -746,7 +806,7 @@ def _fixed(store: Store, ctx: ActionContext, g: Grant, t: Target, req: ActionReq
 def _config_pr(store: Store, ctx: ActionContext, g: Grant, t: Target, req: ActionRequest, at: str,
                res: ActionResult) -> None:
     """Quarantine and un-quarantine: a quarantine record PR job (10.5); Promote candidate flow and Accept anchor
-    patch: a pull request opened through the repo (they have no outbox kind)."""
+    patch: a `flow_pr` or `anchor_pr` job with the pull request's files (9.6), opened by the outbox worker."""
     reason = _need_reason(req, g.rule.clause)
     if g.action in ("quarantine", "unquarantine"):
         with store.batch(f"action:{g.action}") as b:
@@ -754,13 +814,13 @@ def _config_pr(store: Store, ctx: ActionContext, g: Grant, t: Target, req: Actio
                  {"action": g.action, "checkpoint": t.checkpoint_id, "finding": t.finding_id, "reason": reason,
                   "owner": req.login, "ticket": req.ticket, "at": at}, at)
         return
-    if ctx.repo is None:
-        raise ActionRefused(g.rule.clause, "the sentinel-config repository is not reachable; nothing was opened")
     if not req.files:
         raise ActionRefused(g.rule.clause, "the pull request needs its files")
-    kind = "flow" if g.action == "promote_flow" else "anchor_patch"
-    res.pr = ctx.repo.open(kind, title=f"{g.rule.row}: {t.checkpoint_id or t.finding_id}", author=req.login,
-                           body=f"{reason}\n\nfinding {t.finding_id}, run {t.run_id}", files=dict(req.files))
+    kind = "flow_pr" if g.action == "promote_flow" else "anchor_pr"
+    with store.batch(f"action:{g.action}") as b:
+        _job(b, store, res, t.run_id, kind, CONFIG_REPO,
+             {"action": g.action, "checkpoint": t.checkpoint_id, "finding": t.finding_id, "run": t.run_id,
+              "reason": reason, "author": req.login, "files": dict(req.files), "at": at}, at)
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -842,11 +902,6 @@ def mask_pr_opened(store: Store, decision_id: str, pr: int) -> None:
         raise ActionRefused("9.6 Request mask", f"{decision_id} is not a request_mask decision")
     with store.batch("mask_pr_opened") as b:
         _note(b, store, rows[0]["source_finding_id"], triage_note=f"mask requested, PR {pr}")
-
-
-def ticket_landed(store: Store, payload: Mapping[str, Any], key: str) -> Decision:
-    """A `jira_create` job of confirm_bug delivered: the ticket key goes on the decision and its finding (9.9)."""
-    return store.fill_ticket_ref(str(payload["decision"]), key)
 
 
 def _confirm_proposal(store: Store, ctx: ActionContext, g: Grant, t: Target, req: ActionRequest, at: str,
@@ -967,23 +1022,29 @@ def target_of(store: Store, action: str, req: ActionRequest) -> tuple[Target, An
     return finding_target(store, req.finding), None
 
 
-def apply(action: str, store: Store, ctx: ActionContext, req: ActionRequest) -> ActionResult:
+def apply(action: str, store: Store, ctx: ActionContext, req: ActionRequest, *, _bug: bool = True) -> ActionResult:
     """Authorize `req` against the 9.6 table and perform `action` through the store's writer (9.6 Writes column).
 
     Raises `ActionRefused` (the clause), `MaskBudgetExceeded` (L-DEC-04 with the share, budget and the mask's
     share), `ActiveDecisionExists` (9.7) or another `StoreRefused` from the store's own constraints; nothing is
     written on a refusal before the first write. With `req.cluster` a finding action applies to every open member
-    of the finding's cluster in its run (9.5), each with its own decision row carrying the cluster id (9.7)."""
+    of the finding's cluster in its run (9.5), each with its own decision row carrying the cluster id (9.7); a
+    cluster's confirm_bug without a ticket files one product Bug for all of them (9.9)."""
     t, row = target_of(store, action, req)
     if req.cluster and t.cluster_id and action in ("confirm_bug", "mark_intended", "noise_signature"):
         members = store.query("SELECT natural_key FROM findings WHERE run_id = ? AND cluster_id = ? AND "
                               "triage_state = 'open' AND synthetic = 0 ORDER BY natural_key", (t.run_id, t.cluster_id))
+        one_bug = action == "confirm_bug" and not req.ticket
         out = ActionResult(action)
         for m in members:
-            one = apply(action, store, ctx, dataclasses.replace(req, finding=m["natural_key"], cluster=False))
+            one = apply(action, store, ctx, dataclasses.replace(req, finding=m["natural_key"], cluster=False),
+                        _bug=not one_bug)
             out.decisions += one.decisions
             out.jobs += one.jobs
             out.payloads.update(one.payloads)
+        if one_bug and out.decisions and t.run_id is not None:
+            made = [d for d in (store.get_decision(x) for x in out.decisions) if d is not None]
+            _file_bug(store, ctx, t, made, _ts(ctx, req), out)
         return out
     actor = Actor(req.login, ctx.directory, req.source)
     requester: tuple[str, ...] = ()
@@ -1015,7 +1076,7 @@ def apply(action: str, store: Store, ctx: ActionContext, req: ActionRequest) -> 
     if name == DISPOSITION_RULE:
         _disposition(store, ctx, grant, t, req, at, res, action)
     elif name == "confirm_bug":
-        _confirm_bug(store, ctx, grant, t, req, at, res)
+        _confirm_bug(store, ctx, grant, t, req, at, res, file_bug=_bug)
     elif name == "mark_intended":
         _mark_intended(store, ctx, grant, t, req, at, res)
     elif name == "waive":
@@ -1111,5 +1172,5 @@ __all__ = [
     "ActionContext", "ActionRefused", "ActionRequest", "ActionResult", "Actor", "ConfigRepo", "Grant",
     "PullRequest", "RULES", "RoleDirectory", "Rule", "Target", "apply", "authorize", "check_table", "confirm",
     "decision_target", "decline", "finding_target", "mask_pr_opened", "open_proposals", "propose", "rule_for",
-    "run_authors", "run_target", "table", "target_of", "ticket_landed",
+    "run_authors", "run_target", "table", "target_of",
 ]

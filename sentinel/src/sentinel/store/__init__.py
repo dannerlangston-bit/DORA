@@ -4,7 +4,8 @@ from .artifacts import (ArtifactCorrupt, ArtifactError, ArtifactHashMismatch, Ar
                         StoredArtifact, TextScanner)
 from .store import (SYSTEM_STATE_KEYS, ActiveDecisionExists, DecisionLookup, DecisionMatch, ImportConflict,
                     PaperAssertionMissing, PostRunProof, RecordIncomplete, Review, RunNotComplete, RunPlan, ScopeEntry,
-                    SessionContext, ShardPlan, Store, StoreError, StoreRefused, StoreWriteFailed, SweepResult,
+                    SessionContext, ShardPlan, Store, StoreError, StoreRefused, StoreWriteFailed, ExportResult,
+                    ReplayResult, ShardRows, StoreIntegrityError,
                     WriteBatch, WriterLockError, apply_inheritance, connect_reader, hamming, lookup_decisions,
                     render_schema, seed_rows)
 
@@ -14,7 +15,8 @@ __all__ = [
     "StoredArtifact", "TextScanner",
     "SYSTEM_STATE_KEYS", "ActiveDecisionExists", "DecisionLookup", "DecisionMatch", "ImportConflict",
     "PaperAssertionMissing", "PostRunProof", "RecordIncomplete", "Review", "RunNotComplete", "RunPlan", "ScopeEntry",
-    "SessionContext", "ShardPlan", "Store", "StoreError", "StoreRefused", "StoreWriteFailed", "SweepResult",
+    "SessionContext", "ShardPlan", "Store", "StoreError", "StoreRefused", "StoreWriteFailed", "ExportResult",
+    "ReplayResult", "ShardRows", "StoreIntegrityError",
     "WriteBatch", "WriterLockError", "apply_inheritance", "connect_reader", "hamming", "lookup_decisions",
     "render_schema", "seed_rows",
 ]

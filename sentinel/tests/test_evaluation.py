@@ -111,20 +111,19 @@ def test_surface_must_see_landmarks_are_anchors(tmp_path):
     entry = surface(landmarks=[
         {"id": "lm.positions", "template": "registry/templates/positions.png", "must_see": True},
         {"id": "lm.decor", "template": "registry/templates/absent.png", "must_see": False},    # never read
-        {"id": "lm.watchlist", "template": "registry/templates/absent.png", "must_see": True},  # the regions file's
     ])
     cfg = config(tmp_path, [entry])
     no_positions = copy.deepcopy(LAYOUT)
     synth.node(no_positions, "positions")["title"] = ""
     erased = synth.render(no_positions, SIZE).image
     spec = settle_spec_for(cfg, checkpoint(), regfile=regfile())
-    assert [a.name for a in spec.anchors] == ["lm.watchlist", "lm.positions"]
+    assert [a.name for a in spec.anchors] == ["lm.positions"]          # the regions file's landmark is no anchor
     assert settle(frames([IMG] * 4), spec).settled
     res = settle(frames([erased] * 4), spec)
     assert res.reason == "anchor_missing" and "lm.positions" in res.detail
     # a resolver that cannot show the template (the simulation) leaves that anchor out
     sim = settle_spec_for(cfg, checkpoint(), regfile=regfile(), template=lambda lm_id, p: None)
-    assert [a.name for a in sim.anchors] == ["lm.watchlist"] and settle(frames([erased] * 4), sim).settled
+    assert sim.anchors == [] and settle(frames([erased] * 4), sim).settled
     with pytest.raises(ValueError, match="not readable"):
         settle_spec_for(config(tmp_path, [surface(landmarks=[{"id": "lm.x", "template": "nope.png",
                                                               "must_see": True}])]), checkpoint())
@@ -413,3 +412,28 @@ def test_a_missing_landmark_refuses_every_panel_after_the_hash_short_circuit():
     assert same.terminal is None and same.level == "zero"
     c = classify(Facts(landmark=Condition(res.terminal.reason, side=res.terminal.side)))
     assert (c.outcome, c.reason) == ("landmark_missing", "landmark:lm.positions")
+
+
+def test_a_regions_file_landmark_missing_on_either_side_settles_and_reaches_the_diff(tmp_path):
+    # capture-eval:0, SD-37, 4.5, 5.7 Inputs: settle's must-see anchors are the registry landmarks with
+    # `must_see: true`; the regions file gives settle only its masks. A regions-file landmark missing on a build is
+    # 3.7's landmark_missing (landmark:<id>) with the side (the PR comment's Unexpected list), not not_settled.
+    wx, wy, _, _ = SCREEN.get("watchlist.title.label").bbox
+    px, py, _, _ = SCREEN.get("positions.title.label").bbox
+    clock = Region("rgn.title.clock", "mask", "lm.watchlist", Rect(CLOCK.x - wx + 2, CLOCK.y - wy + 2, 70, 16))
+    reg = RegionsFile("census/gadget.one/" + WS, [
+        Landmark("lm.watchlist", SCREEN.crop("watchlist.title.label", 2), expected=(wx - 2, wy - 2)),
+        Landmark("lm.positions", SCREEN.crop("positions.title.label", 2), confidence_min=0.5,
+                 expected=(px - 2, py - 2))],
+        [clock, Region("rgn.positions.grid", "diff", "lm.positions", Rect(0, 20, 300, 140))])
+    cfg = config(tmp_path, [surface()])                                     # no must_see registry landmark
+    spec = settle_spec_for(cfg, checkpoint(), regfile=reg)
+    assert spec.anchors == [] and list(spec.ignore) == [CLOCK]              # the masks still come from the file
+    no_positions = copy.deepcopy(LAYOUT)
+    synth.node(no_positions, "positions")["title"] = ""
+    cand = synth.render(no_positions, SIZE).image
+    assert settle(frames([cand] * 4), spec).settled and settle(frames([IMG] * 4), spec).settled
+    for base, candidate, side in ((IMG, cand, "candidate"), (cand, IMG, "base")):
+        res = diff_pair(base, candidate, reg, context=DiffContext("run-1", reg.checkpoint_id, 1))
+        assert (res.terminal.outcome, res.terminal.reason, res.terminal.side) == (
+            "landmark_missing", "landmark:lm.positions", side)

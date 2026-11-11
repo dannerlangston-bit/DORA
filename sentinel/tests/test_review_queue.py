@@ -157,9 +157,20 @@ def test_more_than_two_percent_above_floor_is_aa_drift_global():
 
 
 def test_the_prepass_alone_trips_aa_drift_global():
-    n = nightly_global_shift(pairs(pair("glyphs", 100, 95, source="uncalibrated")))
-    assert n.drift.global_drift is None and n.prepass.raised
+    lost = [pair(f"lost.s{i:02d}", terminal=Terminal("landmark_missing", "landmark:lm.x", side="candidate"))
+            for i in range(25)]                                # in aa_drift's denominator, not in the pre-pass's
+    n = nightly_global_shift(pairs(pair("glyphs", 100, 95), *lost))
+    assert n.drift.global_drift is None and n.drift.above_floor_fraction == pytest.approx(1 / 50) and n.prepass.raised
     assert n.terminal.reason == "aa_drift_global" and len(n.applies_to) == 25
+
+
+def test_uncalibrated_changes_never_trip_the_nightly_global_rule():
+    """10.6 (review pipeline-nightly:1): with no floor a changed A/A pair stays needs_human (uncalibrated); text-edge
+    changes on 3 of 27 uncalibrated pairs trip neither the 2 percent rule nor the pre-pass."""
+    glyphs = [pair(f"glyphs.s{i}", 100, 95, source="uncalibrated") for i in range(3)]
+    n = nightly_global_shift(pairs(*glyphs))
+    assert n.terminal is None and n.applies_to == () and not n.prepass.raised and n.prepass.evaluated
+    assert n.prepass.fraction_above_floor == 0.0 and n.drift.above_floor_fraction == 0.0
 
 
 def test_a_quiet_night_and_synthetic_pairs_trip_nothing():

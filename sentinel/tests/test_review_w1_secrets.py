@@ -52,10 +52,13 @@ def test_secrets_0_a_run_without_an_allowlist_refuses_and_logs_every_reviewer_re
     assert gates and gates[0] is not None and r.reviewer_calls
     assert sent == []                                           # nothing reached the network
     db = sqlite3.connect(tmp_path / "out" / "sentinel.db")
-    rows = db.execute("SELECT destination, status, refusal_reason FROM egress_log WHERE run_id = ?",
-                      (sc.run_id,)).fetchall()
+    rows = db.execute("SELECT destination, status, refusal_reason FROM egress_log WHERE run_id = ? AND purpose <> "
+                      "'pr_comment'", (sc.run_id,)).fetchall()
     assert rows and {(d, s) for d, s, _ in rows} == {("api.anthropic.com", "refused")}
     assert all("not allowlisted" in why for _, _, why in rows)
+    posts = db.execute("SELECT destination, status FROM egress_log WHERE run_id = ? AND purpose = 'pr_comment'",
+                       (sc.run_id,)).fetchall()
+    assert set(posts) == {("scm.example.internal", "refused")}   # the run's PR posts (9.1) are refused as well
     with Store(tmp_path / "out" / "sentinel.db") as store:
         refused = [(f.kind, f.severity) for f in store.findings(sc.run_id) if f.detail == "egress_refused"]
     assert refused == [("harness_error", "S3")]
@@ -105,7 +108,8 @@ def test_secrets_1_review_live_sends_through_the_runs_gate_and_logs_each_request
     out = tmp_path / "review-clean-pr"
     run_id = clean_scenario(TODAY).run_id
     db = sqlite3.connect(out / "sentinel.db")
-    rows = db.execute("SELECT run_id, checkpoint_id, destination, status, redaction_version FROM egress_log").fetchall()
+    rows = db.execute("SELECT run_id, checkpoint_id, destination, status, redaction_version FROM egress_log "
+                      "WHERE purpose <> 'pr_comment'").fetchall()      # the run's PR posts (9.1) go to the SCM host
     assert rows and {(r[0], r[2], r[3]) for r in rows} == {(run_id, "exfil.attacker.example", "refused")}
     assert all(r[1] and r[4] for r in rows)                    # the item's checkpoint and redaction version
     with Store(out / "sentinel.db") as store:
@@ -352,8 +356,11 @@ def test_secrets_6_the_rendered_report_is_scanned_before_it_is_published(tmp_pat
     """6.9: the rendered report files are scanned too; text that only they hold (here a renderer that adds it) is
     withheld: the comment and report page are removed and the summary records the scan."""
     import sentinel.pipeline.run as pr
+    import sentinel.report.prhost as ph
     real = pr.render_report_markdown
-    monkeypatch.setattr(pr, "render_report_markdown", lambda rep: real(rep) + f"\n{pr.SIM_SECRET}\n")
+    leaky = lambda rep: real(rep) + f"\n{pr.SIM_SECRET}\n"           # noqa: E731
+    monkeypatch.setattr(pr, "render_report_markdown", leaky)
+    monkeypatch.setattr(ph, "render_report_markdown", leaky)         # a PR run's comment is rendered by post_report
     sc = clean_scenario(TODAY)
     r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
     assert not (tmp_path / "pr-comment.md").exists() and not (tmp_path / "report.html").exists()

@@ -22,9 +22,9 @@ Choices where the spec is ambiguous (each is reported to the coordinator):
    no-manifest, non-UI case (b) the plan adds the tier-1 flows of class `standard` whose surfaces
    meet the smoke subset, so a backend change that moves values is still checked. No longer a
    choice since the spec states it; the number stays for the references to it.
-2. PR census workspaces (2.11, 1.11). The pseudocode visits the canonical workspace only; 1.11
-   visits the declared chart cell in both its tier A workspaces. Declared surfaces are visited in
-   every workspace of `census.workspaces`; every other surface in the canonical one only.
+2. PR census workspaces (2.11 `census_items`, SD-12, 1.11). Every change surface (declared,
+   map-expanded or static) is visited in every workspace of `census.workspaces`; a smoke surface
+   outside the change scope in the canonical one only. No longer a choice since the spec states it.
 3. Global surfaces (2.4 "tabs, sub-tabs, Setup entries, settings pages, and dialogs"): kinds `tab`,
    `subtab`, `menu`, `settings_page` and `dialog`. Hosting is `gadgets_present` of the workspace or
    the workspace being listed in the surface's `census.workspaces`.
@@ -1155,11 +1155,29 @@ def _common_filters(items: list[PlanItem], ctx: _Ctx, flows: Mapping[str, Flow],
     return kept, cuts
 
 
-def _run_order(it: PlanItem) -> tuple:
+LADDER_KINDS = ("sweep", "split")
+
+
+def _sorted_run_order(items: Iterable[PlanItem]) -> list[PlanItem]:
     """2.11 `order_and_cut` sort (SD-14): tier ascending, declared surfaces first within a tier, kind (flows, sweeps,
-    census), census grouped by workspace, estimated duration descending, then planning order."""
-    ws = it.checkpoints[0].workspace_id if it.kind == "census" and it.checkpoints else ""
-    return (it.tier, not it.declared, KIND_ORDER[it.kind], ws, -it.estimated_s, it.order)
+    census), census grouped by workspace, estimated duration descending, then planning order.
+
+    A sweep or split ladder (one shard key, choice 6) is ordered as one unit by its total estimated duration and
+    keeps its steps in planning order, which is ladder order (2.5.2: descending, corners, corpus sizes, then the
+    `-asc` pass, SD-04): per-step p50s (SD-03) never reorder a ladder's steps or interleave two ladders (2.5.1)."""
+    items = list(items)
+    total: dict[str, float] = {}
+    for it in items:
+        if it.kind in LADDER_KINDS:
+            total[it.shard_key] = total.get(it.shard_key, 0.0) + it.estimated_s
+
+    def key(it: PlanItem) -> tuple:
+        ws = it.checkpoints[0].workspace_id if it.kind == "census" and it.checkpoints else ""
+        if it.kind in LADDER_KINDS:
+            return (it.tier, not it.declared, KIND_ORDER[it.kind], ws, -total[it.shard_key], it.shard_key, it.order)
+        return (it.tier, not it.declared, KIND_ORDER[it.kind], ws, -it.estimated_s, "", it.order)
+
+    return sorted(items, key=key)
 
 
 @dataclass
@@ -1188,7 +1206,7 @@ def _order_and_cut(items: list[PlanItem], rigs: Sequence[Rig], soak_rig: Rig | N
         raise ScopeConfigError("a run needs at least one rig for scripted work besides the soak and Explorer rigs")
     pool_ids = {r.id for r in pool}
     fingerprint = {r.id: r.fingerprint_id for r in pool}
-    items = sorted(items, key=_run_order)
+    items = _sorted_run_order(items)
     soak = [it for it in items if it.kind == "soak"]
     if soak and soak_rig is None:
         raise ScopeConfigError("soak cycles need the soak rig (1.9)")
@@ -1388,7 +1406,8 @@ def compute_scope(run_type: str, manifest: Manifest | None, dep_map: DependencyM
             if s.census_enabled:
                 if not s.census_workspaces:
                     raise ScopeConfigError(f"{s.id} has census enabled and no workspaces (L-SRF-10)")
-                items += _census_items(ctx, s, s.census_workspaces if s.id in declared else s.census_workspaces[:1])
+                visit = s.census_workspaces if s.id in scope_surfaces else s.census_workspaces[:1]   # choice 2
+                items += _census_items(ctx, s, visit)
             if s.id in scope_surfaces:
                 items += _sweep_items(ctx, s)
         touched = impact.touched_primitives
@@ -1504,7 +1523,7 @@ def plan_nightly(registry: Registry, day: date, rigs: Sequence[Rig], *, workspac
         chosen = [it for it in candidates if any(cp.tier == 1 for cp in it.checkpoints)
                   or stable_hash(_rotation_key(it)) % NIGHTLY_ROTATION == slot]
         items, cuts = _common_filters(chosen, ctx, flow_map, frozenset(entitlements), frozenset(quarantine))
-        items = sorted(items, key=_run_order)
+        items = _sorted_run_order(items)
     layout = shard_plan(items, rigs, None, startups, mode="aa", passes=NIGHTLY_PASSES, seed_s={canary: rig5})
     load = {r.id: layout.load_s(r.id) + (rig5 if r.id == canary else 0.0) for r in rigs}
     if not items:                                  # rig 5 still opens its session for the canaries (11.2)
@@ -1572,7 +1591,7 @@ def plan_calibration(scope: ScopePlan | Iterable[PlanItem], rigs: Sequence[Rig],
         start_deadline = datetime.combine(day + timedelta(days=1), WEEKEND_START_DEADLINE)
     if not rigs:
         raise ScopeConfigError("a Calibration run needs pool rigs (11.2: rigs 1 to 4)")
-    layout = shard_plan(sorted(work, key=_run_order), rigs, durations, startups, mode="aa", passes=passes[0])
+    layout = shard_plan(_sorted_run_order(work), rigs, durations, startups, mode="aa", passes=passes[0])
     loads: dict[str, tuple[float, ...]] = {}
     for r in rigs:
         cost = layout.cost(r.id)
@@ -1580,7 +1599,7 @@ def plan_calibration(scope: ScopePlan | Iterable[PlanItem], rigs: Sequence[Rig],
         nights = [cost.total_s] + [per_pass * n + (startups.per_session_s + cost.switch_s if cost.sessions else 0.0)
                                    for n in passes[1:]]
         loads[r.id] = tuple(nights)
-    kept = sorted(work, key=_run_order)
+    kept = _sorted_run_order(work)
     return CalibrationPlan(kind, kept, {r.id: [it for it in kept if r.id in it.rigs] for r in rigs}, passes, loads,
                            starts, deadline, start_deadline, left, layout.shards())
 

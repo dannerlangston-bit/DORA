@@ -147,6 +147,58 @@ def test_order_defaults_quantity_above_the_fixture_size_aborts():
     assert port.calls == []
 
 
+@dataclass
+class FirstReadsUnreadable(FakePort):
+    """OCR misses the equity quantity on the first `misses` reads of that page (popups-gates:4)."""
+
+    misses: int = 1
+    seen: int = 0
+
+    def read_page(self, page: str) -> dict[str, Any]:
+        out = dict(self.pages[page])
+        if page == "order_defaults.equity":
+            self.seen += 1
+            if self.seen <= self.misses:
+                out["quantity"] = None
+        return out
+
+
+def test_an_order_defaults_quantity_above_the_fixture_size_aborts_on_every_read():
+    # popups-gates:4, 7.5 Order Defaults row and 7.6 stage 1 step 1: the safety row is read before anything is
+    # corrected; an unreadable first read is read once more, never corrected blind, and a later read above the
+    # fixture size is the abort, not drift.
+    late = FirstReadsUnreadable()
+    late.pages["order_defaults.equity"]["quantity"] = 500
+    late.pages["application_settings"]["display_time_zone"] = "UTC"
+    r = run_stage1(late, FIXTURE, PROFILE)
+    assert r.result is not None and r.result.run_reason == "attestation_mismatch" and not r.profile_drift
+    assert "quantity 500 above the fixture size 100" in r.result.detail and late.calls == []
+    # the re-read after a correction is checked too: a control that does not take and shows above is the abort
+    after = FakePort(sticky={"order_defaults.equity.tif"})
+    after.pages["order_defaults.equity"]["tif"] = "GTC"
+    after.read_page = lambda page, _orig=after.read_page: (
+        {**_orig(page), "quantity": 500} if page == "order_defaults.equity" and after.calls else _orig(page))
+    hit = run_stage1(after, FIXTURE, PROFILE)
+    assert hit.result is not None and hit.result.run_reason == "attestation_mismatch"
+    assert "quantity 500 above the fixture size 100" in hit.result.detail
+    # OCR text that reads as a number is a number
+    text = FakePort()
+    text.pages["order_defaults.equity"]["quantity"] = "500"
+    assert run_stage1(text, FIXTURE, PROFILE).result.run_reason == "attestation_mismatch" and text.calls == []
+
+
+def test_an_order_defaults_quantity_unreadable_twice_is_never_written():
+    # popups-gates:4: the quantity is the control 7.5 makes a safety row; unreadable on both reads it is not set by a
+    # scripted click (that would hide a changed value) but stays wrong: fixture_drift for the shard.
+    blind = FirstReadsUnreadable(misses=2)
+    r = run_stage1(blind, FIXTURE, PROFILE)
+    assert r.result is None and r.profile_drift and "apply order_defaults.equity.quantity" not in blind.calls
+    assert r.drift == ("order_defaults.equity.quantity unreadable on two reads, never corrected blind",)
+    once = FirstReadsUnreadable(misses=1)                    # the second read shows 100: nothing to correct
+    clean = run_stage1(once, FIXTURE, PROFILE)
+    assert clean.result is None and not clean.profile_drift and once.changes == []
+
+
 def test_one_correction_pass_then_drift():
     # 7.6 stage 1 step 2: one correction pass; still wrong is fixture_drift for the shard.
     port = FakePort()

@@ -7,8 +7,8 @@ import copy
 import pytest
 
 from sentinel.diff.regions import MaskRecord
-from sentinel.records import Decision, Finding, Signature
-from sentinel.store import RunPlan, ScopeEntry, Store, StoreRefused
+from sentinel.records import CheckpointOutcome, Decision, Finding, Signature
+from sentinel.store import RunPlan, ScopeEntry, Store, StoreRefused, apply_inheritance
 from sentinel.store.lifecycle import expire_due
 from sentinel.store.mirror import (MaskBudgetExceeded, MirrorRefused, apply_renames, approved_baseline,
                                    flake_stats_for, link_mask, load_config_mirror, record_request_mask,
@@ -290,6 +290,35 @@ def test_a_rename_carries_decisions_baselines_and_flake_stats_and_tombstones_the
                              "new": FLOW, "build": "b3"}]
         with pytest.raises(StoreRefused, match="already renamed"):
             apply_renames(s, other, "c3")
+
+
+def test_an_outcome_inheriting_a_decision_across_a_rename_is_written_on_the_new_id(tmp_path):
+    """8.3 (gap G33): the rename carries the old id's decisions, so the write accepts `decision:<id>` for a decision
+    on any id of the record's rename chain, the chain the lookup follows; a decision on another checkpoint is still
+    refused (4.13)."""
+    old_entry = ScopeEntry(OLD, WS, "active_trader", 2, "frozen", flow_class="standard")
+    new_entry = ScopeEntry(FLOW, WS, "active_trader", 2, "frozen", flow_class="standard")
+    with Store(tmp_path / "c.db") as s:
+        s.begin_run(plan("run-00", (ScopeEntry(CENSUS, WS, "active_trader", 1, "frozen"), old_entry)))
+        s.record_decision(decision("dec-000001", "noise_signature", "rgn.confirm.symbol", cid=OLD), run_id="run-00")
+        s.record_decision(decision("dec-000002", "noise_signature", "rgn.confirm.symbol", cid=CENSUS),
+                          run_id="run-00")
+        assert s.rename_checkpoint(OLD, FLOW, build_id="b2", config_commit="c2")
+        s.begin_run(plan("run-02", (ScopeEntry(CENSUS, WS, "active_trader", 1, "frozen"), new_entry)))
+        computed = CheckpointOutcome(run_id="run-02", checkpoint_id=FLOW, outcome="collateral", workspace_id=WS,
+                                     persona="active_trader", data_mode="frozen", recorded_at=TS)
+        o = apply_inheritance(computed, s.lookup_decisions(Signature(FLOW, "rgn.confirm.symbol", PH, "collateral"),
+                                                           run_id="run-02"))
+        assert (o.outcome, o.reason, o.decision_ref) == ("noise", "decision:dec-000001", "dec-000001")
+        s.write_checkpoint(o)
+        row = s.query("SELECT outcome, reason, reason_detail FROM outcomes WHERE run_id = 'run-02' AND "
+                      "checkpoint_id = ?", (FLOW,))[0]
+        assert tuple(row) == ("noise", "decision", "dec-000001")
+        other = CheckpointOutcome(run_id="run-02", checkpoint_id=CENSUS, outcome="noise", workspace_id=WS,
+                                  persona="active_trader", data_mode="frozen", recorded_at=TS,
+                                  reason="decision:dec-000001", decision_ref="dec-000001")
+        with pytest.raises(StoreRefused, match="is on checkpoint"):          # not on CENSUS's chain
+            s.write_checkpoint(other)
 
 
 def test_a_rename_whose_old_id_the_store_never_saw_creates_its_tombstone(s):

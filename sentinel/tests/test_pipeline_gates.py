@@ -19,7 +19,8 @@ from sentinel.orchestrator.rig import LaunchObservation, LoginObservation
 from sentinel.orchestrator.simrig import BUILD, MemorySink, SimScenario, SimulatedRig, default_context
 from sentinel.pipeline.config import SentinelConfig
 from sentinel.pipeline.orchestration import RigScript
-from sentinel.pipeline.run import run_pipeline
+from sentinel.pipeline.run import RigsRefused, run_pipeline
+from sentinel.store import Store
 from sentinel.scope import Flow, UNSCHEDULED_CLASSES
 from sentinel.store import safety as S
 
@@ -73,6 +74,12 @@ def test_a_failed_authenticated_gate_escalates_on_the_logins_next_run(tmp_path):
     assert pages and {a["priority"] for a in pages} == {"P2"}
     sc = dataclasses.replace(wrong_number_scenario(TODAY), run_id=first.run_id.replace("-01", "-02"),
                              rig=RigScript(login=(("challenge", True),)))
+    with pytest.raises(RigsRefused, match="blocked"):     # 11.6: the challenge took every login's rig out of the pool
+        run_pipeline(EXAMPLE, sc, tmp_path)
+    with Store(tmp_path / "sentinel.db") as store, store.batch("human:reenable") as b:     # a person re-enables them
+        for row in store.query("SELECT login_alias FROM logins WHERE blocked_at IS NOT NULL"):
+            b.update("logins", {"login_alias": row["login_alias"]},
+                     {"unblocked_by": "dana.okafor", "unblocked_at": "2026-11-10T16:00:00+00:00"})
     second = run_pipeline(EXAMPLE, sc, tmp_path)
     again = [a for a in second.alerts if a["control"] == "login"]
     assert again and {a["priority"] for a in again} == {"P1"}     # the same gate failed last run (9.10)

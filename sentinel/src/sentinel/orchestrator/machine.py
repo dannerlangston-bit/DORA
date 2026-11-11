@@ -88,7 +88,10 @@ whole run; its fresh Monitor read is checked against the snapshot instead, and a
 kill switch (6.6 Triggers) at the gate in force. The hook is put in deny-all before the tree is killed and stays
 there until the relaunch's `launched` gate arms it for the LOGIN flow. `session_release_wait` is waited before the
 relaunch, which precedes its login (7.7 "before any relaunch login"); `reset_input_state` runs right after the kill
-(7.7). The default wall budget starts when the Orchestrator is built; a Calibration run must be given its
+(7.7). A kill that leaves a process from the install folder alive (`kill_tree` False, killswitch choice 20) fails
+closed: no launch, relaunch or recovery login starts from it (`killswitch.survivor`: `env_error (gate: launched)` on the
+rest of the shard), and the proof is UNPROVEN `recovery_login_failed` with the hand-over, the survivor named. The
+default wall budget starts when the Orchestrator is built; a Calibration run must be given its
 `WallBudget` (its window end is a calendar time). The chords loaded at `settings_attested` are the A6 bindings and the
 pinned defaults (`gateway_config.order_hotkey_list`, from `RunContext.order_hotkeys` or the chords given alone); more
 than sixteen fail the run closed there (`aborted_harness (reason: config_invalid)`, 5.4.7).
@@ -143,11 +146,12 @@ from .gateway import Chord, DropLedger
 from .gateway_config import DefaultOrderHotkeys, GatewayConfigError, order_hotkey_list
 from .gates import (AccountExpectation, WorkspaceExpectation, check_authenticated, check_canary_flow, check_fixture,
                     check_launched, check_provisioned, check_teardown, check_workspace, decide_run_outcome)
-from .identity import (READ_GAP_S, TIMER_S, Allowlist, assertion_due, deferral_unreadable, judge_fixture_account,
-                       judge_identity, paper_stamp, readable as selector_readable, stamp_current)
+from .identity import (ONDEMAND_MODE, PAPER_MODE, READ_GAP_S, TIMER_S, Allowlist, assertion_due, deferral_unreadable,
+                       judge_fixture_account, judge_identity, paper_stamp, readable as selector_readable,
+                       stamp_current)
 from .killswitch import (ORDERS_SENT, KillSwitchReport, Proof, ProofInputs, RecoveryLogin, account_ref,
                          cancel_new_working, execute_kill_switch, kill_switch, post_run_proof, proof_result,
-                         recovery_login, teardown_incident, teardown_proof)
+                         recovery_login, survivor, teardown_incident, teardown_proof, tree_survived)
 from .alerts import AlertRoute
 from .orderbook import MonitorBook
 from .ports import SessionSafety
@@ -155,6 +159,8 @@ from .results import ControlResult, Outcome, OutcomeSink, RunVerdict, worse, wri
 from .rig import ConfirmationCheck, LaunchObservation, OrderBook, Rig, SelectorRead
 from .watchdog import (Heartbeat, HeartbeatUnwritable, HeartbeatWriter, disk_check, heartbeat_failed,
                        proactive_relaunch_due, watchdog_check)
+from .preflight import combine, run_preflight
+from .. import calendar as _calendar          # module reference: calendar imports this package
 
 # what each relaunch cause spends (7.7, 10.2, SD-66): K for an environment re-login; an app relaunch or the hook host
 # restart, already charged by the control that asked for the relaunch; nothing for the proactive relaunch
@@ -198,6 +204,9 @@ class RunContext:
     fixture_doc: Mapping[str, Any] | None = None              # the 4.9 fixture: stage 1 and stage 2 read it (7.6)
     stage1: Any = None                                        # stage1.Stage1Profile: the profiles Stage 1 restores
     paper_send_ok: bool = False                               # the gated branch's own-tag Cancel All (7.6 stage 2)
+    preflight_pins: Any = None                                # preflight.PreflightPins: what 12.7 compares with
+    preflight_local: Mapping[str, Callable[[], Any]] = field(default_factory=dict)   # the harness's own reads
+    windows: Any = None                                       # calendar.WindowsConfig: the maintenance windows (7.11)
 
     def default_hotkeys(self) -> DefaultOrderHotkeys:
         """The pinned build's default order chords loaded at `settings_attested` (5.4.7): the loaded file, or the
@@ -221,6 +230,7 @@ class RunReport:
     results: list[ControlResult] = field(default_factory=list)
     kill_switch: KillSwitchReport | None = None
     filled: list[str] = field(default_factory=list)
+    cancel_all_located: bool | None = None          # Rig.locate_cancel_all at teardown, when teardown read it (6.6)
 
     @property
     def alerts(self) -> list[AlertRoute]:
@@ -284,7 +294,11 @@ class Orchestrator:
         self._a1: str | None = None
         self._a2: str | None = None
         self.bounds = BoundsState(ctx.bounds_branch)       # the session's bounds source (5.9, 7.5)
+        self.tree_survived = False                         # the last kill left a process alive (killswitch choice 20)
         self.stage1_steps: tuple[str, ...] = ()            # Stage 1's run-health lines (7.6)
+        self.cancel_all_located: bool | None = None         # what teardown's template read found (6.6)
+        self.preflight_runs: list[Any] = []                 # preflight.PreflightRun per attempt set (12.7)
+        self.reschedules: list[Any] = []                    # calendar.Reschedule: the one maintenance move (7.11)
 
     # -- recording --------------------------------------------------------------------------------------
     def apply(self, r: ControlResult) -> ControlResult:
@@ -300,6 +314,22 @@ class Orchestrator:
         if r.run is not None and self.stop is None:
             self.stop = r
         return r
+
+    def kill_tree(self) -> bool:
+        """Kill the thinkorswim tree; True when nothing from the install folder survives (6.6 step 3, 10.2 step 4). A
+        survivor fails closed (killswitch choice 20): the first one applies `killswitch.survivor`, which stops the
+        shard at `launched`, and the session's safety state is cleared."""
+        if self.rig.kill_process_tree():
+            self.tree_survived = False
+            return True
+        self._survived()
+        return False
+
+    def _survived(self) -> None:
+        if not self.tree_survived:
+            self.apply(survivor())
+        self.tree_survived = True
+        self._clear_safety()
 
     def _contain(self, r: ControlResult) -> None:
         """A stopping result that asks for deny-all or the kill switch puts the hook in deny-all at once (6.6 step 1)."""
@@ -346,7 +376,8 @@ class Orchestrator:
 
     def _asserted(self, read: SelectorRead) -> None:
         """A passing paper-mode assertion of `read`: the session's stamp and its last assertion time (6.4)."""
-        self._stamp = paper_stamp(read.text or "", self.clock.now())
+        od = self.ctx.allowlist.ondemand_account is not None and read.text == self.ctx.allowlist.ondemand_account
+        self._stamp = paper_stamp(read.text or "", self.clock.now(), mode=ONDEMAND_MODE if od else PAPER_MODE)
         self._set_safety(replace(self.safety, last_assertion_mono=self.clock.monotonic(),
                                  account_id_sha256=self._stamp["account_id_sha256"]))
 
@@ -404,10 +435,18 @@ class Orchestrator:
         if start == "provisioned":
             if not self._gate("provisioned"):
                 return False
-            dpi = getattr(rig, "process_dpi_awareness", None)    # H3: the harness's own awareness (3.4 rule 5)
-            r = self.apply(check_provisioned(rig.preflight(), repeat_gates=frozenset(
-                g for g in ctx.history.failed_gates_last_run if g.startswith("preflight.")),
-                dpi_awareness=dpi() if dpi is not None else None))
+            report, dpi = self._preflight()
+            while ctx.windows is not None:                     # 7.11: an N item down inside a maintenance window
+                moved = _calendar.maintenance_reschedule(report, self.clock.now(), ctx.windows, run_id=ctx.run_id,
+                                               previous_reschedules=len(self.reschedules))
+                if moved is None:
+                    break
+                self.reschedules.append(moved)                 # the run waits once, to the window end plus 15 minutes
+                self.clock.sleep(max(0.0, (moved.start_at - self.clock.now()).total_seconds()))
+                self.wall = WallBudget.for_run(ctx.run_type, self.clock.monotonic())    # the rescheduled run's own
+                report, dpi = self._preflight()
+            r = self.apply(check_provisioned(report, repeat_gates=frozenset(ctx.history.failed_gates_last_run),
+                                             dpi_awareness=dpi))   # 9.10, 11.6: every gate of the previous run
             if not r.passed or not self._hook("provisioned"):
                 return False
         first = start == "provisioned"
@@ -419,7 +458,8 @@ class Orchestrator:
             r = self.apply(check_launched(obs, expected_build=ctx.expected_build, first_launch=first,
                                           budgets=self.budgets, launcher_log_sha256=log() if log else None))
             if r.has("relaunch") and self.stop is None:
-                rig.kill_process_tree()
+                if not self.kill_tree():                   # no launch from a survivor (killswitch choice 20)
+                    return False
                 first = False
                 continue
             if not r.passed:
@@ -476,6 +516,21 @@ class Orchestrator:
             return False
         self.apply(check_canary_flow(rig.run_canary_flow()))
         return self.stop is None and self._hook("canary_flow_passed")    # 2.2.3, SD-15: registry validation
+
+    def _preflight(self) -> tuple[Any, str | None]:
+        """12.7 preflight and the harness's DPI awareness (H3). With pinned values (`RunContext.preflight_pins`) and a
+        rig whose raw reads it can evaluate (`preflight_reads`), every item through `preflight.run_preflight` (the one
+        60 s retry, both attempts in `preflight_runs`), the harness's own reads (`RunContext.preflight_local`: G1, G3,
+        G4, G5 and its halves of R7 and H7) beside the rig's (`preflight.combine`); else the rig's decided report."""
+        rig, ctx = self.rig, self.ctx
+        reads = getattr(rig, "preflight_reads", None)
+        if reads is None or ctx.preflight_pins is None:
+            dpi = getattr(rig, "process_dpi_awareness", None)    # H3: the harness's own awareness (3.4 rule 5)
+            return rig.preflight(), dpi() if dpi is not None else None
+        run = run_preflight(combine(reads(ctx.preflight_pins).read, dict(ctx.preflight_local)), self.clock,
+                            ctx.preflight_pins, run_id=ctx.run_id, shard_id=ctx.shard_id)
+        self.preflight_runs.append(run)
+        return run.report, run.dpi_awareness
 
     def _hook(self, name: str) -> bool:
         """The caller's check after gate `name` (`gate_hooks`): its result is applied; False when the run stopped."""
@@ -557,8 +612,9 @@ class Orchestrator:
             rig.set_hook_state(armed=True, deny_all=True)          # nothing is pressed while identity is unknown
             self.clock.sleep(READ_GAP_S)
             reads.append(rig.read_account_selector())
-        r = self.apply(judge_identity(reads, ctx.allowlist,
-                                      unreadable_streak=ctx.history.identity_unreadable_streak))
+        toolbar = getattr(rig, "ondemand_toolbar", None)        # 7.9: the OnDemand toolbar by template
+        r = self.apply(judge_identity(reads, ctx.allowlist, unreadable_streak=ctx.history.identity_unreadable_streak,
+                                      ondemand_toolbar=bool(toolbar()) if callable(toolbar) else False))
         if r.passed:
             if r.has("rearm"):
                 rig.set_hook_state(armed=True, deny_all=False)
@@ -807,8 +863,9 @@ class Orchestrator:
                                  evidence={"cause": cause, "budget": RELAUNCH_BUDGETS[cause],
                                            "flows_since_launch": self.flows_since_launch}))
         self.rig.set_hook_state(armed=True, deny_all=True)
-        self.rig.kill_process_tree()
         self.session = "ended"                             # until the relaunch's `authenticated` gate passes again
+        if not self.kill_tree():                           # no relaunch from a survivor (killswitch choice 20)
+            return False
         self.rig.reset_input_state()                       # 7.7: after the kill, before the relaunch
         self._clear_safety()
         self.flow = None
@@ -829,8 +886,8 @@ class Orchestrator:
         account = account_ref(ctx.allowlist, ctx.fixture_account)
         if not kill_switch_path and ((stop is not None and stop.has("kill_tree")) or self.session in ("kicked",
                                                                                                        "ended")):
-            rig.kill_process_tree()          # a kicked session's tree goes too: the proof's login starts afresh
-            rig.reset_input_state()          # as before every relaunch (7.7)
+            if self.kill_tree():             # a kicked session's tree goes too: the proof's login starts afresh
+                rig.reset_input_state()      # as before every relaunch (7.7)
         if kill_switch_path:
             ks = self._kill_switch_sequence(stop, so_far, sends)
             proof = ks.proof
@@ -841,17 +898,19 @@ class Orchestrator:
             proof = post_run_proof(ProofInputs(start=None, end=None, session="never", tokens_issued=tokens))
             self.apply(proof_result(proof, run_so_far=so_far, unproven_streak=streak))
         elif self.session in ("kicked", "ended") or (stop is not None and stop.has("kill_tree")):
-            if self.session == "ended" and stop is not None and stop.unreached is not None \
-                    and stop.unreached.reason in NEVER_RETRIED:          # 6.9: no second login after it
+            if self.tree_survived or self.session == "ended" and stop is not None and stop.unreached is not None \
+                    and stop.unreached.reason in NEVER_RETRIED:  # 6.9: no second login after it; none from a survivor
                 proof, end = post_run_proof(ProofInputs(start=self.start_book, end=None, recovery_login_ok=False,
                                                         declared_sends=sends)), None
             else:
                 proof, end = self._recovery_proof(kicked=self.session == "kicked", sends=sends)
             # the run so far includes a 6.4 mismatch the proof's login applied (the login blocked for it, SD-64)
-            self.apply(proof_result(proof, run_so_far=self._run_so_far(), unproven_streak=streak, account=account,
-                                    screenshot_sha256=_screenshot(end)))
+            effect = proof_result(proof, run_so_far=self._run_so_far(), unproven_streak=streak, account=account,
+                                  screenshot_sha256=_screenshot(end))
+            self.apply(tree_survived(effect) if self.tree_survived else effect)
         else:
             self.state = last_gate = "teardown"
+            self.cancel_all_located = rig.locate_cancel_all()     # 6.6: located by template, never clicked
             obs = rig.teardown()
             self.apply(check_teardown(obs))
             end = rig.read_orders()
@@ -867,7 +926,8 @@ class Orchestrator:
                 proof = teardown_proof(proof, ks)
             self.apply(effect)
         rig.set_hook_phase("between_runs")                  # every run ends with the hook disarmed (6.6, 6.2)
-        report = RunReport(ctx.run_id, ctx.run_type, RunVerdict("complete"), last_gate, proof, kill_switch=ks)
+        report = RunReport(ctx.run_id, ctx.run_type, RunVerdict("complete"), last_gate, proof, kill_switch=ks,
+                           cancel_all_located=self.cancel_all_located)
         any_env = any(o is not None and o.outcome == "env_error"
                       for r in self.results for o in (r.unreached, r.checkpoint, *[s.outcome for s in r.outcomes]))
         report.verdict = decide_run_outcome([r.run for r in self.results], any_env_error=any_env,
@@ -921,6 +981,10 @@ class Orchestrator:
             if login.identity is not None:
                 self._contain(self.apply(login.identity))
                 break
+            if login.tree_survived:                    # its close left a process: no second login (killswitch 20)
+                self._survived()
+                return post_run_proof(ProofInputs(start=self.start_book, end=None, recovery_login_ok=False,
+                                                  declared_sends=sends)), None
             if login.ok:
                 break
         if login.live_identity:

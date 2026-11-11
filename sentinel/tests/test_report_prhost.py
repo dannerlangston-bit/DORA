@@ -348,3 +348,51 @@ def test_the_fake_host_refuses_editing_a_missing_comment(host):
     assert ph.find_marker([ph.Comment("c1", "hello"), ph.Comment("c2", comment_marker(PR) + "\nbody")], PR) == \
         ph.Comment("c2", comment_marker(PR) + "\nbody")
     assert ph.find_marker([], PR) is None
+
+
+# -- re-post from the stored context, the withheld report, the file-backed host ----------------------------------
+
+def test_repost_renders_with_the_stored_context_and_the_run_rows_override(store, arts, host):
+    run(store, "run-1")
+    post(store, arts, host, "run-1", 41, context=ReportContext(pr=0, candidate_build="cand-1", base_build="base-1",
+                                                                base_url=BASE_URL, detector_banner="DETECTOR BLIND"))
+    deliver(store, arts, host, 41)
+    stored = store.run_summary("run-1")["pr_report"]["context"]
+    assert stored["detector_banner"] == "DETECTOR BLIND" and "history" not in stored and "pr" not in stored
+    store.update("runs", {"run_id": "run-1"}, {"check_override_by": "carol", "check_override_reason": "flaky"})
+    again = ph.repost(store, arts, "run-1", host, allowlist=ALLOW, now_=t(60))
+    assert again is not None and "DETECTOR BLIND" in again.comment and again.status.state == "success"
+    deliver(store, arts, host, 60)
+    (comment,) = host.comments[PR]
+    assert comment.comment_id == "c1" and comment.body == again.comment          # edited in place (9.1)
+
+
+def test_repost_of_a_run_never_reported_or_not_a_pr_run_does_nothing(store, arts, host):
+    run(store, "run-1")
+    assert ph.repost(store, arts, "run-1", host, allowlist=ALLOW, now_=t(41)) is None
+    assert ph.repost(store, arts, "no-such-run", host, allowlist=ALLOW, now_=t(41)) is None
+    assert store.query("SELECT count(*) FROM outbox")[0][0] == 0
+
+
+def test_a_withheld_report_abandons_the_open_pr_jobs_and_queues_did_not_report(store, arts, host):
+    run(store, "run-1")
+    posted = post(store, arts, host, "run-1", 41)
+    job = ph.post_withheld(store, arts, "run-1", description="Sentinel did not report: the report is withheld",
+                           base_url=BASE_URL, now_=t(42))
+    states = {r["job_id"]: r["state"] for r in store.query("SELECT job_id, state FROM outbox")}
+    assert states[posted.comment_job] == states[posted.status_job] == "abandoned" and states[job] == "queued"
+    deliver(store, arts, host, 42)
+    assert PR not in host.comments                                                 # 6.9: no comment published
+    assert status(host)["state"] == "error" and status(host)["description"].startswith("Sentinel did not report")
+
+
+def test_the_file_backed_host_keeps_comments_and_statuses_across_instances(tmp_path):
+    first = ph.FilePrHost(tmp_path / "pr-host.json", SCM)
+    cid = first.create_comment(PR, comment_marker(PR) + "\nv1")
+    first.set_status(COMMITS["cand-1"], context="sentinel/pr-run", state="pending", description="d", target_url=None)
+    second = ph.FilePrHost(tmp_path / "pr-host.json", SCM)
+    assert ph.find_marker(second.list_comments(PR), PR).comment_id == cid
+    second.edit_comment(PR, cid, comment_marker(PR) + "\nv2")
+    third = ph.FilePrHost(tmp_path / "pr-host.json", SCM)
+    assert third.list_comments(PR)[0].body.endswith("v2") and third.create_comment(PR, "other") == "c2"
+    assert third.statuses[(COMMITS["cand-1"], "sentinel/pr-run")]["state"] == "pending"

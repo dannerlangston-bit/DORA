@@ -35,6 +35,11 @@ Choices where the spec is ambiguous (reported):
 3. After a failed write the policy writes nothing more, ENOSPC included: the ENOSPC result asks the Watchdog for its
    immediate free-space check, which decides `disk_full` (10.2, 8.9).
 4. `max_wait_s` absent from a heartbeat reads as 0 in `hang_detected`, so the 60 s floor of sampling rule 5 applies.
+5. The expectation is kept as a monotonic time and written, at each write, as the wall-clock ISO string 10.2 names:
+   `ts` less the monotonic seconds since the input. A wall-clock correction between the input and a write (a time
+   sync step) then moves `ts` and the expectation together, so it can neither fake nor hide a hang (10.2: "`mono_ts`
+   is the monotonic clock, so a wall-clock correction cannot fake or hide staleness"); the string is the wall time of
+   the input only while the wall clock ran evenly.
 """
 from __future__ import annotations
 
@@ -42,7 +47,7 @@ import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from ..orchestrator.clock import Clock
@@ -117,7 +122,7 @@ class HeartbeatPolicy:
         self.step_id: str | None = None
         self.checkpoint_id: str | None = None
         self.max_wait_s: float | None = None
-        self.expect_since: str | None = None
+        self.expect_mono: float | None = None     # the monotonic time of the latest screen-changing input
         self.capture_suspended = False
         self.last_capture_sha256: str | None = None
         self.last: Heartbeat | None = None
@@ -127,13 +132,17 @@ class HeartbeatPolicy:
 
     # -- what the file says -------------------------------------------------------------------------------------
     def heartbeat(self) -> Heartbeat:
-        """The heartbeat as it would be written now."""
-        return Heartbeat(self.run_id, self.shard, self.attempt, self.state, self.clock.now().isoformat(),
-                         self.clock.monotonic(), flow_id=self.flow_id, step_id=self.step_id,
-                         checkpoint_id=self.checkpoint_id, app_pid=self.life.app_pid,
-                         orchestrator_pid=self.orchestrator_pid, hook_host_pid=self.hook_host_pid,
-                         expect_screen_change_since=self.expect_since, max_wait_s=self.max_wait_s,
-                         capture_suspended=self.capture_suspended, last_capture_sha256=self.last_capture_sha256)
+        """The heartbeat as it would be written now. `expect_screen_change_since` is the wall time `ts` less the
+        monotonic time since the input, so `mono_ts - (ts - expect_screen_change_since)` is the input's monotonic
+        time whatever the wall clock did meanwhile (choice 5)."""
+        now, mono = self.clock.now(), self.clock.monotonic()
+        since = None if self.expect_mono is None else (now - timedelta(seconds=mono - self.expect_mono)).isoformat()
+        return Heartbeat(self.run_id, self.shard, self.attempt, self.state, now.isoformat(), mono,
+                         flow_id=self.flow_id, step_id=self.step_id, checkpoint_id=self.checkpoint_id,
+                         app_pid=self.life.app_pid, orchestrator_pid=self.orchestrator_pid,
+                         hook_host_pid=self.hook_host_pid, expect_screen_change_since=since,
+                         max_wait_s=self.max_wait_s, capture_suspended=self.capture_suspended,
+                         last_capture_sha256=self.last_capture_sha256)
 
     def write(self) -> ControlResult | None:
         """Write now; the first failure's result once, then nothing (choice 3)."""
@@ -188,12 +197,12 @@ class HeartbeatPolicy:
 
     # -- content --------------------------------------------------------------------------------------------------
     def expect_screen_change(self) -> None:
-        """A screen-changing input was emitted now (choice 1)."""
-        self.expect_since = self.clock.now().isoformat()
+        """A screen-changing input was emitted now (choice 1), kept on the monotonic clock (choice 5)."""
+        self.expect_mono = self.clock.monotonic()
 
     def screen_settled(self, capture_sha256: str | None = None) -> None:
         """The settle rule accepted a capture (or a `wait_for` passed): the expectation is cleared."""
-        self.expect_since = None
+        self.expect_mono = None
         if capture_sha256 is not None:
             self.last_capture_sha256 = capture_sha256
 

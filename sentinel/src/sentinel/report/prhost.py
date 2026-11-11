@@ -19,6 +19,12 @@ Every post goes through the outbox (`report.outbox`): this module renders and en
 - `overdue_runs(store, now)` and `post_overdue(...)`: the Reporter host's timer, the `error` status for a PR run
   with no comment posted by budget plus 15 minutes (9.2, 9.10).
 - `announce_check_mode(...)`: a commit status mode change is announced in the release channel once (9.2).
+- `repost(store, payloads, run_id, host, ...)`: `post_report` again from what the first one stored (the report
+  context and manifest it rendered with, under `summary_json["pr_report"]`), for the Reporter service after a
+  decision write and for the review drain after a landed verdict (9.2, 10.7).
+- `post_withheld(...)`: 6.9 withholds the report: the run's open PR comment and status jobs are abandoned (a human
+  scans the run before anything posts) and the `error` status "Sentinel did not report" is queued in their place.
+- `FilePrHost(path)`: the in-memory host kept in a JSON file, the simulated runs' PR host across processes.
 
 Choices where the spec is ambiguous (reported):
 
@@ -43,13 +49,20 @@ Choices where the spec is ambiguous (reported):
    re-posted after an outage of the Reporter host itself.
 8. The mode announcement is posted once per change: the entry in force, when its mode differs from the entry
    before it (the first entry is no change), as one deterministic payload to the release channel.
+9. A re-post renders with the report context and manifest the first `post_report` stored, plus the run row's
+   check override (9.6 Override check), so a decision written from the report UI re-renders the comment the run
+   posted with its new state, without the pipeline's in-memory facts.
+10. A withheld report (6.9) abandons the run's open `pr_comment` and `commit_status` jobs rather than deleting
+    them: abandoned jobs stay listed on the digest and the run page until the human who scans the run closes them.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 from ..calendar import ny
@@ -58,7 +71,7 @@ from ..egress import EgressAllowlist, EgressGate
 from ..records import OutboxJob, now
 from ..store.store import Store, utc
 from .inline import Urls
-from .model import CHECK_CONTEXT, CommitStatus, ReportContext, ReportInputs, pending_status
+from .model import CHECK_CONTEXT, CommitStatus, ReportContext, ReportInputs, RunReport, pending_status
 from .outbox import Delivery, PayloadStore, ReporterSink, Sender, enqueue_job
 from .pr_comment import comment_marker, render_report_markdown
 from .reporting_config import ReportingConfig
@@ -145,6 +158,45 @@ class FakePrHost:
                   "target_url": target_url}
         self.statuses[(commit, context)] = posted
         self.status_log.append(posted)
+
+
+class FilePrHost(FakePrHost):
+    """`FakePrHost` kept in a JSON file, so the simulated runs and the demo's control host share one PR host across
+    processes (the comment a run's job created is found by the next run's marker lookup)."""
+
+    def __init__(self, path: str | Path, host: str = "scm.example.internal"):
+        super().__init__(host)
+        self.path = Path(path)
+        if self.path.exists():
+            doc = json.loads(self.path.read_text(encoding="utf-8"))
+            self.comments = {int(pr): [Comment(**c) for c in cs] for pr, cs in doc["comments"].items()}
+            self.status_log = list(doc["status_log"])
+            self.statuses = {(s["commit"], s["context"]): s for s in self.status_log}
+            self._next_id = int(doc["next_id"])
+
+    def _save(self) -> None:
+        doc = {"host": self.host, "next_id": self._next_id, "status_log": self.status_log,
+               "comments": {str(pr): [dataclasses.asdict(c) for c in cs] for pr, cs in sorted(self.comments.items())}}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+
+    def create_comment(self, pr: int, body: str) -> str:
+        cid = super().create_comment(pr, body)
+        self._save()
+        return cid
+
+    def edit_comment(self, pr: int, comment_id: str, body: str) -> None:
+        super().edit_comment(pr, comment_id, body)
+        self._save()
+
+    def delete_comment(self, pr: int, comment_id: str) -> None:
+        super().delete_comment(pr, comment_id)
+        self._save()
+
+    def set_status(self, commit: str, *, context: str, state: str, description: str,
+                   target_url: str | None) -> None:
+        super().set_status(commit, context=context, state=state, description=description, target_url=target_url)
+        self._save()
 
 
 def find_marker(comments: Sequence[Comment], pr: int) -> Comment | None:
@@ -340,6 +392,7 @@ class Posted:
     report_late: bool
     comment_overdue: bool
     history: tuple[dict, ...] = field(default_factory=tuple)
+    report: RunReport | None = field(default=None, compare=False, repr=False)   # what was rendered (report.html)
 
 
 def post_report(store: Store, payloads: PayloadStore, run_id: str, host: PrHost, context: ReportContext, *,
@@ -372,8 +425,54 @@ def post_report(store: Store, payloads: PayloadStore, run_id: str, host: PrHost,
         **prior, "rendered_at": at, "result": report.result, "marker_recreated": recreated,
         "report_late": report_late, "comment_overdue": comment_overdue, "comment_job": comment_job,
         "status_job": status_job, "counts": {"unexpected": report.n_unexpected, "intended": report.n_intended,
-                                             "suppressed": report.n_suppressed}}})
-    return Posted(run_id, report.status, body, comment_job, status_job, recreated, report_late, comment_overdue, past)
+                                             "suppressed": report.n_suppressed},
+        "context": prior.get("context") or _stored_context(context),
+        "manifest": prior["manifest"] if "manifest" in prior else manifest}})
+    return Posted(run_id, report.status, body, comment_job, status_job, recreated, report_late, comment_overdue, past,
+                  report)
+
+
+_FILLED = ("pr", "check_mode", "history", "marker_recreated", "report_late", "comment_overdue", "override")
+
+
+def _stored_context(context: ReportContext) -> dict[str, Any]:
+    """The caller's report context without the fields `post_report` fills (choice 9)."""
+    return {k: v for k, v in dataclasses.asdict(context).items() if k not in _FILLED}
+
+
+def repost(store: Store, payloads: PayloadStore, run_id: str, host: PrHost, *, allowlist: EgressAllowlist,
+           reporting: ReportingConfig | None = None, now_: str | None = None) -> Posted | None:
+    """`post_report` again for a PR run already reported once (choice 9): after a decision write or a landed
+    verdict. None for a run that is not a PR run with a PR number or that was never reported."""
+    try:
+        pr_run(store, run_id)
+    except ValueError:
+        return None
+    prior = store.run_summary(run_id).get(SUMMARY_KEY) or {}
+    stored = prior.get("context")
+    if not isinstance(stored, dict):
+        return None
+    known = {f.name for f in dataclasses.fields(ReportContext)}
+    kw = {k: v for k, v in stored.items() if k in known}
+    row = store.query("SELECT check_override_by, check_override_reason FROM runs WHERE run_id = ?", (run_id,))[0]
+    override = {"by": row[0], "reason": row[1]} if row[0] else None
+    context = ReportContext(pr=0, override=override, **kw)
+    return post_report(store, payloads, run_id, host, context, allowlist=allowlist, manifest=prior.get("manifest"),
+                       reporting=reporting, now_=now_)
+
+
+def post_withheld(store: Store, payloads: PayloadStore, run_id: str, *, description: str, base_url: str,
+                  reporting: ReportingConfig | None = None, check_mode: str = "informational",
+                  now_: str | None = None) -> int | None:
+    """6.9: the report is withheld. The run's open `pr_comment` and `commit_status` jobs are abandoned (choice 10)
+    and the `error` status with `description` is queued; returns its job id (None for a run with no PR commit)."""
+    at = utc(now_) or now()
+    run = pr_run(store, run_id)
+    for r in store.query("SELECT job_id FROM outbox WHERE run_id = ? AND kind IN ('pr_comment','commit_status') "
+                         "AND state IN ('queued','failed') ORDER BY job_id", (run_id,)):
+        store.abandon(r[0])
+    status = CommitStatus("error", description, _mode(reporting, check_mode, at), None)
+    return _enqueue_status(store, payloads, run, status, at)
 
 
 def overdue_runs(store: Store, now_: str) -> list[str]:
@@ -438,7 +537,7 @@ def announce_check_mode(store: Store, payloads: PayloadStore, reporting: Reporti
     return enqueue_job(store, payloads, kind="slack", destination=channel, payload=payload, at=at)
 
 
-__all__ = ["Comment", "CommitStatusSender", "DID_NOT_REPORT", "FakePrHost", "OVERDUE_AFTER", "PrCommentSender",
-           "PrHost", "PrHostError", "PrRun", "Posted", "announce_check_mode", "comment_destination", "find_marker",
-           "history", "latest_pr_run", "overdue_runs", "post_overdue", "post_pending", "post_report", "pr_number",
-           "pr_run", "senders", "status_destination"]
+__all__ = ["Comment", "CommitStatusSender", "DID_NOT_REPORT", "FakePrHost", "FilePrHost", "OVERDUE_AFTER",
+           "PrCommentSender", "PrHost", "PrHostError", "PrRun", "Posted", "announce_check_mode", "comment_destination",
+           "find_marker", "history", "latest_pr_run", "overdue_runs", "post_overdue", "post_pending", "post_report",
+           "post_withheld", "pr_number", "pr_run", "repost", "senders", "status_destination"]

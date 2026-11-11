@@ -94,10 +94,14 @@ def test_flexgrid_pr_scope_has_the_four_grid_cells_and_no_findings(inputs):
     assert plan.findings == []                                   # the map carries every edge: no dependency_map_gap
     assert GRID_CELLS <= plan.scope_surfaces <= plan.census_surfaces
     census = sorted(cid for s in GRID_CELLS for cid in ids(plan, s, "census"))
-    assert census == sorted([
-        f"census/{CHART}/ws.tier-a.active-trader", f"census/{CHART}/ws.tier-a.swing-trader",   # declared: both workspaces
-        f"census/{AT_CELL}/ws.tier-a.active-trader",                                             # canonical only
+    assert census == sorted([                                    # every change surface: all its census workspaces
+        f"census/{CHART}/ws.tier-a.active-trader", f"census/{CHART}/ws.tier-a.swing-trader",   # declared
+        f"census/{AT_CELL}/ws.tier-a.active-trader", f"census/{AT_CELL}/ws.tier-c.sweep-harness",   # map-expanded
         f"census/{L2_CELL}/ws.tier-a.active-trader", f"census/{TS_CELL}/ws.tier-a.active-trader"])
+    assert ids(plan, LADDER, "census") == [f"census/{LADDER}/{w}" for w in (   # map-expanded, undeclared (1.11)
+        "ws.tier-a.active-trader", "ws.tier-a.futures-trader", "ws.tier-c.sweep-harness")]
+    ps = "monitor.activity.position-statement"                  # smoke, outside the change scope: canonical only
+    assert ps not in plan.scope_surfaces and ids(plan, ps, "census") == [f"census/{ps}/ws.tier-a.active-trader"]
     assert plan.x_input(CHART) == "declared" and plan.x_input(AT_CELL) == "undeclared"
     assert plan.attribution[AT_CELL] == Attribution("FlexibleGrid", "tos-48120-1")
     assert plan.attribution[CHART].entry_id == "tos-48120-1"
@@ -121,6 +125,57 @@ def test_flexgrid_pr_sweeps_the_active_trader_cell_on_ladder_s(inputs):
     for tier2 in (CHART, L2_CELL, TS_CELL):                      # tier 2: no sweep in a PR run (2.5.3)
         assert ids(plan, tier2, "sweep") == [] and ids(plan, tier2, "split") == []
     assert ids(plan, "monitor.activity.position-statement", "sweep") == []   # smoke adds census only (choice 1)
+
+
+def _ladders(plan) -> dict[str, list[str]]:
+    """Sweep and split checkpoint ids by ladder (shard key), in the order the plan runs them."""
+    out: dict[str, list[str]] = {}
+    for it in plan.items:
+        if it.kind in ("sweep", "split"):
+            out.setdefault(it.shard_key, []).extend(cp.checkpoint_id for cp in it.checkpoints)
+    return out
+
+
+def _contiguous(plan) -> bool:
+    keys = [it.shard_key for it in plan.items if it.kind in ("sweep", "split")]
+    runs = [k for i, k in enumerate(keys) if i == 0 or keys[i - 1] != k]
+    return len(runs) == len(set(runs))
+
+
+def test_measured_p50s_keep_each_ladder_whole_and_in_ladder_order(inputs):
+    """scope-pairs:1, 2.5.2 ("the descending order is mandatory"), SD-04 (`-asc` after the descending pass), 2.5.1
+    (one ladder, then the next host or surface): per-step p50s (SD-03) never reorder a ladder's steps or interleave
+    ladders; ladders are ordered by their total duration, longest first (SD-14)."""
+    default = pr(inputs)
+    steps = [cp.checkpoint_id for cp in default.planned if cp.test_kind in ("sweep", "split")]
+
+    def p50(cid: str) -> float:                                  # small cells settle slower
+        size = cid.rsplit("/", 1)[1].removesuffix("-asc")
+        if "x" not in size:
+            return 8.0
+        w, h = map(int, size.split("x"))
+        return 7 + (960 - w) / 320 + (720 - h) / 360
+
+    measured = pr(inputs, durations={cid: p50(cid) for cid in steps})
+    assert _ladders(measured) == _ladders(default) and _contiguous(measured)
+    at = _ladders(measured)[f"sweep:{AT_CELL}:flexgrid"]
+    assert at == [f"sweep/{AT_CELL}/flexgrid/{w}x{h}" for w, h in LADDER_S]      # descending, 960x720 first
+    on_rig = [cp.checkpoint_id for it in measured.items for cp in it.checkpoints if cp.checkpoint_id in at]
+    assert on_rig == at
+    ladder = _ladders(measured)
+    totals = [sum(p50(c) for c in ladder[k]) for k in dict.fromkeys(
+        it.shard_key for it in measured.items if it.kind == "sweep" and it.tier == 1 and not it.declared)]
+    assert totals == sorted(totals, reverse=True)                # longest ladder first
+
+    rc_default = full(inputs, "rc")
+    asc = [cp.checkpoint_id for cp in rc_default.planned if cp.checkpoint_id.endswith("-asc")]
+    assert asc
+    rc = full(inputs, "rc", durations={cid: 8.5 if cid.endswith("-asc") else 8.0
+                                       for cid in [cp.checkpoint_id for cp in rc_default.planned]})
+    assert _ladders(rc) == _ladders(rc_default) and _contiguous(rc)
+    for ids_ in _ladders(rc).values():
+        marks = [c.endswith("-asc") for c in ids_]
+        assert marks == sorted(marks)                            # the ascending pass after the descending one
 
 
 def test_flexgrid_pr_smoke_census_capped_at_40(inputs):
@@ -200,7 +255,8 @@ def test_ui_pr_without_manifest_is_case_a(inputs):
     derived = set(missing[0].evidence["raw_values"]["derived_surfaces"].split(","))
     assert GRID_CELLS | {LADDER} <= derived
     assert "dependency_map_gap" not in [f.kind for f in plan.findings]
-    assert ids(plan, CHART, "census") == [f"census/{CHART}/ws.tier-a.active-trader"]   # no longer declared
+    assert ids(plan, CHART, "census") == [f"census/{CHART}/ws.tier-a.active-trader",   # undeclared but derived:
+                                          f"census/{CHART}/ws.tier-a.swing-trader"]    # a change surface (2.11)
     assert plan.attribution[AT_CELL] == Attribution("FlexibleGrid", None)
 
 

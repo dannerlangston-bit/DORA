@@ -56,8 +56,7 @@ Choices where the spec is ambiguous or silent (reported):
    `is_hung_app_window`, `jab_timeout`). An entry without a PID is counted (the host filters by the install folder).
 5. `main_frame_missing` and the `launched` gate failure are recorded in `watchdog.json`'s last trigger, which the
    Orchestrator reads at every gate and step, and the `launched` failure is also signalled. `main_frame_missing` is
-   not journaled: `step_event_actions` (and so `store.journal.WATCHDOG_ACTIONS`) has no action for it, and the journal
-   carries only the closed vocabulary (reported: the action is needed for 10.2's "journals main_frame_missing").
+   also journaled (10.2: "the Watchdog journals `main_frame_missing`"; the 8.3 step-event action of the same name).
    The 5 minutes run from the first sample whose heartbeat says `launched`.
 6. Journal action per reaction: an app hang `watchdog_hang`; any other app failure, and an Orchestrator death after
    its restart budget is spent, `watchdog_crash`; an Orchestrator death or hang with a restart `resume`; the local
@@ -519,8 +518,9 @@ class Watchdog:
         if running is not None and not self._frame_missing_fired and \
                 now - max(running, seen if seen is not None else running) >= MAIN_FRAME_MISSING_S:
             self._frame_missing_fired = True
-            return Reaction("main_frame_missing", (), "no frame matches the main-window regex for 30 s while running: "
-                                                      "the tree is tracked by the install-folder rule (choice 5)")
+            detail = ("no frame matches the main-window regex for 30 s while running: the tree is tracked by the "
+                      "install-folder rule (choice 5)")
+            return Reaction("main_frame_missing", (self._journal("main_frame_missing", detail),), detail)   # 10.2
         if self._launched_since is not None and not self._launched_fired and obs.install_alive and \
                 (seen is None or seen < self._launched_since) and now - self._launched_since >= LAUNCHED_FRAME_S:
             self._launched_fired = True

@@ -296,8 +296,8 @@ def test_the_message_string_matches_the_910_format(store):
 
 # -- delivery, the undelivered watch and acks (choices 4 and 5) ----------------------------------------------------
 
-def test_a_page_no_channel_accepts_within_5_minutes_writes_alert_undelivered(store, monkeypatch):
-    monkeypatch.setattr(store_mod, "SYSTEM_STATE_KEYS", store_mod.SYSTEM_STATE_KEYS | {"alert_undelivered"})
+def test_a_page_no_channel_accepts_within_5_minutes_writes_alert_undelivered(store):
+    assert "alert_undelivered" in store_mod.SYSTEM_STATE_KEYS                     # CD-1: a documented 8.3 key
     run = begin(store, RUN)
     d = Dispatcher(store, channels=CHANNELS, oncall=ONCALL)
     lost = d.dispatch(Alert.of(alerts.aborted_harness(), detail="hook_lost", key="lost", run=run), ny(10, 11))
@@ -331,8 +331,7 @@ def test_an_acknowledgement_is_mirrored_into_summary_json(store):
                                         "at": iso(ny(10, 11, 3)), "via": "paging_service"}
 
 
-def test_a_held_alerts_undelivered_clock_starts_at_0600(store, monkeypatch):
-    monkeypatch.setattr(store_mod, "SYSTEM_STATE_KEYS", store_mod.SYSTEM_STATE_KEYS | {"alert_undelivered"})
+def test_a_held_alerts_undelivered_clock_starts_at_0600(store):
     run = begin(store, RUN)
     d = Dispatcher(store, channels=CHANNELS, oncall=ONCALL)
     route = alerts.env_error().plus(paged=("accounts_owner",))

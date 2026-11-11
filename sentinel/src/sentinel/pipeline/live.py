@@ -31,6 +31,7 @@ refusal's `harness_error` finding lands on the open run; its verdicts are kept i
 """
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -41,7 +42,9 @@ import yaml
 
 from ..capture import Sweep
 from ..egress import EgressGate
+from ..policy import Budgets
 from ..reviewer import ConfigError, ReviewerConfig, ReviewerJob, Verdict
+from ..reviewer.config import DEFAULT_CALL_CAPS
 from ..reviewer.images import crop_box
 from ..reviewer.prompt import DependencyEdge, DiffMetrics, FlowContext, ManifestEntryRef, ReviewItem, StepCrops
 from ..reviewer.transport import AnthropicTransport
@@ -62,6 +65,13 @@ def load_reviewer_config(path: str | Path | None) -> ReviewerConfig:
     if not isinstance(block, dict):
         raise ConfigError(f"{path}: no `reviewer:` mapping")
     return ReviewerConfig.from_mapping(block)
+
+
+def budgeted(config: ReviewerConfig, budgets: Budgets) -> ReviewerConfig:
+    """`config` under the run's `policy/budgets.yaml` (11.4, 3.15): the per-run-type item caps it sets over the
+    defaults, the per-run USD ceiling and the weekly cap."""
+    return dataclasses.replace(config, call_caps={**DEFAULT_CALL_CAPS, **budgets.reviewer_call_caps()},
+                               run_ceiling_usd=budgets.usd_per_run, weekly_cap_usd=budgets.usd_per_week)
 
 
 def live_job(env: Mapping[str, str] | None = None, config: ReviewerConfig | None = None,

@@ -5,7 +5,8 @@
 1. attempt 1, rungs 1 to 3 on `capture`, first accepted rung wins:
    - rung 1, JAB (DR-01 Branch A only; otherwise the rung is recorded `rung1_skipped`): the accessible context with
      the target's role, name and path under the window; accepted when found, unique, visible and inside the window,
-     else `locator_failed(jab)` (not found, ambiguous, stale, invisible, outside the window, bridge unavailable);
+     else `locator_failed(jab)` (not found, ambiguous, not provably unique in a walk that lost a context (choice
+     10), stale, invisible, outside the window, bridge unavailable);
    - rung 2, image anchor: `TM_CCOEFF_NORMED` within the declared region; accepted when the best score is at least
      the floor (default 0.92) and the second peak at least 0.05 below it, else `locator_failed(image)` or
      `locator_ambiguous(image)`; the evidence carries the score, both peaks and the 40x20 crop at the match;
@@ -56,6 +57,11 @@ Choices where the spec is ambiguous or silent (reported):
    also retried inside `locate` tried a target four times and needed four misses to exhaust it. In single-attempt
    mode a miss on attempt 1 returns `failed` with the rungs tried and no retry, rescue, finding or consequence:
    the caller's retry is the second and last scripted attempt, and the caller files the finding.
+10. Uniqueness over an incomplete walk (5.5 "found, unique"; fail closed): a context the bridge could not read is
+    the `jabtree.UNREAD` placeholder, whose role and name are unknown and whose subtree is not read
+    (`win32.access_bridge` choice 4, jabtree choice 5). It may be the target's twin or hold one, whatever the
+    target's path says, so one match in a tree with a placeholder is not proven unique: the rung fails with cause
+    `incomplete_tree` (and the count of placeholders) and the ladder goes on to the image rung.
 """
 from __future__ import annotations
 
@@ -73,6 +79,7 @@ import numpy as np
 from ..capture.redaction import OcrWord, WordOcr
 from ..diff.engine import match_template
 from ..diff.regions import Rect
+from ..jabtree import UNREAD_ROLE
 from ..orchestrator.gateway import Flag
 from ..orchestrator.ports import AccessNode, AccessPort, Frame, LocateResult
 from ..orchestrator.results import ControlResult, FindingSpec, Outcome, SubsetOutcome
@@ -428,12 +435,16 @@ def _rung_jab(target: Mapping[str, Any], cap: WindowCapture, jab: AccessPort | N
     if root is None:
         return fail("bridge_unavailable")
     path = [p for p in str(d.get("path", "")).split("/") if p] or None
-    found = [n for n, chain in _walk(root, ()) if n.role.lower() == str(d.get("role", "")).lower()
+    nodes = list(_walk(root, ()))
+    found = [n for n, chain in nodes if n.role.lower() == str(d.get("role", "")).lower()
              and n.name == d.get("name") and (path is None or _path_matches(chain, path))]
     if not found:
         return fail("not_found")
     if len(found) > 1:
         return fail("ambiguous", count=len(found))
+    unread = sum(1 for n, _ in nodes if n.role == UNREAD_ROLE)
+    if unread:                                   # choice 10: a context not read may be, or hold, the twin
+        return fail("incomplete_tree", unread=unread)
     node = found[0]
     if node.rect is None:
         return fail("stale")

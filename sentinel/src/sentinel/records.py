@@ -65,10 +65,11 @@ RUNG_RESULT_KEYS = frozenset({"rung", "result", "score"})
 EXTRACTION_SOURCES = ("ocr", "export", "jab", "api")
 # 8.3 egress_log and outbox
 EGRESS_PURPOSES = ("review", "batch_review", "agent_step", "explorer_step", "pr_comment", "jira", "slack", "digest",
-                   "preflight", "model_check")
+                   "preflight", "model_check", "page")      # page: the paging service (9.10)
 EGRESS_STATUSES = ("sent", "refused", "failed")
 OUTBOX_KINDS = ("pr_comment", "commit_status", "jira_create", "jira_comment", "jira_transition", "slack", "page",
-                "digest", "manifest_pr", "mask_pr", "quarantine_pr")   # quarantine_pr: the quarantine.yaml PR (10.5)
+                "digest", "manifest_pr", "mask_pr", "quarantine_pr",   # quarantine_pr: the quarantine.yaml PR (10.5)
+                "flow_pr", "anchor_pr")                  # 9.6: Promote candidate flow, Accept anchor patch
 OUTBOX_STATES = ("queued", "sent", "failed", "abandoned")
 SEVERITIES = ("S1", "S2", "S3")                                 # 6.12
 MODEL_COMPONENTS = ("reviewer", "agent_rescue", "explorer")     # 11.4: every model call of a run, per component

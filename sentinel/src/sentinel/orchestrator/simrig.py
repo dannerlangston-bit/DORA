@@ -68,6 +68,12 @@ Choices (reported):
    5.4.10 tabulates (double clicks, drags, wheels, chords, typed characters, the `reset_input_state` releases); the
    simulated app reacts to the pointer events and to Enter or Space on the open dialog as before. A click labelled
    `Close` on the open Order Confirmation is its title-bar close: the dialog goes away and nothing is sent.
+11. Preflight (12.7): `preflight_reads()` gives the raw reads `preflight.run_preflight` evaluates against the run's
+   pins (`RunContext.preflight_pins`; `sim_preflight_pins` holds the stand-ins of a simulated 7.1 VM
+   rig): every item passes unless the scenario fails it (`preflight_failures`) or an outage is scripted until a time
+   (`preflight_down`); H3 reads the harness's awareness, H5 round-trips the kill channels, H6 runs the redaction
+   stage, and R7 and H7 hold only the rig's half. `preflight()` keeps the decided report for a rig driven without
+   pins.
 
 `MemorySink` is an in-memory `OutcomeSink` over a list of scoped checkpoint ids, and `default_context`
 builds the `RunContext` that matches the default scenario (the example config's rig-01 accounts).
@@ -264,6 +270,77 @@ class SimScenario:
     probe_hidden: tuple[tuple[str, str], ...] = ()
     probe_renamed: tuple[tuple[str, str, str], ...] = ()
     probe_unlocated: tuple[tuple[str, str], ...] = ()
+    # 12.7 items read unreadable until this aware time (a backend outage, e.g. the login host inside a maintenance
+    # window, 7.11): item -> until; the raw reads behind `preflight_reads`
+    preflight_down: dict[str, Any] = field(default_factory=dict)
+    ondemand_toolbar: bool = False                   # the OnDemand toolbar shows by template (7.9)
+
+
+# -- preflight's raw reads (choice 11) -----------------------------------------------------------------------------
+SIM_VMOPTIONS = ("-Xms1g\n-Xmx4g\n-Dsun.java2d.d3d=false\n-Dsun.java2d.noddraw=true\n"
+                 "-XX:ErrorFile=C:\\sentinel\\crash\\hs_err_pid%p.log\n-XX:+HeapDumpOnOutOfMemoryError\n"
+                 "-XX:HeapDumpPath=C:\\sentinel\\crash\n-XX:+CreateCoredumpOnCrash\n")
+SIM_N1_HOSTS = ("login.sim.invalid", "update.sim.invalid", "marketdata.sim.invalid")
+RIG_HALVES = {"R7": ("rig_free_bytes", "shard_bytes", "ntp_offset_s"),       # the harness reads the rest (MERGED_ITEMS)
+              "H7": ("db_local", "artifacts_local", "quick_check", "wal", "lock", "writable", "free_bytes",
+                     "shard_bytes")}
+
+
+def sim_preflight_pins(*, corpus: Mapping[str, str], catalogs: Mapping[str, str], model_ids: Sequence[str] = (),
+                       data_fixture_branch: str = "A", jab_branch: str = "A") -> Any:
+    """The pinned values of a simulated 7.1 VM rig (choice 11): the snapshot manifest, Windows build and ClearType
+    block, the installers, the vmoptions and JRE references, the N1 hosts and the dataset are stand-ins; the corpus
+    files, the catalog versions, the model ids and the Phase 0 branches are the run's."""
+    from .preflight import PreflightPins
+    from ..rigfiles import vmoptions_sha256
+    ref = {"vmoptions_hash": vmoptions_sha256(SIM_VMOPTIONS), "jre_release_sha256": "sha256:" + _sha("jre-release"),
+           "java2d_pipeline": "software"}
+    return PreflightPins(snapshot_manifest_sha256="sha256:" + _sha("snapshot-manifest"),
+                         windows_build={"current_build": "22631", "ubr": "4460"},
+                         cleartype={"gamma": 2200, "contrast": 1200, "orientation": "rgb"},
+                         artifacts={"candidate": "sha256:" + _sha("installer-candidate"),
+                                    "base": "sha256:" + _sha("installer-base")},
+                         b3_references={"manifest": ref}, jab_branch=jab_branch, jdk_major=11,
+                         vmoptions_sha256=vmoptions_sha256(SIM_VMOPTIONS), n1_hosts=SIM_N1_HOSTS,
+                         model_ids=tuple(model_ids) or ("sim-reviewer-model",),
+                         data_fixture_branch=data_fixture_branch, dataset_id="sim-dataset-2026-11",
+                         corpus=dict(corpus), catalogs=dict(catalogs))
+
+
+class SimPreflightReads:
+    """`ports.PreflightReads` of a `SimulatedRig` (choice 11): `preflight.SimulatedPreflightReads` over the pins the
+    run context carries, with the rig's own dynamic reads (H3's awareness, H5 over its kill channels, H6 through the
+    redaction stage), the scenario's failures (`preflight_failures`: unreadable, an H item naming its blocking
+    control; G5 as its result) and outages (`preflight_down`); R7 and H7 carry only the rig's half, the harness reads
+    the rest (`preflight.combine`)."""
+
+    def __init__(self, rig: "SimulatedRig", pins: Any):
+        self.rig, self.pins = rig, pins
+
+    def read(self, item: str) -> Any:
+        from .ports import PreflightRead
+        from .preflight import SimulatedPreflightReads
+        rig, s, pins = self.rig, self.rig.s, self.pins
+        down = s.preflight_down.get(item)
+        if down is not None and rig.clock.now() < down:
+            return PreflightRead(item, {}, readable=False, detail=f"scripted outage until {down.isoformat()}")
+        if item in s.preflight_failures:
+            why = s.preflight_failures[item]
+            if item == "G5":
+                return PreflightRead(item, {"result": why or "fingerprint_mismatch:os_build"})
+            values = {"blocking_control": why} if item.startswith("H") and why else {}
+            return PreflightRead(item, values, readable=False, detail=why or "scripted failure")
+        if item == "H5":
+            return h5_round_trip(rig.flag_channel, rig.pipe_channel, rig_id=s.rig_id, clock=rig.clock)
+        values = dict(SimulatedPreflightReads(pins, vmoptions=SIM_VMOPTIONS).read(item).values)
+        if item == "H3":
+            values["awareness"] = s.dpi_awareness
+        elif item == "H6":
+            h6 = h6_self_test(H6_THEME, s.redaction_ocr)
+            values = {"masked": h6.passed, "egress_logged": True}
+        elif item in RIG_HALVES:
+            values = {k: values[k] for k in RIG_HALVES[item]}
+        return PreflightRead(item, values)
 
 
 class SimulatedRig(Rig):
@@ -351,6 +428,14 @@ class SimulatedRig(Rig):
             if not h6.passed:
                 detail["H6"] = h6.detail or "the redaction self-test failed"
         return PreflightReport(items, detail)
+
+    def ondemand_toolbar(self) -> bool:
+        """The OnDemand toolbar seen by template in the frame (7.9)."""
+        return self.s.ondemand_toolbar
+
+    def preflight_reads(self, pins: Any) -> "SimPreflightReads":
+        """The raw 12.7 reads behind `preflight.run_preflight` against `pins` (`ports.PreflightReads`, choice 11)."""
+        return SimPreflightReads(self, pins)
 
     def install_base(self, build_id: str) -> str | None:
         """Install the pair's base build on the rig (4.2): None when it installed, else why it could not be."""

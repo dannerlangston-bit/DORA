@@ -59,7 +59,7 @@ from ..orchestrator.results import ControlResult
 from ..store.safety import SafetyQuarantine
 from ..store.store import PostRunProof
 from .inline import plural, words_and
-from .model import SafetyRows, _incident_text, _overdue_text
+from .model import PROOF_TABLE_ROWS, SafetyRows, _incident_text, _overdue_text
 
 ITEMS = tuple(f"A{n}" for n in range(1, 12))
 # 6.3 / 12.6 checklist names, as the attestation table prints them
@@ -76,8 +76,7 @@ VERDICT_SEVERITY = {"proven_no_sends": 0, "proven_declared_sends": 0, "proven_no
                     "orders_sent": 2}
 _CANCEL_ALL_SAID = {code: CANCEL_ALL_TEXT[k] for k, code in CANCEL_ALL_CODES.items()}
 # the 6.6 table's row order; the stored counts_json keeps no order (8.3 canonical JSON)
-TABLE_ROWS = ("working orders", "filled orders", "canceled orders", "position statement rows", "net liq",
-              "buying power")
+TABLE_ROWS = PROOF_TABLE_ROWS                  # 6.6: the table's row order, shared with the model's block
 _LABEL_W, _NAME_W, _NUM_W, _NEW_W, _EXP_W = 15, 26, 12, 5, 10
 # 6.13 Known residuals, accepted and listed in every RC sign-off
 RESIDUALS = (
@@ -171,8 +170,12 @@ class ShardSafety:
     @classmethod
     def from_dict(cls, d: Mapping[str, Any]) -> "ShardSafety":
         att, ident = d.get("attestation") or {}, d.get("identity") or {}
+        stored = dict(att.get("rows") or {})
+        # The run summary is canonical JSON with sorted keys (A1, A10, A11, A2, ...): put the rows back in A1 to A11
+        # order; a missing or extra row is still refused by __post_init__.
+        rows = {k: stored[k] for k in ITEMS if k in stored} | {k: v for k, v in stored.items() if k not in ITEMS}
         return cls(d.get("shard_id"), str(d.get("run_type") or ""), str(att.get("result") or "not_reached"),
-                   dict(att.get("rows") or {}), dict(att.get("evidence_sha256") or {}), att.get("profile_sha256"),
+                   rows, dict(att.get("evidence_sha256") or {}), att.get("profile_sha256"),
                    att.get("at"), tuple(AssertedAccount(a["entry"], a.get("account") or "", a.get("role"),
                                                         a["account_id_sha256"]) for a in ident.get("accounts") or ()),
                    ident.get("mode"), int(ident.get("assertions") or 0), int(ident.get("mismatches") or 0),

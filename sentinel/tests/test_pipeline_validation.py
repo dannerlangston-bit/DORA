@@ -28,7 +28,8 @@ def _run(tmp_path, **script):
     with Store(tmp_path / "sentinel.db") as store:
         return (r, {o.checkpoint_id: o for o in store.outcomes(r.run_id)}, store.findings(r.run_id),
                 store.run_summary(r.run_id), [tuple(x) for x in store.query(
-                    "SELECT kind, ref, owner FROM maintenance_items WHERE run_id = ?", (r.run_id,))])
+                    "SELECT kind, ref, owner FROM maintenance_items WHERE run_id = ? AND kind <> 'sent_ticket'",
+                    (r.run_id,))])                 # less the SENT task ledger (report.jira_sync, 9.9)
 
 
 @pytest.fixture(scope="module")

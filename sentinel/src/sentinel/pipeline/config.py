@@ -17,6 +17,13 @@ The scope inputs of 2.11 are read here too: Q from `quarantine.yaml` (`scope.qua
 (`corpus/measured_sizes.yaml`), MAXW x MAXH (`configs/allowed.yaml` `work_area`) and the coverage matrix's entitlement
 profiles, one per fixture account kind (`coverage.fixture_profiles`, 2.12), with `paper_send` on every profile when
 the send policy is gated (6.7).
+
+The ops files the runtime reads (4.16): `schedule/windows.yaml` (`calendar.WindowsConfig`: the operating day, the
+quiet windows and the maintenance windows, 7.10, 7.11), `ops/credential_rotation.yaml` (`rotation.RotationCalendar`,
+7.7), `policy/budgets.yaml` (`policy.load_budgets`, 11.4; the 11.4 values without the file), `ops/oncall.yaml`
+(`sla.OnCall`, who an alert names, 9.10) and the authorization in force (`policy.load_authorization`, 6.12): its
+reference and sha256 go into the run plan; a missing or stale one is kept as `authorization_error`, which preflight
+G1 refuses (`config_invalid`, L-XREF-16).
 """
 from __future__ import annotations
 
@@ -28,10 +35,15 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .. import invariants as inv
+from ..calendar import WindowsConfig
 from ..canary import Catalog, parse_catalog
+from ..policy import Authorization, Budgets, PolicyError, load_authorization, load_budgets
+from ..rotation import RotationCalendar
+from ..sla import OnCall
 from ..coverage import Profile, fixture_profiles
 from ..diff.regions import MaskRecord
 from ..lint.repo import Repo
+from ..report.reporting_config import ReportingConfig, from_dict as reporting_from_dict
 from ..scope import (DependencyMap, Flow, LadderDef, Registry, Workspace, load_ladders, measured_sizes,
                      quarantine_ids, work_area)
 
@@ -88,6 +100,13 @@ class SentinelConfig:
     corpus_sizes: dict[str, tuple] = field(default_factory=dict)         # corpus/measured_sizes.yaml (SD-06)
     max_client: tuple[int, int] | None = None                            # configs/allowed.yaml work_area (2.5.2)
     profiles: tuple[Profile, ...] = ()                                   # the 2.12 matrix columns
+    reporting: ReportingConfig | None = None                             # policy/reporting.yaml (4.16, 9.2, 9.9)
+    windows: WindowsConfig | None = None                                 # schedule/windows.yaml (7.10, 7.11)
+    rotation: RotationCalendar | None = None                             # ops/credential_rotation.yaml (7.7)
+    budgets: Budgets = field(default_factory=Budgets)                    # policy/budgets.yaml (11.4)
+    oncall: OnCall = field(default_factory=OnCall)                       # ops/oncall.yaml (9.10, 9.12)
+    authorization: Authorization | None = None                           # the authorization in force (6.12)
+    authorization_error: str | None = None                               # why none is (preflight G1, L-XREF-16)
 
     @classmethod
     def load(cls, root: str | Path) -> "SentinelConfig":
@@ -106,6 +125,11 @@ class SentinelConfig:
             doc = repo.one(kind)
             return doc.data if doc is not None and isinstance(doc.data, dict) else None
         mutants = Path(root) / "canaries" / "mutants.yaml"
+        try:
+            auth, auth_error = load_authorization(root), None
+        except PolicyError as exc:                    # 6.12: preflight G1 refuses the run (L-XREF-16)
+            auth, auth_error = None, str(exc)
+        windows, rotation, oncall = data("windows"), data("credential_rotation"), data("oncall")
         return cls(
             root=Path(root), repo=repo, registry=Registry.from_entries(surfaces.values()),
             workspaces=[Workspace.from_dict(d.data) for d in repo.of("workspace")],
@@ -121,7 +145,13 @@ class SentinelConfig:
             fixture=fixture, send_policy_ref=str((send.data or {}).get("decision") or "OPEN") if send else "OPEN",
             ladders=load_ladders(data("ladders")), corpus_sizes=measured_sizes(data("measured_sizes")),
             max_client=work_area(data("configs_allowed")),
-            profiles=fixture_profiles(fixture, extra=("paper_send",) if policy == "gated" else ()))
+            profiles=fixture_profiles(fixture, extra=("paper_send",) if policy == "gated" else ()),
+            reporting=reporting_from_dict(data("reporting")) if data("reporting") is not None else None,
+            windows=WindowsConfig.from_doc(windows) if windows is not None else None,
+            rotation=RotationCalendar.from_doc(rotation) if rotation is not None else None,
+            budgets=load_budgets(root) if repo.one("budgets") is not None else Budgets(),
+            oncall=OnCall.from_doc(oncall) if oncall is not None else OnCall(),
+            authorization=auth, authorization_error=auth_error)
 
     # -- helpers ---------------------------------------------------------------------------
     def regions_doc(self, checkpoint_id: str, surface_id: str, kind: str, host: str | None) -> dict | None:

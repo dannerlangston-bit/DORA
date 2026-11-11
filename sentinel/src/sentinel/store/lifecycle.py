@@ -53,9 +53,13 @@ Choices where the spec is ambiguous (reported to the coordinator):
   the signature, tolerance, run, build and cluster, has reason `RECONFIRM_PREFIX` plus the old reason and no
   finding of its own (the old row keeps it), and is not a contest or a freeze supersession (store docstring).
 - An Explorer finding matched by both dispositions takes the nearest, then newest (the 9.7 rule for one verdict;
-  both store `noise`). The hold is recorded on the finding: `held`, triage state `agent_mistake` or
-  `expected_behavior`, the decision ref and `evidence.explorer_disposition` (`candidate_flow`: discard or keep);
-  moving or deleting the flows/quarantine file is the Orchestrator's.
+  both store `noise`). A disposition holds nothing on a frozen signature (9.7 "later matches inherit nothing") or
+  when an applicable decision of another verdict (a confirmed bug, an intended) also matches (9.7 More than one
+  match); the finding is then reported, and `conflicting` names the other decisions. An active disposition is an
+  active decision for the 9.7 Two-humans refusal (`Store._check_signature_free`). The hold is recorded on the
+  finding: `held`, triage state `agent_mistake` or `expected_behavior`, the decision ref and
+  `evidence.explorer_disposition` (`candidate_flow`: discard or keep); moving or deleting the flows/quarantine file
+  is the Orchestrator's.
 - Novelty matches checkpoint (rename chain), region and category and a pHash within the tier's default tolerance
   (6 on tier 1, else 8; 9.7), over non-synthetic findings of other runs created in the 30 days up to the
   finding's own time; the earliest match's `first_seen_run_id` (else its run) is returned.
@@ -77,7 +81,7 @@ from ..canonical import canonical_json, sha256_id
 from ..classify import DecisionMatch
 from ..records import Decision, Finding, OutboxJob, Signature, now
 from .store import (DEFAULT_TOLERANCE, RECONFIRM_PREFIX, TIER1_TOLERANCE, WAIVER_CATEGORIES, Store, StoreRefused,
-                    _LOOKUP_FROM, _match, build_reached, candidate_build_of, decision_int, decision_ref, phash_bytes,
+                    build_reached, candidate_build_of, decision_int, decision_ref, disposition_matches, phash_bytes,
                     rename_chain, utc)
 
 COMPARED_OUTCOMES = ("identical", "noise", "intended", "collateral", "needs_human", "invariant_violation",
@@ -141,17 +145,23 @@ class TicketNotFound:
 @dataclass(frozen=True)
 class ExplorerDisposition:
     """The active agent_mistake and expected_behavior decisions on an Explorer finding's signature (9.6, 9.7),
-    nearest then newest."""
+    nearest then newest, and what stops them from holding it (9.7)."""
     matches: tuple[DecisionMatch, ...] = ()
+    frozen: bool = False                              # two supersessions within 30 days: nothing inherited
+    conflicting: tuple[DecisionMatch, ...] = ()       # applicable decisions of another verdict (More than one match)
 
     @property
     def decision(self) -> Decision | None:
-        return self.matches[0].decision if self.matches else None
+        """The disposition that holds the finding: the nearest, then newest, match unless the signature is frozen
+        or another verdict conflicts, in which case nothing is inherited and the finding is reported (9.7)."""
+        if not self.matches or self.frozen or self.conflicting:
+            return None
+        return self.matches[0].decision
 
     @property
     def held(self) -> bool:
-        """A matching disposition holds the finding: not reported."""
-        return bool(self.matches)
+        """A disposition holds the finding: not reported."""
+        return self.decision is not None
 
     @property
     def keep_flow(self) -> bool:
@@ -404,21 +414,21 @@ def ticket_not_found(store: Store, decision_id: str, *, at: str | None = None,
 # ---------------------------------------------------------------------------------------------------------------
 # Explorer dispositions (9.6, 9.7)
 
-_DISPOSITION_SQL = (_LOOKUP_FROM + """
-WHERE d.checkpoint_id IN (SELECT value FROM json_each(:cps)) AND d.region_id = :region AND d.category = :cat
-  AND d.action IN ('agent_mistake','expected_behavior') AND d.status = 'active' AND d.revoked_at IS NULL
-  AND (d.expires_at IS NULL OR d.expires_at > :now) AND hamming(d.phash, :phash) <= d.hamming_tolerance
-ORDER BY hamming(d.phash, :phash), d.decided_at DESC""")
-
-
-def lookup_explorer_dispositions(store: Store, signature: Signature, *, at: str | None = None
-                                 ) -> ExplorerDisposition:
+def lookup_explorer_dispositions(store: Store, signature: Signature, *, at: str | None = None,
+                                 run_id: str | None = None, manifest_entries: Iterable[str] = (),
+                                 manifest_tickets: Iterable[str] = ()) -> ExplorerDisposition:
     """The active agent_mistake and expected_behavior decisions within tolerance of an Explorer finding's
-    signature (checkpoint along its rename chain, region, category), nearest then newest (9.6, 9.7)."""
-    args = {"cps": json.dumps(list(rename_chain(store.conn, signature.checkpoint_id))),
-            "region": signature.region_id, "cat": signature.category, "phash": phash_bytes(signature.phash),
-            "now": utc(at) or now()}
-    return ExplorerDisposition(tuple(_match(r) for r in store.query(_DISPOSITION_SQL, args)))
+    signature (checkpoint along its rename chain, region, category), nearest then newest (9.6, 9.7), with the 9.7
+    freeze of the signature and the applicable decisions of another verdict that conflict with them (the 8.3
+    lookup; `run_id` and the manifests give its mark_intended scope as in `Store.lookup_decisions`)."""
+    matches = disposition_matches(store.conn, signature, at=at)
+    if not matches:
+        return ExplorerDisposition()
+    look = store.lookup_decisions(signature, at=at, run_id=run_id, manifest_entries=manifest_entries,
+                                  manifest_tickets=manifest_tickets)
+    verdicts = {m.decision.verdict for m in matches}
+    return ExplorerDisposition(matches, frozen=look.frozen,
+                               conflicting=tuple(m for m in look.applicable if m.decision.verdict not in verdicts))
 
 
 def hold_explorer_finding(finding: Finding, disposition: ExplorerDisposition) -> Finding:

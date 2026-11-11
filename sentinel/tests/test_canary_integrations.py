@@ -37,7 +37,8 @@ def test_alert_routes_follow_the_canary_failure_row():
                                                                  "canary_path_divergence", "detector_degraded"))
     assert (blind.priority, blind.paged, blind.rule) == (P1, ("harness_on_call",), "canary_failure")
     assert failed == blind and (path.priority, path.rule) == (P1, "canary_path_divergence")
-    assert (degraded.priority, degraded.paged, degraded.notified) == (P2, (), ("on_call_channel",))
+    assert (degraded.priority, degraded.paged, degraded.notified) == (P2, (), ("on_call_channel",
+                                                                              "release_channel"))   # 11.6
     assert I.alert_route("ok") is None
     with pytest.raises(ValueError):
         I.alert_route("missed")
@@ -64,7 +65,8 @@ def test_a_blind_night_files_a_highest_bug_keyed_by_the_mutant():
     (bug,) = I.sent_bug_payload(rep, run_id=RUN, report_link="https://sentinel.internal/r/1")
     assert (bug["project"], bug["issuetype"], bug["priority"], bug["dedup_key"]) == ("SENT", "Bug", "Highest", "M04")
     cp = hashlib.sha256(CONFIRM.encode()).hexdigest()[:12]
-    assert bug["labels"] == ["sentinel", "sentinel-surface-dialog.order-confirmation", f"sentinel-cp-{cp}"]
+    surface = hashlib.sha256(b"dialog.order-confirmation").hexdigest()[:12]       # hashed by default (11.8)
+    assert bug["labels"] == ["sentinel", f"sentinel-surface-{surface}", f"sentinel-cp-{cp}"]
     assert "Absorbed by: mask msk-1 (region rgn.confirm.bp-effect)." in bug["description"]
     assert "  canary: M04\n" in bug["description"] and "  report: https://sentinel.internal/r/1" in bug["description"]
     green = C.score([result(m04, "assertion_failed", "assertion:R02")])

@@ -5,7 +5,8 @@ Platform-independent logic over the ports of `orchestrator.ports` and the rig's 
 Windows module.
 
 - `flow.run_unit(unit, ports, locator, planner, ctx)`: one flow or census visit from its preconditions to its teardown
-  (`Unit`, `census_unit`, `UnitResult`, `WorkspaceStreak`, `UnitHooks`).
+  (`Unit`, `census_unit`, `UnitResult`, `WorkspaceStreak`, `UnitHooks`; `ExportPorts` and `SecretPorts` for export
+  and secret steps).
 - `emitter.emit(step, ports, locator, planner, ctx)`: stages 1 to 8 of 5.4.3 for one step (`StepResult`,
   `ExecContext`, `agent_rung_block`).
 - `heartbeat.HeartbeatPolicy`: the heartbeat at every step start and end, every gate and every 10 s, with
@@ -20,15 +21,15 @@ The input-side modules of the same package (`primitives`, `locator`, `secret`, `
 from .emitter import (AgentRescue, Effect, EmitterPorts, ExecContext, Foreground, ModalState, Rescue, StepResult,
                       agent_rung_block, emit)
 from .failures import FailureLedger, Fault, FaultInjector, guard, map_exception
-from .flow import (AssertVerdict, Captured, CheckRead, Unit, UnitHooks, UnitPorts, UnitResult, WaitPoll,
-                   WorkspaceStreak, census_unit, run_unit)
+from .flow import (AssertVerdict, Captured, CheckRead, ExportPorts, SecretPorts, Unit, UnitHooks, UnitPorts,
+                   UnitResult, WaitPoll, WorkspaceStreak, census_unit, run_unit)
 from .heartbeat import AppLife, HeartbeatPolicy, hang_detected, read_heartbeat
 
 __all__ = [
     "AgentRescue", "Effect", "EmitterPorts", "ExecContext", "Foreground", "ModalState", "Rescue", "StepResult",
     "agent_rung_block", "emit",
     "FailureLedger", "Fault", "FaultInjector", "guard", "map_exception",
-    "AssertVerdict", "Captured", "CheckRead", "Unit", "UnitHooks", "UnitPorts", "UnitResult", "WaitPoll",
-    "WorkspaceStreak", "census_unit", "run_unit",
+    "AssertVerdict", "Captured", "CheckRead", "ExportPorts", "SecretPorts", "Unit", "UnitHooks", "UnitPorts",
+    "UnitResult", "WaitPoll", "WorkspaceStreak", "census_unit", "run_unit",
     "AppLife", "HeartbeatPolicy", "hang_detected", "read_heartbeat",
 ]

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -365,9 +366,9 @@ def test_label_collisions_are_counted_in_run_health(s):
 
 def test_a_job_about_a_synthetic_finding_is_never_queued(s):
     f = finding(s, "F-syn", synthetic=True)
-    assert not f.synthetic                                       # the store's read-back drops the flag
-    job = J.auto_file_job(f, ctx())
-    assert job is not None and S.enqueue(s, job, run_id="run-00", at=T0) is None
+    assert f.synthetic and J.auto_file_job(f, ctx()) is None    # the store's read-back keeps the flag
+    job = J.auto_file_job(replace(f, synthetic=False), ctx())    # a job built from a copy without it
+    assert job is not None and S.enqueue(s, job, run_id="run-00", at=T0) is None   # the store still says synthetic
     assert s.query("SELECT count(*) FROM outbox")[0][0] == 0
     real = finding(s, "F-real")
     assert S.enqueue(s, J.auto_file_job(real, ctx()), run_id="run-00", at=T0) is not None

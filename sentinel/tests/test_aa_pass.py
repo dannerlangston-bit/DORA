@@ -160,6 +160,29 @@ def test_no_calibration_at_all_is_uncalibrated_and_queues_one():
     assert res.queue_calibration == A.CalibrationRequest("no_calibration")
 
 
+def test_text_changes_on_uncalibrated_pairs_never_trip_aa_drift_global():
+    """10.6, 3.9 step 6 (review pipeline-nightly:1): grid text shifted 1 px on 3 of 50 checkpoints. With no floors
+    the changed pairs are needs_human (uncalibrated) and the rest identical; with floors where the grid has none (a
+    region added after the Calibration) only that region is uncalibrated and no floor is invalidated."""
+    cps = [cp(n) for n in range(50)]
+    b = BASE.image
+    gx, gy, gw, gh = BASE.get("watchlist.grid").bbox
+    text = b.copy()
+    text[gy:gy + gh, gx + 1:gx + gw] = b[gy:gy + gh, gx:gx + gw - 1]
+    changes = {cid(n): text for n in range(3)}
+    res = go(cps, changes, cal=None)
+    rows = by_id(res)
+    assert {(rows[cid(n)].outcome, rows[cid(n)].reason) for n in range(3)} == {("needs_human", "uncalibrated")}
+    assert {rows[cid(n)].outcome for n in range(3, 50)} == {"identical"} and not res.invalidate
+    no_grid = calibration(cps)
+    for c in no_grid.checkpoints.values():
+        del c.floors["rgn.watchlist.grid"], c.thresholds["rgn.watchlist.grid"]
+    res = go(cps, changes, cal=no_grid)
+    rows = by_id(res)
+    assert (rows[cid(0)].outcome, rows[cid(0)].threshold_source) == ("needs_human", "uncalibrated")
+    assert rows[cid(9)].outcome == "identical" and not res.invalidate and res.queue_calibration is None
+
+
 def test_zero_floor_regions_of_masked_live_checkpoints_are_excluded_from_drift():
     frozen = [cp(n) for n in range(30)]
     live = [cp(n, "masked_live") for n in range(30, 40)]

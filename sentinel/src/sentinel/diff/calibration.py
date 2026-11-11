@@ -32,8 +32,8 @@ What this module holds besides the measurement (`calibrate_checkpoint`):
   redaction version, the workspace hash, the epoch definition hash), and `invalidation` / `is_valid` compare that
   with the live config (`LiveVersions`, built by `checkpoint_versions`) row by row, so a changed region, mask or
   redaction version uncalibrates that region, a changed workspace or epoch definition that checkpoint, and nothing
-  else. `carry_over` copies the floors of a key that differs only in `jre_release` or `render_probe_hash` once the
-  Nightly A/A on the new key passes (`carry_over_source` finds it).
+  else. `carry_over` copies the floors of a key that differs only in `jre_release` or `render_probe_hash`, with
+  their open fix items, once the Nightly A/A on the new key passes (`carry_over_source` finds it).
 - Queueing (7.13, 12.7 G5, L-FPR-04): `has_calibration` answers G5's `calibration_record` (and `calibrated_keys` is
   the container `fingerprint.g5` reads); `StoreCalibration` collects every region it answered `uncalibrated` and
   `CalibrationRequest` is the request to queue.
@@ -81,7 +81,10 @@ Choices where the spec is ambiguous (reported to the coordinator):
    epoch's `data_delay`; `window_date`, `dataset_id`, roll months and expirations are the dated epoch, outside it.
 8. A stored calibration's fix items are linked to its key through the floor they name or, for a failed-capture
    item without a floor, through the fingerprints its Calibration run recorded (their calibration keys). A key is
-   complete when none of its open items lacks a live `floor_exception` (with the same ticket or not).
+   complete when none of its open items lacks a live `floor_exception` (with the same ticket or not). The store
+   never closes an item for an exception: an item an exception covered at calibration is written open with the
+   exception's ticket (`floor_exception_ref`), so it is back on the fix list (and the key incomplete) once the
+   exception expires or is removed; only a re-calibration closes a stored item.
 9. `CalibrationFile` (the 4.16 export) marks a checkpoint whose calibration had a failed capture with an empty
    region list, and its `settle_p50_ms` is 0 when no time was measured (a real settle takes at least three 250 ms
    frames): the schema has no other place for either. A loaded file rebuilds its fix items from the regions (a
@@ -1010,9 +1013,11 @@ def floor_rows(cal: CheckpointCalibration, *, calibration_key: str, fingerprint_
 
 
 def fix_rows(cal: CheckpointCalibration, *, run_id: str) -> list[dict]:
-    """The `calibration_fixes` rows of one checkpoint (3.9 step 5, SD-20): one per item; an item a floor exception
-    closes is written closed by its approver, with the exception's ticket. A checkpoint with a failed capture writes
-    only its failed-capture items: it has no valid floor for a region item to name."""
+    """The `calibration_fixes` rows of one checkpoint (3.9 step 5, SD-20): one per item, written open. An item a floor
+    exception covers carries the exception's ticket (`floor_exception_ref`) but stays open: the exception closes it
+    only while it is in force in the config (`live_exceptions`, choice 8), so an expired or removed exception
+    reopens it (4.8, L-RGN-05). A checkpoint with a failed capture writes only its failed-capture items: it has no
+    valid floor for a region item to name."""
     out = []
     for f in cal.fix_list:
         if cal.failed and f.region_id is not None:
@@ -1022,8 +1027,7 @@ def fix_rows(cal: CheckpointCalibration, *, run_id: str) -> list[dict]:
             "cause_class": f.cause, "outcome": f.outcome, "reason": f.reason, "owner": f.owner or "unassigned",
             "ticket_ref": f.ticket, "opened_at": _utc_text(f.opened_at) if f.opened_at else None}
         if f.floor_exception is not None:
-            row.update(closed_at=row["opened_at"] or _utc_text(datetime.now(timezone.utc)),
-                       closed_by=f.floor_exception.approved_by, floor_exception_ref=f.floor_exception.ticket)
+            row["floor_exception_ref"] = f.floor_exception.ticket
         out.append(row)
     return out
 
@@ -1032,19 +1036,24 @@ def write_calibration(store: Any, checkpoints: Iterable[CheckpointCalibration], 
                       fingerprint_id: str | None, run_id: str, now: datetime,
                       live: Mapping[str, LiveVersions] | None = None) -> list[int]:
     """Write the floors and fix items of calibrated checkpoints (`Store.write_calibration`): each checkpoint's earlier
-    open items on the key are closed by this run, and an item that is still there keeps its opened date and
-    ticket, so its age counts from the day it was first opened (3.9 step 6). Returns the floor ids."""
+    open items on the key are closed by this run, and an item that is still there keeps its earliest opened date and
+    a ticket, so its age counts from the day it was first opened (3.9 step 6, 10.5: the clock is on the region's
+    floor). An item is the same item by checkpoint and region, or for a failed capture by checkpoint and outcome; the
+    cause class read off the pairs can change between calibrations and is taken from the new one. Returns the floor
+    ids."""
     cals = list(checkpoints)
     floors: list[dict] = []
     fixes: list[dict] = []
     mine = {c.checkpoint_id for c in cals}
-    earlier = [i for i in open_fixes(store, calibration_key) if i.checkpoint_id in mine]
+    earlier = sorted((i for i in open_fixes(store, calibration_key) if i.checkpoint_id in mine),
+                     key=lambda i: (i.opened_at or now, i.fix_id or 0))
     for cal in cals:
         for f in cal.fix_list:
-            prev = next((i for i in earlier if (i.checkpoint_id, i.region_id, i.cause, i.outcome)
-                         == (f.checkpoint_id, f.region_id, f.cause, f.outcome)), None)
-            if prev is not None:
-                f.opened_at, f.ticket = prev.opened_at, f.ticket or prev.ticket
+            same = [i for i in earlier if (i.checkpoint_id, i.region_id) == (f.checkpoint_id, f.region_id)
+                    and (f.region_id is not None or i.outcome == f.outcome)]
+            if same:
+                f.opened_at = same[0].opened_at
+                f.ticket = f.ticket or next((i.ticket for i in same if i.ticket), None)
         floors += floor_rows(cal, calibration_key=calibration_key, fingerprint_id=fingerprint_id, run_id=run_id,
                              live=(live or {}).get(cal.checkpoint_id), valid_from=now)
         fixes += fix_rows(cal, run_id=run_id)
@@ -1338,7 +1347,10 @@ def carry_over(store: Any, from_key: str, to_key: str, *, aa_passed: bool, now: 
     """Copy the current floors of `from_key` to `to_key` once the Nightly A/A on the new key passed (7.13); returns
     how many floors were carried (0 when the A/A did not pass: the new key stays at threshold zero, and a failing
     A/A is `aa_drift_global` with a full calibration, 10.6). The carried rows keep their measurements and their
-    Calibration run; their open fix items stay with the old key."""
+    Calibration run, and the open fix items of the carried floors come with them (same cause, owner, opened date
+    and ticket, linked to the new key's floor), so the new key is complete exactly when the old one is (3.9 steps 5
+    and 6) and an item's age is unchanged. A failed-capture item has no floor to carry; a key holding one is never
+    complete, so its floors never carry over."""
     if not aa_passed:
         return 0
     rows = store.query("SELECT * FROM calibration_floors WHERE rendering_key_sha256 = ? AND superseded_at IS NULL",
@@ -1347,7 +1359,11 @@ def carry_over(store: Any, from_key: str, to_key: str, *, aa_passed: bool, now: 
     carried = [{**{k: r[k] for k in r.keys() if k not in skip}, "rendering_key_sha256": to_key,
                 "fingerprint_sha256": fingerprint_id or r["fingerprint_sha256"], "valid_from": _utc_text(now)}
                for r in rows]
-    store.write_calibration(carried)
+    items = store.query("SELECT x.* FROM calibration_fixes x JOIN calibration_floors f ON f.floor_id = x.floor_id "
+                        "WHERE f.rendering_key_sha256 = ? AND f.superseded_at IS NULL AND x.closed_at IS NULL "
+                        "ORDER BY x.fix_id", (from_key,))
+    fixes = [{k: r[k] for k in r.keys() if k not in ("fix_id", "floor_id")} for r in items]   # relinked by region
+    store.write_calibration(carried, fixes)
     return len(carried)
 
 

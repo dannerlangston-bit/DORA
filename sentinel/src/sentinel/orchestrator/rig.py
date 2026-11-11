@@ -425,3 +425,11 @@ class Rig(ABC):
     def free_bytes(self) -> int:
         """Free bytes on the rig's artifact volume, the Watchdog's free-space result (10.2), read at every flow
         boundary."""
+
+
+def win32_input(api: Any = None) -> Any:
+    """The rig's `ports.InputPort` over `SendInput` (`gateway.emitter_win32.Win32Emitter`), for the Win32 rig
+    composition (`orchestrator.win32rig`). The rig is one of the three places allowed to import the emitter (5.4.9,
+    `lint.code.EMITTER_IMPORTERS`); the import happens here when called, never at module import (Windows only)."""
+    from ..gateway.emitter_win32 import Win32Emitter
+    return Win32Emitter(api)

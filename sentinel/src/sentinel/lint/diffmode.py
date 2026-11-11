@@ -27,9 +27,13 @@ Choices where the spec is ambiguous (reported):
 
 1. `--changed`: every error of the merged tree is reported, wherever it is (a change can break an untouched file,
    4.15 cross-file rationale), and warnings only on the changed files and from the history rules; the changed files
-   are `git diff --name-only BASE` plus untracked files, relative to the config root.
+   are `git diff --name-only BASE` plus untracked files, relative to the config root. A past `expires_at` (L-MSK-02,
+   L-RGN-05, L-SRF-11) is the exception: an error only in a changed file (4.8 L-MSK-02 "on the PR that adds or
+   renews it"); an expired record elsewhere is listed in the report's `expired`, as at run start (3.8).
 2. Approved checkpoints (L-XREF-10) come from the caller (a store query or a file); without that list every
-   checkpoint with a regions file in the base tree counts as approved, the conservative reading.
+   checkpoint the base tree defines or has a regions file for counts as approved, the conservative reading. Every
+   kind counts (census, sweep, split, flow), with or without a regions file: a changed ladder host, splitter or
+   workspace removes ids just as a renamed flow step does; the geometry half needs a regions file on both sides.
 3. A renewal "quotes" the A/A result when `reason` contains the run id of the latest nightly A/A result for (checkpoint,
    region); the region is stable when that result's changed-pixel count is 0. Without A/A results the renewal must
    change `reason` and name "A/A".
@@ -231,24 +235,31 @@ def history_violations(base: Repo, head: Repo, *, approved: Iterable[str] | None
         if sid not in head_surfaces and sid not in surface_entries:
             out.append(_v("L-SRF-01", rel, f"surface {sid} was removed or renamed without a rename map entry in "
                                            f"{renames_file} (old: {sid}, new: <id> or retired, build; 2.2.4)", "id"))
-    out += _xref10(base, head, renames, renames_file, approved)
+    out += _xref10(base, head, renames, renames_file, approved, base_def, head_def)
     out += _renewals(base, head, aa)
     if month_ago is not None:
         out += _growth(month_ago, head, head_def)
     return sorted(set(out))
 
 
-def _xref10(base: Repo, head: Repo, renames: list[dict], renames_file: str,
-            approved: Iterable[str] | None) -> list[Violation]:
+def _xref10(base: Repo, head: Repo, renames: list[dict], renames_file: str, approved: Iterable[str] | None,
+            base_def: Mapping[str, Any], head_def: Mapping[str, Any]) -> list[Violation]:
+    """L-XREF-10 (choice 2): every approved checkpoint of the base tree, of any kind and with or without a regions
+    file, whose id the head no longer defines (or whose regions file it dropped) needs a RENAMES entry; one whose
+    regions file changed geometry needs that entry or `recalibrate: true`."""
     out = []
     b_reg, h_reg = _regions(base), _regions(head)
-    for cid in sorted(set(b_reg) if approved is None else set(approved) & set(b_reg)):
+    pool = set(b_reg) | set(base_def)
+    for cid in sorted(pool if approved is None else set(approved) & pool):
         moved = follow_renames(cid, renames)
         h = h_reg.get(cid)
-        if h is None:
+        if (cid in base_def and cid not in head_def) or (cid in b_reg and h is None):
             if moved is None:
-                out.append(_v("L-XREF-10", b_reg[cid].rel, f"approved checkpoint {cid} disappeared without a "
-                                                           f"{renames_file} entry; its baseline would be orphaned"))
+                rel = b_reg[cid].rel if cid in b_reg else base_def[cid].file
+                out.append(_v("L-XREF-10", rel, f"approved checkpoint {cid} disappeared without a "
+                                                f"{renames_file} entry; its baseline would be orphaned"))
+            continue
+        if cid not in b_reg or h is None:          # no regions file on one side: no geometry to compare
             continue
         what = _changed_geometry(base, head, b_reg[cid], h)
         if what and _d(h.data).get("recalibrate") is not True and moved is None:
@@ -336,15 +347,23 @@ def lint_changed(root: str | Path, base_rev: str, phase: int = 0, today: date | 
                  approved: Iterable[str] | None = None, aa: Mapping[tuple[str, str], AAResult] | None = None
                  ) -> tuple[LintReport, frozenset[str]]:
     """`sentinel lint --changed BASE` on a sentinel-config pull request (4.15, choice 1): (report, changed files).
-    The history rules run against BASE and against the tree of 30 days ago and leave the skipped list."""
+    The history rules run against BASE and against the tree of 30 days ago and leave the skipped list.
+
+    An `expires_at` in the past (L-MSK-02, L-RGN-05, L-SRF-11) is an error only in a file the pull request changed
+    (4.8: "error on the PR that adds or renews it"); elsewhere the record has simply stopped applying (3.8), so it
+    is read as the run-start lint reads it and listed in `expired`, and an unrelated pull request is not blocked."""
     root = Path(root)
     today = today or date.today()
-    full = lint_repo(Repo.load(root), phase, today)
+    repo = Repo.load(root)
+    full = lint_repo(repo, phase, today)                        # CI: every past expiry is its rule's error
+    rest = lint_repo(repo, phase, today, run_start=True)        # past expiries become ExpiredRecord (rules.py 18)
     changed = changed_files(root, base_rev)
     history = history_at(root, base_rev, approved=approved, aa=aa, today=today)
-    kept = [v for v in full.violations if v.severity == "error" or v.file in changed]
+    kept = ([v for v in full.violations if v.file in changed]
+            + [v for v in rest.violations if v.severity == "error" and v.file not in changed])
+    expired = [e for e in rest.expired if e.file not in changed]
     skipped = {k: v for k, v in full.skipped.items() if k not in HISTORY_RULES}
-    return LintReport(sorted(set(kept + history)), skipped, full.expired), changed
+    return LintReport(sorted(set(kept + history)), skipped, expired), changed
 
 
 def review_comment(report: LintReport) -> dict[str, Any]:

@@ -17,7 +17,7 @@ from sentinel.store import RunPlan, ScopeEntry, Store, StoreRefused, apply_inher
 from sentinel.store.lifecycle import (add_business_days, expire_due, expiring_within, export_decisions, first_seen,
                                       hold_explorer_finding, lookup_explorer_dispositions, reconfirm,
                                       suspect_decisions, ticket_not_found, verify_fixes)
-from sentinel.store.store import Roster
+from sentinel.store.store import ActiveDecisionExists, Roster
 
 RUN0 = "run-00"
 WS = "ws.tier-a.active-trader"
@@ -365,6 +365,65 @@ def test_expected_behavior_holds_the_finding_and_keeps_the_flow(s):
     held = hold_explorer_finding(later, disp)
     assert disp.keep_flow and held.triage_state == "expected_behavior"
     assert held.evidence["explorer_disposition"]["candidate_flow"] == "keep"
+
+
+def test_a_frozen_signature_holds_no_explorer_finding(s):
+    """9.7: two supersessions within 30 days freeze the signature; later matches inherit nothing, so a later Explorer
+    finding is not held and its candidate flow is not discarded."""
+    cat = "invariant_violation"
+    start(s, RUN0, "b1")
+    finding(s, "F-1", RUN0, kind="explorer_candidate", category=cat)
+    decide(s, "dec-000001", "agent_mistake", category=cat, finding_ref="F-1", source="explorer_triage",
+           decided_at="2026-11-01T12:00:00+00:00")
+    decide(s, "dec-000002", "expected_behavior", category=cat, by="bob", source="explorer_triage",
+           decided_at="2026-11-02T12:00:00+00:00", call={"supersedes": "dec-000001"})
+    decide(s, "dec-000003", "agent_mistake", category=cat, by="carol", source="explorer_triage",
+           decided_at="2026-11-03T12:00:00+00:00", call={"supersedes": "dec-000002"})
+    sig = Signature(SWEEP, REGION, ph((1,)), cat)
+    at = "2026-11-04T12:00:00+00:00"
+    assert s.lookup_decisions(sig, at=at).frozen
+    disp = lookup_explorer_dispositions(s, sig, at=at)
+    assert disp.frozen and [m.decision.decision_id for m in disp.matches] == ["dec-000003"]
+    assert not disp.held and disp.decision is None
+    later = Finding("F-2", RUN0, "explorer_candidate", "overlap", RUN0, checkpoint_id=SWEEP, tier=2,
+                    region_id=REGION, phash=ph((1,)), category=cat)
+    assert hold_explorer_finding(later, disp) == later
+
+
+def test_conflicting_verdicts_hold_no_explorer_finding(s):
+    """9.7 More than one match: a confirmed bug and an agent_mistake both within tolerance of the finding differ in
+    verdict, so nothing is inherited and the finding is reported with both decisions."""
+    cat = "invariant_violation"
+    start(s, RUN0, "b1")
+    finding(s, "F-1", RUN0, kind="explorer_candidate", category=cat)
+    finding(s, "F-3", RUN0, category=cat, phash=ph(range(10)))
+    decide(s, "dec-000001", "agent_mistake", category=cat, finding_ref="F-1", source="explorer_triage")
+    decide(s, "dec-000002", "confirm_bug", category=cat, by="bob", phash=ph(range(10)), finding_ref="F-3")
+    mid = Signature(SWEEP, REGION, ph(range(5)), cat)                     # 5 bits from both
+    disp = lookup_explorer_dispositions(s, mid, at=TS)
+    assert [m.decision.decision_id for m in disp.conflicting] == ["dec-000002"]
+    assert not disp.held and disp.decision is None
+    near = lookup_explorer_dispositions(s, Signature(SWEEP, REGION, ph((1,)), cat), at=TS)
+    assert near.held and near.conflicting == ()                           # the bug is 9 bits away: no conflict
+    decide(s, "dec-000003", "noise_signature", category=cat, by="bob", phash=ph((2,)))   # noise agrees
+    assert lookup_explorer_dispositions(s, Signature(SWEEP, REGION, ph((1,)), cat), at=TS).held
+
+
+@pytest.mark.parametrize("action", ["confirm_bug", "expected_behavior"])
+def test_a_plain_decision_over_an_active_explorer_disposition_is_refused(s, action):
+    """9.7 Two humans, one signature: an active agent_mistake is an active decision on its signature, so another
+    human's plain decision on a matching finding is refused; supersede is the way forward."""
+    cat = "invariant_violation"
+    start(s, RUN0, "b1")
+    finding(s, "F-1", RUN0, kind="explorer_candidate", category=cat)
+    finding(s, "F-3", RUN0, kind="explorer_candidate", category=cat, phash=ph((3,)))
+    decide(s, "dec-000001", "agent_mistake", category=cat, finding_ref="F-1", source="explorer_triage")
+    with pytest.raises(ActiveDecisionExists, match="dec-000001"):
+        decide(s, "dec-000002", action, category=cat, by="bob", phash=ph((3,)), finding_ref="F-3",
+               source="explorer_triage")
+    d = decide(s, "dec-000002", action, category=cat, by="bob", phash=ph((3,)), finding_ref="F-3",
+               source="explorer_triage", call={"supersedes": "dec-000001"})
+    assert d.status == "active" and s.get_decision("dec-000001").status == "superseded"
 
 
 # -- novelty (9.2) --------------------------------------------------------------------------------------------------

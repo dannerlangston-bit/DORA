@@ -148,6 +148,8 @@ from ..store.store import PostRunProof
 from ..taxonomy import checkpoint_parts, load
 from .cluster import Cluster, Member, cluster_members
 from .inline import C, Image, Line, Link, T, Urls, join_and, number_word, plural, words_and
+from .jira import flow_task_phrase
+from .jira_sync import pending_notes
 
 if TYPE_CHECKING:
     from ..store.store import Store
@@ -343,6 +345,7 @@ class ReportContext:
     comment_overdue: bool = False                # 9.2 error: no comment posted by budget plus 15 minutes
     override: dict | None = None                 # {"by": login, "reason": text}: forced success (9.2, 9.6)
     provenance: dict = field(default_factory=dict)  # 9.5: harness/config commit, VM image id
+    release_gate_note: str | None = None         # RC runs: `policy.ReleaseGate.header_line()` (11.7 row 12)
 
 
 @dataclass(frozen=True)
@@ -452,6 +455,7 @@ class RunReport:
     g2_failures: list[str] = field(default_factory=list)         # 1.4 G2: the matrix is withheld when non-empty
     safety_proof: list[tuple[str, list[Line]]] = field(default_factory=list)   # 9.4 item 8, for the page
     alerts: list[Line] = field(default_factory=list)             # 9.5 Alerts panel, one line per alert
+    ticket_notes: Mapping[str, str] = field(default_factory=dict)  # 9.9: decision id -> "ticket pending (...)"
 
     @property
     def n_unexpected(self) -> int:
@@ -1033,6 +1037,7 @@ class _Builder:
             ("Reviewer", prose.reviewer(cl, rep, group, done)),
             ("Re-run", prose.rerun(cl, rep, group)),
             ("Related decisions", prose.related(rep)),
+            *_triage_note(rep.finding),
             ("Actions", prose.actions(ref)),
         ]
 
@@ -1054,7 +1059,8 @@ class _Builder:
         evidence = Evidence(self.urls.image("base step", ev.get("base_screenshot")),
                             self.urls.image("candidate step", ev.get("pre_screenshot")), None,
                             self.urls.checkpoint(ref), None)
-        item.fields = [("What moved", moved), (FIELD_EVIDENCE, evidence), ("Actions", prose.actions(ref))]
+        item.fields = [("What moved", moved), (FIELD_EVIDENCE, evidence), *_triage_note(f),
+                       ("Actions", prose.actions(ref))]
 
     def _fill_finding(self, item: Item) -> None:
         f = item.finding
@@ -1064,7 +1070,7 @@ class _Builder:
                      C(f.checkpoint_id)]
         item.header = tuple(head)
         item.fields = [("What", (T(f.description),)),
-                       ("Details", (Link("finding page", self.urls.finding(f.finding_id)),))]
+                       ("Details", (Link("finding page", self.urls.finding(f.finding_id)),)), *_triage_note(f)]
 
     # ---- intended -------------------------------------------------------------------------
     def intended_items(self, intended: list[Member]) -> tuple[list[IntendedItem], list[Cluster]]:
@@ -1123,9 +1129,7 @@ class _Builder:
                 parts.append((T(f"{eid}: not verified; covering checkpoints "),) + _codes(ids) +
                              (T(" have no intended outcome"),))
             else:
-                task = tasks.get(eid)
-                parts.append((T(f"{eid}: no covering checkpoint; flow-authoring task "
-                                f"{task + ' ' if task else ''}opened"),))
+                parts.append((T(f"{eid}: no covering checkpoint; {flow_task_phrase(tasks.get(eid))}"),))
         return (T("Manifest reconciliation: "),) + join_and(parts, sep="; ", last="; ")
 
     # ---- suppressed -----------------------------------------------------------------------
@@ -1239,7 +1243,7 @@ def coverage_cell(c: Mapping[str, Any]) -> dict:
     return {"surface": c.get("surface", c.get("surface_id")), "persona": c.get("persona"),
             "entitlement": c.get("entitlement", c.get("profile")), "state": c.get("state"),
             "worst": c.get("worst", c.get("worst_outcome")), "n": int(c.get("n", c.get("checkpoint_count")) or 0),
-            "reason": c.get("reason", c.get("not_run_reason"))}
+            "reason": c.get("reason", c.get("not_run_reason")), "tier": c.get("tier")}
 
 
 def g2_failures(coverage: Mapping[str, Any]) -> list[str]:
@@ -1729,6 +1733,8 @@ def _banners(b: _Builder, members: list[Member], items: list[Item]) -> tuple[str
                 and i.cluster.representative.reason_code == "reviewer_unavailable")
         lines.append((T(f"Reviewer disabled since {rd.get('since', 'unknown')}: eval gate {rd.get('gate', 'unknown')} "
                         f"failed; {plural(n, 'item')} await{'s' if n == 1 else ''} a human"),))
+    if b.ctx.release_gate_note and b.run.run_type == "rc":     # 11.7 row 12: the assumed release gate
+        lines.append((T(b.ctx.release_gate_note),))
     if any(f.kind == "global_rendering_shift" for f in b.findings):
         n = sum(1 for m in members if m.reason_code == "global_shift")
         lines.append((T(f"Global rendering shift: {n} checkpoints collapsed into one "),
@@ -1773,6 +1779,10 @@ def _count(x: Any) -> str:
     return "not read" if x is None else f"{float(x):g}"
 
 
+PROOF_TABLE_ROWS = ("working orders", "filled orders", "canceled orders", "position statement rows", "net liq",
+                    "buying power")          # 6.6: the table's row order (the stored counts come back key-sorted)
+
+
 def _proof_block(p: PostRunProof) -> tuple[str, list[Line]]:
     """One `post_run_proofs` row as the 6.6 ORDER SAFETY PROOF block prints it; the login alias is never printed."""
     title = f"ORDER SAFETY PROOF, shard {p.shard_id}" if p.shard_id else \
@@ -1785,7 +1795,9 @@ def _proof_block(p: PostRunProof) -> tuple[str, list[Line]]:
     lines += [f"send policy {p.send_policy_ref}",
               f"gateway {plural(p.gateway_events, 'event')} allowed, {plural(p.gateway_drops, 'drop')}, "
               f"{plural(p.refusals_count, 'refusal')}"]
-    for name, row in (p.counts.get("rows") or {}).items():
+    rows = p.counts.get("rows") or {}
+    order = {n: i for i, n in enumerate(PROOF_TABLE_ROWS)}
+    for name, row in sorted(rows.items(), key=lambda kv: (order.get(kv[0], len(order)), kv[0])):
         if "drift" in row:
             lines.append(_drift_line(name, row))
         else:
@@ -1833,6 +1845,12 @@ def safety_proof_blocks(b: _Builder) -> list[tuple[str, list[Line]]]:
     return blocks
 
 
+def _triage_note(f: Finding | None) -> list[Field]:
+    """The finding's triage note (9.6, 9.9: "mask requested, PR {n}", a proposal, a declined proposal's reason)."""
+    note = (f.evidence or {}).get("triage_note") if f is not None else None
+    return [("Triage note", (T(str(note)),))] if note else []
+
+
 def _alert_line(b: _Builder, a: Mapping[str, Any]) -> Line:
     """One 9.10 alert of the summary, with the 6.6 hand-over facts (account, Working Orders screenshot, instruction)
     when the alert carries them."""
@@ -1844,6 +1862,11 @@ def _alert_line(b: _Builder, a: Mapping[str, Any]) -> Line:
             text += f": {a['detail']}"
         if a.get("paged"):
             text += f"; paged {', '.join(map(str, a['paged']))}"
+        if len(a.get("shards") or ()) > 1:                # one alert per run and rule, its shards listed (10.1)
+            text += f"; shards {', '.join(map(str, a['shards']))}"
+        acks = [k for k in b.summary.get("alert_acks") or () if a.get("key") and k.get("key") == a.get("key")]
+        if acks:                                         # 9.10: who acknowledged it, and when
+            text += "; acknowledged by " + ", ".join(f"{k.get('by')} at {k.get('at')}" for k in acks)
     else:
         text = ", ".join(f"{k} {v}" for k, v in a.items()
                          if k not in ("account", "working_orders_screenshot", "instruction"))
@@ -1868,7 +1891,7 @@ def build_report(run: RunOutcome, outcomes: list[CheckpointOutcome], findings: l
                  decisions: list[Decision], coverage: dict | None, health: dict | None,
                  manifest: dict | None, context: ReportContext,
                  steps: list[StepOutcome] = (), *, summary: Mapping[str, Any] | None = None,
-                 safety: SafetyRows | None = None) -> RunReport:
+                 safety: SafetyRows | None = None, ticket_notes: Mapping[str, str] | None = None) -> RunReport:
     """Arrange one run's records into the report of 9.2 (and 9.5 for the static page). `summary` is the run's
     `summary_json` and `safety` the store rows of the Safety section (module docstring); `ReportInputs.from_store`
     reads both, with `coverage` and `health` from the summary."""
@@ -1914,7 +1937,7 @@ def build_report(run: RunOutcome, outcomes: list[CheckpointOutcome], findings: l
         health_rows=health_rows(b, items, intended_clusters), history=tuple(context.history), outcomes=b.outcomes,
         manifest_lint_lead=lint_lead, manifest_lint=lint, manifest_template=template, empty_reason_line=empty,
         g2_failures=g2, safety_proof=safety_proof_blocks(b),
-        alerts=[_alert_line(b, a) for a in b.summary.get("alerts") or ()])
+        alerts=[_alert_line(b, a) for a in b.summary.get("alerts") or ()], ticket_notes=dict(ticket_notes or {}))
 
 
 @dataclass(frozen=True)
@@ -1928,6 +1951,7 @@ class ReportInputs:
     steps: list[StepOutcome]
     summary: dict
     safety: SafetyRows
+    ticket_notes: Mapping[str, str] = field(default_factory=dict)   # 9.9 (`jira_sync.pending_notes`)
 
     @classmethod
     def from_store(cls, store: "Store", run_id: str, *, at: str | None = None) -> "ReportInputs":
@@ -1944,13 +1968,14 @@ class ReportInputs:
         decisions = [d for d in (store.get_decision(i) for i in ids) if d is not None]
         nightly = (summary.get("safety") or {}).get("nightly_run_id")
         safety = SafetyRows.from_store(store, run_id, nightly_run_id=nightly, at=at)
-        return cls(run, outcomes, findings, decisions, store.step_outcomes(run_id), summary, safety)
+        notes = pending_notes(store, ids, at or run.ended_at or run.started_at or "")
+        return cls(run, outcomes, findings, decisions, store.step_outcomes(run_id), summary, safety, notes)
 
     def build(self, manifest: dict | None, context: ReportContext) -> RunReport:
         """The report of these inputs; `manifest` is the run's loaded manifest (4.3) as a dict, None when missing."""
         return build_report(self.run, self.outcomes, self.findings, self.decisions, self.summary.get("coverage"),
                             self.summary.get("health"), manifest, context, self.steps, summary=self.summary,
-                            safety=self.safety)
+                            safety=self.safety, ticket_notes=self.ticket_notes)
 
 
 def commit_status(run: RunOutcome, outcomes: list[CheckpointOutcome], mode: str = "informational", *,

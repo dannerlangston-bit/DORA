@@ -14,7 +14,8 @@ step led to gets (`led_to`) and what every later checkpoint of the flow gets (`r
    fails; the checkpoint it led to takes the sentinel's checkpoint outcome (an `env_error` for a catalog abort, 4.7)
    or `not_run (reason: step_failed:<step>)`.
 3. Resolution: the scripted rungs of the locator ladder (`Locator.locate`) on a fresh grab, for every point the step
-   names (`target`, a drag's `from` and `to`, a wheel's `at`; a literal `[x, y]` needs no ladder). All rungs failing
+   names (`target`, a drag's `from` and `to`, a wheel's `at`; a literal `[x, y]` needs no ladder), and the parking
+   coordinate of a `wheel` or `park_mouse` (choice 10). All rungs failing
    runs `reset_input_state`, re-enumerates, re-grabs and tries once more (the step's single retry: success is
    `passed_after_retry`, the first attempt's screenshot kept); then rung 4, the agent rescue, when
    `agent_rung_block` allows it (5.5, 4.7): success is `passed_via_agent_fallback`, failure or a skipped rung is
@@ -34,8 +35,10 @@ step led to gets (`led_to`) and what every later checkpoint of the flow gets (`r
    (`watchdog.hook_host_died`: kill the tree, restart the hook host out of its budget of one per shard, relaunch;
    the second time `aborted_harness (reason: hook_lost)`).
 8. Post-condition: the step's declared effect (`ports.postcondition`) is polled within the step's `timeout_ms`
-   (default 5000); a failure is `failed` with reason `postcondition` (`export_timeout` for an export or copy-grid step
-   that produced nothing, 4.7), and with `on_fail: retry_once` the step's single retry runs first.
+   (default 5000); a failure is `failed` with reason `postcondition` (or the final reason the read gives), and with
+   `on_fail: retry_once` the step's single retry runs first, unless a
+   run-level consequence during the poll (a heartbeat that cannot be written) stopped the run: that step fails at
+   once and no input follows (10.2 "never a retry loop").
 
 A step has one retry, whatever uses it (the scripted ladder's second attempt, the integrity retry, `retry_once`), and
 it never crosses a capture: a checkpoint is its own step (4.7, 5.4.3). The emitter's own step events are one action row
@@ -66,6 +69,18 @@ Choices where the spec is ambiguous (reported):
    differ in name only; `retry_once` adds the post-condition retry.
 7. `focus_neutral` and every other emitted step set `expect_screen_change_since`; `park_mouse` (a move) does not.
 8. A secret step's action row carries `<redacted:<vault_ref>>` and the character count in `reason` (6.9, 5.4.10).
+9. The sticky `order_stage` declaration (`ExecContext.order_stage`, 5.4.6 source 3) is set as soon as an action of an
+   `order_stage: true` step gets past stage 4, before the step's post-condition is read: 6.2 has the declaration set
+   "before the click is emitted", so an order-stage step that fails after its click went out still holds it, and an
+   unknown order-dialog label in its teardown ends the run `aborted_safety (unknown_dialog_in_order_stage)`. Only
+   the teardown rule of the flow (a passing `close_dialog` or `clear_ticket` with the flag clear) or a killed tree
+   lifts it.
+10. The parking coordinate a `park_mouse` moves to and a `wheel` parks at after its notches (5.4.10, 4.7 "mouse
+    parked after") is the declared dead area of 3.5, 8 px inside the bottom-right corner of the step's fresh grab:
+    the coordinate `pipeline.run._park` takes for the capture and its 16 px system mask (`diff.regions.park_rect`).
+11. A `focus_neutral` step that names no `target` (4.7 allows none) sends nothing and passes with `NO_NEUTRAL` as its
+    detail: no configuration declares a neutral control beside the step's own target, so there is no control to
+    click, and the settle rule's condition 2 (focus dropped on the neutral control, 3.5) still decides the capture.
 """
 from __future__ import annotations
 
@@ -94,12 +109,13 @@ TARGET_CROP = (40, 20)                    # 5.5: the crop around the agent's fin
 POLL_S = 0.25                             # the settle loop's frame interval (3.5)
 PASSED = ("passed", "passed_after_retry", "passed_via_agent_fallback")
 POINT_FIELDS = ("target", "from", "to", "at")
+PARKED_STEPS = ("park_mouse", "wheel")    # the steps the planner gives the parking coordinate (choice 10)
+PARK_INSET_PX = 8                         # 3.5: the dead area 8 px inside the grab's bottom-right corner
+NO_NEUTRAL = "no neutral control named; nothing clicked, the settle rule checks focus (3.5)"   # choice 11
 GUARDED_NAMES = ("enter", "return", "space")
 ON_FAIL = ("fail", "retry_once", "teardown")
 EVENT_ACTION = {"click": "click", "dblclick": "dblclick", "rclick": "rclick", "drag": "drag", "wheel": "wheel",
                 "press": "key_chord", "key_chord": "key_chord", "type_fixture": "type", "secret": "secret"}
-STEP_EVENT_ACTION = {"export": "export", "copy_grid": "clipboard"}
-EXPORT_STEPS = ("export", "copy_grid")
 LOCATOR_TEXT = "scripted locator broke at step {step}"
 DEGRADED_TEXT = "scripted locator failed; agent fallback disabled"     # 10.7
 
@@ -128,8 +144,8 @@ class ModalState:
 @dataclass(frozen=True)
 class Effect:
     """A post-condition read (stage 8). `passed` None: the step declares no effect. `reason` is a final failure
-    reason that replaces `postcondition` (an export step's `export_unavailable`); `assertion_id` names the failing
-    assertion when the effect is one (a `type_fixture` `verify`)."""
+    reason that replaces `postcondition` and ends the poll at once (the port knows the effect cannot appear);
+    `assertion_id` names the failing assertion when the effect is one (a `type_fixture` `verify`)."""
 
     passed: bool | None
     reason: str | None = None
@@ -374,6 +390,15 @@ def click_crop(frame: Frame, point: tuple[int, int], size: int | tuple[int, int]
     return img[max(0, top):min(height, top + h), max(0, left):min(width, left + w)].copy()
 
 
+def park_point(frame: Frame) -> tuple[int, int] | None:
+    """The parking coordinate on the screen (choice 10): 8 px inside the grab's bottom-right corner; None when the
+    frame has no image."""
+    if frame.image is None:
+        return None
+    height, width = frame.image.shape[0], frame.image.shape[1]
+    return frame.origin[0] + width - PARK_INSET_PX, frame.origin[1] + height - PARK_INSET_PX
+
+
 def declares_guarded(step: Mapping[str, Any]) -> bool:
     """The step requests Enter or Space explicitly: `press: enter` or `commit: enter` (5.4.7)."""
     key = step.get("key") if step.get("type") == "press" else step.get("commit")
@@ -441,10 +466,15 @@ class _Step:
     def target(self) -> Mapping[str, Any] | None:
         return self.targets.get("target") or next(iter(self.targets.values()), None)
 
+    @property
+    def stopped(self) -> bool:
+        """A kept consequence set a run outcome (choice 3)."""
+        return any(r.run is not None for r in self.consequences)
+
     def done(self, status: str, *, reason: str | None = None, led_to: Outcome | None = None,
              rest: bool = False, gateway_event: Mapping[str, Any] | None = None,
              detail: str | None = None) -> StepResult:
-        stops = any(r.run is not None for r in self.consequences)
+        stops = self.stopped
         up, restarts = self.ctx.tags()
         events = tuple(replace(e, step_outcome=status) if e.source == "orchestrator" else e for e in self.events)
         return StepResult(
@@ -476,6 +506,8 @@ def emit(step: Mapping[str, Any], ports: EmitterPorts, locator: Locator, planner
     if on_fail not in ON_FAIL:
         raise ValueError(f"on_fail {on_fail!r}; one of {ON_FAIL} (4.7)")
     s = _Step(step, ports, locator, planner, ctx, teardown)
+    if s.kind == "focus_neutral" and "target" not in step:
+        return s.done("passed", detail=NO_NEUTRAL)                                       # choice 11
     if ctx.audit is not None:
         ctx.audit.set_context(mode=ctx.mode, flow_id=ctx.flow_id, step_id=s.step_id,
                               secret_step=s.kind == "secret", pre_hash=ctx.last_capture_sha256)
@@ -529,11 +561,14 @@ def _attempt(s: _Step, on_fail: str) -> StepResult | None:
     # 8. post-condition
     effect = _postcondition(s)
     if effect is not None and effect.passed is False:
+        if s.stopped:                            # 10.2: a stop during the poll is never retried (choice 3)
+            return s.failed(reason="postcondition", detail="a run-level consequence during the post-condition poll "
+                                                           "stopped the run")
         if on_fail == "retry_once" and not s.retry_used:
             s.retry_used = True
             return None
         led = Outcome("assertion_failed", f"assertion:{effect.assertion_id}") if effect.assertion_id else None
-        reason = effect.reason or ("export_timeout" if s.kind in EXPORT_STEPS else "postcondition")
+        reason = effect.reason or "postcondition"
         return s.failed(led, reason=reason, detail="the step's declared effect did not appear within its timeout")
     return s.done("passed_after_retry" if s.retry_used else "passed")
 
@@ -558,7 +593,8 @@ def _resolve(s: _Step, frame: Frame) -> dict[str, tuple[int, int]] | str | None:
         else:
             missed = True
     if not missed:
-        return points
+        park = park_point(frame) if s.kind in PARKED_STEPS else None
+        return points if park is None else {**points, "park": park}
     if not s.retry_used:                       # 5.5: reset_input_state, re-enumerate, re-capture, once more
         s.retry_used = True
         reset = s.ports.reset_input_state()
@@ -644,6 +680,8 @@ def _send(s: _Step, frame: Frame, points: Mapping[str, tuple[int, int]]) -> Step
         if ctx.heartbeat is not None and s.kind != "park_mouse":
             ctx.heartbeat.expect_screen_change()
         res = ports.send_input(a)
+        if res.refused is None and a.order_stage_step:
+            ctx.order_stage = True               # choice 9: the click got past stage 4, whatever the step does next
         s.events.append(_action_row(s, a, res, crop_sha))
         _audit(s, a, res, crop_sha)
         if res.refused is not None:
@@ -656,7 +694,7 @@ def _send(s: _Step, frame: Frame, points: Mapping[str, tuple[int, int]]) -> Step
 
 def _action_row(s: _Step, a: Action, res: EmitResult, crop_sha: str | None) -> StepEvent:
     """The emitter's row for one action (choice 8 for secrets)."""
-    action = STEP_EVENT_ACTION.get(s.kind) or EVENT_ACTION.get(a.kind, "click")
+    action = EVENT_ACTION.get(a.kind, "click")
     secret = a.kind == "secret"
     decision, reason, cls = "emitted", None, "allowed"
     if res.refused is not None:

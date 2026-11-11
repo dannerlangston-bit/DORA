@@ -82,7 +82,7 @@ from datetime import datetime, timedelta
 
 from ..calendar import ny
 from ..canonical import canonical_json, sha256_id
-from ..orchestrator.alerts import ON_CALL_CHANNEL, P2, AlertRoute
+from ..orchestrator import alerts
 from ..records import NON_HUMAN, Decision, Finding, MaintenanceItem, OutboxJob
 from ..store.lifecycle import ticket_not_found
 from ..store.store import Store, StoreRefused, decision_int, decision_ref, utc
@@ -95,7 +95,7 @@ REOPEN_TRANSITION = "Reopen"                      # 9.9: the workflow transition
 COLLISION_ROW = "Jira label collisions"           # choice 8
 WITHOUT_TICKET_HOURS = 24                         # 9.9: decisions without tickets after 24 hours
 POLL_JQL = 'labels = "sentinel" AND statusCategory = Done'          # choice 6
-REOPEN_FORBIDDEN = AlertRoute("jira_reopen_forbidden", P2, (), (ON_CALL_CHANNEL,))   # 9.9, choice 7
+REOPEN_FORBIDDEN = alerts.jira_reopen_forbidden()                                    # 9.9, choice 7
 _JIRA_IN = ",".join(f"'{k}'" for k in jira.JIRA_KINDS)
 
 

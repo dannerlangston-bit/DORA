@@ -19,7 +19,7 @@ T0 = datetime(2026, 11, 10, 15, 0, tzinfo=timezone.utc)
 SCM, SLACK, JIRA, PAGER = "scm.example.internal", "slack.com", "jira.example.internal", "pager.example.internal"
 ALLOW = EgressAllowlist.from_dict({"hosts": [
     {"host": SCM, "purposes": ["pr_comment"]}, {"host": SLACK, "purposes": ["slack", "digest"]},
-    {"host": JIRA, "purposes": ["jira"]}, {"host": PAGER, "purposes": ["digest"]}],
+    {"host": JIRA, "purposes": ["jira"]}, {"host": PAGER, "purposes": ["page"]}],
     "signed_by": "sec", "signed_at": "2026-11-01T00:00:00Z", "signature": "pgp:x"})
 ALERTS = (ob.AlertDestination("slack", "slack", "#sentinel-oncall"), ob.AlertDestination("paging", "page", "pager"))
 
@@ -31,10 +31,8 @@ def t(minutes: float = 0) -> str:
 class FakeSender:
     """Fails the first `failures` sends (HTTP 502), then delivers; `down` fails every send."""
 
-    def __init__(self, host: str, failures: int = 0, *, down: bool = False, purpose: str | None = None):
+    def __init__(self, host: str, failures: int = 0, *, down: bool = False):
         self.host, self.failures, self.down = host, failures, down
-        if purpose is not None:
-            self.purpose = purpose
         self.sent: list[tuple[int, dict]] = []
         self.tries = 0
 
@@ -167,7 +165,7 @@ def test_a_job_failing_for_24_hours_follows_the_schedule_and_is_abandoned(store,
 def test_the_outage_alert_fires_once_at_15_minutes_on_every_other_channel(store, arts):
     jid = enqueue(store, arts, kind="jira_comment", destination="TOS-41", payload={"body": "seen again"})
     jira = FakeSender(JIRA, down=True)
-    slack, pager = FakeSender(SLACK), FakeSender(PAGER, purpose="digest")
+    slack, pager = FakeSender(SLACK), FakeSender(PAGER)
     senders = {"jira_comment": jira, "slack": slack, "page": pager}
     raised = {}
     clock = t(0)
@@ -192,7 +190,7 @@ def test_the_outage_alert_fires_once_at_15_minutes_on_every_other_channel(store,
 
 def test_a_slack_outage_alerts_the_paging_service_only(store, arts):
     enqueue(store, arts)
-    pager = FakeSender(PAGER, purpose="digest")
+    pager = FakeSender(PAGER)
     senders = {"slack": FakeSender(SLACK, down=True), "page": pager}
     for m in (0, 1, 2, 5, 15):
         rep = ob.dispatch(store, arts, senders, t(m), allowlist=ALLOW, alert_to=ALERTS)
@@ -204,7 +202,7 @@ def test_one_alert_per_channel_outage_and_a_new_one_after_recovery(store, arts):
     a = enqueue(store, arts, payload={"text": "a"})
     b = enqueue(store, arts, payload={"text": "b"}, at=3)
     slack = FakeSender(SLACK, down=True)
-    pager = FakeSender(PAGER, purpose="digest")
+    pager = FakeSender(PAGER)
     senders = {"slack": slack, "page": pager}
     alerts = []
     for m in (0, 1, 2, 3, 4, 5, 8, 15, 18, 60):
@@ -223,7 +221,7 @@ def test_one_alert_per_channel_outage_and_a_new_one_after_recovery(store, arts):
 def test_an_outage_alert_that_fails_raises_no_further_alert(store, arts):
     enqueue(store, arts, kind="jira_create", destination="SENT", payload={"summary": "task"})
     senders = {"jira_create": FakeSender(JIRA, down=True), "slack": FakeSender(SLACK, down=True),
-               "page": FakeSender(PAGER, down=True, purpose="digest")}
+               "page": FakeSender(PAGER, down=True)}
     raised = []
     for m in range(0, 24 * 60 + 61, 1):
         if ob.due_jobs(store, t(m)):
@@ -278,13 +276,14 @@ def test_a_missing_payload_fails_without_a_request(store, arts):
     assert store.outbox_job(jid).state == "failed"
 
 
-def test_a_page_needs_a_sender_that_names_its_purpose(store, arts):
+def test_a_page_logs_the_page_purpose_and_the_new_pr_kinds_are_stored(store, arts):
     jid = enqueue(store, arts, kind="page", destination="pager", run_id=None)
-    rep = ob.dispatch(store, arts, {"page": FakeSender(PAGER)}, t(0), allowlist=ALLOW)
-    assert rep.attempts[0].error == "no egress purpose for page posts (6.10)" and egress(store) == []
-    ob.dispatch(store, arts, {"page": FakeSender(PAGER, purpose="digest")}, t(1), allowlist=ALLOW)
+    ob.dispatch(store, arts, {"page": FakeSender(PAGER)}, t(1), allowlist=ALLOW)
     assert store.outbox_job(jid).state == "sent"
-    assert [(r["purpose"], r["run_id"]) for r in egress(store)] == [("digest", None)]
+    assert [(r["purpose"], r["run_id"]) for r in egress(store)] == [("page", None)]      # CD-2: 6.10 `page`
+    for kind in ("flow_pr", "anchor_pr"):                                                  # CD-3: 9.6 PRs
+        fid = enqueue(store, arts, kind=kind, destination="sentinel-config", payload={"title": kind})
+        assert store.outbox_job(fid).kind == kind and ob.channel_of(kind) == "pr_host"
 
 
 def test_a_sender_that_returns_nothing_still_delivers(store, arts):
@@ -306,7 +305,8 @@ def test_channels_and_egress_purposes():
                                        "slack", "page", "digest")] == [
         "pr_host", "pr_host", "pr_host", "pr_host", "jira", "slack", "paging", "email"]
     assert [ob.egress_purpose(k) for k in ("commit_status", "manifest_pr", "jira_create", "slack", "digest",
-                                           "page")] == ["pr_comment", "pr_comment", "jira", "slack", "digest", None]
+                                           "page", "flow_pr", "anchor_pr")] == [
+        "pr_comment", "pr_comment", "jira", "slack", "digest", "page", "pr_comment", "pr_comment"]
     with pytest.raises(ValueError):
         ob.channel_of("fax")
 

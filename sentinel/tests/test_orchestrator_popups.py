@@ -200,6 +200,23 @@ def test_launcher_update_is_version_mismatch_then_version_changed_after_a_relaun
     assert decide(entry("POP-01"), again).checkpoint.reason == "version_changed_mid_run"
 
 
+def test_launcher_update_at_launch_holds_the_rig_and_after_a_relaunch_does_not():
+    """popups-gates:3: a version_mismatch means nothing else runs on that rig until a human looks (7.3, 7.7 step 1),
+    as `gates.check_launched` asks; a change within the run (after a relaunch) does not hold the rig."""
+    from sentinel.store.safety import disable_reason_for
+    for phase, gate in (("launch", "launched"), ("login", "authenticated"), ("running", "running")):
+        r = decide(entry("POP-01"), PopupContext(phase=phase, gate=gate), win("Updating thinkorswim"))
+        assert r.unreached.reason == "version_mismatch" and r.has("disable_rig") and r.has("teardown"), phase
+        assert disable_reason_for(r) == "version_mismatch"
+        moved = decide(entry("POP-01"), PopupContext(phase=phase, gate=gate, relaunched=True))
+        assert moved.unreached.reason == "version_changed_mid_run" and not moved.has("disable_rig"), phase
+    other_class = variant("POP-01", **{"class": "dismissable"})    # a version_mismatch ends the shard whatever the class
+    held = decide(entry("POP-01", other_class), RUN)
+    assert held.has("disable_rig") and held.unreached.reason == "version_mismatch" and held.has("teardown")
+    assert disable_reason_for(held) == "version_mismatch"
+    assert not decide(entry("POP-04"), RUN).has("disable_rig")     # other shard-level env errors hold nothing
+
+
 def test_app_error_dialog_is_inv14_never_dismissed():
     r = decide(entry("POP-10"), RUN, win("Java Exception"))
     assert r.checkpoint.outcome == "invariant_violation" and r.checkpoint.reason == "INV-14"
@@ -498,3 +515,31 @@ def test_order_title_sets_feed_the_window_watcher():
     classes = classify_windows([win("Order Confirmation", hwnd=1), win("Order filled", hwnd=2),
                                 win("Message Center", hwnd=3)], titles, now=0.0)
     assert [w.window.hwnd for w in classes.order_dialogs] == [1] and classes.order_event_window
+
+
+def test_an_unmatched_detached_order_entry_window_is_never_handed_to_the_agent_or_closed():
+    """popups-gates:0: the order-dialog set is the Order Confirmation entry and the detached Order Entry window (5.4.6
+    source 1, 6.2); the example catalog has no Order Entry entry, so the window takes the unmatched path (7.8 policy
+    5): never the agent, never WM_CLOSE, drafted as a safety entry; inside an order stage the kill switch."""
+    from sentinel.orchestrator.popups import DETACHED_TICKET_REGEXES
+    ticket = win("Order Entry - AAPL", hwnd=700, cls="SunAwtFrame")
+    assert CAT.match(ticket, "running") is None
+    for agent in (True, False):
+        r = unknown_window(ticket, PopupContext(flow_id="flow.x", step_id="s2", agent_enabled=agent), CAT)
+        assert r.evidence["close"] is None and "dismiss_labels" not in r.evidence, agent
+        assert json.loads(r.findings[0].detail)["class"] == "safety" and r.has("quarantine_flow")
+    staged = unknown_window(ticket, PopupContext(flow_id="flow.x", step_id="s2", order_stage=True), CAT)
+    assert staged.unreached.reason == "unknown_dialog_in_order_stage" and staged.has("kill_switch")
+    main = win("Main@thinkorswim [build 1998]", hwnd=1, cls="SunAwtFrame")
+    (hit,) = PopupSentinel(CAT).sweep([main, ticket], PopupContext(flow_id="flow.x", step_id="s2",
+                                                                   agent_enabled=False), expected_hwnds={1})
+    assert hit.result.evidence["close"] is None
+    # the same window is an order window for the Window Watcher: the two sets agree
+    titles = TitleSets.compile(order_dialog=order_dialog_regexes(CAT), detached_ticket=DETACHED_TICKET_REGEXES,
+                               order_event=order_event_regexes(CAT))
+    assert classify_windows([ticket], titles, 0.0).enumeration_hit
+    # the guard is the title set: a sentinel given no detached-ticket regexes closes the window as before
+    assert unknown_window(ticket, PopupContext(agent_enabled=False), CAT,
+                          detached_ticket=()).evidence["close"] == "wm_close"
+    assert PopupSentinel(CAT, detached_ticket=()).sweep(
+        [ticket], PopupContext(agent_enabled=False))[0].result.evidence["close"] == "wm_close"

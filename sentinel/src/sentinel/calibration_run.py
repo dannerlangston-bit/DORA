@@ -42,6 +42,11 @@ Choices where the spec is ambiguous (reported):
    and per rig its checkpoints with their owners; `scope.plan_calibration` is what produces one. The simulated
    rig's fingerprint uses the PR run's harness fields (`pipeline.run`), so a PR run on the same simulated
    rig finds these floors under its calibration key.
+6. A checkpoint with a capture that ended `env_error` carries that outcome (3.9 step 2), so 1.10's
+   `complete_with_env_errors` applies: a shard with such a capture, its r6 replaced on a changed key (choice 2)
+   included, ends at least `complete_with_env_errors` with no run reason (the `env_error` checkpoint is the cause),
+   and so does the run (8.2, worst of the shards); `sentinel calibrate` then exits 1. Other failed captures
+   (`not_settled`, `landmark_missing`, `harness_error`) are fix items only and leave the run `complete`.
 """
 from __future__ import annotations
 
@@ -73,6 +78,7 @@ NY = ZoneInfo("America/New_York")
 FAILED = ("not_settled", "landmark_missing", "env_error", "harness_error")      # 3.9 step 2
 GATE_FAILURE = ("env_error", "gate")
 KEY_CHANGED = ("env_error", "rig_spec_mismatch")                                # choice 2
+ENV_ERRORS = ("complete_with_env_errors", "env_error")                          # 1.10, choice 6
 
 
 # ------------------------------------------------------------------------------------------------
@@ -283,6 +289,25 @@ def _worst(reports: Sequence[SessionReport]) -> SessionReport:
     return max(reversed(reports), key=lambda r: RUN_SEVERITY.index(r.status))
 
 
+def _key(report: SessionReport) -> str | None:
+    """The rendering key of a session's recorded fingerprint, None when it recorded none (choice 3)."""
+    return calibration_key(report.fingerprint.match) if report.fingerprint is not None else None
+
+
+def _key_changed(night1: SessionReport, night2: SessionReport) -> bool:
+    """Choice 2: the night-2 session recorded another rendering key than night 1's."""
+    k1, k2 = _key(night1), _key(night2)
+    return k1 is not None and k2 is not None and k1 != k2
+
+
+def _raised(status: str, reason: str | None, env_error: bool) -> tuple[str, str | None]:
+    """Choice 6: an outcome less severe than `complete_with_env_errors` becomes it (no run reason: an `env_error`
+    checkpoint is its own cause, 1.10) when a capture ended `env_error`."""
+    if env_error and RUN_SEVERITY.index(status) < RUN_SEVERITY.index(ENV_ERRORS[0]):
+        return ENV_ERRORS[0], None
+    return status, reason
+
+
 def run_calibration(cfg: Any, rig_factory: RigFactory, store: Store, plan: CalibrationPlan, *,
                     now: datetime | None = None, out_dir: str | Path | None = None,
                     holidays: Iterable[date] = (), params: Mapping[str, Any] | None = None,
@@ -314,6 +339,7 @@ def run_calibration(cfg: Any, rig_factory: RigFactory, store: Store, plan: Calib
     registries: dict[str, RegionsFile] = {}
     reports: dict[tuple[str, int], SessionReport] = {}
     sessions: list[dict] = []
+    env_shards = False                                    # a shard raised to complete_with_env_errors (choice 6)
     for night, count, offset in ((1, n1, 0), (2, n2, n1)):
         for shard in shards:
             sid = shard_ids[(shard.rig_id, night)]
@@ -331,16 +357,21 @@ def run_calibration(cfg: Any, rig_factory: RigFactory, store: Store, plan: Calib
             reports[(shard.rig_id, night)] = rep
             if rep.fingerprint is not None:
                 store.write_fingerprint(rep.fingerprint)
-            store.end_shard(sid, rep.status, rep.reason)
-            store.mark_shard_imported(sid)
-            key = calibration_key(rep.fingerprint.match) if rep.fingerprint is not None else None
-            sessions.append({"shard_id": sid, "rig": shard.rig_id, "night": night, "status": rep.status,
-                             "reason": rep.reason, "last_gate": rep.last_gate, "calibration_key": key,
-                             "started_at": rep.started_at.isoformat() if rep.started_at else None})
             for item in shard.items:
                 row = shots[item.checkpoint.checkpoint_id]
                 for k in range(offset, offset + count):
                     row[k] = row[k] or _failed(rep.stopped)
+            key = _key(rep)
+            env = any(_capture(s).outcome == ENV_ERRORS[1] for item in shard.items
+                      for s in shots[item.checkpoint.checkpoint_id][offset:offset + count] if s is not None)
+            env = env or (night == 2 and _key_changed(reports[(shard.rig_id, 1)], rep))
+            status, reason = _raised(rep.status, rep.reason, env)
+            env_shards |= status != rep.status
+            store.end_shard(sid, status, reason)
+            store.mark_shard_imported(sid)
+            sessions.append({"shard_id": sid, "rig": shard.rig_id, "night": night, "status": status,
+                             "reason": reason, "last_gate": rep.last_gate, "calibration_key": key,
+                             "started_at": rep.started_at.isoformat() if rep.started_at else None})
 
     calibrations: dict[str, CheckpointCalibration] = {}
     keys: dict[str, str | None] = {}
@@ -349,13 +380,12 @@ def run_calibration(cfg: Any, rig_factory: RigFactory, store: Store, plan: Calib
     fingerprints: dict[str | None, str | None] = {}
     for shard in shards:
         r1, r2 = reports[(shard.rig_id, 1)], reports[(shard.rig_id, 2)]
-        k1 = calibration_key(r1.fingerprint.match) if r1.fingerprint is not None else None
-        k2 = calibration_key(r2.fingerprint.match) if r2.fingerprint is not None else None
+        k1 = _key(r1)
         fingerprints.setdefault(k1, r1.fingerprint.fingerprint_id if r1.fingerprint is not None else None)
         for item in shard.items:
             cp = item.checkpoint
             row = [s for s in shots[cp.checkpoint_id] if s is not None]
-            if k2 is not None and k1 is not None and k2 != k1:
+            if _key_changed(r1, r2):
                 row[n1:] = [Shot(None, *KEY_CHANGED) for _ in row[n1:]]
             reg = registries.get(cp.checkpoint_id, RegionsFile(cp.checkpoint_id))
             boxes = tuple(dict.fromkeys(b for s in row for b in s.redactions))
@@ -388,6 +418,7 @@ def run_calibration(cfg: Any, rig_factory: RigFactory, store: Store, plan: Calib
     for item in open_items:
         routes.setdefault(item.owner or "unassigned", []).append(item.text(now, hol))
     worst = _worst(list(reports.values()))
+    status, reason = _raised(worst.status, worst.reason, env_shards)
     summary = {"calibration": {
         "build_id": plan.build_id, "checkpoints": len(calibrations),
         "calibrated": sum(1 for c in calibrations.values() if not c.failed),
@@ -395,7 +426,7 @@ def run_calibration(cfg: Any, rig_factory: RigFactory, store: Store, plan: Calib
         "fix_list": fix_list_lines(open_items, now, hol), "fix_routes": routes,
         "overdue": [i.label() for i in overdue(open_items, now, hol)],
         "files": [f.name for f in files]}}
-    outcome = store.end_run(RunOutcome(plan.run_id, "calibration", worst.status, worst.last_gate, reason=worst.reason,
+    outcome = store.end_run(RunOutcome(plan.run_id, "calibration", status, worst.last_gate, reason=reason,
                                        started_at=_aware(plan.window_start).isoformat(), ended_at=now.isoformat()),
                             summary=summary)
     return CalibrationResult(outcome, calibrations, keys, open_items, files, sessions, summary["calibration"])

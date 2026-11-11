@@ -34,10 +34,9 @@ Choices where the spec is ambiguous (reported):
 3. Posts that set a state (`pr_comment`, `commit_status`) go out in order per destination: a job waits while an
    older job to the same destination is queued or failing, so a retried stale status can never overwrite a newer one
    (a stale `success` after a revoked decision would unblock a merge in blocking mode, 9.2).
-4. Egress purposes (6.10): PR host posts (`pr_comment`, `commit_status` and every `*_pr` pull request) log
-   `pr_comment`, Jira kinds `jira`, `slack` `slack`, `digest` `digest`. 6.10 lists no paging purpose, so a `page` job
-   is sent only through a sender that names its own `purpose`; without one the attempt fails without a request
-   (reported: the purpose list needs a paging entry).
+4. Egress purposes (6.10): PR host posts (`pr_comment`, `commit_status` and every `*_pr` pull request, among them
+   the 9.6 `flow_pr` and `anchor_pr`) log `pr_comment`, Jira kinds `jira`, `slack` `slack`, `digest` `digest` and
+   `page` `page` (the paging service).
 5. One attempt is one egress row, whatever the sender does inside it (a PR comment edit lists the comments, then
    edits). A sender that raises is a failed attempt; an allowlist refusal is a failed attempt too, its `refused` row
    and `harness_error` finding written by the gate's rules, the finding returned in `DispatchReport.refusals` (the
@@ -53,6 +52,7 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from ..canonical import SHA256_PREFIX, canonical_json, sha256_id
 from ..egress import EgressAllowlist, EgressGate, EgressRefused
+from ..orchestrator import alerts
 from ..records import OUTBOX_KINDS, EgressRow, Finding, OutboxJob, now
 from ..store.artifacts import ArtifactError, ArtifactMissing
 from ..store.store import Store, StoreRefused, utc
@@ -60,12 +60,13 @@ from .reporting_config import ReportingConfig
 
 RETRY_MINUTES = (1, 2, 5, 15) + tuple(range(60, 24 * 60 + 1, 60))   # 9.1: then hourly until 24 hours
 OUTAGE_AFTER = timedelta(minutes=15)                                 # 9.1, 9.10 Integration outage
-OUTAGE_ALERT = "integration_outage"
-OUTAGE_SEVERITY = "P2"                                               # 9.10
+OUTAGE_ALERT = alerts.integration_outage().rule                     # 9.10 Integration outage
+OUTAGE_SEVERITY = alerts.integration_outage().priority
 ORDERED_KINDS = frozenset({"pr_comment", "commit_status"})           # choice 3
 _CHANNELS = {"pr_comment": "pr_host", "commit_status": "pr_host", "jira_create": "jira", "jira_comment": "jira",
              "jira_transition": "jira", "slack": "slack", "page": "paging", "digest": "email"}
-_PURPOSES = {"pr_host": "pr_comment", "jira": "jira", "slack": "slack", "email": "digest"}   # 6.10; choice 4
+_PURPOSES = {"pr_host": "pr_comment", "jira": "jira", "slack": "slack", "email": "digest",
+             "paging": "page"}                                       # 6.10; choice 4
 
 
 def channel_of(kind: str) -> str:
@@ -78,8 +79,8 @@ def channel_of(kind: str) -> str:
     return _CHANNELS[kind]
 
 
-def egress_purpose(kind: str) -> str | None:
-    """The 6.10 `egress_log` purpose of a job kind's posts; None for `page` (choice 4)."""
+def egress_purpose(kind: str) -> str:
+    """The 6.10 `egress_log` purpose of a job kind's posts (choice 4)."""
     return _PURPOSES.get(channel_of(kind))
 
 
@@ -100,8 +101,8 @@ class DeliveryError(RuntimeError):
 
 
 class Sender(Protocol):
-    """Delivers the jobs of one kind. `host` is the allowlisted host name the post goes to; a sender for a kind with
-    no 6.10 purpose (`page`) also names its `purpose` attribute."""
+    """Delivers the jobs of one kind. `host` is the allowlisted host name the post goes to; the attempt's 6.10
+    purpose is the kind's (`egress_purpose`)."""
     host: str
 
     def send(self, job: OutboxJob, payload: Mapping[str, Any]) -> Delivery: ...
@@ -361,10 +362,7 @@ def _attempt(store: Store, payloads: PayloadStore, sender: Sender, jid: int, job
     except (ArtifactError, ValueError) as e:
         return _fail(store, payloads, jid, job, None, f"payload {job.payload_sha256} unavailable: {e}", at, alert_to,
                      report)
-    purpose = egress_purpose(job.kind) or getattr(sender, "purpose", None)
-    if purpose is None:
-        return _fail(store, payloads, jid, job, payload, f"no egress purpose for {job.kind} posts (6.10)", at, alert_to,
-                     report)
+    purpose = egress_purpose(job.kind)
     gate = EgressGate(allowlist, ReporterSink(store), run_id=job.run_id, clock=lambda: at)
     try:
         delivery = gate.request(sender.host, lambda: sender.send(job, payload), purpose=purpose, nbytes=len(data),

@@ -21,7 +21,8 @@ Watchdog journal line (choice; 10.2 says only "a JSON line"; the Watchdog writer
      "detail": "cause: hang", "app_uptime_s": 1820, "app_restart_count": 1}
 
 `action` is one of `WATCHDOG_ACTIONS` (the 8.3 actions of the 10.2 reaction: hang and crash, the kill switch's
-second half, `reset_input_state`, the relaunch and the Orchestrator's resume); `event_id`, `action`, `at` and
+second half, `reset_input_state`, the relaunch and the Orchestrator's resume; and `main_frame_missing`, which 10.2
+says the Watchdog journals when no frame matches the title regex for 30 s while running); `event_id`, `action`, `at` and
 `mono_ms` are required. The stored `reason` is `<event_id>` or `<event_id>: <detail>` (8.3: "Watchdog event id").
 A torn last line (the writer died mid-append) is skipped; a torn line elsewhere raises.
 """
@@ -40,7 +41,8 @@ from .store import Store, StoreRefused
 GATEWAY_JOURNAL = drainer.JOURNAL_NAME            # gateway_drops.jsonl (8.4)
 WATCHDOG_JOURNAL = "watchdog_events.jsonl"        # 8.4, 10.2
 JOURNALS = {"gateway_hook": GATEWAY_JOURNAL, "watchdog": WATCHDOG_JOURNAL}
-WATCHDOG_ACTIONS = ("watchdog_hang", "watchdog_crash", "kill_switch", "reset_input_state", "relaunch", "resume")
+WATCHDOG_ACTIONS = ("watchdog_hang", "watchdog_crash", "kill_switch", "reset_input_state", "relaunch", "resume",
+                    "main_frame_missing")
 _REQUIRED = ("event_id", "action", "at", "mono_ms")
 
 

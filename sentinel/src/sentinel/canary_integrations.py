@@ -1,7 +1,8 @@
 """Who hears about the night's canary state: the 9.10 page and the SENT Bug of 9.9 (10.3 Scoring, Morning message).
 
-`alert_route(state)` is the 9.10 "Canary failure" row: P1 to the harness on-call for `detector_blind`,
-`generation_failed` and `canary_path_divergence`, P2 to the on-call channel for `detector_degraded`, none for `ok`.
+`alert_route(state)` is the 9.10 "Canary failure" row (`alerts.canary_failure`, `canary_path_divergence`): P1 to the
+harness on-call for `detector_blind`, `generation_failed` and `canary_path_divergence`, P2 to the on-call channel for
+`detector_degraded` (the release channel told too, 11.6), none for `ok`.
 `alert_entries(detector_state, run_id)` gives the `alerts.json` entries of a Nightly run in the shape
 `pipeline.orchestration.alert_entry` writes. `sent_bug_payload(report, run_id=...)` builds the SENT Bugs of 9.9:
 Highest for `detector_blind` and `generation_failed`, High for `detector_degraded`, deduplicated by mutant id, by
@@ -16,34 +17,30 @@ Choices where the spec is ambiguous (reported):
 2. A blind money-cell mutant and a blind redaction canary (M19) each get a Highest Bug keyed by the mutant id, and
    M19 is not filed again under its degraded class; the run state `generation_failed` gets one Highest Bug keyed by
    the stage, `stage:canary_generation`.
-3. Labels: `sentinel`, and per checkpoint `sentinel-surface-<surface id>` and `sentinel-cp-<first 12 hex of the
-   sha256 of the checkpoint id>` (9.9); a canary row carries no tier, so no `sentinel-tier-*` label. The
-   description carries the 9.9 identity block with the dedup key under `canary`.
+3. Labels: `report.jira.labels` of the checkpoints: `sentinel`, the surface labels (hashed, the 11.8 default) and
+   the `sentinel-cp-<first 12 hex of the sha256 of the checkpoint id>` labels (9.9); a canary row carries no tier,
+   so no `sentinel-tier-*` label. The description carries the 9.9 identity block with the dedup key under `canary`.
 """
 from __future__ import annotations
 
-import hashlib
 from typing import Any
 
 from .canary import CanaryReport, CanaryResult, DetectorState
-from .orchestrator.alerts import ON_CALL_CHANNEL, P1, P2, AlertRoute
-from .taxonomy import checkpoint_parts
+from .orchestrator import alerts
+from .orchestrator.alerts import AlertRoute
+from .report import jira
 
-PROJECT = "SENT"                                   # 9.9: the harness project (assumed key)
+PROJECT = jira.HARNESS_PROJECT                     # 9.9: the harness project (assumed key)
 GENERATION_STAGE = "stage:canary_generation"       # choice 2
 
 
 def alert_route(state: str) -> AlertRoute | None:
     """The 9.10 route of a canary state or of `canary_path_divergence`; None for `ok`."""
-    if state in ("detector_blind", "generation_failed"):
-        return AlertRoute("canary_failure", P1, ("harness_on_call",), (ON_CALL_CHANNEL,))
     if state == "canary_path_divergence":
-        return AlertRoute("canary_path_divergence", P1, ("harness_on_call",), (ON_CALL_CHANNEL,))
-    if state == "detector_degraded":
-        return AlertRoute("canary_failure", P2, (), (ON_CALL_CHANNEL,))
+        return alerts.canary_path_divergence()
     if state == "ok":
         return None
-    raise ValueError(f"canary state {state!r} (10.3)")
+    return alerts.canary_failure(state)
 
 
 def alert_entries(ds: DetectorState, run_id: str, shard_id: str | None = None) -> list[dict[str, Any]]:
@@ -64,13 +61,8 @@ def alert_entries(ds: DetectorState, run_id: str, shard_id: str | None = None) -
 
 
 def _labels(checkpoints: list[str]) -> list[str]:
-    out = ["sentinel"]
-    for cid in checkpoints:
-        for label in (f"sentinel-surface-{checkpoint_parts(cid)['surface']}",
-                      f"sentinel-cp-{hashlib.sha256(cid.encode()).hexdigest()[:12]}"):
-            if label not in out:
-                out.append(label)
-    return out
+    """The 9.9 labels of the Bug's checkpoints (`report.jira.labels`: the surface label hashed by default, 11.8)."""
+    return list(jira.labels(checkpoints).labels)
 
 
 def _bug(priority: str, key: str, summary: str, rows: list[CanaryResult], state: str, run_id: str,

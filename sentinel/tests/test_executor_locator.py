@@ -16,6 +16,7 @@ from sentinel.diff.regions import Rect
 from sentinel.executor.locator import (OCR_UPSCALE, Branches, Ladder, LadderContext, RescueCap, RescueOutcome,
                                        RescueRequest, WindowCapture, agent_disabled, ladder, prepare_ocr,
                                        target_from_control)
+from sentinel.jabtree import UNREAD
 from sentinel.orchestrator.gateway import Flag
 from sentinel.orchestrator.ports import AccessNode, Frame, Locator
 from sentinel.records import StepOutcome
@@ -212,6 +213,20 @@ def test_jab_rung_failures_fall_through_to_the_image_rung(nodes, up, cause):
     first, second = r.rung_results[:2]
     assert first.result == "locator_failed(jab)" and first.evidence["cause"] == cause
     assert second.rung == "image" and r.rung == "image"
+
+
+@pytest.mark.parametrize("tree", [
+    jab_tree(QTY_NODE, UNREAD),                                         # the unread sibling may be its twin
+    AccessNode("frame", "Main", (ORIGIN[0], ORIGIN[1], 320, 140), frozenset({"visible"}),
+               (jab_tree(QTY_NODE).children[0], UNREAD)),               # or hold one in its unread subtree
+])
+def test_a_jab_match_is_not_unique_when_the_walk_lost_a_context(tree):
+    """K2 (5.5 "found, unique", jabtree choice 5, fail closed): a context the bridge could not read may be the
+    target's twin or hold it, so one match in a tree with an UNREAD placeholder is not proven unique."""
+    r = ladder(JAB_TARGET, capture(), None, FakeJab(tree), A_ON, ctx())
+    first = r.rung_results[0]
+    assert first.result == "locator_failed(jab)" and first.evidence == {"cause": "incomplete_tree", "unread": 1}
+    assert r.rung == "image"
 
 
 def test_branch_b_records_rung1_skipped():

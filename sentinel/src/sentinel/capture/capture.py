@@ -59,7 +59,8 @@ Choices where the spec is ambiguous or silent (reported):
 7. DPI (3.4 rule 5). The port reports the awareness by name (`PER_MONITOR_AWARE_V2` expected, 7.1 H3); case,
    hyphens and spaces are ignored. The self-test runs at gate `provisioned`, before any capture (10.8).
 8. Crops. A window partly off the frame is cropped to the part on the frame; a window wholly off it, or without
-   bounds, has no crop. The composite pastes each window's redacted crop over its rect and fills a window with no
+   bounds, has no crop. The composite pastes each window's redacted crop over its rect, bottom-up by z-order so
+   the topmost window shows where windows overlap, and fills a window with no
    redacted crop with the fill colour, so no unredacted window pixel reaches it, and writes the titles redacted
    as in choice 10; the redaction stage still sweeps the composite before it is stored (the artifact store
    refuses an image without a redaction header).
@@ -373,11 +374,13 @@ def crop_windows(frame: Frame, windows: Sequence[WindowInfo]) -> dict[int, np.nd
 def composite(frame: Frame, windows: Sequence[WindowInfo], redacted: Mapping[int, np.ndarray],
               fill: tuple[int, int, int], sweep: Sweep | None = None) -> np.ndarray:
     """The report composite (5.7): the frame with each window replaced by its redacted crop (filled when it has
-    none), its rect drawn and its title, redacted as the metadata's is, written (choices 8, 10)."""
+    none), its rect drawn and its title, redacted as the metadata's is, written (choices 8, 10). Windows are painted
+    bottom-up by `z_order` (a window without one first), whatever order they come in, so where windows overlap the
+    topmost shows, as on screen."""
     sweep = sweep or Sweep()
     img = np.array(frame.image, dtype=np.uint8, copy=True)
     ox, oy = frame.origin
-    for w in windows:
+    for w in sorted(windows, key=_z, reverse=True):
         r = _rect(w)
         if r is None or _crop_at(frame, r) is None:
             continue

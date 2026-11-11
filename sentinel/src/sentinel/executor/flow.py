@@ -18,12 +18,15 @@ consequences for the Orchestrator and the findings and step events. The sequence
    precondition:<check>)` and the next unit re-checks (2.4, 2.6.1, 4.7). Three consecutive such census visits in one
    workspace mark the shard's remaining visits there `env_error` with the same gate and reason, and on-call is told
    once per workspace (a `workspace:<id>` subset outcome).
-3. Steps in order. Input steps go through `emitter.emit` (a `secret` step with the heartbeat's `capture_suspended`
-   held, 5.4.10); `reset_input_state` through the gateway; `wait_for` polls its anchor and anti-anchors until
-   `timeout_ms`, and a timeout is step `failed` with the next checkpoint `not_settled` naming the condition still
-   failing (`timeout` only when no frame was obtained, 4.7, 3.5); a `checkpoint` step is captured (`ports.capture`),
-   after the flow's `normalize` steps when the step before it was rescued (5.5); an `assert` step's failure is step
-   `failed` with the enclosing checkpoint's failing assertion ids in `failed_assertions` (4.7). A `failed` or
+3. Steps in order. Input steps go through `emitter.emit`; an `export` or `copy_grid` step through
+   `export.run_export`, each of its sub-steps through `emitter.emit` (choice 8); a `secret` step through
+   `secret.run_secret_step` with the heartbeat's `capture_suspended` held, its leased key pairs through
+   `emitter.emit` (5.4.10, choice 9); `reset_input_state` through the gateway; `wait_for` polls its anchor and
+   anti-anchors until `timeout_ms`, and a timeout is step `failed` with the next checkpoint `not_settled` naming the
+   condition still failing (`timeout` only when no frame was obtained, 4.7, 3.5); a `checkpoint` step is captured
+   (`ports.capture`), after the flow's `normalize` steps when the step before it was rescued (5.5); an `assert`
+   step's failure is step `failed` with the enclosing checkpoint's failing assertion ids in `failed_assertions`
+   (4.7). A `failed` or
    `blocked_by_gateway` step ends the flow: the checkpoint it led to takes the step's `led_to`, every later checkpoint
    `not_run (reason: step_failed:<step>)` (2.6.1, 4.7, 5.2). Every step and checkpoint runs inside
    `failures.guard`, so an exception is the 10.1 harness row (`harness_error` with a listed reason or
@@ -59,6 +62,27 @@ Choices where the spec is ambiguous (reported):
    cannot place and file a `locator_failure` for a control that is rightly absent. The step passes with the
    detail "no dialog open; nothing to close", and the `order_stage` declaration lifts as for a close that
    passed. `clear_ticket` always runs: the ticket lives in the main frame, open or not.
+8. An `export` or `copy_grid` step (4.7, 5.10; SD-32) is composite: `export.run_export` drives its menu clicks, its
+   typed path or Ctrl+C, each a sub-step (`<step>-menu-<n>`, `<step>-path`, `<step>-focus`, `<step>-copy`) through
+   `emitter.emit`, with the caller's `ExportPorts` (the clipboard, the export folder, the grid's export menu targets
+   from the Surface Registry). The step takes the export's outcome and SD-32 reason, raised to
+   `passed_after_retry` or `passed_via_agent_fallback` when a sub-step passed that way (so the next checkpoint is
+   captured after `normalize` and flagged rescued, 5.5), and gets an `export` (file) or `clipboard` (Copy All) step
+   event; the `ExportResult` is kept in `UnitResult.exports` by step id, for the Oracle's `source: export`. A failed
+   sub-step's checkpoint outcome passes to the checkpoint the step led to (a ladder miss, `hook_lost`); otherwise a
+   failed export leads to `not_run (reason: step_failed:<step>)` like any failed step. Without `ExportPorts` the step
+   is `failed` with `export_unavailable` and sends nothing: the rig cannot run the export (4.7 "an export action that
+   fails at run time"). A run stop during the export's poll (a heartbeat that cannot be written) ends the step at
+   once, as in the emitter (10.2 "never a retry loop").
+9. A `secret` step (5.4.10, 6.9; L-FLW-06: `class: login` flows only, which scope never schedules, so only a caller
+   that runs a login flow through `run_unit` gets here) is planned only by `secret.run_secret_step`, which leases the
+   value at the last moment through the caller's `SecretPorts` (the vault and the Capture control) and hands the
+   planned key pairs to `emitter.emit` (stages 1 to 8, the step's own target and post-condition). The step takes the
+   emitted step's result; a lease that failed twice is the `vault_unreachable` run consequence (nothing typed); a
+   step `run_secret_step` refuses before typing (not a login flow, an untypeable value) is `failed`. The
+   `SecretResult`, with its lease for the teardown plaintext scan and release, is kept in `UnitResult.secrets` by
+   step id. Without `SecretPorts` the step is `failed` and nothing is leased or typed; a run stop during the lease's
+   30 s retry wait ends the step before the second lease.
 """
 from __future__ import annotations
 
@@ -69,21 +93,28 @@ from typing import Any, Protocol
 from ..orchestrator import alerts
 from ..orchestrator.boundary import working_orders_precondition
 from ..orchestrator.gateway import Flag
-from ..orchestrator.ports import Locator, PrimitivePlanner
+from ..orchestrator.ports import ClipboardPort, Locator, PrimitivePlanner, VaultPort
 from ..orchestrator.results import ControlResult, FindingSpec, Outcome, SubsetOutcome, step_failed
 from ..records import StepEvent, StepOutcome
-from .emitter import EmitterPorts, ExecContext, StepResult, _run_level, emit
+from .emitter import PASSED, EmitterPorts, ExecContext, StepResult, _run_level, emit
+from .export import ExportFiles, ExportResult, run_export
 from .failures import FailureLedger, FaultInjector, guard
+from .primitives import PlannedAction
+from .secret import CaptureControl, SecretResult, run_secret_step
 
 CENSUS_CHECKS = ("workspace_loaded", "single_main_frame", "no_modal", "fixture_symbol_linked", "paper_mode")   # 2.4
-INPUT_STEPS = ("click_named", "dblclick", "rclick", "drag", "wheel", "press", "key_chord", "type_fixture", "secret",
-               "park_mouse", "focus_neutral", "export", "copy_grid")
+INPUT_STEPS = ("click_named", "dblclick", "rclick", "drag", "wheel", "press", "key_chord", "type_fixture",
+               "park_mouse", "focus_neutral")
+EXPORT_STEPS = ("export", "copy_grid")
+EXPORT_EVENT = {"file": "export", "copy_all": "clipboard"}          # choice 8: the step's own event, by kind (8.3)
+SUB_PASS_ORDER = ("passed_via_agent_fallback", "passed_after_retry")  # choice 8: how a sub-step's pass lifts the step
 DEFAULT_MAX_WAIT_S = 15.0               # 3.5: a checkpoint's max wait
 DEFAULT_WAIT_MS = 5000                  # 4.7 timeout_ms
 STREAK_LIMIT = 3                        # 2.4: three consecutive env_error visits in one workspace
 PRECONDITION_GATE = "workspace_loaded"
 TREE_GONE = ("kill_tree", "kill_switch", "relaunch")
 NO_DIALOG = "no dialog open; nothing to close"     # choice 7
+STOPPED = "a run-level consequence during the step's wait stopped the run; nothing more sent"   # choices 8 and 9
 
 
 # -- observations ---------------------------------------------------------------------------------------------------
@@ -151,6 +182,39 @@ class UnitPorts(EmitterPorts, Protocol):
 
     def evaluate(self, step: Mapping[str, Any]) -> AssertVerdict:
         """An `assert` step's assertions (5.10)."""
+
+
+@dataclass(frozen=True)
+class ExportPorts:
+    """What `export` and `copy_grid` steps need beyond the emitter's ports (choice 8, `export.run_export`): the
+    clipboard, the files of the run's export folder, the grid's export menu targets from the Surface Registry for a
+    step (5.10, export choice 1) and the export folder a file export without a `path` writes to."""
+
+    clipboard: ClipboardPort
+    files: ExportFiles
+    menu: Callable[[Mapping[str, Any]], Sequence[str]] = lambda step: ()
+    export_dir: str | None = None
+
+
+@dataclass(frozen=True)
+class SecretPorts:
+    """What a `secret` step needs (choice 9, `secret.run_secret_step`): the vault, the Capture control it suspends
+    while the value is typed, and whether the previous run ended on `vault_unreachable` too (P1, 9.10)."""
+
+    vault: VaultPort
+    capture: CaptureControl
+    repeat: bool = False
+
+
+@dataclass(frozen=True)
+class _Planned:
+    """The planner `emitter.emit` gets for a secret step: the action `run_secret_step` planned with the leased value."""
+
+    action: PlannedAction
+
+    def plan(self, step: Mapping[str, Any], points: Mapping[str, tuple[int, int]], flag: Flag,
+             now: float) -> tuple[PlannedAction, ...]:
+        return (self.action,)
 
 
 @dataclass(frozen=True)
@@ -242,6 +306,8 @@ class UnitResult:
     ended_by: str | None = None
     undecided: tuple[str, ...] = ()
     recovery: tuple[str, ...] = ()
+    exports: Mapping[str, ExportResult] = field(default_factory=dict)
+    secrets: Mapping[str, SecretResult] = field(default_factory=dict)
 
     def step_outcomes(self, run_id: str, *, shard_id: str | None = None, mode: str = "scripted") -> list[StepOutcome]:
         """The 4.13 step outcome rows of the steps and the teardown, for `Store.write_steps`."""
@@ -255,9 +321,13 @@ class _Unit:
 
     def __init__(self, unit: Unit, ports: UnitPorts, locator: Locator, planner: PrimitivePlanner, ctx: ExecContext,
                  hooks: UnitHooks, failures: FailureLedger | None, faults: FaultInjector | None,
-                 streak: WorkspaceStreak | None):
+                 streak: WorkspaceStreak | None, export_ports: ExportPorts | None,
+                 secret_ports: SecretPorts | None):
         self.unit, self.ports, self.locator, self.planner, self.ctx = unit, ports, locator, planner, ctx
         self.hooks, self.failures, self.faults, self.streak = hooks, failures, faults, streak
+        self.export_ports, self.secret_ports = export_ports, secret_ports
+        self.exports: dict[str, ExportResult] = {}
+        self.secrets: dict[str, SecretResult] = {}
         self.doc = unit.doc
         self.flow_id = unit.unit_id
         self.scoped = list(unit.checkpoints)
@@ -327,15 +397,18 @@ class _Unit:
             captures=dict(self.captures), rescued=tuple(self.rescued), failed_assertions=dict(self.failed_assertions),
             consequences=tuple(self.consequences), findings=tuple(self.findings), events=tuple(self.events),
             stopped=self.stopped, ended_by=self.ended_by,
-            undecided=tuple(self.undecided()) if self.stopped else (), recovery=tuple(self.recovery))
+            undecided=tuple(self.undecided()) if self.stopped else (), recovery=tuple(self.recovery),
+            exports=dict(self.exports), secrets=dict(self.secrets))
 
 
 def run_unit(unit: Unit, ports: UnitPorts, locator: Locator, planner: PrimitivePlanner, ctx: ExecContext, *,
              hooks: UnitHooks | None = None, failures: FailureLedger | None = None,
-             faults: FaultInjector | None = None, streak: WorkspaceStreak | None = None) -> UnitResult:
+             faults: FaultInjector | None = None, streak: WorkspaceStreak | None = None,
+             exports: ExportPorts | None = None, secrets: SecretPorts | None = None) -> UnitResult:
     """Run one flow or census visit (module docstring). `failures` collects the run taint of 8.9 for teardown,
-    `faults` injects simulated failures (sites `step` and `capture`), `streak` is the shard's census workspace rule."""
-    u = _Unit(unit, ports, locator, planner, ctx, hooks or UnitHooks(), failures, faults, streak)
+    `faults` injects simulated failures (sites `step` and `capture`), `streak` is the shard's census workspace rule,
+    `exports` what export steps need (choice 8), `secrets` what a login flow's secret step needs (choice 9)."""
+    u = _Unit(unit, ports, locator, planner, ctx, hooks or UnitHooks(), failures, faults, streak, exports, secrets)
     ctx.flow_id, ctx.flow = u.flow_id, u.doc
     if unit.kind == "census":
         marked = streak.outcome_for(unit.workspace_id) if streak is not None else None
@@ -474,6 +547,10 @@ def _step(u: _Unit, step: Mapping[str, Any], index: int, *, teardown: bool = Fal
             return StepResult(step_id=sid, status="passed", detail=NO_DIALOG)                       # choice 7
         if kind in INPUT_STEPS or (teardown and kind == "teardown" and step.get("target")):
             return emit(step, u.ports, u.locator, u.planner, ctx, teardown=teardown)
+        if kind in EXPORT_STEPS:
+            return _export(u, step)
+        if kind == "secret":
+            return _secret(u, step)
         if kind == "reset_input_state":
             return _reset(u, step)
         if kind == "wait_for":
@@ -507,6 +584,100 @@ def _reset(u: _Unit, step: Mapping[str, Any]) -> StepResult:
     return StepResult(step_id=sid, status="passed" if ok else "failed", events=(ev,),
                       led_to=None if ok else step_failed(sid), rest=None if ok else step_failed(sid),
                       detail=None if ok else "reset_input_state did not complete")
+
+
+class _Stopped(Exception):
+    """A wait inside an export or a secret step returned a result that stops the run (10.2: never carried on)."""
+
+
+def _waiter(ctx: ExecContext, waits: list[ControlResult]) -> Callable[[float], None]:
+    """`ctx.sleep` for `run_export` and `run_secret_step`: keeps every heartbeat result and raises `_Stopped` at a
+    run stop, so no step goes on (or types) after it."""
+    def sleep(seconds: float) -> None:
+        r = ctx.sleep(seconds)
+        if r is not None:
+            waits.append(r)
+            if r.run is not None:
+                raise _Stopped
+    return sleep
+
+
+def _export(u: _Unit, step: Mapping[str, Any]) -> StepResult:
+    """An `export` or `copy_grid` step through `export.run_export` (choice 8)."""
+    ctx, sid = u.ctx, str(step.get("id"))
+    started = ctx.clock.monotonic()
+    kind = "copy_all" if step.get("type") == "copy_grid" else str(step.get("kind"))
+    subs: list[StepResult] = []
+    waits: list[ControlResult] = []
+
+    def drive(sub: Mapping[str, Any]) -> str:
+        r = emit(sub, u.ports, u.locator, u.planner, ctx)
+        subs.append(r)
+        return r.status
+
+    status, reason, detail = "failed", "export_unavailable", "no export ports on this rig: nothing sent (choice 8)"
+    if u.export_ports is not None:
+        p = u.export_ports
+        try:
+            res = run_export(step, p.clipboard, p.files, drive=drive, flag=u.ports.flag, clock=ctx.clock.monotonic,
+                             sleep=_waiter(ctx, waits), menu=p.menu(step), export_dir=p.export_dir)
+        except _Stopped:
+            status, reason, detail = "failed", None, STOPPED
+        else:
+            u.exports[sid] = res
+            status, reason, detail = res.status, res.reason, res.detail
+    if status == "passed":
+        status = next((x for x in SUB_PASS_ORDER if any(r.status == x for r in subs)), status)
+    consequences = tuple(c for r in subs for c in r.consequences) + tuple(waits)
+    stops = any(c.run is not None for c in consequences)
+    broke = next((r for r in subs if r.status not in PASSED), None)
+    led_to = rest = None
+    if status not in PASSED and not stops:
+        led_to = broke.led_to if broke is not None and broke.led_to is not None and \
+            broke.led_to.outcome != "not_run" else step_failed(sid)
+        rest = step_failed(sid)
+    ms = int((ctx.clock.monotonic() - started) * 1000)
+    ev = ctx.event(EXPORT_EVENT.get(kind, "export"), sid, step_outcome=status, reason=reason or detail,
+                   duration_ms=ms)
+    return StepResult(step_id=sid, status=status, reason=reason,
+                      gateway_event=broke.gateway_event if broke is not None else None,
+                      findings=tuple(f for r in subs for f in r.findings),
+                      events=tuple(e for r in subs for e in r.events) + (ev,), led_to=led_to, rest=rest,
+                      consequences=consequences, pre_screenshot=subs[0].pre_screenshot if subs else None,
+                      click_crop=next((r.click_crop for r in subs if r.click_crop), None), duration_ms=ms,
+                      detail=detail)
+
+
+def _secret(u: _Unit, step: Mapping[str, Any]) -> StepResult:
+    """A `secret` step through `secret.run_secret_step` (choice 9)."""
+    ctx, sid = u.ctx, str(step.get("id"))
+    if u.secret_ports is None:
+        return StepResult(step_id=sid, status="failed", led_to=step_failed(sid), rest=step_failed(sid),
+                          detail="no vault on this rig: nothing leased or typed (choice 9)")
+    p = u.secret_ports
+    emitted: list[StepResult] = []
+    waits: list[ControlResult] = []
+
+    def send(action: PlannedAction) -> str:
+        r = emit(step, u.ports, u.locator, _Planned(action), ctx)
+        emitted.append(r)
+        return r.status
+
+    try:
+        res = run_secret_step(step, p.vault, flow_class=u.doc.get("class"), emit=send, capture=p.capture,
+                              now=ctx.clock.monotonic(), sleep=_waiter(ctx, waits), repeat=p.repeat)
+    except _Stopped:
+        return StepResult(step_id=sid, status="failed", consequences=tuple(waits), detail=STOPPED)
+    u.secrets[sid] = res
+    if emitted:
+        return replace(emitted[-1], consequences=emitted[-1].consequences + tuple(waits))
+    consequences = tuple(_run_level(c) for c in (res.consequence,) if c is not None) + tuple(waits)
+    stops = any(c.run is not None for c in consequences)
+    ev = ctx.event("secret", sid, step_outcome=res.status, target_text=res.target_text, keys=res.keys_text,
+                   reason=res.detail)
+    return StepResult(step_id=sid, status=res.status, events=(ev,), consequences=consequences,
+                      led_to=None if stops else step_failed(sid), rest=None if stops else step_failed(sid),
+                      detail=res.detail)
 
 
 def _wait_for(u: _Unit, step: Mapping[str, Any]) -> StepResult:

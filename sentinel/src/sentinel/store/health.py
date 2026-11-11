@@ -11,7 +11,7 @@
   owner restored the latest snapshot and `baselines\\` to a scratch host and re-diffed at least ten checkpoints of
   one RC run with every outcome matching the original rows, `last_restore_drill_at` is set; a drill with fewer
   checkpoints or any mismatch is refused and nothing is written.
-- `main(argv)` is `sentinel restore-drill --db PATH --by NAME --compared N --matched N [--at TS]` when no service
+- `main(argv)` is `sentinel store restore-drill --db PATH --by NAME --compared N --matched N [--at TS]` when no service
   holds the Central Store's writer; with it held (8.2) nothing is written and it exits 4, and the service records
   the drill through its writer (`record_restore_drill` as one unit of writer work).
 
@@ -38,7 +38,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Protocol
 
-from ..orchestrator.alerts import ON_CALL_CHANNEL, P2, AlertRoute
+from ..orchestrator import alerts
+from ..orchestrator.alerts import AlertRoute
 from ..records import now as utc_now
 from .retention import ts
 from .store import SERVICE_IDENTITIES, Store, StoreError, StoreRefused, utc
@@ -55,8 +56,8 @@ NOT_OPENED_HINT = ("nothing was written. While the Reporter service runs it is t
 
 
 def store_health() -> AlertRoute:
-    """The 9.10 Store health row: P2 to the on-call channel, the system owner told (8.9)."""
-    return AlertRoute("store_health", P2, (), (ON_CALL_CHANNEL, "system_owner"))
+    """The 9.10 Store health row: P2 to the on-call channel, the system owner told (8.9; `alerts.store_health`)."""
+    return alerts.store_health()
 
 
 class DiskUsage(Protocol):
@@ -176,7 +177,7 @@ def record_restore_drill(store: Store, by: str, *, compared: int, matched: int, 
 
 
 def _parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="sentinel restore-drill", description="Record a passing restore drill (8.6).")
+    p = argparse.ArgumentParser(prog="sentinel store restore-drill", description="Record a passing restore drill (8.6).")
     p.add_argument("--db", required=True, help="the Central Store database")
     p.add_argument("--by", required=True, help="the person who ran the drill (the system owner)")
     p.add_argument("--compared", type=int, required=True, help="checkpoints of one RC run re-diffed")
@@ -191,18 +192,18 @@ def main(argv: list[str] | None = None) -> int:
     drill through its writer, `record_restore_drill` as one unit of writer work); nothing is written then."""
     a = _parser().parse_args(argv)
     if not Path(a.db).is_file():
-        print(f"sentinel restore-drill: no database at {a.db}", file=sys.stderr)
+        print(f"sentinel store restore-drill: no database at {a.db}", file=sys.stderr)
         return 2
     try:
         store = Store(a.db)
     except StoreError as e:
-        print(f"sentinel restore-drill: not recorded: {e}; {NOT_OPENED_HINT}", file=sys.stderr)
+        print(f"sentinel store restore-drill: not recorded: {e}; {NOT_OPENED_HINT}", file=sys.stderr)
         return EXIT_NOT_OPENED
     try:
         with store:
             when = record_restore_drill(store, a.by, compared=a.compared, matched=a.matched, at=a.at)
     except StoreRefused as e:
-        print(f"sentinel restore-drill: refused: {e}", file=sys.stderr)
+        print(f"sentinel store restore-drill: refused: {e}", file=sys.stderr)
         return 1
     print(f"restore drill recorded at {when} by {a.by}")
     return 0

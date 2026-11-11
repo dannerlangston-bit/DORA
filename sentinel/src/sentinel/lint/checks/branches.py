@@ -101,7 +101,7 @@ def check(repo: Repo, add: Callable[..., None], phase: int, today: date) -> None
     for key in BRANCH_KEYS:
         c = b.choices[key]
         if c.past_deadline(today):
-            add(RULE, doc.rel, f"{c.record} {key} is still undecided after its deadline {c.deadline.isoformat()}; "
+            add(RULE, doc.rel, f"{c.record} {key} is still undecided after its deadline {c.deadline}; "
                 f"its default branch {c.resolved} is in force (11.8)", key, "warn")
     _dismiss_allowlist(repo, b, add)
     _profiles(repo, b, add)

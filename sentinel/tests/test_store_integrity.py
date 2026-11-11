@@ -7,7 +7,7 @@ import sqlite3
 
 import pytest
 
-from sentinel.records import (ACTION_VERDICT, CheckpointOutcome, Classification, Decision, DiffSummary, Finding,
+from sentinel.records import (ACTION_VERDICT, CheckpointOutcome, Decision, DiffSummary, Finding,
                               RunOutcome, Signature, StepOutcome)
 from sentinel.store import RunPlan, ScopeEntry, ShardPlan, Store, StoreRefused
 from sentinel.store.artifacts import StoredArtifact

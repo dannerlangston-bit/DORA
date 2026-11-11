@@ -34,6 +34,17 @@ Enforced here and, where SQL can say it, again by the schema:
   names an artifact the store has no row for is refused at write (8.2); an artifact row needs bytes on disk that
   hash to its name, and an image its redaction version (8.3, 8.4); a `decision:<id>` reason needs an active decision
   with the outcome's verdict (4.13).
+- L-OUT-06: once `set_session_context` names a shard, a record written for it that references a capture needs the
+  session's paper-mode stamp from an allowlisted account (`PaperAssertionMissing`; SD-48 exempts records without a
+  capture). L-OUT-02: a `strict_records` store refuses a record the 4.13 required-fields table refuses
+  (`RecordIncomplete`, through `sentinel.required_fields`); `write_checkpoint_or_repair` is the Orchestrator's
+  repair-once path ending in `harness_error (reason: store_write_failed)`.
+- 9.7 Two humans, one signature (`ActiveDecisionExists`), the frozen signature's system owner, 9.6 idempotency and
+  L-DEC-03 (an explicit tolerance above the tier's default is refused) at `record_decision`; the 4.13 late verdict
+  produces only intended or needs_human (SD-23).
+- the run row carries its pair (`register_pair`), its teardown summary (`end_run(summary=)`, `update_summary`) and
+  its review state (unreviewed, partial, reviewed, recomputed as reviews land). A finished run is final except the
+  10.2 late arrival: `replace_dead_man_run` replaces a dead-man run with its real rows and outcome.
 - every write batch is one `BEGIN IMMEDIATE` transaction, appended to `results.jsonl` before it commits (8.2).
 
 Choices where the spec is ambiguous or silent (reported to the coordinator):
@@ -89,8 +100,24 @@ Choices where the spec is ambiguous or silent (reported to the coordinator):
   8.3 names, the undeclared and declared row keys, since an ORDERS SENT verdict lists every undeclared row (6.6)
   and no other column can hold them.
 - A finished run is not re-ended with a different outcome (the 10.7 re-evaluation of a returning rig belongs
-  to the import, which is not this module). A RunOutcome's summary and 4.13 artifact refs go into `summary_json`
-  (8.3 has no column for them); `base_commit_distance` and `authorization_sha256` have their `runs` columns.
+  to the import, which is not this module), except the 10.2 late arrival of a dead-man run. A RunOutcome's summary
+  and 4.13 artifact refs go into `summary_json` (8.3 has no column for them) under `summary` and `refs`, beside
+  `counts` and `last_gate`; those four keys are the store's, and the teardown summary and `update_summary` add any
+  other top-level key (8.3: coverage matrix, run health, detector state; 8.7, 9.10: acknowledgements). Top-level
+  keys replace, so a caller updating a list (the alerts) passes the whole list. `base_commit_distance` and
+  `authorization_sha256` have their `runs` columns.
+- runs.review_state (8.3, 9.2): `reviewed` when no outcome of the run is pending; `unreviewed` while items are
+  pending and none of the run's reviews has landed (`review_state` done on none of its outcomes); `partial` between.
+- L-OUT-02 at write is `strict_records` (off by default) because records built by tools and older callers do not
+  carry every required field yet; `record_errors` and `write_checkpoint_or_repair` apply it whatever the setting.
+  `step_failed:<step>` is checked against the run plan's `flow_steps` and the steps of registered flow checkpoints
+  (a writer restarted mid-run knows only the latter, 8.3 has no table of flow steps).
+- L-OUT-06: the session context is per shard (None: writes without a shard) and holds this session's assertion
+  times; a stamp that is present is checked even on an exempt record; synthetic mutant rows are generated, not
+  captured, and are not checked (10.3).
+- 10.2 late arrival: the placeholders move to `outcomes_superseded` (the 8.3 table for rows kept for diagnosis and
+  never counted); the deletion briefly lifts the two keep triggers inside the batch and restores their exact SQL.
+  The delay is `late_arrival` (also under `health`) and the closed alert an `alerts` entry of the summary.
 - The foundation helpers are thin: no business rule beyond the 8.3 constraints and the record validation. Rows
   with a natural key (step events by shard and seq, extractions, fingerprints by shard and side, soak samples,
   coverage cells, synthetic outcomes, canary manifests) are written once: a replay is a no-op, a different row an

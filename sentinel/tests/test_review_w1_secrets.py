@@ -370,6 +370,39 @@ def _nightly(out: Path, run_id: str = "run-2026-11-10-nightly-01"):
                                                 mutants=("M01",)), out)
 
 
+# == secrets:7: the Nightly run's teardown scans too ==========================================================
+
+def test_secrets_7_a_plaintext_in_a_nightly_run_withholds_its_report(tmp_path, monkeypatch):
+    """6.9: every run's teardown scans before `reported`, the Nightly's too: a plaintext its records carry ends it
+    `aborted_harness (secret_leaked)` at teardown, its report and canary results are not published, and its
+    artifact set is quarantined."""
+    import sentinel.pipeline.run as pr
+    run_id = "run-2026-11-10-nightly-01"
+    monkeypatch.setattr(pr, "SIM_SECRET", f"{run_id}/1")                 # a value the Nightly's records carry
+    n = _nightly(tmp_path, run_id)
+    assert (n.status, n.reason) == ("aborted_harness", "secret_leaked")
+    assert not list(tmp_path.glob("nightly-report-*.html")) and not list(tmp_path.glob("canary-results-*.json"))
+    assert (tmp_path / "artifacts" / "quarantine" / run_id).is_dir()
+    with Store(tmp_path / "sentinel.db") as store:
+        assert store.run_summary(run_id)["secret_scan"]["report_withheld"] is True
+        assert store.query("SELECT outcome FROM runs WHERE run_id = ?", (run_id,))[0][0] == "aborted_harness"
+
+
+def test_secrets_7_a_clean_nightly_run_is_scanned_and_reports(tmp_path, monkeypatch):
+    """6.9: the clean Nightly is scanned (its canary results through the upload check) and still reports."""
+    import sentinel.pipeline.run as pr
+    seen = []
+    real = pr.check_upload
+
+    def check(scanner, data, *, location):
+        seen.append(location)
+        return real(scanner, data, location=location)
+    monkeypatch.setattr(pr, "check_upload", check)
+    n = _nightly(tmp_path)
+    assert n.status == "complete" and "canary results" in seen
+    assert list(tmp_path.glob("nightly-report-*.html")) and list(tmp_path.glob("canary-results-*.json"))
+
+
 def test_secrets_6_scan_run_reads_a_ledger_tail_and_in_memory_texts(tmp_path):
     """6.9 choice 1: a shared results.jsonl is scanned from the offset where this run began (an earlier run's lines
     are not this run's), and text the run has not written yet (the report's inputs) is scanned from memory."""

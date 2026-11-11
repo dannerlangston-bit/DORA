@@ -2632,6 +2632,7 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
     cfg_root = materialize(config_dir, scenario.overlay, out / "config" / scenario.run_id)
     lrep, expired = lint_at_run_start(cfg_root, phase=1, today=today)
     with Store(out / "sentinel.db") as store:    # not strict: canary.score's synthetic harness rows lack a Watchdog id
+        ledger_at = _ledger_size(out)                                   # 6.9: this run's results.jsonl lines
         if lrep.errors:
             sc = Scenario(scenario.name, scenario.run_id, scenario.build, scenario.build, run_type="nightly",
                           clock=scenario.clock)
@@ -2648,6 +2649,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
             sc = Scenario(scenario.name, scenario.run_id, scenario.build, scenario.build, run_type="nightly",
                           clock=scenario.clock)
             return _abort_config(store, sc, cfg_root, [str(exc)], [], out, today, started)
+        secrets = run_secrets([str(cfg.fixture.get("rig", "rig-01"))])     # 6.9: the plaintexts the login used
+        scanner = SecretScanner(secrets)
         bound = sorted({e.checkpoint_id for e in entries} | {str(e.params.get("donor_checkpoint")) for e in entries
                                                               if e.params.get("donor_checkpoint")})
         cps = {cid: planned_for(cfg, cid) for cid in bound}
@@ -2678,7 +2681,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
             gen = cn.generate(entries, {cid: c.screen.image for cid, c in approved.items()}, boxes)
             results: list[cn.MutantResult] = []
             produced: dict[str, CheckpointOutcome] = {}
-            writer = _Writer(run, ArtifactStore.at(out / "artifacts", f"runs/{scenario.run_id}"), today, scenario.clock)
+            writer = _Writer(run, ArtifactStore.at(out / "artifacts", f"runs/{scenario.run_id}", scanner=scanner),
+                             today, scenario.clock)
             rows_meta = []
             arts_by_sha: dict[str, StoredArtifact] = {}
             for m in gen.mutants:
@@ -2784,14 +2788,11 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         egress = nightly_reconcile(store, cfg.root, now)          # 6.10: the day's egress rows against the allowlist
         work._note(st, egress)
         health["egress"] = {"verdict": "ok" if egress.passed else egress.incident, "detail": egress.detail}
-        runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", shard.verdict.status, "reported",
-                                          reason=shard.verdict.reason, started_at=started,
-                                          ended_at=_ts(today, scenario.clock, 2 * 3600)),
-                               summary={"coverage": {}, "health": health, "alerts": work.alerts,
-                                        "detector_state": "detector_blind" if "detector_blind" in
-                                        (report.state, safety.state) else report.state,
-                                        "safety": {"banner": safety.banner, "nightly_run_id": scenario.run_id,
-                                                   "detector_state": safety.state}})
+        summary = {"coverage": {}, "health": health, "alerts": work.alerts,
+                   "detector_state": "detector_blind" if "detector_blind" in (report.state, safety.state)
+                   else report.state,
+                   "safety": {"banner": safety.banner, "nightly_run_id": scenario.run_id, "detector_state": safety.state}}
+        store.update_summary(scenario.run_id, summary)      # 6.9: a row of this run, and a ledger line, for the scan
         body = {"run_id": scenario.run_id, "detector_state": report.state, "banner": report.banner,
                 "safety": {"detector_state": safety.state, "banner": safety.banner,
                            "rows": [r.mutant_id for r in safety.rows], "drill": safety.drill.result.detail},
@@ -2799,17 +2800,42 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                 "not_simulated": {k: v for k, v in NOT_SIMULATED.items() if k not in wanted},
                 "results": [r.to_dict() for r in report.results],
                 "class_rates": report.class_rates, "class_floors": report.class_floors}
-        (out / f"canary-results-{scenario.run_id}.json").write_text(json.dumps(body, indent=1, sort_keys=True) + "\n")
-        writer.arts.put(json.dumps(body, sort_keys=True).encode(), name=f"{scenario.run_id}/canary-results.json",
-                        kind="canary_results", media_type="application/json")
+        results = json.dumps(body, sort_keys=True).encode()
+        leak = check_upload(scanner, results, location="canary results")   # 6.9: a text artifact before upload
+        if leak is None:
+            writer.arts.put(results, name=f"{scenario.run_id}/canary-results.json", kind="canary_results",
+                            media_type="application/json")
         writer.arts.write_manifest(ManifestHeader(config_commit=tree_sha256(cfg.root)[:12],
                                                   harness_commit="sentinel-core-0.1.0", run_id=scenario.run_id,
                                                   created_at=started))
         ctx = ReportContext(pr=0, candidate_build=scenario.build.build_id, base_build=scenario.build.build_id,
                             detector_banner=report.banner)
+        # 6.9 teardown: the plaintext scan of the Nightly run, as of a PR run, before it reaches `reported`
+        secret = _teardown_scan(store, writer.arts, out, scenario.run_id, secrets, ledger_at, leak,
+                                texts={"nightly report inputs": dataclasses.asdict(ctx),
+                                       "alerts.json and orchestrator.json": work.entries()})
+        status, reason, last_gate = shard.verdict.status, shard.verdict.reason, "reported"
+        if secret is not None:
+            v = worse(RunVerdict(status, reason), secret.run)
+            status, reason, last_gate = v.status, v.reason, secret.gate or "teardown"
+            work.alerts += [a for a in [alert_entry(scenario.run_id, None, secret)] if a is not None]
+            summary["alerts"] = work.alerts
+            summary["secret_scan"] = {"result": secret.run_reason, "detail": secret.detail, "report_withheld": True}
+        runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", status, last_gate, reason=reason,
+                                          started_at=started, ended_at=_ts(today, scenario.clock, 2 * 3600)),
+                               summary=summary)
         outcomes = store.outcomes(scenario.run_id)
-        write_run_report(ReportInputs.from_store(store, scenario.run_id).build(None, ctx),
-                         out / f"nightly-report-{scenario.run_id}.html")
+        if secret is None:                                # 6.9: a hit withholds the Nightly's report and results
+            published = [out / f"canary-results-{scenario.run_id}.json", out / f"nightly-report-{scenario.run_id}.html"]
+            published[0].write_text(json.dumps(body, indent=1, sort_keys=True) + "\n")
+            write_run_report(ReportInputs.from_store(store, scenario.run_id).build(None, ctx), published[1])
+            late = _teardown_scan(store, writer.arts, out, scenario.run_id, secrets, ledger_at, files=published)
+            if late is not None:
+                for f in published:
+                    f.unlink(missing_ok=True)
+                work.alerts += [a for a in [alert_entry(scenario.run_id, None, late)] if a is not None]
+                store.update_summary(scenario.run_id, {"secret_scan": {"result": late.run_reason, "detail": late.detail,
+                                                                       "report_withheld": True}})
         res = RunResult(scenario.run_id, "nightly", runrec.status, runrec.reason, out, outcomes,
                         store.findings(scenario.run_id), alerts=work.alerts, shards=work.summaries,
                         proof=shard.proof.line)

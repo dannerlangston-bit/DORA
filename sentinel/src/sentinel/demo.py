@@ -882,11 +882,11 @@ INDEX = {
 
 def _rev(reviewer: Any) -> dict:
     """`run_pipeline` keyword arguments for the Reviewer: none (the simulated one) or a live job."""
-    return {} if reviewer is None else {"live": reviewer()}
+    return {} if reviewer is None else {"live_factory": reviewer}       # built per run over its egress gate (6.10)
 
 
 def run_demo(name: str, out_root: str | Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE,
-             reviewer: Callable[[], Any] | None = None) -> list[RunResult]:
+             reviewer: Callable[..., Any] | None = None) -> list[RunResult]:
     """Run one scenario into `out_root/<name>/`, replacing what a previous run left there. `reviewer` makes
     the live Reviewer's job for a run (`pipeline.live.live_job`); None keeps the offline simulated one."""
     if name not in DEMOS:
@@ -965,7 +965,7 @@ def main(argv: list[str] | None = None) -> int:
         except NetworkNotAllowed as exc:
             print(f"sentinel demo: --reviewer live: {exc}", file=sys.stderr)
             return 2
-        factory = lambda: live_job(config=settings)     # noqa: E731 - one job per run
+        factory = lambda gate=None: live_job(config=settings, gate=gate)     # noqa: E731 - one job per run
     names = SCENARIOS if a.scenario == "all" else (a.scenario,)
     done: dict[str, list[RunResult]] = {}
     for name in names:

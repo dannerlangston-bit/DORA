@@ -29,14 +29,23 @@ checkpoint sequence of 5.17 with the rig replaced by `sim`:
    (`report.cluster.cluster_members`, 9.7); one simulated Reviewer call per cluster that needs one
    (task A for declared surfaces, task B descriptions for `collateral`; never for invariants or
    assertions, never for a member that inherited a decision), up to the PR cap of 60 calls.
+   Before the diff, Capture's redaction stage (`capture.redact_pair`, 3.6, 6.10) redacts the pair with the
+   config's `redaction/anchors.yaml` and the fixture's account ids, the simulated OCR reading what synth drew: a
+   redaction landmark found on one side only is `landmark_missing (redaction_landmark:<id>)` with nothing stored;
+   otherwise the redacted pair is diffed with its boxes (`diff_pair(redactions=)`), stored and sent, a stray id
+   is a `redaction_miss` finding, and every artifact carries the run's redaction version.
 7. Everything goes through `store.Store` (single writer) and `store.ArtifactStore` (content
-   addressed, redaction header set: synthetic screens carry no account data), each shard's post-run
+   addressed, under the run's redaction header, with the plaintext scanner of 6.9), each shard's post-run
    proof included (one 8.3 `post_run_proofs` row per shard, keyed by the rig's login alias). The teardown
    summary (8.3 `runs.summary_json`: the coverage matrix of `coverage.build_matrix`, run health, the abort
    block, the manifest's lint, the expiring masks and the alerts) is written with `Store.end_run(summary=)`,
    and the Reporter's PR comment, commit status and static HTML report are rendered from the finished run read
    back (`report.ReportInputs.from_store`): the proof line, what Cancel All did and the blocked login's
-   readable label (`orchestration.login_label`, never the vault alias) come from the stored proofs.
+   readable label (`orchestration.login_label`, never the vault alias) come from the stored proofs. Each results
+   batch is checked for a secret's plaintext before it is uploaded (`secret_scan.check_upload`), and the teardown
+   scan (`scan_run`) reads every row and file the run wrote; a hit, or a scan that cannot run, is `aborted_harness
+   (secret_leaked | secret_scan_unavailable)` with the report withheld. One `egress.EgressGate` per run, over
+   `policy/egress_allowlist.yaml`, carries every outbound call of the live Reviewer (`live_factory`, 6.10).
 
 `run_nightly` is the canary pass of a Nightly run (10.3): `canary.generate` mutates approved
 captures of the base build, every mutant goes through the same `evaluate` path as a PR checkpoint
@@ -92,6 +101,7 @@ Choices (reported):
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import itertools
@@ -114,13 +124,18 @@ from ..diff import load_params
 from ..diff.calibration import CalibrationFile, Capture as CalCapture, calibrate_checkpoint
 from ..diff.engine import (DiffContext, DiffResult, compare_fingerprints, diff_pair, fingerprint_id,
                            global_shift_prepass)
+from ..capture import (RedactionContext, RedactionList, RedactionResult, Sweep, SyntheticOcr, redact_pair,
+                       redaction_version)
 from ..diff.phash import phash
-from ..diff.regions import RegionsFile, effective_registry, locate, park_rect
+from ..egress import EgressAllowlist, EgressGate, reconcile
+from ..synth import THEME
+from ..diff.regions import Rect as RedactRect, RegionsFile, effective_registry, locate, park_rect
 from ..diff.settle import Recapture, RerunBudget, SettleResult, diff_stability, settle
 from ..lint.repo import Repo
 from ..lint.rules import EXPIRY_KINDS, ExpiredRecord, Violation, check_pair
 from ..lint.runstart import expiring_soon, lint_at_run_start, lint_manifest
-from ..records import PERSONAS, CheckpointOutcome, Decision, Finding, RunOutcome, Signature, StepEvent, StepOutcome
+from ..records import (FINDING_CATEGORIES, PERSONAS, CheckpointOutcome, Decision, EgressRow, Finding, RunOutcome,
+                       Signature, StepEvent, StepOutcome)
 from ..report import ReportContext, ReportInputs, render_report_markdown, write_run_report
 from ..report.cluster import Member, cluster_members
 from ..report.model import proof_severity, worst_proof
@@ -128,6 +143,7 @@ from ..scope import (DependencyIndex, Manifest, PlannedCheckpoint, Rig, ScopeCon
                      compute_scope)
 from ..store import ArtifactStore, Store
 from ..store.artifacts import ManifestHeader, Redaction, StoredArtifact
+from ..store.secret_scan import SecretScanner, check_upload, scan_run
 from ..store.store import PostRunProof, RunPlan, ScopeEntry, ShardPlan
 from ..taxonomy import checkpoint_parts, load
 from ..oracle.assertions import AssertionResult, step_assertions
@@ -164,7 +180,6 @@ from .sim import Capture, SimApp, SimBuild, observe
 
 DEFAULT_TODAY = date(2026, 11, 10)
 RIGS = ("rig-01", "rig-02", "rig-03", "rig-04")
-REDACTION = Redaction("redaction-v4-sim")
 PR_REVIEWER_CAP = 60                     # 3.15 per-run call cap of a PR run
 GATES_S, TEARDOWN_S = 9 * 60, 6 * 60     # 1.7: gates T+0:03 to 0:09; re-runs, teardown and report
 LISTED = ("invariant_violation", "assertion_failed", "collateral", "needs_human", "intended", "landmark_missing",
@@ -223,6 +238,20 @@ class Evaluated:
     released: bool = True                          # the stamp was current at capture (Orchestrator.may_release)
     shard_id: str | None = None                    # the shard that captured it, and its session's index there
     session: int = -1
+    redaction: RedactionResult | None = None       # the redaction stage's result (3.6); None: not redacted
+
+    @property
+    def storable(self) -> bool:
+        """False when the redaction stage refused the pair (6.10): nothing of it is stored or sent."""
+        return self.redaction is None or self.redaction.terminal is None
+
+    def images(self) -> tuple[np.ndarray | None, np.ndarray]:
+        """(base, candidate) as stored and sent: the redacted pair when the stage ran (3.6), else the screens."""
+        r = self.redaction
+        if r is not None and r.terminal is None and r.candidate is not None:
+            base = (r.base if self.base is not None else None) if r.base is not None else None
+            return base, r.candidate
+        return (self.base.screen.image if self.base else None), self.cand.screen.image
 
     @property
     def category(self) -> str:
@@ -357,6 +386,45 @@ class _Run:
         self.budget: RerunBudget | None = None
         self.entries = frozenset(e.entry_id for e in manifest.entries) if manifest else frozenset()
         self.tickets = frozenset(t for e in manifest.entries for t in e.tickets) if manifest else frozenset()
+        # 3.6, 6.10: the redaction list and the sweep's literal ids (the fixture's accounts); one version per run
+        anchors = cfg.root / "redaction" / "anchors.yaml"
+        self.anchors = RedactionList.load(anchors, cfg.root) if anchors.is_file() else RedactionList()
+        self.sweep = Sweep(tuple(str(a["account_id"]) for a in cfg.fixture.get("accounts") or () if a.get("account_id")),
+                           display_name=cfg.fixture.get("display_name"))
+        self.red_header = Redaction(redaction_version(self.anchors, self.sweep))
+        self.redaction_counts = {"base": 0, "candidate": 0}
+
+    # -- the redaction stage of Capture (3.6, 5.7, 6.10) ----------------------------------------------
+    def redact(self, cp: PlannedCheckpoint, base: Capture | None, cand: Capture, base_img: np.ndarray | None,
+               cand_img: np.ndarray) -> RedactionResult:
+        """Redact one checkpoint's pair in memory before anything is diffed or stored (`capture.redact_pair`): the
+        simulated OCR reads what synth drew on each side; a capture without a base is redacted against itself."""
+        b_cap, b_img = (base, base_img) if base is not None and base_img is not None else (cand, cand_img)
+        res = redact_pair(b_img, cand_img, self.anchors,
+                          {"base": SyntheticOcr.from_screen(b_cap.screen), "candidate": SyntheticOcr.from_screen(cand.screen)},
+                          THEME["bg"], sweep=self.sweep, context=RedactionContext(self.run_id, cp.checkpoint_id, cp.tier),
+                          params=self.params)
+        if res.terminal is None:
+            for side in ("base", "candidate") if base is not None else ("candidate",):
+                self.redaction_counts[side] += int(res.counts.get(side, 0))
+        return res
+
+    def redaction_canary(self, cp: PlannedCheckpoint, base: Capture, m: cn.Mutant) -> bool:
+        """M19 (12.5, 6.10): the mutant leaves a synthetic account id unredacted in the candidate frame; the redaction
+        stage must find it and mask it. The simulated OCR reads the planted footprint as a nine-digit id (the live
+        id pattern of 3.6, whatever digits the generator drew), and the hit is the footprint masked by a
+        `redaction_miss` box."""
+        if m.image is None or m.footprint is None:
+            return False
+        fx, fy, fw, fh = m.footprint
+        h, w = m.image.shape[:2]
+        res = redact_pair(base.screen.image, m.image, self.anchors,
+                          {"base": SyntheticOcr.from_screen(base.screen),
+                           "candidate": SyntheticOcr([("123456789", RedactRect(fx, fy, fw, fh))], (w, h))},
+                          THEME["bg"], sweep=self.sweep, context=RedactionContext(self.run_id, cp.checkpoint_id, cp.tier),
+                          params=self.params)
+        return res.terminal is None and res.masked(RedactRect(fx, fy, fw, fh)) and \
+            any(f.kind == "redaction_miss" for f in res.findings)
 
     # -- registry and rules ----------------------------------------------------------------
     def registry(self, cp: PlannedCheckpoint, base: Capture) -> RegionsFile:
@@ -495,13 +563,21 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
     s_b = settle(base.frames, spec, run.params) if base is not None else None
     res, comparison = None, None
     recaps = 0
+    red: RedactionResult | None = None                  # 3.6: only redacted images are diffed or stored
     if not s_c.settled:
+        red = run.redact(cp, None, cand, None, s_c.last_frame if s_c.last_frame is not None else cand.screen.image)
         facts = Facts(not_settled=Condition(s_c.reason, side="candidate", detail=s_c.detail), **fkw)
     elif base is None or (s_b is not None and not s_b.settled):
+        red = run.redact(cp, None, cand, None, s_c.capture)
         facts = Facts(base="absent", base_reason=absent_reason or "base_not_settled", **fkw)
         comparison = inv.compare(None, cand.models, rules)
+    elif (red := run.redact(cp, base, cand, s_b.capture, s_c.capture)).terminal is not None:
+        t = red.terminal                                # a redaction landmark on one side only: nothing is stored
+        facts = Facts(landmark=Condition(t.reason, side=t.side, detail=t.detail), **fkw)
     else:
-        res = diff_pair(s_b.capture, s_c.capture, reg, calibration=run.calibration, system_masks=[park_rect(park)],
+        boxes = red.boxes
+        res = diff_pair(red.base, red.candidate, reg, calibration=run.calibration, redactions=boxes,
+                        system_masks=[park_rect(park)],
                         context=DiffContext(run.run_id, cp.checkpoint_id, cp.tier, synthetic=synthetic),
                         params=run.params)
         comparison = inv.compare(base.models, cand.models, rules)
@@ -530,16 +606,17 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
                     stab, cause = inv_stab, inv_cause
                 else:
                     def above(a: np.ndarray, b: np.ndarray) -> bool:
-                        return diff_pair(a, b, reg, calibration=run.calibration, system_masks=[park_rect(park)],
+                        return diff_pair(a, b, reg, calibration=run.calibration, redactions=boxes,
+                                         system_masks=[park_rect(park)],
                                          context=DiffContext(run.run_id, cp.checkpoint_id, cp.tier, synthetic=synthetic),
                                          params=run.params).level == "above"
                     if recapturable and budget_ok:
                         again = [recapture(), recapture()]
                         recaps = 2
-                        st = diff_stability(s_c.capture, [Recapture(True, a.screen.image) for a in again], above,
+                        st = diff_stability(red.candidate, [Recapture(True, a.screen.image) for a in again], above,
                                             params=run.params)
                     else:
-                        st = diff_stability(s_c.capture, [], above, recapturable=recapturable, budget_ok=budget_ok,
+                        st = diff_stability(red.candidate, [], above, recapturable=recapturable, budget_ok=budget_ok,
                                             params=run.params)
                     stab, cause = st.stability, st.cause
             fix = None
@@ -565,7 +642,7 @@ def evaluate(run: _Run, cp: PlannedCheckpoint, base: Capture | None, cand: Captu
             checks = (c_chk, b_chk)
     classified = classify(facts)
     ev = Evaluated(cp, base, cand, reg, facts, classified, res, comparison, recaptures=recaps,
-                   settle_ms=s_c.time_to_settle_ms, oracle=checks[0], oracle_base=checks[1])
+                   settle_ms=s_c.time_to_settle_ms, oracle=checks[0], oracle_base=checks[1], redaction=red)
     ev.facts_category = classified.outcome
     cand_lm = {k: m[1].pos for k, m in (res.landmarks.items() if res else []) if m[1].found}
     h, w = cand.screen.image.shape[:2]
@@ -621,6 +698,12 @@ def _asserted_region(ev: Evaluated, cand_lm: Mapping[str, tuple[int, int]]) -> t
         return None
     lx, ly = cand_lm[r.landmark]
     return r.id, (r.rect.x + lx, r.rect.y + ly, r.rect.w, r.rect.h)
+
+
+def _category(ev: Evaluated) -> str | None:
+    """The finding's 9.7 category: the computed category when it is one of the finding categories (4.13); none for an
+    outcome outside them, such as a redaction landmark's `landmark_missing`."""
+    return ev.category if ev.category in FINDING_CATEGORIES else None
 
 
 def _as_settled(cap: Capture) -> SettleResult:
@@ -785,14 +868,15 @@ class _Writer:
     def _put(self, img: np.ndarray, name: str, kind: str, cid: str, side: str | None, tag: str = "") -> StoredArtifact:
         path = f"{self.run.run_id}/{cid}/{tag + '/' if tag else ''}{name}.png"
         return self.arts.put(_png(img), name=path, kind=kind, media_type="image/png",
-                             redaction=REDACTION, checkpoint_id=cid, side=side,
+                             redaction=self.run.red_header, checkpoint_id=cid, side=side,
                              captured_at=_ts(self.today, self.clock))
 
     def artifacts(self, ev: Evaluated, tag: str = "") -> tuple[dict, list[StoredArtifact]]:
         cid = ev.cp.checkpoint_id
         stored: list[StoredArtifact] = []
-        cimg = ev.cand.screen.image
-        bimg = ev.base.screen.image if ev.base else None
+        if not ev.storable:                       # 3.6: a redaction landmark missing on one side stores nothing
+            return {}, stored
+        bimg, cimg = ev.images()
         listed = ev.classified.outcome in LISTED or ev.classified.decision_ref is not None
         box = ev.crop if listed else (0, 0, cimg.shape[1], cimg.shape[0])
         if ev.comparison is not None and ev.comparison.fired:
@@ -878,12 +962,14 @@ class _Writer:
             findings.append(Finding(
                 finding_id=fid, run_id=self.run.run_id, kind=kind, description=desc, first_seen_run_id=self.run.run_id,
                 checkpoint_id=cp.checkpoint_id, tier=cp.tier, region_id=ev.region, primitive=c.primitive,
-                manifest_entry_ref=c.manifest_entry_ref, phash=ev.phash, category=ev.category, evidence=evidence,
+                manifest_entry_ref=c.manifest_entry_ref, phash=ev.phash, category=_category(ev), evidence=evidence,
                 severity=sev, side=c.side, step_id=cp.step_id, decision_ref=c.decision_ref,
                 created_at=_ts(self.today, self.clock, 900)))
         if ev.diff is not None:
             for f in ev.diff.findings:
                 findings.append(dataclasses.replace(f, created_at=_ts(self.today, self.clock, 900), tier=cp.tier))
+        for f in ev.redaction.findings if ev.redaction is not None else ():     # 3.6: never the primary finding
+            findings.append(dataclasses.replace(f, created_at=_ts(self.today, self.clock, 900)))
         return o, findings, stored
 
 
@@ -1694,9 +1780,11 @@ def run_start(repo: Repo, candidate: str, today: date) -> RunStart:
 
 
 def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path, today: date = DEFAULT_TODAY,
-                 reviewer: ReviewerAdapter | None = None, live: ReviewerJob | None = None) -> RunResult:
+                 reviewer: ReviewerAdapter | None = None, live: ReviewerJob | None = None,
+                 live_factory: Callable[[EgressGate | None], ReviewerJob] | None = None) -> RunResult:
     """One simulated PR run from webhook to PR comment (module docstring). The Reviewer is `reviewer`, else
-    with `live` (a `reviewer.ReviewerJob`, `pipeline.live.live_job`) the real adapter `ModelReviewer`, else
+    with `live` (a `reviewer.ReviewerJob`, `pipeline.live.live_job`; or `live_factory`, which builds it over the
+    run's `egress.EgressGate`, 6.10) the real adapter `ModelReviewer`, else
     the offline `SimulatedReviewer`. Writes into `out_dir`:
     `config/<run_id>/`, `sentinel.db` (shared by every run of the directory), `artifacts/`,
     `calibration/`, `heartbeat/`, `pr-comment.md`, `commit-status.json`, `report.html`,
@@ -1745,7 +1833,10 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                                         {"match": dict(run.fp_match, build_id=scenario.candidate.build_id)})
         assert mismatch is None
         # -- T+0:00 to 0:02: the run row, its scope and shards (1.7)
-        arts = ArtifactStore(out / "artifacts", f"runs/{scenario.run_id}")
+        secrets = run_secrets(RIGS)                       # 6.9: the plaintexts the run's logins used, by reference
+        scanner = SecretScanner(secrets)
+        arts = ArtifactStore(out / "artifacts", f"runs/{scenario.run_id}", scanner=scanner)
+        leak: ControlResult | None = None                 # the first results batch the upload check stopped
         writer = _Writer(run, arts, today, scenario.clock)
         _register(store, cfg, [base_id, scenario.candidate.build_id])
         used = sorted({rig_of[cp.checkpoint_id] for cp in planned})
@@ -1764,7 +1855,10 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                                   mtext.read_text() if mtext.exists() else None, scenario.pr, scenario.author))
         work = _ShardWork(run, cfg, scenario, out, oracle, store, planned, plan, today)
         rev = reviewer or SimulatedReviewer()
-        items = ItemBuilder(scenario.run_id, arts, REDACTION, _EvalIndex(work), manifest=manifest, epoch=run.epoch,
+        gate = egress_gate(cfg.root, store, scenario.run_id)   # 6.10: one gate per run for every outbound call
+        if live is None and live_factory is not None:
+            live = live_factory(gate)
+        items = ItemBuilder(scenario.run_id, arts, run.red_header, _EvalIndex(work), manifest=manifest, epoch=run.epoch,
                             flow_docs=cfg.flow_docs, pad=(live.config if live else ReviewerConfig()).crop.pad_px)
         if reviewer is None and live is not None:          # 3.12: the real Reviewer; crops from the artifact store
             rev = ModelReviewer(live, items)
@@ -1785,7 +1879,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
             gf = shift.finding(scenario.run_id)
             if gf is not None:
                 store.write_finding(dataclasses.replace(gf, created_at=started))
-        calls = _review_pass(run, evals, rev, scenario.reviewer_cap)
+        calls = _review_pass(run, evals, rev, scenario.reviewer_cap, gate)
         for f in plan.findings:
             store.write_finding(dataclasses.replace(f, created_at=started))
         for f in _expired_findings(scenario.run_id, start.expired, run.expiry_notices, run.expired_exceptions,
@@ -1793,6 +1887,9 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
             store.write_finding(f)
         for ev in evals:
             o, fs, stored = writer.records(ev)
+            if leak is None:                             # 6.9: each results batch is scanned before it is uploaded
+                batch = json.dumps([o.to_dict(), [f.to_dict() for f in fs]], sort_keys=True, default=str).encode()
+                leak = check_upload(scanner, batch, location=f"results batch {ev.cp.checkpoint_id}")
             work.session_context(ev)                     # L-OUT-06: the stamp is one of its session's assertions
             steps = []
             if ev.cp.test_kind == "flow":
@@ -1841,11 +1938,26 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
             stopped = [s.rig_id for s, rep in work.reports if rep.verdict.status == "aborted_safety"]
             abort = {"trigger": r.run_reason, "gate": r.gate, "proof": work.proof(), "incident": r.incident or "unknown",
                      "rig": stopped or [st.rig_id]}                    # every rig the abort disabled (6.6 step 6)
+        (out / "reviewer-calls.json").write_text(json.dumps(calls, indent=1, sort_keys=True, default=str) + "\n")
+        # 6.9 teardown: the plaintext scan of everything the run wrote, before anything is reported
+        written = [p for p in (out / "journal" / scenario.run_id, out / "reviewer-calls.json") if p.exists()]
+        scan = scan_run(store, arts, written, secrets, run_id=scenario.run_id,
+                        quarantine_root=out / "artifacts" / "quarantine")
+        secret = leak or (scan if not scan.passed else None)
+        if secret is not None:
+            v = worse(RunVerdict(status, reason), secret.run)
+            status, reason, last_gate = v.status, v.reason, secret.gate or "teardown"
+            work.alerts += [a for a in [alert_entry(scenario.run_id, None, secret)] if a is not None]
+            abort = {"trigger": secret.run_reason, "gate": last_gate, "not_requeued": "the report is withheld until "
+                     "a human scans the run and rotates the credential (6.9)"}
         summary = _summary(store, cfg, plan, run, scenario, wall, len(work.reports), safety=work.safety(), abort=abort,
                            start=start, alerts=work.alerts)
+        if secret is not None:
+            summary["secret_scan"] = {"result": secret.run_reason, "detail": secret.detail, "report_withheld": True}
         runrec = store.end_run(RunOutcome(scenario.run_id, "pr", status, last_gate, reason=reason, started_at=started,
                                           ended_at=_ts(today, scenario.clock, int(wall))), summary=summary)
-        result = _report(store, plan, scenario, runrec, mdoc, out, cfg.root)
+        result = _withheld(store, plan, scenario, runrec, out, secret) if secret is not None else \
+            _report(store, plan, scenario, runrec, mdoc, out, cfg.root)
         result.reviewer_calls = calls
         n_pairs = sum(1 for ev in evals if ev.diff is not None and ev.diff.signal is not None)
         result.notes.append(
@@ -1861,12 +1973,13 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
             summary["proof"] = lines[summary["shard_id"]]
         result.alerts, result.shards, result.proof = work.alerts, work.summaries, work.proof()
         work.write()
-        (out / "reviewer-calls.json").write_text(json.dumps(calls, indent=1, sort_keys=True, default=str) + "\n")
         return result
 
 
-def _review_pass(run: _Run, evals: list[Evaluated], rev: ReviewerAdapter, cap: int) -> list[dict]:
-    """5.11, 9.7: one Reviewer call per report cluster that needs one, in cluster order, up to `cap`."""
+def _review_pass(run: _Run, evals: list[Evaluated], rev: ReviewerAdapter, cap: int,
+                 gate: EgressGate | None = None) -> list[dict]:
+    """5.11, 9.7: one Reviewer call per report cluster that needs one, in cluster order, up to `cap`; each call's
+    egress rows name the item's checkpoint and the run's redaction version (`gate.context`, 6.10)."""
     members = []
     by_id: dict[str, Evaluated] = {}
     for ev in evals:
@@ -1877,7 +1990,7 @@ def _review_pass(run: _Run, evals: list[Evaluated], rev: ReviewerAdapter, cap: i
                                 persona=ev.cp.persona, data_mode=ev.cp.data_mode, tier=ev.cp.tier,
                                 diff=ev.diff.summary if ev.diff and ev.diff.terminal is None else None, **c.fields())
         f = Finding("pre", run.run_id, "collateral", "", run.run_id, checkpoint_id=ev.cp.checkpoint_id,
-                    region_id=ev.region, phash=ev.phash, category=ev.category)
+                    region_id=ev.region, phash=ev.phash, category=_category(ev))
         members.append(Member(rec, f, ev.category, 0, ev.region, c.decision_ref))
         by_id[ev.cp.checkpoint_id] = ev
     calls: list[dict] = []
@@ -1927,11 +2040,13 @@ def _review_pass(run: _Run, evals: list[Evaluated], rev: ReviewerAdapter, cap: i
             edge={"primitive": att.primitive, "entry_id": att.entry_id} if att and task == "describe_collateral" else None,
             sizes=sizes, ladder=any(d.kind == "order_strip" for d in rep.cand.screen.components))
         try:
-            answer = rev.review(req)
-            problems = validate(answer, req)
-            if problems:                  # 3.13: re-sent once, then unavailable (row 23)
+            with gate.context(checkpoint_id=req.checkpoint_ids[0], redaction_version=run.red_header.version) \
+                    if gate is not None else contextlib.nullcontext():
                 answer = rev.review(req)
                 problems = validate(answer, req)
+                if problems:              # 3.13: re-sent once, then unavailable (row 23)
+                    answer = rev.review(req)
+                    problems = validate(answer, req)
         except ReviewerUnavailable as exc:       # the live adapter gave up on the item (3.11 row 23)
             for ev in evs:
                 _with_review(ev, exc.review())
@@ -1976,6 +2091,7 @@ def _summary(store: Store, cfg: SentinelConfig, plan: ScopePlan, run: _Run, scen
                if f.kind in EXPIRY_KINDS]
     if expired:
         health["expired"] = expired
+    health["redaction"] = dict(run.redaction_counts)    # 3.6: the run's redaction boxes per side
     if scenario.canary:
         health["canary"] = dict(scenario.canary)
     out: dict[str, Any] = {"coverage": coverage_summary(cfg, plan, outcomes, scenario.run_id), "health": health,
@@ -1987,6 +2103,50 @@ def _summary(store: Store, cfg: SentinelConfig, plan: ScopePlan, run: _Run, scen
     if start.expiring:
         out["expiring"] = list(start.expiring)
     return out
+
+
+def egress_gate(cfg_root: Path, store: Store, run_id: str) -> EgressGate | None:
+    """The run's egress gate over the signed allowlist (`policy/egress_allowlist.yaml`, 6.10); None without one."""
+    path = cfg_root / "policy" / "egress_allowlist.yaml"
+    return EgressGate(EgressAllowlist.load(path), store, run_id=run_id) if path.is_file() else None
+
+
+def nightly_reconcile(store: Store, cfg_root: Path, now: datetime) -> ControlResult | None:
+    """The Nightly egress reconciliation (6.10): the last day's `egress_log` rows against the signed allowlist and
+    the rigs' firewall logs; the simulated rig keeps no firewall log, so only rows to an unapproved host can trip it.
+    Each run the reconciliation names is re-marked `aborted_harness (egress_unlogged)` by its caller (none here)."""
+    path = cfg_root / "policy" / "egress_allowlist.yaml"
+    if not path.is_file():
+        return None
+    since = (now - timedelta(days=1)).astimezone(timezone.utc).isoformat()
+    names = {f.name for f in dataclasses.fields(EgressRow)}
+    rows = [EgressRow(**{k: r[k] for k in r.keys() if k in names})
+            for r in store.query("SELECT * FROM egress_log WHERE sent_at >= ?", (since,))]
+    return reconcile(rows, EgressAllowlist.load(path), ()).control()
+
+
+SIM_SECRET = "sim-paper-login-secret-4b7e19"     # the stand-in plaintext of every simulated login's password (6.9)
+
+
+def run_secrets(rigs: Iterable[str]) -> dict[str, str]:
+    """The plaintext of each secret the run's logins used, by vault reference (6.9 Plaintext scan): on the rig the
+    Orchestrator's locked buffer; here one stand-in value the simulated LOGIN flow never types (its keys are
+    stand-ins too), so a hit can only come from a value written where it must not be."""
+    return {f"{login_alias(r)}#password": SIM_SECRET for r in rigs}
+
+
+def _withheld(store: Store, plan: ScopePlan, scenario: Scenario, runrec: RunOutcome, out: Path,
+              secret: ControlResult) -> RunResult:
+    """6.9: a leaked secret (or a scan that could not run) withholds the report: no PR comment and no report page
+    are published; the commit status says Sentinel did not report, with the reason."""
+    status = {"context": "sentinel/pr-run", "state": "error", "mode": "informational", "target_url": None,
+              "description": f"Sentinel did not report: {runrec.status} ({runrec.reason}); the report is withheld"}
+    (out / "commit-status.json").write_text(json.dumps(status, indent=2) + "\n")
+    for name in ("pr-comment.md", "report.html"):
+        (out / name).unlink(missing_ok=True)
+    return RunResult(scenario.run_id, "pr", runrec.status, runrec.reason, out, store.outcomes(scenario.run_id),
+                     store.findings(scenario.run_id), [], "", status, plan, None,
+                     notes=[f"report withheld: {secret.detail or secret.run_reason}"])
 
 
 def _report(store: Store, plan: ScopePlan, scenario: Scenario, runrec: RunOutcome, mdoc: dict | None,
@@ -2051,7 +2211,7 @@ class NightlyScenario:
     history_nights: int = 14
 
 
-SIMULATED_MUTANTS = ("M01", "M02", "M03", "M04", "M05", "M06", "M08", "M09", "M12", "M14", "M18", "M20", "M22",
+SIMULATED_MUTANTS = ("M01", "M02", "M03", "M04", "M05", "M06", "M08", "M09", "M12", "M14", "M18", "M19", "M20", "M22",
                      "M24", "M25", "M26", "M27", "M28", "M29", "M30")
 NOT_SIMULATED = {
     "M07": "color_swap expects INV-15; the registry declares no signed P/L column and palette for the synthetic app",
@@ -2064,7 +2224,6 @@ NOT_SIMULATED = {
            "region in PR runs (SD-29)",
     "M16": "font_height needs OCR cap heights from the pixels",
     "M17": "scrollbar needs a template match of the drawn thumb",
-    "M19": "redaction is proven by the redaction stage and the egress log, which the simulation has no rig for",
     "M21": "global_shift is judged by the run-level pre-pass over at least 20 pairs of one run",
     "M23": "global_shift, as M21",
     "M31": "misaligned_column expects INV-12; the registry declares no grid columns for the synthetic app",
@@ -2225,7 +2384,9 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                 if ev.classified.outcome in ("identical", "noise"):
                     masks = [f"mask {r.mask_ref} (region {r.id})" for r in ev.registry.regions if r.type == "mask"]
                     absorbed = ", ".join(masks) if masks else None
-                results.append(cn.MutantResult(m, rec, absorbed_by=absorbed, step_status=step_status))
+                hit = run.redaction_canary(cp, base_cap, m) if m.defect_class == "redaction" else None
+                results.append(cn.MutantResult(m, rec, absorbed_by=absorbed, step_status=step_status,
+                                               redaction_hit=hit))
                 produced[m.key] = rec
                 rows_meta.append((m, ev))
             report = cn.score(results, history=history or {}, since=f"{today.isoformat()} {scenario.clock[:5]} ET",
@@ -2294,6 +2455,10 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                                    1 if report.state != "ok" else 0, "slack": {"queued": 0}}}
         if expired_findings:
             health["expired"] = [f.evidence["raw_values"]["run_health"] for f in expired_findings]
+        egress = nightly_reconcile(store, cfg.root, now)          # 6.10: the day's egress rows against the allowlist
+        if egress is not None:
+            work._note(st, egress)
+            health["egress"] = {"verdict": "ok" if egress.passed else egress.incident, "detail": egress.detail}
         runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", shard.verdict.status, "reported",
                                           reason=shard.verdict.reason, started_at=started,
                                           ended_at=_ts(today, scenario.clock, 2 * 3600)),

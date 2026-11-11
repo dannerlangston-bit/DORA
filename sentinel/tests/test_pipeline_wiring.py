@@ -180,3 +180,128 @@ def test_the_default_order_chords_come_from_the_gateway_file(tmp_path):
     (root / "gateway" / "default_order_hotkeys.yaml").unlink()
     hotkeys, err = order_hotkeys(SentinelConfig.load(root))
     assert hotkeys is None and err.result.run_status == "aborted_harness" and err.result.gate == "settings_attested"
+
+
+# -- redaction, secrets and egress (3.6, 6.9, 6.10) ----------------------------------------------------------------
+
+def test_every_stored_image_is_redacted_under_the_runs_redaction_version(tmp_path):
+    """3.6, 8.4: images are diffed and stored only after the redaction stage (`redact_pair`); every artifact carries
+    the run's redaction version, and run health counts the boxes per side."""
+    from sentinel.capture import RedactionList, Sweep, redaction_version
+    sc = clean_scenario(TODAY)
+    run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    want = redaction_version(RedactionList.load(EXAMPLE / "redaction" / "anchors.yaml", EXAMPLE),
+                             Sweep(("D-20481133", "D-20481134")))
+    with Store(tmp_path / "sentinel.db") as store:
+        versions = {r[0] for r in store.conn.execute("SELECT redaction_version FROM artifacts")}
+        health = store.run_summary(sc.run_id)["health"]
+    assert versions == {want} and want.startswith("redaction-")
+    assert set(health["redaction"]) == {"base", "candidate"}
+
+
+def test_an_identifier_outside_the_anchors_is_a_redaction_miss_and_is_masked(tmp_path, monkeypatch):
+    """3.6, 6.10 stage 2: an account id the anchors do not cover is filled and recorded as a `redaction_miss`
+    finding; a miss on the candidate only is tier 1 and never fails the check (3.6, 9.2)."""
+    from sentinel.capture import SyntheticOcr
+    from sentinel.diff.regions import Rect
+    real = SyntheticOcr.from_screen
+    target = "census/charts.flexible-grid.chart-cell/ws.tier-a.swing-trader"
+
+    def from_screen(screen):
+        ocr = real(screen)
+        label = next((c for c in screen.components if c.text and c.kind in ("label", "text")), None)
+        if label is not None and getattr(screen, "_stray", False):
+            ocr._words.append(("D-20481134", Rect(*label.bbox)))      # a stray id drawn over a label
+        return ocr
+
+    import sentinel.pipeline.run as pr
+    real_capture = pr._Run.capture
+
+    def capture(self, cp, side, tick=0):
+        cap = real_capture(self, cp, side, tick)
+        if cp.checkpoint_id == target and side == "candidate":
+            cap.screen._stray = True
+        return cap
+
+    monkeypatch.setattr(pr._Run, "capture", capture)
+
+    monkeypatch.setattr(SyntheticOcr, "from_screen", staticmethod(from_screen))
+    sc = clean_scenario(TODAY)
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    (miss,) = [f for f in r.findings if f.kind == "redaction_miss"]
+    assert miss.evidence["pattern"] == "literal_id" and "D-20481134" not in miss.description
+    assert (miss.checkpoint_id, miss.side, miss.tier, miss.evidence["candidate_only"]) == (target, "candidate", 1, True)
+    assert r.status == "complete"
+    # the miss's box is filled on both sides (3.6), so the label under it no longer differs; no failure follows
+    assert {o.outcome for o in r.outcomes if o.checkpoint_id == target} <= {"intended", "identical"}
+    assert r.commit_status["state"] == "success"
+
+
+def test_a_redaction_landmark_on_one_side_only_stores_nothing(tmp_path, monkeypatch):
+    """6.10: a redaction landmark found on one capture of the pair ends the checkpoint `landmark_missing (reason:
+    redaction_landmark:<id>)`, and nothing of it is stored."""
+    import sentinel.pipeline.run as pr
+    from sentinel.capture import RedactionResult
+    from sentinel.diff.engine import Terminal
+    target = "census/charts.flexible-grid.chart-cell/ws.tier-a.swing-trader"
+    real = pr.redact_pair
+
+    def redact(base, cand, anchors, ocr, theme, *, sweep=None, context=None, params=None):
+        if context is not None and context.checkpoint_id == target:
+            return RedactionResult("redaction-x", None, None, terminal=Terminal(
+                "landmark_missing", "redaction_landmark:lm.position-statement-header", side="candidate"))
+        return real(base, cand, anchors, ocr, theme, sweep=sweep, context=context, params=params)
+
+    monkeypatch.setattr(pr, "redact_pair", redact)
+    sc = clean_scenario(TODAY)
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    (o,) = [o for o in r.outcomes if o.checkpoint_id == target]
+    assert (o.outcome, o.reason) == ("landmark_missing", "redaction_landmark:lm.position-statement-header")
+    assert o.artifacts in (None, {})
+    manifest = (tmp_path / "artifacts" / "manifest.json").read_text()
+    assert target not in manifest
+
+
+def test_a_leaked_secret_withholds_the_report(tmp_path, monkeypatch):
+    """6.9: a results batch holding a secret's plaintext stops the uploads (`check_upload`); the run is
+    `aborted_harness (reason: secret_leaked)` and its report is withheld: no PR comment, no report page."""
+    import sentinel.pipeline.run as pr
+    sc = clean_scenario(TODAY)
+    monkeypatch.setattr(pr, "SIM_SECRET", f"{sc.run_id}/1")          # a value the records do carry (a shard id)
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY)
+    assert (r.status, r.reason) == ("aborted_harness", "secret_leaked")
+    assert not (tmp_path / "pr-comment.md").exists() and not (tmp_path / "report.html").exists()
+    assert r.commit_status["state"] == "error" and "withheld" in r.commit_status["description"]
+    with Store(tmp_path / "sentinel.db") as store:
+        assert store.run_summary(sc.run_id)["secret_scan"]["report_withheld"] is True
+
+
+def test_the_live_reviewer_is_built_over_the_runs_egress_gate(tmp_path):
+    """6.10: one egress gate per run, over the signed allowlist, handed to the live Reviewer's job
+    (`live_factory`, `pipeline.live.live_job(gate=)`); it refuses a host the allowlist does not name."""
+    from sentinel.egress import EgressGate, EgressRefused
+    from sentinel.reviewer import ReviewerConfig, ReviewerJob
+    from test_integration import FakeTransport
+    gates: list = []
+
+    def factory(gate):
+        gates.append(gate)
+        return ReviewerJob(ReviewerConfig(sync_concurrency=1), FakeTransport(), "pr")
+
+    sc = clean_scenario(TODAY)
+    r = run_pipeline(EXAMPLE, sc, tmp_path, today=TODAY, live_factory=factory)
+    (gate,) = gates
+    assert isinstance(gate, EgressGate) and gate.run_id == sc.run_id and r.reviewer_calls
+    assert gate.allowlist.entry("api.anthropic.com") is not None and gate.allowlist.entry("evil.example.com") is None
+
+
+def test_the_nightly_redaction_canary_m19_is_detected(tmp_path):
+    """12.5 M19, 6.10: the planted account id goes through `redact_pair`; the stage masks it with a `redaction_miss`
+    box, so the canary is detected (no longer listed as not simulated)."""
+    from sentinel.demo import BASE_ID, _main_build
+    from sentinel.pipeline.run import NOT_SIMULATED, NightlyScenario, run_nightly
+    from sentinel.pipeline.sim import SimBuild
+    n = run_nightly(EXAMPLE, NightlyScenario("nightly", "run-2026-11-10-nightly-01", SimBuild(BASE_ID),
+                                             overlay=dict([_main_build()]), mutants=("M19",)), tmp_path)
+    (res,) = n.canary["report"].results
+    assert (res.mutant_id, res.state) == ("M19", "detected") and "M19" not in NOT_SIMULATED

@@ -176,7 +176,7 @@ def login_label(rig: str) -> str:
 
 
 # -- what the run writes besides the store ----------------------------------------------------------------
-def alert_entry(run_id: str, shard_id: str, r: ControlResult) -> dict | None:
+def alert_entry(run_id: str, shard_id: str | None, r: ControlResult) -> dict | None:
     """One `alerts.json` entry: the 9.10 route of a control result, or None when it pages nobody."""
     a: AlertRoute | None = r.alert
     if a is None:

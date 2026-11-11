@@ -71,6 +71,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 
+from . import required_fields
 from .invariants import INVARIANT_IDS
 from .records import Classification, Decision
 from .taxonomy import TaxonomyError, load
@@ -478,48 +479,10 @@ class Classified:
 
 
 def required_field_errors(c: Classified) -> list[str]:
-    """The 4.13 required-fields table for what classification knows (L-OUT-02). `diff` and
-    `artifacts` belong to the Diff Engine and Capture and are not checked here."""
-    errs: list[str] = []
-    cls = c.classification
-
-    def need(ok: object, what: str) -> None:
-        if not ok:
-            errs.append(f"{c.outcome}: {what}")
-
-    o = c.outcome
-    if o == "env_error":
-        need(c.gate and c.reason, "gate and reason")
-    elif o == "harness_error":
-        need(c.reason and c.detail and "watchdog_event" in c.detail, "reason and a Watchdog event id in detail")
-    elif o in ("not_run", "needs_human"):
-        need(c.reason, "reason")
-    elif o == "not_comparable":
-        need(c.reason and c.detail, "reason and the differing fields in detail")
-    elif o in ("not_settled", "landmark_missing"):
-        need(c.reason and c.side and c.detail, "reason, side and detail")
-    elif o == "needs_baseline":
-        need(c.reason and c.side, "reason and side")
-    elif o == "invariant_violation":
-        need(c.invariant_ids and c.reason == c.invariant_ids[0], "invariant_ids with the first id as reason")
-    elif o == "assertion_failed":
-        need(c.assertion_ids and c.reason == f"assertion:{c.assertion_ids[0]}" and c.detail,
-             "assertion_ids, reason assertion:<id> and detail")
-    elif o == "noise":
-        need(cls is not None and cls.by == "rule", "classification by rule")
-        need(c.reason == "below_floor" or (c.reason or "").startswith("decision:") and c.decision_ref,
-             "below_floor, or decision:<id> with decision_ref")
-    elif o == "intended":
-        need((cls is not None and cls.by == "reviewer" and cls.confidence is not None)
-             or ((c.reason or "").startswith("decision:") and c.decision_ref),
-             "a reviewer classification with confidence, or decision:<id> with decision_ref")
-        need(c.manifest_entry_ref, "manifest_entry_ref")
-    elif o == "collateral":
-        need(cls is not None and cls.by == "rule", "classification by rule")
-        if c.row in ("16", "17"):
-            need(c.primitive, "primitive")
-            need(c.manifest_entry_ref or c.reason == "manifest_missing", "manifest_entry_ref")
-    return errs
+    """The 4.13 required-fields table for what classification knows (L-OUT-02), through the one validator of
+    `required_fields`. `diff`, `artifacts` and the capture provenance belong to the Diff Engine and Capture and are
+    not checked here; a `collateral` from row 26 is the removed surface whose probe screenshots replace `diff`."""
+    return required_fields.errors(c, evidence=False, removed=c.row == "26")
 
 
 # --------------------------------------------------------------------------------------------

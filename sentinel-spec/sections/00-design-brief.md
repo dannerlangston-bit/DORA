@@ -19,7 +19,7 @@ This brief is the single source of truth for every section writer. Every decisio
 ### 1.1 Run types and the build pair
 - The unit of comparison is a **build pair**: candidate build vs base build, both installed from pipeline artifacts, both run on identically fingerprinted rigs in the same data window. Attribution of a diff to a change comes from the build pair, not from AI.
 - Run types:
-  - **PR run**: candidate = branch build, base = its merge-base main build. Scope = dependency-map expansion of the change manifest (surfaces that consume what changed) + the smoke subset of the census. Budget: 45 minutes wall clock, sharded across rigs.
+  - **PR run**: candidate = branch build, base = its merge-base main build (or the nearest main ancestor with a build, at most 20 commits back). Scope = dependency-map expansion of the change manifest (surfaces that consume what changed) + the smoke subset of the census. Budget: 45 minutes wall clock, sharded across rigs.
   - **Merge run**: on every merge to main, candidate = new main build, base = previous main build. Scope = full census + all tier-1 flows. Budget: 3 hours.
   - **RC run**: candidate = RC build, base = last released build (lineage baseline). Scope = full census, all flows, size sweeps, soak, Explorer. Budget: 8 hours. Gate: triaged and signed off N business days before GA.
   - **Nightly run**: canaries (mutants), A/A drift check on the current main build, flake statistics refresh, environment fingerprint check. Not a product test.
@@ -72,7 +72,7 @@ Orchestrator (state machine: provisioned -> launched -> authenticated -> paper_m
 - **Environment fingerprint** computed from live reads at run start (build id from the main window title, JRE release file, vmoptions hash, Windows build, display settings, theme, workspace hash, pipeline) and stored per run; candidate and base must match or every checkpoint is `not_comparable`.
 - **State model**: local state (workspace files, usergui folder, vmoptions) restored by snapshot revert; server-side state on the login (positions, working orders, watchlists, alerts, studies, drawings, settings) restored by the fixture reset flow and verified by `verify_account_fixture` at run start; drift = `env_error` not a diff.
 - **Logins**: one dedicated paperMoney or test login per rig, named owner, trusted-device MFA exemption or test-backend credential (OPEN which one the platform team grants), credential rotation calendar, re-login flow with its own checkpoints.
-- **Popup catalog**: versioned list of title regex plus template plus action (dismiss key, click, abort) for everything the app throws on its own; unmatched top-level windows go to the agent with a strict dismiss-only toolset and are logged as `unknown_popup` findings.
+- **Popup catalog**: versioned list of title regex plus template plus action (dismiss key, click, wait, relogin, abort, ignore) for everything the app throws on its own; unmatched top-level windows go to the agent with a strict dismiss-only toolset and are logged as `unknown_popup` findings.
 - **Data modes**: frozen = deterministic market-data fixture from the backend team (preferred; OPEN) or OnDemand at a pinned, paused timestamp where available on the login; masked_live = paperMoney live-delayed data with the region registry. Quiet windows for anything that still needs them come from an exchange-calendar library in America/New_York, never wall-clock cron.
 
 ### 1.9 Reporting and process

@@ -952,7 +952,8 @@ class DropLedger:
         """Apply 5.4.8 to one drop or refusal. `unit` is the flow id (or the agent or Explorer session id) and
         `step_id` the step it blocked, for `rest_of_flow` (choice 13); `order_stage` is whether an order-stage
         step is in force; `probe_answered` and `retried` decide the single retry of an own-token integrity drop
-        (5.4.3 stage 7); `budgets` are the shard's restart budgets, which a `hook_host_dead` refusal needs
+        (5.4.3 stage 7: a silent probe makes the step `failed`, a retry the answering hook dropped again
+        `blocked_by_gateway`); `budgets` are the shard's restart budgets, which a `hook_host_dead` refusal needs
         (choice 14)."""
         res = self._record(drop, unit=unit, step_id=step_id, order_stage=order_stage, exempt=exempt,
                            probe_answered=probe_answered, retried=retried, budgets=budgets)
@@ -1016,8 +1017,10 @@ class DropLedger:
         quarantine = self.unit_counts[unit] >= self.per_flow
         own_integrity = drop.gate_class == "integrity" and drop.decision == "dropped" and drop.own_token
         if own_integrity and (retried or not probe_answered):
-            # 5.4.3 stage 7: the retry dropped again or the hook did not answer: fail closed (5.4.2)
-            return ControlResult("gateway", False, "running", step="blocked_by_gateway", step_reason=drop.reason,
+            # 5.4.3 stage 7: the retry dropped again or the hook did not answer: fail closed (5.4.2). A silent hook never
+            # saw the event, so the step is failed (SD-52); a hook that answered and dropped the retry blocked it
+            return ControlResult("gateway", False, "running", step="blocked_by_gateway" if probe_answered else "failed",
+                                 step_reason=drop.reason,
                                  checkpoint=Outcome("harness_error", "hook_lost"),
                                  actions=("end_flow", "kill_tree", "restart_hook_host")
                                  + (("quarantine_flow",) if quarantine else ()),

@@ -626,8 +626,14 @@ def test_integrity_drop_of_own_token_retries_once_then_fails_closed():
     again = ledger.record(d, unit="f", retried=True)
     assert again.step == "blocked_by_gateway" and again.checkpoint.reason == "hook_lost"
     assert again.has("kill_tree") and again.has("restart_hook_host")
-    silent = DropLedger().record(d, unit="g", probe_answered=False)
-    assert silent.checkpoint.outcome == "harness_error"
+    # 5.4.3 stage 7, SD-52: a hook that does not answer the probe never saw the event, so the step is failed (a hook
+    # that answered and dropped the retry again blocked it); the checkpoint and the fail-closed sequence are the same
+    for silent in (DropLedger().record(d, unit="g", step_id="s05", probe_answered=False),
+                   DropLedger().record(d, unit="g", step_id="s05", retried=True, probe_answered=False)):
+        assert (silent.step, silent.checkpoint.outcome, silent.checkpoint.reason) == ("failed", "harness_error",
+                                                                                     "hook_lost")
+        assert silent.has("kill_tree") and silent.has("restart_hook_host") and silent.has("end_flow")
+        assert any(o.selector == "rest_of_flow" for o in silent.outcomes)
 
 
 def test_untokened_and_foreign_input_raise_gateway_integrity_and_the_run_continues():

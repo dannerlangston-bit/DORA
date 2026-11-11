@@ -315,3 +315,86 @@ def test_fixed_in_build_is_not_a_contest(store):
     decide(store, "dec-000002", "fixed_in_build", by="bob", supersedes="dec-000001", finding_ref="F-1",
            call={"fixed_in_build_id": "b2", "build_id": "b1"})
     assert not store.get_finding("F-1").contested
+
+
+# -- the run summary, review state and late verdicts (8.3, 8.7, 4.13, SD-23) ----------------------------------------
+
+def review(cid, mapped="intended", verdict="matches_manifest", diff_hash="h1", confidence=0.93):
+    from sentinel.store import Review
+    return Review(run_id=RUN, checkpoint_id=cid, diff_hash=diff_hash, model_id="model-x", prompt_hash="p1",
+                  request_sha256="f" * 64, response_json="{}", verdict=verdict, mapped_outcome=mapped,
+                  confidence=confidence, created_at=TS)
+
+
+def pending(store, cid):
+    store.write_checkpoint(out(cid, "needs_human", reason="reviewer_unavailable", review_state="pending", diff=D))
+
+
+def end_complete(store, **kw):
+    store.end_shard(SHARD, "complete")
+    store.mark_shard_imported(SHARD)
+    return store.end_run(RunOutcome(RUN, "pr", "complete", "reported"), **kw)
+
+
+def review_state(store):
+    return store.conn.execute("SELECT review_state FROM runs WHERE run_id = ?", (RUN,)).fetchone()[0]
+
+
+def test_the_teardown_summary_holds_coverage_health_and_detector_state(store):
+    store.update_summary(RUN, {"alerts": [{"id": "a1", "ack": None}]})
+    for cid in (CENSUS, SWEEP, FLOW):
+        store.write_checkpoint(out(cid, diff=D))
+    coverage = {"cells": [{"surface_id": "trade.active-trader.ladder", "persona": "active_trader",
+                           "entitlement": "paper-margin", "state": "covered"}]}
+    end_complete(store, summary={"coverage": coverage, "health": {"wall_clock": "31:04"}, "detector_state": "ok"})
+    summ = store.run_summary(RUN)
+    assert summ["coverage"] == coverage and summ["health"] == {"wall_clock": "31:04"}
+    assert summ["detector_state"] == "ok" and summ["counts"]["identical"] == 3 and summ["last_gate"] == "reported"
+    assert summ["alerts"] == [{"id": "a1", "ack": None}]                 # written before teardown, kept
+    acked = store.update_summary(RUN, {"alerts": [{"id": "a1", "ack": {"by": "rkim", "at": TS}}]})
+    assert store.run_summary(RUN) == acked and acked["alerts"][0]["ack"]["by"] == "rkim"
+    assert store.run_outcome(RUN).counts["identical"] == 3
+    with pytest.raises(StoreRefused, match="store's own"):
+        store.update_summary(RUN, {"counts": {}})
+    with pytest.raises(StoreRefused, match="JSON"):
+        store.update_summary(RUN, {"bad": object()})
+
+
+def test_review_state_follows_the_pending_items(store):
+    pending(store, CENSUS)
+    pending(store, SWEEP)
+    store.write_checkpoint(out(FLOW, diff=D))
+    end_complete(store)
+    assert review_state(store) == "unreviewed"
+    store.apply_review(review(CENSUS))
+    assert review_state(store) == "partial"
+    store.end_review(RUN, SWEEP, "reviewer_unavailable")
+    assert review_state(store) == "reviewed"
+
+
+def test_a_run_with_nothing_pending_is_reviewed(store):
+    for cid in (CENSUS, SWEEP, FLOW):
+        store.write_checkpoint(out(cid, diff=D))
+    end_complete(store)
+    assert review_state(store) == "reviewed"
+
+
+def test_a_late_verdict_never_produces_collateral_or_noise(store):
+    pending(store, CENSUS)
+    for mapped, reason in (("collateral", None), ("noise", "below_floor")):
+        with pytest.raises(StoreRefused, match="SD-23"):
+            store.apply_review(review(CENSUS, mapped=mapped, verdict="does_not_match_manifest"), reason=reason)
+    assert store.get_outcome(RUN, CENSUS).review_state == "pending"
+    o = store.apply_review(review(CENSUS, mapped="needs_human", verdict="does_not_match_manifest"),
+                           reason="reviewer_no_match")
+    assert (o.outcome, o.reason, o.review_state) == ("needs_human", "reviewer_no_match", "done")
+
+
+def test_a_late_verdict_is_idempotent_on_the_reviews_key(store):
+    pending(store, CENSUS)
+    first = store.apply_review(review(CENSUS))
+    assert store.apply_review(review(CENSUS)) == first                     # the drainer delivered it twice
+    assert store.conn.execute("SELECT count(*) FROM reviews").fetchone()[0] == 1
+    from sentinel.store import ImportConflict
+    with pytest.raises(ImportConflict):
+        store.apply_review(review(CENSUS, confidence=0.5))

@@ -176,6 +176,7 @@ SYSTEM_STATE_KEYS = frozenset({
     "reviewer_disabled", "harness_freeze", "free_bytes_at_last_preflight"})
 OUTBOX_OPEN = ("queued", "failed")             # 9.1: states a job is retried from
 PAIR_KINDS = ("pr", "merge", "rc", "aa")       # 8.3 build_pairs.pair_kind
+SUMMARY_RESERVED = frozenset({"counts", "last_gate", "summary", "refs"})   # summary_json keys end_run owns
 RUN_REFS = ("report_sha256", "comment_sha256", "coverage_matrix_ref", "egress_log_ref", "post_run_proof_ref")   # 4.13
 
 
@@ -862,6 +863,10 @@ def _json(obj: Any) -> str:
     return json.dumps(to_jsonable(obj), sort_keys=True, separators=(",", ":"))
 
 
+def _summary_json(summary: Mapping[str, Any]) -> str:
+    return json.dumps(summary, sort_keys=True)
+
+
 def _ledger_default(v: Any) -> Any:
     if isinstance(v, (bytes, bytearray, memoryview)):
         return bytes(v).hex()
@@ -1295,12 +1300,14 @@ class Store:
             out.append(f"{n} outcome(s) naming an artifact the store lacks")
         return out
 
-    def end_run(self, outcome: RunOutcome) -> RunOutcome:
+    def end_run(self, outcome: RunOutcome, *, summary: Mapping[str, Any] | None = None) -> RunOutcome:
         """Write the run outcome (8.2: the worst of the shards, decided by the caller); counts are computed here.
 
         `complete` is refused with `RunNotComplete` while `complete_blockers` lists anything; any other outcome is
         refused while a scoped checkpoint is silent (write it with `fill_unreached` first, L-OUT-07) or when it is
-        less severe than a shard's own outcome (8.2).
+        less severe than a shard's own outcome (8.2). `summary` is the teardown summary of 8.3 `runs.summary_json`
+        (coverage matrix of a PR run, run health, detector state, the report context): its keys join the counts and
+        whatever `update_summary` wrote before. `runs.review_state` is computed from the pending reviews.
         """
         r = _revalidate(outcome)
         run = self._one("SELECT * FROM runs WHERE run_id = ?", (r.run_id,))
@@ -1311,6 +1318,14 @@ class Store:
             if (run["outcome"], run["abort_reason"], run["abort_detail"]) == (r.status, code, param):
                 return self.run_outcome(r.run_id)
             raise ImportConflict(f"run {r.run_id} already ended {run['outcome']}")
+        change = self._end_change(run, r, summary)
+        with self._batch("run_end") as rows:
+            self._update(rows, "runs", {"run_id": r.run_id}, change)
+        return self.run_outcome(r.run_id)
+
+    def _end_change(self, run: sqlite3.Row, r: RunOutcome, extra: Mapping[str, Any] | None) -> dict[str, Any]:
+        """The checks of `end_run` and the `runs` columns it sets; reads only, so it runs inside a batch too."""
+        code, param = self._split_reason(r.status, r.reason)
         if code is not None and self._forms.get((r.status, code), (0, ":"))[0] and not param:
             raise StoreRefused(f"reason {code} needs its parameter (8.3)")
         if r.status != "complete" and (missing := self.missing_outcomes(r.run_id)):
@@ -1325,23 +1340,66 @@ class Store:
                                "run outcome is the worst of the shards')")
         if r.status == "complete" and (blockers := self.complete_blockers(r.run_id)):
             raise RunNotComplete(f"run {r.run_id} cannot be complete: " + "; ".join(blockers))
-        counts = self.run_counts(r.run_id)
-        ended = utc(r.ended_at) or now()
-        summary: dict[str, Any] = {"counts": counts, "last_gate": r.last_gate}
+        summary: dict[str, Any] = {**json.loads(run["summary_json"] or "{}"), **self._summary_patch(extra or {}),
+                                   "counts": self.run_counts(r.run_id), "last_gate": r.last_gate}
+        summary.pop("summary", None)
+        summary.pop("refs", None)
         if r.summary is not None:
             summary["summary"] = r.summary
         refs = {k: getattr(r, k) for k in RUN_REFS if getattr(r, k) is not None}
         if refs:
             summary["refs"] = refs
         change: dict[str, Any] = {"lifecycle": "finished", "outcome": r.status, "abort_reason": code,
-                                  "abort_detail": param, "finished_at": ended,
-                                  "summary_json": json.dumps(summary, sort_keys=True)}
+                                  "abort_detail": param, "finished_at": utc(r.ended_at) or now(),
+                                  "summary_json": _summary_json(summary), "review_state": self._review_state(r.run_id)}
         for k in ("base_commit_distance", "authorization_sha256"):
             if getattr(r, k) is not None:
                 change[k] = getattr(r, k)
-        with self._batch("run_end") as rows:
-            self._update(rows, "runs", {"run_id": r.run_id}, change)
-        return self.run_outcome(r.run_id)
+        return change
+
+    @staticmethod
+    def _summary_patch(patch: Mapping[str, Any]) -> dict[str, Any]:
+        reserved = sorted(set(patch) & SUMMARY_RESERVED)
+        if reserved:
+            raise StoreRefused(f"summary keys {reserved} are the store's own (counts, last_gate, the run outcome's "
+                               "summary and refs)")
+        try:
+            return json.loads(_summary_json(dict(patch)))
+        except (TypeError, ValueError) as e:
+            raise StoreRefused(f"a run summary is JSON: {e}") from e
+
+    def update_summary(self, run_id: str, patch: Mapping[str, Any]) -> dict[str, Any]:
+        """Merge later facts into `runs.summary_json` (8.3, 8.7, 9.10): alert acknowledgements, integration state,
+        the Nightly metrics. Top-level keys of `patch` replace the stored ones; counts, last_gate, summary and refs
+        stay as `end_run` wrote them. Returns the summary as stored."""
+        run = self._one("SELECT summary_json FROM runs WHERE run_id = ?", (run_id,))
+        if run is None:
+            raise StoreRefused(f"unknown run {run_id}")
+        summary = {**json.loads(run["summary_json"] or "{}"), **self._summary_patch(patch)}
+        with self._batch("run_summary") as rows:
+            self._update(rows, "runs", {"run_id": run_id}, {"summary_json": _summary_json(summary)})
+        return summary
+
+    def run_summary(self, run_id: str) -> dict[str, Any]:
+        """The run's `summary_json` (8.3): what the run page and the PR comment read first (8.7); {} before any."""
+        run = self._one("SELECT summary_json FROM runs WHERE run_id = ?", (run_id,))
+        if run is None:
+            raise StoreRefused(f"unknown run {run_id}")
+        return json.loads(run["summary_json"] or "{}")
+
+    def _review_state(self, run_id: str) -> str:
+        """8.3 runs.review_state: reviewed with nothing pending; unreviewed while items are pending and no review of
+        the run has landed; partial between (9.2, 10.7)."""
+        pending = self._one("SELECT count(*) FROM outcomes WHERE run_id = ? AND review_state = 'pending'",
+                            (run_id,))[0]
+        if not pending:
+            return "reviewed"
+        landed = self._one("SELECT count(*) FROM outcomes WHERE run_id = ? AND review_state = 'done'", (run_id,))[0]
+        return "partial" if landed else "unreviewed"
+
+    def _sync_review_state(self, rows: list[dict], run_id: str) -> None:
+        """Recompute `runs.review_state` after a review moved, in the same batch (8.3)."""
+        self._update(rows, "runs", {"run_id": run_id}, {"review_state": self._review_state(run_id)})
 
     def run_outcome(self, run_id: str) -> RunOutcome | None:
         """The finished run as a records.RunOutcome; None while the run is not finished."""
@@ -1800,30 +1858,40 @@ class Store:
             "(f.run_id = :run AND f.checkpoint_id = :cp) OR (d.run_id = :run AND d.checkpoint_id = :cp))",
             {"run": run_id, "cp": checkpoint_id}) is not None
 
+    _REVIEW_KEY = ("run_id", "checkpoint_id", "diff_hash", "model_id", "prompt_hash")     # 8.3 reviews UNIQUE
+
     def apply_review(self, review: Review, *, outcome: str | None = None, reason: str | None = None
                      ) -> CheckpointOutcome:
-        """Second later change (4.13, 8.3, F28): a pending verdict lands.
+        """Second later change (4.13, 8.3, F28, SD-23): a pending verdict lands.
 
         The `reviews` row is stored. If a human decision already exists on the item the verdict is an annotation
         only: `review_state` goes to done, the outcome and reason stay. Otherwise the row takes the outcome 3.11
-        gives (default: the review's mapped outcome): `intended` or `collateral` with no reason, `noise` only
-        through the A/A floor (reason below_floor, never from a verdict alone), or `needs_human` with
-        reviewer_no_match or reviewer_uncertain; review_state done with the review id.
+        gives (default: the review's mapped outcome), which for a pending item is only `intended` (no reason) or
+        `needs_human` with reviewer_no_match or reviewer_uncertain: a late verdict never produces `collateral` or
+        `noise` and is refused if it tries (SD-23); review_state done with the review id. The same review again
+        (the 8.3 reviews key: run, checkpoint, diff hash, model, prompt) is a no-op returning the row; a different
+        review under that key is an ImportConflict. `runs.review_state` follows (8.3).
         """
-        row = self._pending(review.run_id, review.checkpoint_id)
-        human = self.human_decision_on(review.run_id, review.checkpoint_id)
-        new = outcome or review.mapped_outcome
-        if not human:
-            allowed = {"intended": (None,), "collateral": (None,), "noise": ("below_floor",),
-                       "needs_human": ("reviewer_no_match", "reviewer_uncertain")}
-            if new not in allowed or reason not in allowed[new]:
-                raise StoreRefused(f"a review cannot end in {new} (reason {reason}); 4.13 allows "
-                                   "intended, collateral, noise via A/A, needs_human no_match or uncertain")
-            self.taxonomy.check_checkpoint(new, reason)
         if not 0.0 <= review.confidence <= 1.0:
             raise StoreRefused("review confidence is in [0, 1] (3.13)")
         values = dataclasses.asdict(review)
         values["created_at"] = utc(review.created_at)
+        old = self._one("SELECT * FROM reviews WHERE " + " AND ".join(f"{k} = ?" for k in self._REVIEW_KEY),
+                        [values[k] for k in self._REVIEW_KEY])
+        if old is not None:
+            if any(old[k] != v for k, v in values.items() if k != "created_at"):
+                raise ImportConflict(f"{review.checkpoint_id} in {review.run_id} already has a different review under "
+                                     "the same key (8.3 reviews UNIQUE)")
+            return self.get_outcome(review.run_id, review.checkpoint_id)
+        row = self._pending(review.run_id, review.checkpoint_id)
+        human = self.human_decision_on(review.run_id, review.checkpoint_id)
+        new = outcome or review.mapped_outcome
+        if not human:
+            allowed = {"intended": (None,), "needs_human": ("reviewer_no_match", "reviewer_uncertain")}
+            if new not in allowed or reason not in allowed[new]:
+                raise StoreRefused(f"a late verdict cannot end in {new} (reason {reason}); a pending item becomes "
+                                   "intended or needs_human (reviewer_no_match, reviewer_uncertain) only (4.13, SD-23)")
+            self.taxonomy.check_checkpoint(new, reason)
         key = {"run_id": row["run_id"], "checkpoint_id": row["checkpoint_id"]}
         with self._batch("review") as rows:
             review_id = self._insert(rows, "reviews", values)
@@ -1831,6 +1899,7 @@ class Store:
             if not human:
                 change = {"outcome": new, "reason": reason, "reason_detail": None, **change}
             self._update(rows, "outcomes", key, change)
+            self._sync_review_state(rows, review.run_id)
         return self.get_outcome(review.run_id, review.checkpoint_id)
 
     def end_review(self, run_id: str, checkpoint_id: str, reason: str) -> CheckpointOutcome:
@@ -1838,6 +1907,7 @@ class Store:
 
         `reviewer_cap` when the per-run spend ceiling ended the run (`cause: dollar_cap` in reason_detail);
         `reviewer_unavailable` when the Reviewer job gave up. Outcome stays needs_human; no review id.
+        `runs.review_state` follows (8.3).
         """
         row = self._pending(run_id, checkpoint_id)
         if reason not in ("reviewer_cap", "reviewer_unavailable"):
@@ -1847,6 +1917,7 @@ class Store:
         with self._batch("review_end") as rows:
             self._update(rows, "outcomes", {"run_id": run_id, "checkpoint_id": checkpoint_id},
                          {"reason": reason, "reason_detail": detail, "review_state": "done"})
+            self._sync_review_state(rows, run_id)
         return self.get_outcome(run_id, checkpoint_id)
 
     # -- decisions (4.14) -------------------------------------------------------------------------------------

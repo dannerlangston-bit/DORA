@@ -570,6 +570,37 @@ def test_a_silent_checkpoint_ends_the_run_aborted_harness_with_the_report_withhe
     assert post_run_check(store, RUN, 2, 1, 2, cells=cells()) == []
 
 
+def test_a_failed_check_keeps_a_shards_safety_abort(store):
+    # store:6, 8.2: the run outcome is the worst of the shards', so a failed post-run check on a run whose shard ended
+    # aborted_safety keeps that outcome (with the report withheld); 1.10: its silent checkpoints are env_error with the
+    # aborting gate and the abort reason. Nothing is written before the outcome is known, so end_run cannot refuse.
+    from sentinel.store.checks import end_taxonomy_check_failed, post_run_check
+    store.write_checkpoint(out(CENSUS, diff=D))
+    store.write_checkpoint(out(SWEEP, diff=D))
+    store.end_shard(SHARD, "aborted_safety", "attempted_send")
+    store.mark_shard_imported(SHARD)
+    failures = post_run_check(store, RUN, 2, 1, 2, cells=cells())
+    assert failures[0].startswith("L-OUT-07")
+    r = end_taxonomy_check_failed(store, RUN, failures, last_gate="running", watchdog_event_id="wd-32")
+    assert (r.status, r.reason, r.last_gate) == ("aborted_safety", "attempted_send", "running")
+    filled = store.get_outcome(RUN, FLOW)
+    assert (filled.outcome, filled.gate, filled.reason) == ("env_error", "running", "attempted_send")
+    assert filled.detail.startswith("watchdog_event: wd-32")
+    assert store.run_summary(RUN)["post_run_check"] == {"failures": failures, "report_withheld": True}
+
+
+def test_a_matrix_failure_on_a_safety_aborted_run_keeps_the_abort(store):
+    from sentinel.store.checks import end_taxonomy_check_failed, post_run_check
+    for cid in (CENSUS, SWEEP, FLOW):
+        store.write_checkpoint(out(cid, diff=D))
+    store.end_shard(SHARD, "aborted_safety", "paper_mode_mismatch")
+    store.mark_shard_imported(SHARD)
+    failures = post_run_check(store, RUN, 2, 1, 2, cells=cells()[:-1])
+    r = end_taxonomy_check_failed(store, RUN, failures, last_gate="paper_mode_asserted", watchdog_event_id="wd-33")
+    assert (r.status, r.reason) == ("aborted_safety", "paper_mode_mismatch")
+    assert store.run_summary(RUN)["post_run_check"]["report_withheld"] is True
+
+
 def test_a_retired_reason_fails_the_taxonomy_check(tmp_path):
     import copy
     from sentinel.store.checks import post_run_check

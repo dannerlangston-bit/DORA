@@ -19,6 +19,12 @@ Choices where the spec is silent (1.4 G2, 2.12, 8.3, 8.7):
   rows are `coverage.Cell.to_row` dicts, keyed (surface_id, persona, entitlement). `n_surfaces` counts every row of
   the matrix, the synthetic rows of unregistered surfaces included. A run with no matrix at all fails.
 - The `harness_error` rows carry the Watchdog event id the caller logged for the failed query (4.13 required fields).
+- 8.2 makes the run outcome the worst of the shards', so a run whose shard ended worse than `aborted_harness`
+  (`aborted_safety`) keeps that shard's outcome and reason (the first such shard in plan order breaks a tie, as the
+  pipeline's verdict does), with the failures and the withheld report in its summary all the same. Its silent
+  checkpoints are the unreached checkpoints of an `aborted_safety` run (1.10): `env_error` with the abort reason and
+  `last_gate` as the gate (for a safety abort the caller's last gate is the aborting one), the Watchdog event id in
+  detail. The outcome is chosen before anything is written, so `end_run` never refuses after the fill committed.
 """
 from __future__ import annotations
 
@@ -27,7 +33,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from ..records import RunOutcome
-from .store import Store, seed_rows
+from .store import RUN_SEVERITY, Store, seed_rows
 
 FAILED_REASON = "taxonomy_check_failed"
 CELL_KEY = ("surface_id", "persona", "entitlement")
@@ -121,18 +127,36 @@ def post_run_check(store: Store, run_id: str, n_surfaces: int, n_personas: int, 
     return out
 
 
+def _worst_shard(store: Store, run_id: str) -> tuple[str, str | None] | None:
+    """The most severe shard outcome of the run and its reason (8.2), the first in plan order among equals; None
+    while no shard has ended."""
+    rows = store.query("SELECT shard_outcome, abort_reason FROM shards WHERE run_id = ? AND shard_outcome IS NOT NULL "
+                       "ORDER BY rowid", (run_id,))
+    if not rows:
+        return None
+    worst = max(rows, key=lambda r: RUN_SEVERITY.index(r["shard_outcome"]))     # max keeps the first of equals
+    return worst["shard_outcome"], worst["abort_reason"]
+
+
 def end_taxonomy_check_failed(store: Store, run_id: str, failures: Sequence[str], *, last_gate: str,
                               watchdog_event_id: str, ended_at: str | None = None) -> RunOutcome:
     """End a run whose post-run check failed (4.13 L-OUT-07, 1.4 G2): every silent scoped checkpoint gets
     `harness_error (reason: taxonomy_check_failed)` with the Watchdog event id, and the run ends `aborted_harness
-    (reason: taxonomy_check_failed)` with `post_run_check: {failures, report_withheld: true}` in its summary."""
+    (reason: taxonomy_check_failed)` with `post_run_check: {failures, report_withheld: true}` in its summary. A shard
+    that ended `aborted_safety` keeps the run there (8.2) and its silent checkpoints take `env_error` with the abort
+    reason and `last_gate` (1.10); the summary is the same (module docstring)."""
     if not failures:
         raise ValueError("end_taxonomy_check_failed needs the failures post_run_check returned")
     run = store.query("SELECT run_type FROM runs WHERE run_id = ?", (run_id,))
     if not run:
         raise ValueError(f"unknown run {run_id}")
     detail = f"watchdog_event: {watchdog_event_id}; post-run check failed: {failures[0]}"
-    store.fill_unreached(run_id, "harness_error", FAILED_REASON, detail=detail)
-    return store.end_run(RunOutcome(run_id, run[0]["run_type"], "aborted_harness", last_gate, reason=FAILED_REASON,
-                                    ended_at=ended_at),
+    status, reason = "aborted_harness", FAILED_REASON
+    worst = _worst_shard(store, run_id)
+    if worst is not None and RUN_SEVERITY.index(worst[0]) > RUN_SEVERITY.index(status):
+        status, reason = worst                                  # 8.2: decided before anything is written
+        store.fill_unreached(run_id, "env_error", reason, gate=last_gate, detail=detail)
+    else:
+        store.fill_unreached(run_id, "harness_error", FAILED_REASON, detail=detail)
+    return store.end_run(RunOutcome(run_id, run[0]["run_type"], status, last_gate, reason=reason, ended_at=ended_at),
                          summary={"post_run_check": {"failures": list(failures), "report_withheld": True}})

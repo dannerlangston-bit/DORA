@@ -3350,6 +3350,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                               context=cn.RowContext(scenario.run_id, "ws.tier-a.swing-trader", "swing_trader", "frozen"))
             done.update(report=report, rows_meta=rows_meta, produced=produced, writer=writer, arts_by_sha=arts_by_sha)
             done["safety"] = safety_pass(cfg, orch, nrig, ctx, work.ledger, out / "safety-canaries" / scenario.run_id)
+            for res in done["safety"].results:      # 6.5, 1.10: a drill that placed an order stops the shard through
+                orch.apply(res)                     # the kill switch, `aborted_safety (drill_order_placed)`
 
         shard = orch.run(canary_pass)
         st = _Shard(ctx.shard_id, cfg.fixture.get("rig", "rig-01"), [], orch, orch.rig, orch.sink, clock, ctx)
@@ -3360,6 +3362,8 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
         work.summaries.append({"shard_id": ctx.shard_id, "rig": st.rig_id, "verdict": shard.verdict.status,
                                "reason": shard.verdict.reason, "last_gate": shard.last_gate,
                                "proof": shard.proof.line,
+                               "kill_switch": [name for name, _ in shard.kill_switch.steps] if shard.kill_switch
+                               else None,
                                "gates": [{"control": r.control, "gate": r.gate, "passed": r.passed, "detail": r.detail}
                                          for r in shard.results]})
         work.write()

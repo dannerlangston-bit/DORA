@@ -31,8 +31,9 @@ Choices where the spec is silent or ambiguous (reported):
   the login-only canary of 6.9 has no `canary_results` kind (reported as a gap). "Passed on the current build"
   is: the latest run on that build (its `env_fingerprints` build, or the candidate of its build pair) holding
   rows of the canary, written at or after the cause, has every required row `detected`.
-- A login blocked by an UNPROVEN proof is re-enabled only when every UNPROVEN proof on it has been cleared by a
-  person (6.6), and by the system owner when the login's last two proofs are UNPROVEN (6.6 "the system owner
+- A blocked login is re-enabled only when every UNPROVEN proof on it has been cleared by a person (6.6), whatever
+  reason blocked it first (a `live_identity` block, for one, always comes with an UNPROVEN `session_unavailable`
+  proof, SD-64), and by the system owner when the login's last two proofs are UNPROVEN (6.6 "the system owner
   must sign the re-enable"); a rig disabled after two UNPROVEN proofs needs the system owner too. A rig is
   re-enabled only once its S1 and S2 incidents are closed (6.6 step 6, 6.12).
 - Re-enable reason and ticket: a quarantine row keeps them in its columns; `logins` and `rigs` have no column
@@ -483,11 +484,11 @@ def unblock_login(store: Store, alias: str, *, by: str, role: str, reason: str, 
         raise SafetyRefused(f"unknown login {alias}")
     if row["blocked_at"] is None or row["unblocked_at"] is not None:
         raise SafetyRefused(f"login {alias} is not blocked")
+    proofs = store.query("SELECT verdict, verified_by FROM post_run_proofs WHERE login_alias = ? "
+                         "ORDER BY produced_at, proof_id", (alias,))
+    if any(p["verdict"] == "unproven" and p["verified_by"] is None for p in proofs):    # whatever blocked it first
+        raise SafetyRefused(f"login {alias} has an UNPROVEN proof no person has cleared; clear_proof first (6.6)")
     if row["blocked_reason"] in UNPROVEN_BLOCKS:
-        proofs = store.query("SELECT verdict, verified_by FROM post_run_proofs WHERE login_alias = ? "
-                             "ORDER BY produced_at, proof_id", (alias,))
-        if any(p["verdict"] == "unproven" and p["verified_by"] is None for p in proofs):
-            raise SafetyRefused(f"login {alias} has an UNPROVEN proof no person has cleared; clear_proof first (6.6)")
         if len(proofs) >= 2 and all(p["verdict"] == "unproven" for p in proofs[-2:]) and role != SYSTEM_OWNER:
             raise SafetyRefused("two UNPROVEN proofs in a row on this login: the system owner signs the re-enable "
                                 "(6.6)")

@@ -265,7 +265,8 @@ def test_a_steps_gateway_event_is_stored_in_the_gate_columns_and_read_back(tmp_p
         assert [tuple(r) for r in rows] == [("s07+enter", "refused", "guarded_key_refused", "safety"),
                                             ("s06", "dropped", "token_expired", "integrity"),
                                             ("s05", "emitted", None, "allowed"), ("s04", "none", None, None)]
-        assert s.step_outcomes(RUN) == [refused, dropped, emitted, plain]
+        placed = dict(side="candidate", shard_id=f"{RUN}/1", mode="scripted")   # stored under its shard and side
+        assert s.step_outcomes(RUN) == [dataclasses.replace(x, **placed) for x in (refused, dropped, emitted, plain)]
         assert s.gateway_drops(RUN) == 2                          # 9.11: dropped or refused rows
         for bad in ({"decision": "refused"},                                       # a refusal names its code
                     {"decision": "refused", "reason": "blocked", "class": "safety"},   # a coarse class, not a code
@@ -308,7 +309,8 @@ def test_steps_and_findings_need_a_shard_and_round_trip(tmp_path):
         with pytest.raises(StoreRefused, match="shard"):
             s.write_checkpoint(out(FLOW, "collateral"), steps=[step])
         s.write_checkpoint(out(FLOW, "collateral"), steps=[step], findings=[f], shard_id=f"{RUN}/1")
-        assert s.step_outcomes(RUN) == [step] and s.findings(RUN) == [f]
+        stored = dataclasses.replace(step, side="candidate", shard_id=f"{RUN}/1", mode="agent")
+        assert s.step_outcomes(RUN) == [stored] and s.findings(RUN) == [f]
         finish_all(s)
         with pytest.raises(RunNotComplete, match="not imported"):
             s.end_run(RunOutcome(RUN, "pr", "complete", "reported"))

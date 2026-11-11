@@ -111,8 +111,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from importlib import resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator, Mapping, Sequence
 
+from .. import required_fields
 from ..canonical import canonical_json
 from ..records import (ACTION_VERDICT, DATA_MODES, PERSONAS, RUN_TYPES, CheckpointOutcome, Classification, Component,
                        Decision, DiffSummary, EgressRow, Escape, ExplorerFinding, Extraction, Finding, Fingerprint,
@@ -191,6 +192,29 @@ class StoreWriteFailed(StoreError):
     """The writer could not commit (busy after retries, I/O error, disk full): 8.9 store_write_failed."""
 
 
+class RecordIncomplete(StoreRefused):
+    """L-OUT-02: the record lacks fields the 4.13 required-fields table names; `errors` lists them."""
+
+    def __init__(self, errors: Sequence[str]):
+        self.errors = tuple(errors)
+        super().__init__("; ".join(self.errors))
+
+
+class PaperAssertionMissing(StoreRefused):
+    """L-OUT-06: a record without the current session's paper-mode stamp, or with an account that is not on the
+    allowlist. The run is `aborted_safety (reason: paper_mode_mismatch)`; the caller ends it through the kill
+    switch (6.4)."""
+
+
+class ActiveDecisionExists(StoreRefused):
+    """9.7 Two humans, one signature: a plain decision on a signature that already has an active decision. `active`
+    holds the active rows, which the API shows; the ways forward are supersede and revoke."""
+
+    def __init__(self, message: str, active: Sequence[Decision]):
+        self.active = tuple(active)
+        super().__init__(message)
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # inputs records has no type for
 
@@ -240,6 +264,19 @@ class RunPlan:
     reviewer_version_sha256: str | None = None
     requeue_of: str | None = None
     pr_committers: tuple[str, ...] | None = None   # 9.6 two-person rule, from the PR host
+    flow_steps: Mapping[str, Sequence[str]] | None = None   # flow id -> its step ids, for step_failed:<step> (4.13)
+    catalog_versions: Mapping[str, str] | None = None       # popup and mutant catalog versions (preflight G3, 8.3)
+    data_window_start: str | None = None                    # 8.3 runs.data_window_start and _end
+    data_window_end: str | None = None
+
+
+@dataclass(frozen=True)
+class SessionContext:
+    """The paper-mode facts of the current session of one shard that L-OUT-06 checks a record's stamp against:
+    the allowlisted accounts' `account_id_sha256` values and the times of this session's assertions (6.4)."""
+    shard_id: str | None
+    allowlisted: frozenset[str]
+    assertion_times: frozenset[str]        # UTC ISO 8601 seconds
 
 
 @dataclass(frozen=True)
@@ -352,6 +389,17 @@ class DecisionLookup:
         if not ok or self.conflict or self.frozen:
             return None
         return ok[0].decision
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    """A checked checkpoint batch, ready for `Store._put_checkpoint`."""
+    outcome: CheckpointOutcome
+    record: str
+    steps: tuple[tuple[StepOutcome, str, str], ...]     # (step, shard, side)
+    findings: tuple[Finding, ...]
+    artifacts: tuple[StoredArtifact, ...]
+    shard_id: str | None
 
 
 @dataclass(frozen=True)
@@ -806,9 +854,16 @@ class Store:
     """The single writer of one Sentinel database (8.2). Use as a context manager or call `close()`."""
 
     def __init__(self, path: str | os.PathLike, *, taxonomy: Taxonomy | None = None, ledger: bool = True,
-                 busy_timeout_ms: int = 5000, require_local: bool = True):
+                 busy_timeout_ms: int = 5000, require_local: bool = True, strict_records: bool = False,
+                 system_owners: Iterable[str] = ()):
+        """`strict_records` refuses, at `write_checkpoint`, a record that fails the 4.13 required-fields table
+        (L-OUT-02, `RecordIncomplete`); `system_owners` are the logins that may decide on a frozen signature (9.7)."""
         self.path = Path(path)
         self.taxonomy = taxonomy or load()
+        self.strict_records = strict_records
+        self.system_owners = frozenset(system_owners)
+        self._sessions: dict[str | None, SessionContext] = {}
+        self._flow_steps: dict[str, dict[str, frozenset[str]]] = {}
         if require_local:
             check_local_volume(self.path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -1065,7 +1120,10 @@ class Store:
                 "base_commit_distance": plan.base_commit_distance, "authorization_sha256": plan.authorization_sha256,
                 "diff_params_sha256": plan.diff_params_sha256, "reviewer_version_sha256": plan.reviewer_version_sha256,
                 "requeue_of": plan.requeue_of,
-                "pr_committers_json": None if plan.pr_committers is None else json.dumps(list(plan.pr_committers))})
+                "pr_committers_json": None if plan.pr_committers is None else json.dumps(list(plan.pr_committers)),
+                "catalog_versions_json": None if plan.catalog_versions is None else canonical_json(
+                    dict(plan.catalog_versions)),
+                "data_window_start": utc(plan.data_window_start), "data_window_end": utc(plan.data_window_end)})
             for e in plan.scope:
                 self._upsert_checkpoint(rows, e, plan.config_commit)
                 self._insert(rows, "run_scope", {"run_id": plan.run_id, "checkpoint_id": e.checkpoint_id,
@@ -1077,6 +1135,49 @@ class Store:
                     "shard_id": s.shard_id, "run_id": plan.run_id, "rig_id": s.rig_id, "attempt": s.attempt,
                     "sides": s.sides, "scope_count": len(ids) if s.scope_count is None else s.scope_count,
                     "state": "running", "started_at": utc(plan.started_at)})
+        if plan.flow_steps is not None:
+            self._flow_steps[plan.run_id] = {f: frozenset(s) for f, s in plan.flow_steps.items()}
+
+    def set_session_context(self, shard_id: str | None, allowlisted_sha256s: Iterable[str],
+                            assertion_times: Iterable[str]) -> None:
+        """L-OUT-06: from now on a record written for `shard_id` (None: written without a shard) is refused with
+        `PaperAssertionMissing` unless its `paper_assertion` names an allowlisted `account_id_sha256` and the time
+        of one of this session's paper-mode assertions (6.4). Call it again at each assertion with every time of
+        the current session; a new session replaces the earlier one's times. A record that references no capture
+        artifact may omit the stamp (SD-48); a synthetic mutant row is generated, not captured, and is not checked.
+        """
+        times = frozenset(utc(t) for t in assertion_times)
+        allowed = frozenset(allowlisted_sha256s)
+        if not allowed or not times:
+            raise StoreRefused("a session context names the allowlisted accounts and its assertion times (6.4)")
+        self._sessions[shard_id] = SessionContext(shard_id, allowed, times)
+
+    def _check_paper(self, o: CheckpointOutcome, shard_id: str | None) -> None:
+        ctx = self._sessions.get(shard_id)
+        if ctx is None or o.synthetic:
+            return
+        stamp = o.paper_assertion
+        if stamp is None:
+            if required_fields.references_capture(o):
+                raise PaperAssertionMissing(f"{o.checkpoint_id} references a capture but carries no paper_assertion "
+                                            "(L-OUT-06)")
+            return
+        if stamp["account_id_sha256"] not in ctx.allowlisted:
+            raise PaperAssertionMissing(f"{o.checkpoint_id}: paper_assertion account {stamp['account_id_sha256']} is "
+                                        "not an allowlisted account's (L-OUT-06)")
+        if utc(stamp["asserted_at"]) not in ctx.assertion_times:
+            raise PaperAssertionMissing(f"{o.checkpoint_id}: paper_assertion at {stamp['asserted_at']} is not from "
+                                        "the current session (L-OUT-06)")
+
+    def record_errors(self, outcome: CheckpointOutcome) -> list[str]:
+        """What `outcome` lacks under the 4.13 required-fields table (L-OUT-02); `step_failed:<step>` is checked
+        against the steps of its flow: the run plan's `flow_steps`, plus the steps of registered flow checkpoints."""
+        steps: dict[str, set[str]] = {}
+        if outcome.outcome == "not_run" and (outcome.reason or "").startswith("step_failed:"):
+            steps = {f: set(s) for f, s in self._flow_steps.get(outcome.run_id, {}).items()}
+            for f, s in self._conn.execute("SELECT flow_id, step_id FROM checkpoints WHERE flow_id IS NOT NULL"):
+                steps.setdefault(f, set()).add(s)
+        return required_fields.errors(outcome, flow_steps=steps)
 
     def _running(self, run_id: str) -> sqlite3.Row:
         run = self._one("SELECT * FROM runs WHERE run_id = ?", (run_id,))
@@ -1244,18 +1345,34 @@ class Store:
             "outcome_id": o.outcome_id, "profile_id": o.profile_id, "settle_ms": o.settle_ms,
             "cand_rig_id": o.cand_rig_id, "base_rig_id": o.base_rig_id, "diff_pixels": o.diff_pixels,
             "masked_pct": o.masked_pct, "data_epoch_id": o.data_epoch_id,
-            "paper_asserted_at": utc((o.paper_assertion or {}).get("asserted_at"))}
+            "paper_asserted_at": utc((o.paper_assertion or {}).get("asserted_at")),
+            "base_source_run_id": o.base_source_run_id, "captured_at": utc(o.captured_at)}
+
+    @staticmethod
+    def _step_place(s: StepOutcome, shard_id: str | None, side: str | None) -> tuple[str, str]:
+        """The (shard, side) a step is stored under: the record's own, else the call's; a record and a call that
+        disagree are refused (8.3 step_events.shard_id and side)."""
+        for name, mine, call in (("shard_id", s.shard_id, shard_id), ("side", s.side, side)):
+            if mine is not None and call is not None and mine != call:
+                raise StoreRefused(f"step {s.step_id} has {name} {mine!r} but was written for {call!r} (8.3)")
+        shard = s.shard_id or shard_id
+        if shard is None:
+            raise StoreRefused("step events need the shard they ran in (8.3 step_events.shard_id)")
+        return shard, s.side or side or "candidate"
 
     def _step_row(self, s: StepOutcome, shard_id: str, side: str, checkpoint_id: str | None) -> dict:
         seq = self._one("SELECT COALESCE(MAX(seq), 0) + 1 FROM step_events WHERE shard_id = ?", (shard_id,))[0]
         agent = s.status == "passed_via_agent_fallback" or s.locator_rung == "agent"
+        finding = f"finding:{s.finding_ref}" if s.finding_ref else None
         return {"run_id": s.run_id, "shard_id": shard_id, "side": side, "seq": seq, "source": "orchestrator",
                 "flow_id": s.flow_id, "step_id": s.step_id, "checkpoint_id": checkpoint_id,
                 "wall_at": utc(s.recorded_at), "mono_ms": time.monotonic_ns() // 1_000_000,
-                "mode": "agent" if agent else "scripted", "action": "step",
+                "mode": s.mode or ("agent" if agent else "scripted"), "action": "step",
                 "locator_level": s.locator_rung if s.locator_rung in LOCATOR_LEVELS else None,
                 "attempt": s.attempt, "step_outcome": s.status, **_gateway_columns(s.gateway_event),
-                "reason": f"finding:{s.finding_ref}" if s.finding_ref else None, "duration_ms": s.duration_ms}
+                "reason": ";".join(filter(None, (s.reason, finding))) or None, "duration_ms": s.duration_ms,
+                "pre_hash": s.pre_screenshot, "post_hash": s.post_screenshot, "click_crop_sha256": s.click_crop,
+                "app_uptime_s": s.app_uptime_s, "app_restart_count": s.app_restart_count}
 
     def _finding_row(self, f: Finding, synthetic: bool) -> dict:
         return {"natural_key": f.finding_id, "run_id": f.run_id, "checkpoint_id": f.checkpoint_id, "kind": f.kind,
@@ -1327,32 +1444,33 @@ class Store:
         self._upsert_checkpoint(rows, ScopeEntry(o.checkpoint_id, o.workspace_id, o.persona, o.tier, o.data_mode),
                                 commit)
 
-    def write_checkpoint(self, outcome: CheckpointOutcome, *, steps: Sequence[StepOutcome] = (),
-                         findings: Sequence[Finding] = (), artifacts: Sequence[StoredArtifact] = (),
-                         shard_id: str | None = None, step_side: str = "candidate") -> None:
-        """Write one checkpoint's batch (8.2): its artifact rows, its outcome, its step events and its findings.
-
-        Refuses: anything outside the taxonomy (TaxonomyError); a finished or unknown run; `review_state:
-        pending` without reason reviewer_unavailable or global_shift (4.13); an artifact the batch and the store
-        lack (8.2); a different record for an outcome already written (ImportConflict); any 8.3 constraint.
-        Writing the same record again is a no-op (replay is idempotent, 8.2).
-        """
+    def _prepare_checkpoint(self, outcome: CheckpointOutcome, steps: Sequence[StepOutcome],
+                            findings: Sequence[Finding], artifacts: Sequence[StoredArtifact], shard_id: str | None,
+                            step_side: str | None, *, reopened: bool = False) -> _Prepared | None:
+        """Every write-time check of one checkpoint batch; None for a replay of the record already written."""
         o = _revalidate(outcome)
-        steps = [_revalidate(s) for s in steps]
+        placed = [(s, *self._step_place(s, shard_id, step_side)) for s in map(_revalidate, steps)]
         findings = [_revalidate(f) for f in findings]
-        self._running(o.run_id)
+        if not reopened:
+            self._running(o.run_id)
         record = _json(o)
         old = self._one("SELECT record_json FROM outcome_records WHERE run_id = ? AND checkpoint_id = ?",
                         (o.run_id, o.checkpoint_id))
         if old is not None:
             if old[0] == record:
-                return
+                return None
             raise ImportConflict(f"{o.checkpoint_id} in {o.run_id} already has an outcome; outcomes are written "
                                  "once (4.13, 8.2)")
+        self._check_paper(o, shard_id)                              # L-OUT-06 before anything repairable
+        if self.strict_records and (errs := self.record_errors(o)):
+            raise RecordIncomplete(errs)                            # L-OUT-02
         code = self._split_reason(o.outcome, o.reason)[0]
         if o.review_state == "pending" and code not in PENDING_REASONS:
             raise StoreRefused("review_state pending only with reason reviewer_unavailable or global_shift (4.13)")
         self._check_decision_reason(o, code)
+        if o.base_source_run_id is not None and self._one("SELECT 1 FROM runs WHERE run_id = ?",
+                                                          (o.base_source_run_id,)) is None:
+            raise StoreRefused(f"base_source_run_id {o.base_source_run_id} is not a run of this store (8.3)")
         for a in artifacts:
             self._verify_artifact(a)
         named = [h for h in (o.artifacts or {}).get("crops", [])] + [
@@ -1361,29 +1479,75 @@ class Store:
         for h in filter(None, named):
             if h not in batch_hashes and self._one("SELECT 1 FROM artifacts WHERE sha256 = ?", (h,)) is None:
                 raise StoreRefused(f"{o.checkpoint_id} names artifact {h}, which was not stored (8.2)")
-        if steps and shard_id is None:
-            raise StoreRefused("step events need the shard they ran in (8.3 step_events.shard_id)")
-        with self._batch("checkpoint") as rows:
-            self._ensure_checkpoint(rows, o)
-            for a in artifacts:
-                self._put_artifact(rows, a, o.run_id)
-            self._insert(rows, "outcomes", self._outcome_row(o, shard_id))
-            self._insert(rows, "outcome_records", {"run_id": o.run_id, "checkpoint_id": o.checkpoint_id,
-                                                   "record_json": record})
-            for s in steps:
-                self._insert(rows, "step_events", self._step_row(s, shard_id, step_side, o.checkpoint_id))
-            for f in findings:
-                self._put_finding(rows, f, o.synthetic)
+        return _Prepared(o, record, tuple(placed), tuple(findings), tuple(artifacts), shard_id)
 
-    def write_steps(self, steps: Sequence[StepOutcome], *, shard_id: str, side: str,
+    def _put_checkpoint(self, rows: list[dict], p: _Prepared) -> None:
+        o = p.outcome
+        self._ensure_checkpoint(rows, o)
+        for a in p.artifacts:
+            self._put_artifact(rows, a, o.run_id)
+        self._insert(rows, "outcomes", self._outcome_row(o, p.shard_id))
+        self._insert(rows, "outcome_records", {"run_id": o.run_id, "checkpoint_id": o.checkpoint_id,
+                                               "record_json": p.record})
+        for s, shard, side in p.steps:
+            self._insert(rows, "step_events", self._step_row(s, shard, side, o.checkpoint_id))
+        for f in p.findings:
+            self._put_finding(rows, f, o.synthetic)
+
+    def write_checkpoint(self, outcome: CheckpointOutcome, *, steps: Sequence[StepOutcome] = (),
+                         findings: Sequence[Finding] = (), artifacts: Sequence[StoredArtifact] = (),
+                         shard_id: str | None = None, step_side: str | None = None) -> None:
+        """Write one checkpoint's batch (8.2): its artifact rows, its outcome, its step events and its findings.
+
+        Refuses: anything outside the taxonomy (TaxonomyError); a finished or unknown run; a record without the
+        session's paper-mode stamp once `set_session_context` names the shard (PaperAssertionMissing, L-OUT-06); on
+        a `strict_records` store, a record the 4.13 required-fields table refuses (RecordIncomplete, L-OUT-02);
+        `review_state: pending` without reason reviewer_unavailable or global_shift (4.13); an artifact the batch
+        and the store lack (8.2); a different record for an outcome already written (ImportConflict); a step whose
+        own shard or side disagrees with the call's; any 8.3 constraint. Writing the same record again is a no-op
+        (replay is idempotent, 8.2). A step is stored under its own shard and side, else the call's (default side
+        candidate).
+        """
+        p = self._prepare_checkpoint(outcome, steps, findings, artifacts, shard_id, step_side)
+        if p is None:
+            return
+        with self._batch("checkpoint") as rows:
+            self._put_checkpoint(rows, p)
+
+    def write_checkpoint_or_repair(self, outcome: CheckpointOutcome, *,
+                                   repair: Callable[[CheckpointOutcome, list[str]], CheckpointOutcome],
+                                   on_refused: Callable[[CheckpointOutcome, list[str]], str],
+                                   **kw: Any) -> CheckpointOutcome:
+        """The Orchestrator's write under L-OUT-02 (4.13): a record the required-fields table refuses gets one
+        `repair(record, errors)`; if the repaired record is still refused, `on_refused(record, errors)` logs the
+        Watchdog event and returns its id, and the checkpoint is written `harness_error (reason:
+        store_write_failed)` with that id in `detail`. `kw` goes to `write_checkpoint`. Returns the record written.
+        L-OUT-06 and every other refusal propagate: they are not repairable."""
+        o = outcome
+        if errs := self.record_errors(o):
+            o = repair(o, errs)
+            if errs := self.record_errors(o):
+                event = on_refused(o, errs)
+                o = CheckpointOutcome(
+                    run_id=o.run_id, checkpoint_id=o.checkpoint_id, outcome="harness_error",
+                    reason="store_write_failed", detail=f"watchdog_event: {event}; refused: {'; '.join(errs)}",
+                    workspace_id=o.workspace_id, persona=o.persona, data_mode=o.data_mode, surface_id=o.surface_id,
+                    test_kind=o.test_kind, tier=o.tier, flow_id=o.flow_id, step_id=o.step_id, size_step=o.size_step,
+                    flow_class=o.flow_class, profile_id=o.profile_id, outcome_id=o.outcome_id, pair_id=o.pair_id,
+                    synthetic=o.synthetic, mutant_id=o.mutant_id, recorded_at=o.recorded_at)
+        self.write_checkpoint(o, **kw)
+        return o
+
+    def write_steps(self, steps: Sequence[StepOutcome], *, shard_id: str | None = None, side: str | None = None,
                     checkpoint_id: str | None = None) -> None:
-        """Write step outcomes as `step_events` rows outside a checkpoint batch (8.3)."""
-        steps = [_revalidate(s) for s in steps]
-        for s in steps:
+        """Write step outcomes as `step_events` rows outside a checkpoint batch (8.3), each under its own shard and
+        side, else the call's; a disagreement is refused."""
+        placed = [(s, *self._step_place(s, shard_id, side)) for s in map(_revalidate, steps)]
+        for s, _, _ in placed:
             self._running(s.run_id)
         with self._batch("steps") as rows:
-            for s in steps:
-                self._insert(rows, "step_events", self._step_row(s, shard_id, side, checkpoint_id))
+            for s, shard, sd in placed:
+                self._insert(rows, "step_events", self._step_row(s, shard, sd, checkpoint_id))
 
     def write_finding(self, finding: Finding, *, synthetic: bool = False) -> None:
         """Write a finding outside a checkpoint batch, e.g. a run-level finding (4.13)."""
@@ -1515,14 +1679,21 @@ class Store:
         return [self._outcome(r, r["record_json"]) for r in rows]
 
     def step_outcomes(self, run_id: str) -> list[StepOutcome]:
+        """The run's step outcomes in shard and seq order, with the shard, side, mode and screenshots they were
+        stored under (8.3 step_events)."""
         rows = self._conn.execute("SELECT * FROM step_events WHERE run_id = ? AND step_outcome IS NOT NULL "
                                   "ORDER BY shard_id, seq", (run_id,))
-        return [StepOutcome(run_id=r["run_id"], flow_id=r["flow_id"], step_id=r["step_id"], status=r["step_outcome"],
-                            attempt=r["attempt"], locator_rung=r["locator_level"], duration_ms=r["duration_ms"] or 0,
-                            finding_ref=(r["reason"][len("finding:"):] if (r["reason"] or "").startswith("finding:")
-                                         else None),
-                            gateway_event=_gateway_event(r),
-                            recorded_at=r["wall_at"]) for r in rows]
+        out = []
+        for r in rows:
+            reason, _, finding = (r["reason"] or "").partition("finding:")
+            out.append(StepOutcome(
+                run_id=r["run_id"], flow_id=r["flow_id"], step_id=r["step_id"], status=r["step_outcome"],
+                attempt=r["attempt"], locator_rung=r["locator_level"], duration_ms=r["duration_ms"] or 0,
+                finding_ref=finding or None, side=r["side"], shard_id=r["shard_id"], pre_screenshot=r["pre_hash"],
+                gateway_event=_gateway_event(r), recorded_at=r["wall_at"], reason=reason.rstrip(";") or None,
+                mode=r["mode"], app_uptime_s=r["app_uptime_s"], app_restart_count=r["app_restart_count"],
+                post_screenshot=r["post_hash"], click_crop=r["click_crop_sha256"]))
+        return out
 
     def gateway_drops(self, run_id: str) -> int:
         """Gateway drops in a run: `step_events` rows the hook dropped or the slow half refused (9.11, 8.3)."""

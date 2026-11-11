@@ -150,6 +150,38 @@ def test_the_session_stamp_is_required_on_a_captured_record(store):
     assert row[0] == "2026-11-09T19:21:02+00:00"
 
 
+def test_the_repair_path_never_replaces_a_paper_mode_refusal(store):
+    # store:0, L-OUT-06: a captured record that also fails L-OUT-02 is refused for its stamp before any repair; it is
+    # never swapped for an exempt harness_error (store_write_failed) with its capture still indexed
+    store.set_session_context(SHARD, [ACCOUNT], [ASSERTED])
+    o, arts = _capture(store, CENSUS, outcome="invariant_violation", reason="INV-01")     # no invariant_ids: L-OUT-02
+    calls = []
+
+    def repair(r, errs):
+        calls.append("repair")
+        return r
+
+    def on_refused(r, errs):
+        calls.append("refused")
+        return "wd-1"
+
+    for bad in (None, stamp(account="sha256:live"), stamp(at="2026-11-08T09:00:00+00:00")):
+        rec = dataclasses.replace(o, paper_assertion=bad)
+        assert store.record_errors(rec)
+        with pytest.raises(PaperAssertionMissing):
+            store.write_checkpoint_or_repair(rec, repair=repair, on_refused=on_refused, artifacts=arts, shard_id=SHARD)
+    assert calls == [] and store.get_outcome(RUN, CENSUS) is None
+    assert store.conn.execute("SELECT count(*) FROM artifacts").fetchone()[0] == 0
+    with pytest.raises(StoreRefused, match="not stored"):     # every other non-L-OUT-02 refusal propagates too
+        store.write_checkpoint_or_repair(out(SWEEP, "invariant_violation", reason="INV-01", diff=D,
+                                             artifacts={"candidate": "e" * 64}), repair=repair, on_refused=on_refused)
+    assert calls == [] and store.get_outcome(RUN, SWEEP) is None
+    written = store.write_checkpoint_or_repair(dataclasses.replace(o, paper_assertion=stamp()), repair=repair,
+                                               on_refused=on_refused, artifacts=arts, shard_id=SHARD)
+    assert (written.outcome, written.reason) == ("harness_error", "store_write_failed") and calls == ["repair",
+                                                                                                     "refused"]
+
+
 def test_records_without_a_capture_are_exempt(store):
     store.set_session_context(SHARD, [ACCOUNT], [ASSERTED])
     store.write_checkpoint(out(CENSUS, "env_error", gate="authenticated", reason="session_kicked"), shard_id=SHARD)

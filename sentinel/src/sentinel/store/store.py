@@ -38,7 +38,8 @@ Enforced here and, where SQL can say it, again by the schema:
   session's paper-mode stamp from an allowlisted account (`PaperAssertionMissing`; SD-48 exempts records without a
   capture). L-OUT-02: a `strict_records` store refuses a record the 4.13 required-fields table refuses
   (`RecordIncomplete`, through `sentinel.required_fields`); `write_checkpoint_or_repair` is the Orchestrator's
-  repair-once path ending in `harness_error (reason: store_write_failed)`.
+  repair-once path ending in `harness_error (reason: store_write_failed)`. It repairs only the required-fields
+  rules: every other refusal, L-OUT-06 first, is checked on the record as given and propagates.
 - 9.7 Two humans, one signature (`ActiveDecisionExists`), the frozen signature's system owner, 9.6 idempotency and
   L-DEC-03 (an explicit tolerance above the tier's default is refused) at `record_decision`; the 4.13 late verdict
   produces only intended or needs_human (SD-23).
@@ -1584,9 +1585,10 @@ class Store:
 
     def _prepare_checkpoint(self, outcome: CheckpointOutcome, steps: Sequence[StepOutcome],
                             findings: Sequence[Finding], artifacts: Sequence[StoredArtifact], shard_id: str | None,
-                            step_side: str | None) -> _Prepared | None:
+                            step_side: str | None, *, required: bool = True) -> _Prepared | None:
         """Every write-time check of one checkpoint batch; None for a replay of the record already written. Reads
-        only, so it also runs inside a batch (`replace_dead_man_run`)."""
+        only, so it also runs inside a batch (`replace_dead_man_run`). `required=False` leaves out the two rules of
+        the 4.13 required-fields table (strict L-OUT-02 and review_state pending), which the repair path repairs."""
         o = _revalidate(outcome)
         placed = [(s, *self._step_place(s, shard_id, step_side)) for s in map(_revalidate, steps)]
         findings = [_revalidate(f) for f in findings]
@@ -1600,10 +1602,10 @@ class Store:
             raise ImportConflict(f"{o.checkpoint_id} in {o.run_id} already has an outcome; outcomes are written "
                                  "once (4.13, 8.2)")
         self._check_paper(o, shard_id)                              # L-OUT-06 before anything repairable
-        if self.strict_records and (errs := self.record_errors(o)):
+        if required and self.strict_records and (errs := self.record_errors(o)):
             raise RecordIncomplete(errs)                            # L-OUT-02
         code = self._split_reason(o.outcome, o.reason)[0]
-        if o.review_state == "pending" and code not in PENDING_REASONS:
+        if required and o.review_state == "pending" and code not in PENDING_REASONS:
             raise StoreRefused("review_state pending only with reason reviewer_unavailable or global_shift (4.13)")
         self._check_decision_reason(o, code)
         if o.base_source_run_id is not None and self._one("SELECT 1 FROM runs WHERE run_id = ?",
@@ -1655,14 +1657,22 @@ class Store:
     def write_checkpoint_or_repair(self, outcome: CheckpointOutcome, *,
                                    repair: Callable[[CheckpointOutcome, list[str]], CheckpointOutcome],
                                    on_refused: Callable[[CheckpointOutcome, list[str]], str],
-                                   **kw: Any) -> CheckpointOutcome:
+                                   steps: Sequence[StepOutcome] = (), findings: Sequence[Finding] = (),
+                                   artifacts: Sequence[StoredArtifact] = (), shard_id: str | None = None,
+                                   step_side: str | None = None) -> CheckpointOutcome:
         """The Orchestrator's write under L-OUT-02 (4.13): a record the required-fields table refuses gets one
         `repair(record, errors)`; if the repaired record is still refused, `on_refused(record, errors)` logs the
         Watchdog event and returns its id, and the checkpoint is written `harness_error (reason:
-        store_write_failed)` with that id in `detail`. `kw` goes to `write_checkpoint`. Returns the record written.
-        L-OUT-06 and every other refusal propagate: they are not repairable."""
+        store_write_failed)` with that id in `detail`. The keywords are `write_checkpoint`'s. Returns the record
+        written (the record itself for a replay of it). L-OUT-06 and every other refusal propagate: they are not
+        repairable, so they are checked on the record as given before any repair, and a missing or foreign
+        paper-mode stamp is never replaced by an exempt harness_error (SD-48 exempts records that captured nothing)."""
+        kw: dict[str, Any] = {"steps": steps, "findings": findings, "artifacts": artifacts, "shard_id": shard_id,
+                              "step_side": step_side}
         o = outcome
         if errs := self.record_errors(o):
+            if self._prepare_checkpoint(o, steps, findings, artifacts, shard_id, step_side, required=False) is None:
+                return o                                            # 8.2: a replay of the record as written
             o = repair(o, errs)
             if errs := self.record_errors(o):
                 event = on_refused(o, errs)

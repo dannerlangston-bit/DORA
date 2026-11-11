@@ -270,7 +270,7 @@ def test_merge_scope(inputs):
     assert len(ids(plan, "tools.thinklog", "census")) == 5                       # a sub-tab is global
     assert len(ids(plan, CHART, "sweep")) == 12                  # tier 2: Ladder S in merge
     assert len(ids(plan, "analyze.risk-profile", "split")) == 3  # short set
-    assert len(ids(plan, LADDER, "sweep")) == 36 and ids(plan, LADDER, "split") == [
+    assert len(ids(plan, LADDER, "sweep")) == 24 and ids(plan, LADDER, "split") == [   # flexgrid, detached (SD-05)
         f"split/{LADDER}/side-panel/0.15", f"split/{LADDER}/side-panel/0.50", f"split/{LADDER}/side-panel/0.85"]
     assert ids(plan, "tools.thinklog", "sweep") == []            # tier 3: RC only
     assert {cp.flow_id for cp in plan.planned if cp.test_kind == "flow"} == {
@@ -293,7 +293,7 @@ def test_rc_scope(inputs):
     assert [s.rsplit("/", 1)[1] for s in ids(plan, LADDER, "split")] == ["0.15", "0.30", "0.50", "0.70", "0.85"]
     assert [s.rsplit("/", 1)[1] for s in ids(plan, "analyze.risk-profile", "split")] == [
         "0.00", "0.15", "0.30", "0.50", "0.70", "0.85", "1.00"]  # collapsible
-    assert len(ids(plan, "tools.thinklog", "sweep")) == 12 and ids(plan, "tools.thinklog", "split") == []
+    assert ids(plan, "tools.thinklog", "sweep") == [] and ids(plan, "tools.thinklog", "split") == []   # a tab host (SD-05)
     assert {cp.flow_id for cp in plan.planned if cp.test_kind == "flow" and cp.flow_id != "soak"} == {
         f.flow_id for f in inputs["flows"]}
     soak_ids = [f"flow/{LADDER}/soak/c{n:02d}" for n in range(1, 25)]

@@ -169,7 +169,7 @@ NEVER_TOKENIZE_RE = re.compile(r"^(send|auto send|flatten|blast all|replace|subm
 SEND_LIKE_RE = re.compile(r"send|submit|replace|flatten|blast|auto", re.I)
 CONFIRM_AND_SEND = "confirm and send"
 SEND_LABEL = "Send"                                   # the only label the gated send token may click (6.7)
-# choice 10: the label 6.2 expects on the Order Confirmation dialog (Edit only when Phase 0 observes it); never a default
+# choice 10: the label 6.2 expects on the Order Confirmation dialog (Edit only when Phase 0 sees it); never a default
 DISMISS_ALLOWLIST = frozenset({"Delete"})
 A9_STAGE, CONFIRM_STAGE = "a3_a8", "a3_a9"           # SD-57: the A9 click itself, every later Confirm and Send
 PAPER_ASSERTION_CURRENT_S = 120.0                     # choice 9: the 6.4 two-minute timer (identity.TIMER_S)

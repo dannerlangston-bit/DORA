@@ -344,7 +344,8 @@ class Rig(ABC):
     def set_hook_state(self, *, armed: bool, deny_all: bool, recovery_only: bool = False) -> None:
         """Write `armed` and `deny_all` in the shared header (5.4.2); the kill switch's first step (6.6).
         `recovery_only` is the recovery arm of 6.6 step 5: the slow half then tokens only what
-        `gateway.recovery_admits` (the scripted login and the recovery teardown actions); every other write clears it."""
+        `gateway.recovery_admits` (the scripted login and the recovery teardown actions); every other write
+        clears it."""
 
     def set_hook_phase(self, phase: str) -> None:
         """Put the hook in one phase of `gateway.HOOK_STATES` (`running`, `kill_switch`, `recovery`, `between_runs`;

@@ -485,8 +485,8 @@ class SimulatedRig(Rig):
         hit = match_deny(title=title, labels=action.labels, target_kind=action.target_kind, end_kind=action.end_kind,
                          deny_list=self.deny_list) if action.profile != "scripted" else None
         return SafetyContext(
-            flag=self.gw.effective_flag(now), order_dialog_present=self.dialog_open,
-            deny_rects=tuple(self.gw.deny_rects), chords=tuple(self.gw.chords), dismiss_allowlist=self.dismiss_allowlist,
+            flag=self.gw.effective_flag(now), order_dialog_present=self.dialog_open, deny_rects=tuple(self.gw.deny_rects),
+            chords=tuple(self.gw.chords), dismiss_allowlist=self.dismiss_allowlist,
             attestation_passed=self.attested, paper_assertion_current=True, deny_list_hit=hit,
             hook_alive=self.gw.hook_alive(now), order_stage=self.order_stage, session=self.session_safety, now=now,
             dialog_foreground=self.dialog_open, dialog_read=self.dialog_open and self.s.dialog_numbers_read,

@@ -11,10 +11,11 @@ from sentinel.orchestrator import safety_canaries as sc
 from sentinel.orchestrator import simrig as simrig_module
 from sentinel.orchestrator.attestation import AttestationProfile
 from sentinel.orchestrator.drill import DrillPreconditions, SimDrillPort, run_drill
-from sentinel.orchestrator.explorer import DEFAULT_DENY_LIST, DenyEntry, load_deny_list, match_deny
+from sentinel.orchestrator.explorer import DEFAULT_DENY_LIST, DenyEntry, load_deny_list
 from sentinel.orchestrator.gateway import DropLedger, SlowDecision
 from sentinel.orchestrator.rig import OrderBook, SelectorRead, SettingRead
 from sentinel.orchestrator.simrig import SimulatedRig, default_context
+from sentinel.store.safety import disable_rig, refuse_blocked
 from sentinel.store.store import RunPlan, ShardPlan, Store
 from sentinel.taxonomy import is_checkpoint_id
 
@@ -276,6 +277,24 @@ def test_canary_and_drill_rows_satisfy_the_8_3_checks(tmp_path):
     stored = store.canary_results("nightly-1")
     assert [r.mutant_id for r in stored] == ["attestation", "deny_list", *(f"drill-{n}" for n in range(1, 6))]
     assert stored[1].state == "detector_blind" and stored[-1].state == "missed"
+    store.close()
+
+
+def test_a_rig_refresh_never_puts_back_a_rig_a_safety_action_disabled(tmp_path):
+    """`register_rig`'s upsert keeps `active` of a rig `disable_rig` took out (6.6 step 6, 6.12): only a human
+    re-enable brings it back."""
+    store = Store(tmp_path / "central.db")
+    kw = dict(login_alias="login-05", owner="ops", allowlist_entry=1, role="nightly")
+    store.register_rig("rig-05", snapshot_id="snap-5", **kw)
+    assert disable_rig(store, "rig-05", "kill_switch")
+    store.register_rig("rig-05", snapshot_id="snap-6", **kw)                   # a re-snapshot refreshes the row
+    row = store.query("SELECT active, snapshot_id, disabled_reason FROM rigs WHERE rig_id = 'rig-05'")[0]
+    assert tuple(row) == (0, "snap-6", "kill_switch")
+    assert refuse_blocked(store, "rig-05").why == "rig_disabled"
+    store.register_rig("rig-06", snapshot_id="snap-1", login_alias="login-06", owner="ops", allowlist_entry=2)
+    store.register_rig("rig-06", snapshot_id="snap-2", login_alias="login-06", owner="ops", allowlist_entry=2)
+    assert store.query("SELECT active FROM rigs WHERE rig_id = 'rig-06'")[0][0] == 1 and \
+        refuse_blocked(store, "rig-06") is None
     store.close()
 
 

@@ -24,7 +24,16 @@ Choices where the spec is ambiguous (reported):
    the first checkpoint resolves against the first one, a teardown step against any checkpoint of
    the flow, and a `*_since_previous_step` kind also against its `since_step` checkpoint (the 4.7
    worked examples need all three). Rule operand lists: RULE_OPERANDS below, generated from the
-   2.8.3 operand table (SD-34).
+   2.8.3 operand table (SD-34), with each operand's type (RULE_OPERAND_TYPES: a literal number stands
+   only for a numeric operand, a whole one for an integer) and the all-or-none groups (R03).
+   Every assertion the lint accepts is one the Oracle builds (`oracle.assertions.Assertion`): a
+   refusal is L-FLW-11 on a rule and L-FLW-00 on any other kind (a field-shape problem), as are a
+   `pattern` that does not compile, a `value_ref` the flow's fixture does not resolve and an
+   `expected` that is not a value of its `format`. Assertion ids are unique among the assertions that
+   decide one checkpoint (its `expect`, the assert and verify steps it resolves against, and for the
+   last checkpoint the teardown asserts): 4.1 says "unique within their flow", but the 4.7 worked
+   example repeats `side`, `qty` and `price` across checkpoints, and an outcome names its assertion
+   per checkpoint.
 6. L-FLW-10 checks `max_duration_s` against 5 minutes unless a measured p50 is passed in; measured
    p50s live in the Run Store, not in the files.
 7. L-MUT-05 ("each appear at least once per tier-1 checkpoint") cannot hold for every tier-1
@@ -34,12 +43,15 @@ Choices where the spec is ambiguous (reported):
    `redaction` class (M19) expect `identical`: a working redaction stage leaves the capture identical,
    and 12.5 proves M19 by the redaction hit, not by a diff.
 8. L-RGN-07 recognises the allowed frozen masks by the region id's last segment: `clock`,
-   `connection-indicator`, `caret` or `parking`.
+   `connection-indicator`, `parking`, or `caret` on a flow checkpoint with `keep_focus: true` (SD-27).
 9. L-MSK-03 measures a panel class as the bounding box of the checkpoint's regions of that class on
-   one landmark; redaction anchors (`redaction/anchors.yaml`) on a landmark the checkpoint declares
-   count toward it unless `identity_field: true`. Every mask and every redaction box, identity or not,
-   is checked against the money cells (budget 0 percent). A rect with a non-positive w or h is an
-   L-RGN-00 (regions) or L-MSK-03 (redaction anchors) error and takes part in no geometry check.
+   one landmark, and counts every mask region and every redaction anchor (`redaction/anchors.yaml`)
+   on that landmark that is not `identity_field: true`, whatever its own `panel` label, as the union
+   of its intersections with the bounds (overlaps once), as the run time does (`panel_share`). The
+   budgets are the Diff Engine parameters file's `mask_budget` (one source). Every mask and every
+   redaction box, identity or not, is checked against the money cells (budget 0 percent). A rect with
+   a non-positive w or h is an L-RGN-00 (regions) or L-MSK-03 (redaction anchors) error and takes part
+   in no geometry check.
 10. L-XREF-06 reports a manifest that still names a surface or primitive absent from the registry
     or the map, and a disagreement between map and registry, once per file.
 11. L-XREF-07's credential pattern: `password`, `passwd`, `pwd` or `secret`, alone or inside a key such
@@ -60,32 +72,79 @@ Choices where the spec is ambiguous (reported):
 15. "The fixture the run uses" (L-WSP-07) is every fixture a flow on that workspace names, or any
     fixture when no flow uses the workspace. The masked_live rule of L-SRF-08 covers census, sweep
     and split checkpoints; flow checkpoints carry their own data mode (L-FLW-05).
+16. L-RGN-04: a money cell (`money_cell: true` or a `money_role`) is never a mask and carries no
+    floor exception anywhere; on a flow checkpoint it is diff or freeze and asserted; on a census
+    checkpoint a money cell of the closed list (a `money_role`, or `money_cell: true` on an
+    order_confirmation or order_ticket panel, SD-28) is a rule region (SD-29); on sweep and split
+    checkpoints the spec names no kind, so only "never a mask" applies.
+17. L-FLW-08 on class paper_send_ok (6.7) reads the order from the flow itself, since the 4.7 header
+    has no order block: the fields typed into the ticket (`type_fixture`, by the control id: `qty`,
+    `price`, `tif`, `order-type`, `symbol`) and the `equals` assertions on the ticket and dialog (by
+    the region id's last segment) before the one Send click (the Order Confirmation's Send by id,
+    OCR text or JAB name). The limit price is a `fixture.prices.<id>.value`, whose `rule` (`last_delayed
+    x <factor>` or `last_delayed - <points>`) gives the last price and so the distance: at least
+    `distance_pct_equity` percent (default 20) for an equity, `tick_distance_futures` ticks for a
+    future (no default: the policy must declare it), other assets refused. The expected Working row
+    text is an `equals`, `matches` or `present` assertion after the send whose text names `working`;
+    the cancel step is a click after the send on a cancel control other than Cancel All. With the
+    policy enabled and signed, that Send click and the cancel clicks after it may target `deny: true`
+    controls (the single-use token lifts the deny rectangle for one click, and the row's cancel is
+    "allowed only in this class"); nothing else is exempt from L-FLW-13. The library holds no more
+    paper_send_ok flows (one send each) than the per-run cap of `caps.per_run` (default 5), and
+    `caps.per_run` is at most `caps.per_day` (default 20).
+18. Expiry (L-MSK-02, L-RGN-05, L-SRF-11): in CI an `expires_at` in the past is that rule's error; a
+    run-start lint (`lint_repo(..., run_start=True)`, sentinel.lint.runstart) turns it into an
+    `ExpiredRecord` instead, never a violation. A missing owner or reason, or an unreadable date,
+    stays an error at run start.
+19. Rule ids of the smaller field checks: a precondition entry of another type, a regex that does not
+    compile (checkpoint `title_regex`, wait_for `window_title_regex`, assertion `pattern`) and a
+    wait_for landmark of none of the flow's surfaces and regions files are L-FLW-00; a secret's
+    `vault_ref` that is not `vault://<path>#<field>` is L-FLW-06; a region rule's uncompilable
+    `pattern`, `min` above `max` and `must_advance` off a time field, and a regions file's landmark
+    list (unique ids, PNG templates of 16x16 to 400x400, `confidence_min` in (0, 1]) are L-RGN-00
+    (L-MSK-03 for the redaction file's landmarks).
+20. L-POP-02 compares the key after folding its spelling (`_chord`: Control or Ctl as Ctrl, Return and
+    numpad or keypad Enter as Enter, Spacebar as Space, modifiers first). L-POP-04 requires `key` on
+    `dismiss_key` and `wait_timeout_ms` on `wait`, and refuses `key`, `target` and
+    `wait_timeout_ms` on the actions they do not belong to.
+21. L-FIX-03: an expired contract is one whose month code and year name a month before today's; a
+    `roll_date` after the contract month also fails (the roll comes before the contract expires).
+22. Checkpoint ids are enumerated by sentinel.checkpoints, the scope's enumeration too: census ids
+    repeat per dimension combination for tier-1 surfaces in tier A workspaces only, sweep ids exist on
+    the flexgrid, detached and dialog hosts only, with `-asc` for Ladder F's ascending pass, and
+    Ladder F's MAXW and MAXH are the work areas of configs/allowed.yaml.
 
 Rules checked only in part from files (the rest needs live state, history or a store; reported):
 L-DEP-07 (the 90 days after the first Phase 1 scan), L-FLW-03 (that a removed id was renamed needs
 the previous commit; the rename map itself is checked), L-FLW-13 (the 6.8 Explorer deny list has no
-file), L-RGN-02 (bounds from the last calibration), L-RGN-04 (the zero floor lives in calibration;
-on census checkpoints the 2.8 Oracle checks are code, not files), L-MSK-01 (the decision record is in
-the Central Store), L-POP-06 (counts the released builds present in builds/), L-XREF-04 and L-XREF-11
-(calibration files), L-XREF-15 (JAB fields are reported by L-SRF-09).
+file), L-RGN-02 (bounds from the last calibration), L-RGN-04 (the zero floor lives in calibration),
+L-RGN-08 (the `money_cell: true` without `money_role` half waits for the regions migration, see
+sentinel.lint.checks.money_roles), L-MSK-01 (the decision record is in the Central Store), L-POP-06
+(counts the released builds present in builds/), L-XREF-04 and L-XREF-11 (calibration files), L-XREF-15
+(JAB fields are reported by L-SRF-09).
+
+Public API beyond `lint`: `check_pair` (L-BLD-04 and L-BLD-05 at run creation, 4.2), `panel_share` and
+`money_cells_covered` (the mask budget of a regions file with an optional proposed mask, 4.8),
+`mask_budgets`, `ExpiredRecord`.
 """
 from __future__ import annotations
 
 import hashlib
 import importlib
-import itertools
 import pkgutil
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from PIL import Image
 
+from .. import checkpoints as cps
 from ..canonical import epoch_id
 from ..canonical import fingerprint_id_of as fingerprint_id
+from ..diff import load_params as load_diff_params
 from ..taxonomy import is_checkpoint_id, is_slug, load as load_taxonomy
 from . import schemas
 from .repo import Doc, Repo
@@ -141,7 +200,7 @@ RULES: dict[str, Rule] = {r.id: r for r in (
     Rule("L-DEP-08", "error", "the edge FlexibleGrid -> trade.active-trader.ladder exists"),
     Rule("L-SRF-00", "error", "surface entry reads and validates against schemas/surface.schema.json"),
     Rule("L-SRF-01", "error", "surface id unique, a slug, and equal to the file name"),
-    Rule("L-SRF-02", "error", "tier 1 has owner, smoke, a must_see landmark, anti_anchors, labels and a required control"),
+    Rule("L-SRF-02", "error", "tier 1 has owner, a must_see landmark, anti_anchors, labels and a required control"),
     Rule("L-SRF-03", "error", "resizable needs hosts and P8 or splitters; size_ladder exists with a reason; ladders S and F as 2.5.2"),
     Rule("L-SRF-04", "error", "dialog, detached and popup windows need title_regex; main forbids it"),
     Rule("L-SRF-05", "error", "path ends with wait_for on a must_see landmark; every path target resolves on two rungs"),
@@ -195,12 +254,13 @@ RULES: dict[str, Rule] = {r.id: r for r in (
          "asserted, on a census checkpoint a rule region"),
     Rule("L-RGN-05", "error", "floor_exception carries its human fields and a future expiry, on diff regions only"),
     Rule("L-RGN-06", "warn", "no non-zero calibration floor on a frozen checkpoint (calibration/<hex>.yaml)", _PENDING),
-    Rule("L-RGN-07", "error", "masks on frozen checkpoints only on the clock, connection indicator, caret or parking rectangle"),
+    Rule("L-RGN-07", "error", "masks on frozen checkpoints only on the clock, connection indicator, parking rectangle or, "
+         "with keep_focus, the caret"),
     Rule("L-RGN-08", "error", "money_cell iff money_role; money_role only on order_confirmation and order_ticket panels",
          _PENDING),
     Rule("L-MSK-00", "error", "mask record reads and validates against schemas/mask.schema.json"),
     Rule("L-MSK-01", "error", "created_by human (the decision_ref lives in the Central Store)"),
-    Rule("L-MSK-02", "error", "expires_at is in the future (CI)"),
+    Rule("L-MSK-02", "error", "expires_at is in the future (CI); at run start the mask is dropped and listed in run health"),
     Rule("L-MSK-03", "error", "masked plus non-identity redacted area per panel class within the mask budget"),
     Rule("L-MSK-04", "warn", "mask growth over 30 days at most 2 percent of a tier-1 checkpoint",
          "needs the mask history of the last 30 days (git history and the regions table)"),
@@ -337,12 +397,20 @@ LADDER_F_CORNERS = ((240, 160), (240, "MAXH"), ("MAXW", 160), ("MAXW", "MAXH"))
 LADDER_F_ASCENDING = tuple((w, 480) for w in (320, 400, 480, 640, 800, 960))
 EXPLORER_BUDGET_6_8 = {"max_actions": 400, "max_minutes": 90, "max_no_change_actions": 20,
                        "max_usd_per_session": 25, "max_usd_per_week": 500}
-MASK_BUDGET = {"order_confirmation": 0.10, "order_ticket": 0.10, "position_statement": 0.10, "account_info": 0.05}
 FROZEN_MASK_SEGMENTS = ("clock", "connection-indicator", "caret", "parking")
+CARET_SEGMENT = "caret"                   # allowed on a frozen checkpoint only with keep_focus: true (SD-27, L-RGN-07)
+MONEY_PANELS = ("order_confirmation", "order_ticket")       # the panels money_role may sit on (SD-28, L-RGN-08)
 # operands of the rule assertion kind: (required, optional) per rule, generated from the 2.8.3 operand table through
 # taxonomy.yaml `rule_operands` (SD-34)
 RULE_OPERANDS: dict[str, tuple[frozenset[str], frozenset[str]]] = {
     rule: load_taxonomy().rule_operands(rule) for rule in load_taxonomy().data["rule_operands"]}
+# the 2.8.3 type of every operand (integer, price, money, percent, date, text, decimal), from the same table
+RULE_OPERAND_TYPES: dict[str, dict[str, str]] = {
+    rule: {name: str(op["type"]) for name, op in ops.items()} for rule, ops in load_taxonomy().data["rule_operands"].items()}
+# 2.8.3: optional operands that are given all together or not at all (R03 "last, low and high, all three or none")
+RULE_OPERAND_GROUPS: dict[str, tuple[frozenset[str], ...]] = {"R03": (frozenset({"last", "low", "high"}),)}
+# operand types a literal number may stand for (2.8.3: "or, where the type allows, a literal"); integer ones whole
+LITERAL_OPERAND_TYPES = frozenset({"integer", "price", "money", "percent", "decimal"})
 JIRA = re.compile(r"^[A-Z][A-Z0-9]+-[0-9]+$")
 FLAG = re.compile(r"^[a-z0-9_.]+$")
 PASCAL = re.compile(r"^[A-Z][A-Za-z0-9]*$")
@@ -350,14 +418,34 @@ POP_ID = re.compile(r"^POP-[0-9]{2,}$")
 MUTANT_ID = re.compile(r"^M[0-9]{2,}$")
 ACCOUNT = re.compile(r"^D-[0-9A-Z]+$")
 FUTURE_MONTH = re.compile(r"^/(?P<root>[A-Z0-9]+?)(?P<month>[FGHJKMNQUVXZ])(?P<year>[0-9]{2})$")
-ENTER_KEYS = frozenset({"enter", "return", "space", "spacebar", "ctrl+enter"})
+MONTH_CODES = "FGHJKMNQUVXZ"              # January to December (4.9 futures month code)
+VAULT_REF = re.compile(r"^vault://[^#]+#.+$")               # 4.1 secrets: vault://<path>#<field>
+# L-POP-02 after chord normalization (`_chord`): Enter, Space and Ctrl+Enter in every spelling
+ENTER_KEYS = frozenset({"enter", "space", "ctrl+enter"})
+_KEY_SYNONYMS = {"return": "enter", "numpad_enter": "enter", "numpadenter": "enter", "kp_enter": "enter",
+                 "keypad_enter": "enter", "spacebar": "space", "space_bar": "space", "control": "ctrl", "ctl": "ctrl"}
 TARGET_FIELDS = ("target", "from", "to", "at")
+# 6.7 gated branch: send caps per run and per day, and the price distance of an equity order (percent of the last)
+SEND_CAPS_6_7 = {"per_run": 5, "per_day": 20}
+DISTANCE_PCT_EQUITY_6_7 = 20.0
+# a fixture price rule the distance check reads (4.9 `prices.rule`): "last_delayed x 0.65", "last - 1000"
+_PRICE_RULE = re.compile(r"^\s*last(?:_delayed)?\s*(?P<op>[x*×+-])\s*(?P<n>[0-9]+(?:\.[0-9]+)?)")
 
 # The keyword may sit inside a snake_case key (`db_password`, `client_secret`, S-19) and a quoted key's closing quote
 # may sit before the separator (`"password": ...` in JSON, S-20); 4.15 L-XREF-07, 4.9 L-FIX-04.
 _CRED_KEY = re.compile(r"(?i)(?<![A-Za-z0-9])(?:password|passwd|pwd|secret)[A-Za-z0-9_]*['\"]?\s*[:=]\s*['\"]?"
                        r"(?P<v>[^\s'\",}\]#]+)")
 _CRED_VALUE = re.compile(r":\s*['\"]?(?P<v>[^\s'\",{}\[\]#]{20,})")
+
+
+def _chord(key: str) -> str:
+    """A key or chord in one spelling for L-POP-02: lower case, `+` separated, modifier and key synonyms folded
+    (control and ctl to ctrl; return, numpad and keypad enter to enter; spacebar to space), modifiers sorted first."""
+    if key and not key.strip():
+        return "space"
+    parts = [_KEY_SYNONYMS.get(k, k) for k in (p.strip().casefold().replace(" ", "_") for p in key.split("+")) if k]
+    mods = sorted(p for p in parts if p in ("ctrl", "alt", "shift", "win"))
+    return "+".join(mods + [p for p in parts if p not in mods])
 
 
 def _klass(c: str) -> int:
@@ -420,9 +508,11 @@ class Violation:
 
 @dataclass
 class LintReport:
-    """Violations sorted by file and rule, plus the rules skipped as not checkable from files."""
+    """Violations sorted by file and rule, plus the rules skipped as not checkable from files. A run-start lint
+    (`lint_repo(..., run_start=True)`) lists the expired records it left out of the violations in `expired`."""
     violations: list[Violation]
     skipped: dict[str, str] = field(default_factory=dict)
+    expired: list["ExpiredRecord"] = field(default_factory=list)
 
     @property
     def errors(self) -> list[Violation]:
@@ -440,6 +530,33 @@ class LintReport:
     def rules(self) -> set[str]:
         """The rule ids that fired."""
         return {v.rule for v in self.violations}
+
+
+# finding kind (taxonomy.yaml finding_kinds) and run-health wording of each expiry the run drops (4.5, 4.8)
+EXPIRY_KINDS = {"mask_expired": "mask expired", "floor_exception_expired": "floor exception expired",
+                "invariant_exception_expired": "invariant exception expired"}
+
+
+@dataclass(frozen=True, order=True)
+class ExpiredRecord:
+    """A record whose `expires_at` has passed (L-MSK-02, L-RGN-05, L-SRF-11). In CI it is that rule's error; at run
+    start it simply stops applying: the run drops it, lists `run_health_line()` and writes a finding of `kind`
+    (`mask_expired`, `floor_exception_expired`, `invariant_exception_expired`), never `config_invalid` (4.1, 4.8).
+
+    `record_id` is the mask id, the floor exception's region id or the surface's invariant id; `scope` the checkpoint
+    (masks and floor exceptions) or the surface (invariant exceptions)."""
+    kind: str
+    record_id: str
+    scope: str
+    file: str
+    path: str
+    expires_at: str
+    rule: str
+    owner: str = ""
+
+    def run_health_line(self) -> str:
+        """The run-health line, for example `mask expired: msk.ps.last-update-01` (4.8 L-MSK-02)."""
+        return f"{EXPIRY_KINDS[self.kind]}: {self.record_id}"
 
 
 # -- small helpers ---------------------------------------------------------------------------------
@@ -494,6 +611,141 @@ def _inside(inner: tuple[int, int, int, int], outer: tuple[int, int, int, int]) 
             and inner[0] + inner[2] <= outer[0] + outer[2] and inner[1] + inner[3] <= outer[1] + outer[3])
 
 
+def _clip(r: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> tuple[int, int, int, int] | None:
+    x0, y0 = max(r[0], b[0]), max(r[1], b[1])
+    x1, y1 = min(r[0] + r[2], b[0] + b[2]), min(r[1] + r[3], b[1] + b[3])
+    return (x0, y0, x1 - x0, y1 - y0) if x1 > x0 and y1 > y0 else None
+
+
+def _union_area(bounds: tuple[int, int, int, int], rects: Iterable[tuple[int, int, int, int]]) -> int:
+    """Area of the union of `rects` inside `bounds` (overlapping boxes count once, as the runtime's canvas does)."""
+    clipped = [c for r in rects if (c := _clip(r, bounds))]
+    xs = sorted({x for r in clipped for x in (r[0], r[0] + r[2])})
+    area = 0
+    for x0, x1 in zip(xs, xs[1:]):
+        covered, end = 0, None
+        for top, bottom in sorted((r[1], r[1] + r[3]) for r in clipped if r[0] <= x0 and r[0] + r[2] >= x1):
+            if end is None or top >= end:
+                covered += bottom - top
+                end = bottom
+            elif bottom > end:
+                covered += bottom - end
+                end = bottom
+        area += covered * (x1 - x0)
+    return area
+
+
+def mask_budgets() -> dict[str, float]:
+    """The panel budgets of the Diff Engine parameters file (`diff_engine.yaml` `mask_budget`, 3.8), the one source
+    the run-time mask budget reads too; classes absent from it (`other`) have no budget."""
+    return {str(k): float(v) for k, v in load_diff_params()["mask_budget"].items()}
+
+
+@dataclass(frozen=True)
+class PanelShare:
+    """The masked plus non-identity redacted share of one panel class on one landmark (4.8 Mask budget, L-MSK-03)."""
+    panel: str
+    landmark: str
+    share: float
+    budget: float
+
+    @property
+    def exceeded(self) -> bool:
+        return self.share > self.budget
+
+
+def _is_money_cell(x: dict) -> bool:
+    """A region the zero mask budget protects: `money_cell: true` or a `money_role` (4.8)."""
+    return x.get("money_cell") is True or x.get("money_role") is not None
+
+
+def _cover(regions: Iterable[Any], masks: Iterable[Any], proposed_rect: Any) -> list[dict]:
+    out = [x for x in map(_d, regions) if x.get("type") == "mask"] + [_d(m) for m in masks]
+    if proposed_rect is not None:
+        out.append({"id": "proposed mask", **_d(proposed_rect)})
+    return [x for x in out if _rect(x.get("rect"))]
+
+
+def panel_share(regions: Iterable[Any], masks: Iterable[Any] = (), proposed_rect: Any = None,
+                budgets: Mapping[str, float] | None = None) -> list[PanelShare]:
+    """The mask budget of a regions file, computed geometrically as the run time does (3.8, 4.8 Mask budget).
+
+    `regions` are the regions file's regions; its `mask` regions cover. `masks` are further covering boxes, each
+    `{landmark, rect, identity_field?}` (the redaction anchors on this file's landmarks); a box with
+    `identity_field: true` is excluded from the share. `proposed_rect` is a mask a human proposes, `{landmark,
+    rect}` (L-DEC-04: no mask over the panel budget). A panel's bounds are the bounding box of the regions of its
+    class on one landmark (choice 9); every covering box on that landmark counts, whatever its own `panel` label, as
+    the union of its intersections with the bounds. One `PanelShare` per (panel class with a budget, landmark) that
+    has bounds; `budgets` defaults to `mask_budgets()`."""
+    budgets = mask_budgets() if budgets is None else dict(budgets)
+    regs = [x for x in map(_d, regions) if _rect(x.get("rect"))]
+    cover = [x for x in _cover(regs, masks, proposed_rect) if x.get("identity_field") is not True]
+    out = []
+    for panel, budget in budgets.items():
+        for lm in sorted({str(x.get("landmark")) for x in regs if x.get("panel", "other") == panel}):
+            rects = [_rect(x["rect"]) for x in regs if x.get("panel", "other") == panel and x.get("landmark") == lm]
+            x0, y0 = min(r[0] for r in rects), min(r[1] for r in rects)  # type: ignore[index]
+            x1, y1 = max(r[0] + r[2] for r in rects), max(r[1] + r[3] for r in rects)  # type: ignore[index]
+            bounds = (x0, y0, x1 - x0, y1 - y0)
+            covered = _union_area(bounds, [_rect(c["rect"]) for c in cover if c.get("landmark") == lm])  # type: ignore[misc]
+            out.append(PanelShare(panel, lm, covered / (bounds[2] * bounds[3]), float(budget)))
+    return out
+
+
+def money_cells_covered(regions: Iterable[Any], masks: Iterable[Any] = (),
+                        proposed_rect: Any = None) -> list[tuple[str, str]]:
+    """(money cell id, covering box id) for every mask, redaction box (identity or not) or proposed mask that
+    touches a money cell on its landmark: the money cell's budget is 0 percent (4.8 Mask budget, L-MSK-03)."""
+    regs = [x for x in map(_d, regions) if _rect(x.get("rect"))]
+    hits = []
+    for c in _cover(regs, masks, proposed_rect):
+        for x in regs:
+            if _is_money_cell(x) and x.get("landmark") == c.get("landmark") and _overlap(_rect(c["rect"]), _rect(x["rect"])):  # type: ignore[arg-type]
+                hits.append((str(x.get("id")), str(c.get("id"))))
+    return hits
+
+
+def _labels(control: dict) -> set[str]:
+    """The casefolded texts a control is known by: its OCR text and its JAB name, the accessible title (4.5)."""
+    return {t.strip().casefold() for t in (_s(control.get("ocr_text")), _s(_d(control.get("jab")).get("name"))) if t.strip()}
+
+
+def _is_cancel_all(control: dict) -> bool:
+    """Cancel All by id, OCR text or JAB name (L-FLW-19)."""
+    return control.get("id") == "cancel-all" or "cancel all" in _labels(control)
+
+
+def _is_send(control: dict) -> bool:
+    """The Order Confirmation dialog's Send button by id, OCR text or JAB name (6.7)."""
+    return control.get("id") in ("send", "send-button") or "send" in _labels(control)
+
+
+def _is_cancel(control: dict) -> bool:
+    """A cancel action other than Cancel All: id, OCR text or JAB name naming cancel (6.7 "the row's cancel action")."""
+    return not _is_cancel_all(control) and ("cancel" in _s(control.get("id")) or any("cancel" in t for t in _labels(control)))
+
+
+_CLICKS = ("click_named", "rclick", "dblclick")
+# order fields of a paper_send_ok ticket by the control or region id that carries them (6.7, choice 17)
+_ORDER_FIELDS = (("qty", ("qty", "quantity")), ("price", ("price",)), ("tif", ("tif", "time-in-force")),
+                 ("type", ("order-type",)), ("symbol", ("symbol",)))
+
+
+def _order_field(name: str) -> str | None:
+    n = name.casefold()
+    return next((fld for fld, keys in _ORDER_FIELDS if any(k in n for k in keys)), None)
+
+
+def _dec(v: Any) -> float | None:
+    """A typed or asserted number: an int or float, or a string that reads as one."""
+    if isinstance(v, str):
+        try:
+            return float(v.strip())
+        except ValueError:
+            return None
+    return _num(v)
+
+
 def _channel(build_id: str) -> str:
     return build_id.split("-", 1)[0] if isinstance(build_id, str) else ""
 
@@ -522,6 +774,7 @@ class CheckpointDef:
     tier: Any
     file: str
     flow: str | None = None
+    keep_focus: bool = False
 
 
 # -- the linter ------------------------------------------------------------------------------------
@@ -570,15 +823,19 @@ def _rule_view(repo: Repo) -> Repo:
 class _Linter:
     """One lint pass over a loaded repository; `run()` returns the violations."""
 
-    def __init__(self, repo: Repo, phase: int, today: date, flow_p50_s: dict[str, float] | None):
+    def __init__(self, repo: Repo, phase: int, today: date, flow_p50_s: dict[str, float] | None,
+                 run_start: bool = False):
         self.raw = repo
         self.r = _rule_view(repo)
         self.phase = phase
         self.today = today
         self.now = datetime.combine(today, time(0), tzinfo=timezone.utc)
         self.p50 = flow_p50_s or {}
+        self.run_start = run_start
         self.tax = load_taxonomy()
+        self.budgets = mask_budgets()
         self.out: list[Violation] = []
+        self.expired: list[ExpiredRecord] = []
         self._index()
 
     # -- reporting -------------------------------------------------------------------------------
@@ -588,6 +845,14 @@ class _Linter:
 
     def _phase_sev(self, until_phase: int) -> str:
         return "warn" if self.phase < until_phase else "error"
+
+    def expiry(self, rec: ExpiredRecord, message: str) -> None:
+        """An `expires_at` in the past (L-MSK-02, L-RGN-05, L-SRF-11): the rule's error in CI; at run start the
+        record is dropped and listed instead, never a violation (4.1, 4.5, 4.8)."""
+        if self.run_start:
+            self.expired.append(rec)
+        else:
+            self.add(rec.rule, rec.file, message, rec.path)
 
     # -- index -----------------------------------------------------------------------------------
 
@@ -647,52 +912,53 @@ class _Linter:
         self.retired = {x.get("old") for x in self.renames if x.get("new") == "retired"}
         red = r.one("redaction")
         self.redaction = [_d(x) for x in _l(_d(red.data).get("regions"))] if red else []
-        self.ladder_sizes = self._ladder_sizes()
+        self.sweep_steps = self._sweep_steps()
         self.defined: dict[str, CheckpointDef] = {}
         self._define_checkpoints()
 
-    def _ladder_sizes(self) -> list[tuple[int, int]]:
+    def _sweep_steps(self) -> list[cps.SweepStep]:
+        """Every w x h step any ladder of registry/ladders.yaml can plan (2.5.2): MAXW and MAXH from the work areas
+        of configs/allowed.yaml, the ascending pass as `-asc` steps, plus the corpus sizes of
+        corpus/measured_sizes.yaml on their host. Without ladders.yaml, ladders S and F of 2.5.2."""
         doc = self.r.one("ladders")
-        sizes: list[tuple[int, int]] = []
-        for lad in map(_d, _l(_d(doc.data).get("ladders")) if doc else []):
-            for st in map(_d, _l(lad.get("steps"))):
-                w, h = st.get("w"), st.get("h")
-                if isinstance(w, int) and isinstance(h, int) and (w, h) not in sizes:
-                    sizes.append((w, h))
+        allowed = self.r.one("configs_allowed")
+        areas = [_d(_d(c).get("work_area")) for c in _l(_d(allowed.data).get("configs") if allowed else [])]
+        maxw = sorted({a["w"] for a in areas if isinstance(a.get("w"), int)})
+        maxh = sorted({a["h"] for a in areas if isinstance(a.get("h"), int)})
+        steps: list[cps.SweepStep] = []
+        raw = [(st.get("w"), st.get("h"), st.get("part", "grid")) for lad in map(_d, _l(_d(doc.data).get("ladders")) if doc else [])
+               for st in map(_d, _l(lad.get("steps")))]
         if not doc:
-            sizes = list(dict.fromkeys(LADDER_S + LADDER_F_GRID + ((240, 160),)))
-        return sizes
+            raw = [(w, h, "grid") for w, h in dict.fromkeys(LADDER_S + LADDER_F_GRID)] + [(w, h, "corner") for w, h in LADDER_F_CORNERS]
+            raw += [(w, h, "ascending") for w, h in LADDER_F_ASCENDING]
+        for w, h, part in raw:
+            for ww in (maxw if w == "MAXW" else [w]):
+                for hh in (maxh if h == "MAXH" else [h]):
+                    if isinstance(ww, int) and isinstance(hh, int):
+                        steps.append(cps.SweepStep(ww, hh, ascending=part == "ascending"))
+        ms = self.r.one("measured_sizes")
+        self.corpus_sizes: dict[str, list[cps.SweepStep]] = {}
+        for x in map(_d, _l(_d(ms.data).get("sizes") if ms else [])):
+            if isinstance(x.get("w"), int) and isinstance(x.get("h"), int) and isinstance(x.get("host"), str):
+                self.corpus_sizes.setdefault(_s(x.get("surface")), []).append(cps.SweepStep(x["w"], x["h"], host=x["host"]))
+        return list(dict.fromkeys(steps))
 
     def _define_checkpoints(self) -> None:
+        """The checkpoint ids the registry and the flows define, enumerated by sentinel.checkpoints (the scope's
+        enumeration too, so lint and scope agree on which ids exist)."""
+        corpus = {wid: w for wid, (_rel, w) in self.workspaces.items()}
         for sid, s in self.surfaces.items():
             file, mode, tier = self.surface_file[sid], s.get("data_mode"), s.get("tier")
-            census = _d(s.get("census"))
-            if census.get("enabled", True):
-                dims = [(k, _l(v)) for k, v in _d(census.get("dimensions")).items()]
-                combos = list(itertools.product(*[[f"{k}={v}" for v in vals] for k, vals in dims])) if dims else [()]
-                for ws in _l(census.get("workspaces")):
-                    for combo in combos:
-                        cid = f"census/{sid}/{ws}" + (f"/{','.join(combo)}" if combo else "")
-                        self.defined.setdefault(cid, CheckpointDef(cid, "census", sid, mode, tier, file))
-            if s.get("resizable") is True:
-                for host in _l(s.get("hosts")):
-                    for w, h in self.ladder_sizes:
-                        cid = f"sweep/{sid}/{host}/{w}x{h}"
-                        self.defined.setdefault(cid, CheckpointDef(cid, "sweep", sid, mode, tier, file))
-            for sp in map(_d, _l(s.get("splitters"))):
-                fractions = [f for f in (_l(sp.get("fractions")) or SPLIT_FULL) if _num(f) is not None]
-                for f in fractions:
-                    if f in (0.0, 1.0) and not sp.get("collapsible"):
-                        continue
-                    cid = f"split/{sid}/{sp.get('id')}/{float(f):.2f}"
-                    self.defined.setdefault(cid, CheckpointDef(cid, "split", sid, mode, tier, file))
+            for cid, kind in cps.surface_checkpoints(s, corpus, self.sweep_steps + self.corpus_sizes.get(sid, [])):
+                self.defined.setdefault(cid, CheckpointDef(cid, kind, sid, mode, tier, file))
         for fid, doc in self.flows.items():
             for st in self._seq(doc.data):
                 if st.get("type") == "checkpoint" and isinstance(st.get("checkpoint_id"), str):
                     sid = _s(st.get("surface_id"))
                     tier = st.get("tier", _d(self.surfaces.get(sid)).get("tier"))
                     cid = st["checkpoint_id"]
-                    self.defined.setdefault(cid, CheckpointDef(cid, "flow", sid, _s(st.get("data_mode")), tier, doc.rel, fid))
+                    self.defined.setdefault(cid, CheckpointDef(cid, "flow", sid, _s(st.get("data_mode")), tier, doc.rel, fid,
+                                                               st.get("keep_focus") is True))
 
     @staticmethod
     def _seq(flow: Any) -> list[dict]:
@@ -826,34 +1092,8 @@ class _Linter:
                     self.add("L-BLD-03", doc.rel, f"{ch} builds do not carry {f}", f"build.{f}")
             if ("released_at" in b) != (ch == "released"):
                 self.add("L-BLD-06", doc.rel, "released_at is present if and only if channel is released", "build.released_at")
-        table = {
-            "pr": ("merge_base_main", "branch", "main"), "merge": ("previous_main", "main", "main"),
-            "rc": ("last_released", "rc", "released"), "nightly": ("same_build", None, None),
-            "calibration": ("same_build", None, None),
-        }
         for rel, p in self.pairs:
-            cand, base, rule, rt = p.get("candidate"), p.get("base"), p.get("base_rule"), p.get("run_type")
-            if rt in table:
-                want_rule, want_c, want_b = table[rt]
-                if rule != want_rule:
-                    self.add("L-BLD-04", rel, f"run_type {rt} requires base_rule {want_rule}, not {rule}", "build_pair.base_rule")
-                cc = _d(self.builds.get(cand)).get("channel", _channel(cand))
-                bc = _d(self.builds.get(base)).get("channel", _channel(base))
-                if want_c and cc != want_c:
-                    self.add("L-BLD-04", rel, f"run_type {rt} requires a {want_c} candidate, not {cc}", "build_pair.candidate")
-                if want_b and bc != want_b:
-                    self.add("L-BLD-04", rel, f"run_type {rt} requires a {want_b} base, not {bc}", "build_pair.base")
-                if rt == "pr":
-                    mb = _s(_d(self.builds.get(cand)).get("merge_base_sha"))
-                    base_sha = _s(_d(self.builds.get(base)).get("commit_sha"))
-                    if not mb:
-                        self.add("L-BLD-04", rel, f"candidate {cand} has no merge_base_sha in builds/", "build_pair.candidate")
-                    elif (base_sha and base_sha != mb) or (not base_sha and not mb.startswith(_short_sha(base))):
-                        self.add("L-BLD-04", rel, f"base {base} is not the candidate's merge base {mb[:7]}", "build_pair.base")
-                if rt == "rc" and not p.get("lineage_baseline_set"):
-                    self.add("L-BLD-04", rel, "rc pairs carry lineage_baseline_set", "build_pair.lineage_baseline_set")
-            if cand == base and rule != "same_build":
-                self.add("L-BLD-05", rel, f"candidate equals base ({cand}) without base_rule same_build", "build_pair")
+            self.out.extend(check_pair(p, self.builds, rel))
 
     # -- 4.3 manifests ---------------------------------------------------------------------------
 
@@ -999,7 +1239,7 @@ class _Linter:
             controls = [_d(x) for x in _l(s.get("controls"))]
             if s.get("tier") == 1:
                 missing = [what for what, ok in (
-                    ("owner", bool(s.get("owner"))), ("smoke: true", s.get("smoke") is True),
+                    ("owner", bool(s.get("owner"))),
                     ("a must_see landmark", any(x.get("must_see") is True for x in landmarks)),
                     ("anti_anchors", bool(_l(s.get("anti_anchors")))), ("labels", bool(_l(s.get("labels")))),
                     ("a required control", any(c.get("required") is True for c in controls))) if not ok]
@@ -1080,10 +1320,13 @@ class _Linter:
                     if cur in chain:
                         self.add("L-SRF-11", f, f"parent chain of {sid} has a cycle at {cur}", "parent")
             for i, x in enumerate(map(_d, _l(s.get("invariant_exceptions")))):
-                exp = _ts(x.get("expires_at"))
-                if not (x.get("owner") and x.get("reason")) or exp is None or exp <= self.now:
-                    self.add("L-SRF-11", f, "an invariant exception carries owner, reason and a future expires_at",
-                             f"invariant_exceptions[{i}]")
+                exp, at = _ts(x.get("expires_at")), f"invariant_exceptions[{i}]"
+                if not (x.get("owner") and x.get("reason")) or exp is None:
+                    self.add("L-SRF-11", f, "an invariant exception carries owner, reason and a future expires_at", at)
+                elif exp <= self.now:
+                    self.expiry(ExpiredRecord("invariant_exception_expired", _s(x.get("invariant_id")), sid, f, at,
+                                              _s(x.get("expires_at")), "L-SRF-11", _s(x.get("owner"))),
+                                f"invariant exception {x.get('invariant_id')} expired at {x.get('expires_at')}")
             for i, sp in enumerate(splitters):
                 if sp.get("host") not in hosts:
                     self.add("L-SRF-13", f, f"splitter host {sp.get('host')} is not in hosts", f"splitters[{i}].host")
@@ -1210,6 +1453,21 @@ class _Linter:
             self._flow_assertions(fl, f)
             self._flow_safety(fl, f)
             self._flow_budget(fl, f, fid)
+        self._send_caps()
+
+    def _send_caps(self) -> None:
+        """L-FLW-08, 6.7: every paper_send_ok flow sends one order, so the library never holds more of them than the
+        per-run send cap (default 5), which a run scoping all of them would breach (the gateway refuses the send past
+        the cap: an attempted send, aborted_safety); the per-run cap is at most the per-day cap (default 20)."""
+        sends = [doc.rel for doc in self.r.of("flow") if _d(doc.data).get("class") == "paper_send_ok"]
+        caps = _d(self.send_policy.get("caps"))
+        per_run = caps.get("per_run", SEND_CAPS_6_7["per_run"])
+        per_day = caps.get("per_day", SEND_CAPS_6_7["per_day"])
+        f = sp.rel if (sp := self.r.one("send_policy")) else "policy/send_policy.yaml"
+        if isinstance(per_run, int) and len(sends) > per_run:
+            self.add("L-FLW-08", f, f"{len(sends)} paper_send_ok flows send {len(sends)} orders; the per-run send cap is {per_run}")
+        if isinstance(per_run, int) and isinstance(per_day, int) and per_run > per_day:
+            self.add("L-FLW-08", f, f"per-run send cap {per_run} is above the per-day cap {per_day}", "caps")
 
     def _flow_structure(self, fl: dict, f: str) -> None:
         ids = [st.get("id") for _sec, st in self._all_steps(fl)]
@@ -1232,6 +1490,10 @@ class _Linter:
         if fl.get("fixture") not in self.fixtures:
             self.add("L-FLW-00", f, f"fixture {fl.get('fixture')} is not in fixtures/", "fixture")
         pre = [_d(x) for x in _l(fl.get("preconditions"))]
+        for p in pre:
+            if p.get("type") != "precondition":
+                self.add("L-FLW-00", f, f"preconditions hold only type precondition steps, not {p.get('type')}",
+                         f"preconditions[{p.get('id')}]")
         checks = {p.get("check") for p in pre}
         for need in ("paper_mode", "no_modal"):
             if need not in checks:
@@ -1253,12 +1515,42 @@ class _Linter:
         if is_quarantine and fl.get("class") != "explorer_candidate":
             self.add("L-FLW-14", f, "flows under flows/quarantine/ are class explorer_candidate", "class")
 
+    def _flow_landmarks(self, fl: dict) -> set[str]:
+        """Landmark ids a flow's wait_for may name: the landmarks of its surfaces and of its checkpoints' regions files."""
+        out = {_d(x).get("id") for s in {*_l(fl.get("surfaces")), fl.get("surface")} if isinstance(s, str)
+               for x in _l(_d(self.surfaces.get(s)).get("landmarks"))}
+        for st in self._seq(fl):
+            reg = st.get("regions")
+            doc = self.r.docs.get(reg) if isinstance(reg, str) else None
+            out |= {_d(x).get("id") for x in _l(_d(doc.data if doc else None).get("landmarks"))}
+        return {x for x in out if isinstance(x, str)}
+
+    def _regex(self, f: str, at: str, value: Any) -> None:
+        """A regex field of a flow (title_regex, window_title_regex) compiles (L-FLW-00)."""
+        if isinstance(value, str):
+            try:
+                re.compile(value)
+            except re.error as exc:
+                self.add("L-FLW-00", f, f"regex {value!r} does not compile: {exc}", at)
+
     def _flow_targets(self, fl: dict, f: str) -> None:
         cls = fl.get("class")
+        landmarks = self._flow_landmarks(fl)
+        exempt = self._send_steps(fl) if cls == "paper_send_ok" and self._send_policy_on() else set()
         for sec, st in self._all_steps(fl):
             at = f"{sec}[{st.get('id')}]"
             if st.get("type") == "secret" and cls != "login":
                 self.add("L-FLW-06", f, "secret steps are allowed only in class login flows", at)
+            if st.get("type") == "secret" and not VAULT_REF.match(_s(st.get("vault_ref"))):
+                self.add("L-FLW-06", f, f"vault_ref {st.get('vault_ref')!r} is not vault://<path>#<field>", f"{at}.vault_ref")
+            if st.get("type") == "checkpoint":
+                self._regex(f, f"{at}.target_window.title_regex", _d(st.get("target_window")).get("title_regex"))
+            if st.get("type") == "wait_for":
+                anchor = _d(st.get("anchor"))
+                self._regex(f, f"{at}.anchor.window_title_regex", anchor.get("window_title_regex"))
+                if "landmark" in anchor and anchor.get("landmark") not in landmarks:
+                    self.add("L-FLW-00", f, f"wait_for landmark {anchor.get('landmark')} is a landmark of none of the "
+                                            "flow's surfaces and regions files", f"{at}.anchor.landmark")
             if st.get("type") == "type_fixture" and isinstance(st.get("value"), str):
                 if credential_hits(f"value: {st['value']}"):
                     self.add("L-FLW-06", f, "a value literal matches a credential pattern", f"{at}.value")
@@ -1278,19 +1570,161 @@ class _Linter:
                     self.add("L-FLW-02", f, f"target {t} is not a <surface>.<control> of the registry", f"{at}.{k}")
                     continue
                 c = ctl[1]
-                if c.get("deny") is True or c.get("id") == "auto-send-checkbox":
+                if c.get("id") == "auto-send-checkbox" or (c.get("deny") is True and st.get("id") not in exempt):
                     self.add("L-FLW-13", f, f"step targets {t}, a denied control", f"{at}.{k}")
                 if self.rungs(t) < 2:
                     self.add("L-FLW-17", f, f"target {t} resolves on fewer than two rungs (template plus jab or ocr_text)", f"{at}.{k}")
-                cancel_all = c.get("id") == "cancel-all" or _s(c.get("ocr_text")).strip().casefold() == "cancel all"
-                if cancel_all and st.get("type") in ("click_named", "rclick", "dblclick"):
+                if _is_cancel_all(c) and st.get("type") in ("click_named", "rclick", "dblclick"):
                     self.add("L-FLW-19", f, f"{st.get('type')} targets Cancel All; only the cancel_all teardown may", f"{at}.{k}")
         if cls == "login" and fl.get("agent_fallback") != "disabled":
             self.add("L-FLW-06", f, "login flows have agent_fallback: disabled", "agent_fallback")
         if cls == "paper_send_ok":
-            sp = self.send_policy
-            if not (sp.get("enabled") is True and sp.get("risk_owner") and sp.get("signature")):
+            if not self._send_policy_on():
                 self.add("L-FLW-08", f, "class paper_send_ok needs policy/send_policy.yaml enabled: true with a risk-owner signature", "class")
+            self._paper_send_ok(fl, f)
+
+    # -- 6.7 gated branch: the paper_send_ok order (L-FLW-08) ----------------------------------------
+
+    def _send_policy_on(self) -> bool:
+        sp = self.send_policy
+        return bool(sp.get("enabled") is True and sp.get("risk_owner") and sp.get("signature"))
+
+    def _ctl(self, st: dict) -> dict:
+        return _d(self.controls.get(_s(st.get("target")), (None, {}))[1])
+
+    def _send_steps(self, fl: dict) -> set[Any]:
+        """The steps the gated branch lets touch a denied control (6.7, 5.4): the one Send click after the
+        order-stage step, which the single-use send token lifts, and the row's cancel action after it, allowed only
+        in class paper_send_ok (choice 17)."""
+        seq = self._seq(fl)
+        stage = next((k for k, st in enumerate(seq) if st.get("order_stage") is True), None)
+        if stage is None:
+            return set()
+        clicks = [(k, st) for k, st in enumerate(seq) if k > stage and st.get("type") in _CLICKS]
+        send = next((k for k, st in clicks if _is_send(self._ctl(st))), None)
+        if send is None:
+            return set()
+        return {seq[send].get("id")} | {st.get("id") for k, st in clicks if k > send and _is_cancel(self._ctl(st))}
+
+    def _order_values(self, seq: list[dict], fx: dict) -> dict[str, list[tuple[Any, str | None]]]:
+        """The order a paper_send_ok flow builds, as (value, value_ref) per field (qty, price, type, tif, symbol): what
+        it types into the ticket (`type_fixture`, by the control id) and what it asserts with `equals` on the ticket
+        and the dialog (by the region id), before the Send click (choice 17)."""
+        from ..oracle.tables import resolve_ref     # lazy: sentinel.oracle imports this module
+
+        out: dict[str, list[tuple[Any, str | None]]] = {}
+
+        def put(name: str, value: Any, ref: Any) -> None:
+            fld = _order_field(name)
+            if fld is None:
+                return
+            if isinstance(ref, str):
+                try:
+                    value = resolve_ref(fx, ref)
+                except ValueError:
+                    value = None
+            out.setdefault(fld, []).append((value, ref if isinstance(ref, str) else None))
+
+        for st in seq:
+            if st.get("type") == "type_fixture":
+                put(_s(self._ctl(st).get("id")), st.get("value"), st.get("value_ref"))
+            items = _l(st.get("expect")) + _l(st.get("assertions")) + ([st["verify"]] if isinstance(st.get("verify"), dict) else [])
+            for a in map(_d, items):
+                if a.get("kind") == "equals" and isinstance(a.get("region"), str):
+                    put(a["region"].rsplit(".", 1)[-1], a.get("expected"), a.get("value_ref"))
+        return out
+
+    def _paper_send_ok(self, fl: dict, f: str) -> None:
+        """L-FLW-08 for class paper_send_ok (6.7 gated branch): one Send click after the order-stage step; quantity 1;
+        a limit order; DAY; a limit price from the fixture's `prices`, whose rule puts it at least the declared
+        distance from the last price (20 percent for equities by default, the policy's tick_distance_futures for
+        futures); a symbol of the fixture; the expected Working row text asserted after the send; a cancel step after
+        it; and a working_orders_check teardown with expect: 0."""
+        seq = self._seq(fl)
+        fdoc = self.fixtures.get(fl.get("fixture"))
+        fx = _d(fdoc.data if fdoc else None)
+
+        def bad(message: str, path: str = "class") -> None:
+            self.add("L-FLW-08", f, f"paper_send_ok: {message}", path)
+
+        stage = next((k for k, st in enumerate(seq) if st.get("order_stage") is True), None)
+        sends = [k for k, st in enumerate(seq) if st.get("type") in _CLICKS and _is_send(self._ctl(st))]
+        if stage is None or len(sends) != 1 or sends[0] < stage:
+            bad("exactly one Send click, after the order-stage step; the send token lifts the dialog allowlist for one "
+                "click and a second is an attempted send (6.7)", "steps")
+        end = sends[0] if sends else len(seq)
+        vals = self._order_values(seq[:end], fx)
+        for fld, ok, want in (("qty", lambda v: _dec(v) == 1, "1 share or 1 contract"),
+                              ("type", lambda v: _s(v).strip().casefold() in ("lmt", "limit"), "a limit order"),
+                              ("tif", lambda v: _s(v).strip().casefold() == "day", "DAY time in force")):
+            got = [v for v, _ref in vals.get(fld, [])]
+            if not got:
+                bad(f"declares no order {fld}; type it or assert it with equals before the send ({want})", "steps")
+            for v in got:
+                if not ok(v):
+                    bad(f"order {fld} {v!r}; the order is {want}", "steps")
+        known = {_d(s).get("symbol") for s in _l(fx.get("symbols"))}
+        syms = [v for v, _ref in vals.get("symbol", [])]
+        if not syms:
+            bad("declares no symbol; type a symbol of the fixture's list into the ticket", "steps")
+        for v in syms:
+            if v not in known:
+                bad(f"symbol {v!r} is not in fixture {fl.get('fixture')}'s symbol list", "steps")
+        typed = [ref for _v, ref in vals.get("price", [])]
+        if not typed:
+            bad("declares no limit price; type one from the fixture's prices (fixture.prices.<id>.value)", "steps")
+        for ref in typed:
+            problem = self._price_distance(ref, fx)
+            if problem:
+                bad(problem, "steps")
+        after = seq[end + 1:]
+        texts = [_s(a.get("expected")) + " " + _s(a.get("pattern")) for st in after
+                 for a in map(_d, _l(st.get("expect")) + _l(st.get("assertions")))
+                 if a.get("kind") in ("equals", "matches", "present")]
+        if not any(re.search(r"(?i)working", t) for t in texts):
+            bad("declares no expected Working row text: an equals, matches or present assertion after the send whose "
+                "text names the Working row", "steps")
+        if not any(st.get("type") in _CLICKS and _is_cancel(self._ctl(st)) for st in after):
+            bad("has no cancel step after the send (the Working row's cancel action)", "steps")
+        if not any(t.get("type") == "teardown" and t.get("action") == "working_orders_check" and t.get("expect") == 0
+                   for t in map(_d, _l(fl.get("teardown")))):
+            bad("ends without a working_orders_check teardown with expect: 0 (L-FLW-12)", "teardown")
+
+    def _price_distance(self, ref: str | None, fx: dict) -> str | None:
+        """The limit price is a fixture price whose rule puts it far enough from the last price (6.7, 4.9 prices)."""
+        from ..oracle.tables import RuleConfig, tick_size     # lazy: sentinel.oracle imports this module
+
+        m = re.match(r"^fixture\.prices\.([^.]+)\.value$", ref or "")
+        if not m:
+            return f"limit price {ref or 'literal'} is not a fixture.prices.<id>.value, which the fixture reset flow recomputes"
+        price = next((p for p in map(_d, _l(fx.get("prices"))) if p.get("id") == m.group(1)), {})
+        sym = next((s for s in map(_d, _l(fx.get("symbols"))) if s.get("id") == price.get("symbol_ref")), {})
+        rule, value = _PRICE_RULE.match(_s(price.get("rule"))), _num(price.get("value"))
+        if not price or not rule or not value:
+            return f"fixture price {m.group(1)} has no rule of the form 'last_delayed x <factor>' or 'last_delayed - <points>'"
+        n = float(rule.group("n"))
+        last = value / n if rule.group("op") in "x*×" else value + n if rule.group("op") == "-" else value - n
+        if last <= 0:
+            return f"fixture price {m.group(1)} gives no positive last price"
+        distance, sp = abs(last - value), self.send_policy
+        if sym.get("asset") == "equity":
+            pct = _num(sp.get("distance_pct_equity"))
+            need = DISTANCE_PCT_EQUITY_6_7 if pct is None else pct
+            if distance / last * 100 < need:
+                return f"limit price {m.group(1)} is {distance / last:.0%} from the last price; at least {need:g} percent"
+            return None
+        if sym.get("asset") == "future":
+            min_ticks = _num(sp.get("tick_distance_futures"))
+            if min_ticks is None:
+                return "policy/send_policy.yaml declares no tick_distance_futures for a futures send (6.7)"
+            try:
+                ticks = distance / float(tick_size(_s(sym.get("symbol")), RuleConfig(), fx))
+            except ValueError:
+                return f"no tick size for {sym.get('symbol')}"
+            if ticks < min_ticks:
+                return f"limit price {m.group(1)} is {ticks:g} ticks from the last price; at least {min_ticks:g}"
+            return None
+        return f"symbol {sym.get('symbol')} is {sym.get('asset')}; paper_send_ok sends 1 share or 1 futures contract"
 
     def _flow_checkpoints(self, fl: dict, f: str, fid: str, seen_cp: dict[str, str]) -> None:
         surfaces = _l(fl.get("surfaces"))
@@ -1351,32 +1785,45 @@ class _Linter:
         steps = [("steps", _d(x)) for x in _l(fl.get("steps"))] + [("teardown", _d(x)) for x in _l(fl.get("teardown"))]
         cps = [k for k, (_sec, st) in enumerate(steps) if st.get("type") == "checkpoint"]
         cp_by_id = {steps[k][1].get("id"): k for k in cps}
+        fdoc = self.fixtures.get(fl.get("fixture"))
+        fixture = _d(fdoc.data if fdoc else None)
         all_regions: set[str] = set()
         for k in cps:
             all_regions |= self._cp_regions(steps[k][1]) or set()
+        owned: dict[Any, list[tuple[str, Any]]] = {}       # checkpoint step -> (location, assertion id) it decides
         for k, (sec, st) in enumerate(steps):
             groups: list[tuple[str, list, set[str] | None, int]] = []
             if st.get("type") == "checkpoint":
                 groups.append((f"{sec}[{st.get('id')}].expect", _l(st.get("expect")), self._cp_regions(st), k))
+                owner: int | None = k
             else:
                 items = _l(st.get("assertions")) if st.get("type") == "assert" else [st["verify"]] if isinstance(st.get("verify"), dict) else []
                 if not items:
                     continue
+                before = [c for c in cps if c < k]
+                after = [c for c in cps if c > k]
+                pick = before[-1] if before else after[0] if after else None
+                owner = cps[-1] if sec == "teardown" and cps else pick
                 if sec == "teardown":
                     base = all_regions
                 else:
-                    before = [c for c in cps if c < k]
-                    after = [c for c in cps if c > k]
-                    pick = before[-1] if before else after[0] if after else None
                     base = self._cp_regions(steps[pick][1]) if pick is not None else set()
                 groups.append((f"{sec}[{st.get('id')}]", items, base, k))
             for at, items, base, pos in groups:
                 for a in map(_d, items):
-                    self._assertion(f, at, a, base, pos, steps, cp_by_id)
+                    self._assertion(f, at, a, base, pos, steps, cp_by_id, fixture)
+                    owned.setdefault(owner, []).append((f"{at}[{a.get('id')}]", a.get("id")))
+        for owner, entries in owned.items():
+            ids = [aid for _loc, aid in entries]
+            cp = steps[owner][1].get("id") if owner is not None else None
+            for loc, aid in entries:
+                if ids.count(aid) > 1:
+                    self.add("L-FLW-11", f, f"assertion id {aid} is not unique among the assertions of checkpoint {cp}", f"{loc}.id")
 
     def _assertion(self, f: str, at: str, a: dict, base: set[str] | None, pos: int,
-                   steps: list[tuple[str, dict]], cp_by_id: dict[Any, int]) -> None:
+                   steps: list[tuple[str, dict]], cp_by_id: dict[Any, int], fixture: dict) -> None:
         loc = f"{at}[{a.get('id')}]"
+        found = len(self.out)
         allowed = set(base or set())
         since = a.get("since_step")
         if a.get("kind") in ("changed_since_previous_step", "unchanged_since_previous_step") or since is not None:
@@ -1396,18 +1843,68 @@ class _Linter:
             if rid not in RULE_OPERANDS:
                 self.add("L-FLW-11", f, f"rule_id {rid} is not one of R01 to R10 (2.8.3)", f"{loc}.rule_id")
                 return
-            req, opt = RULE_OPERANDS[rid]
-            inputs = _d(a.get("inputs"))
-            if not req <= set(inputs) or not set(inputs) <= req | opt:
-                self.add("L-FLW-11", f, f"inputs of {rid} must be {sorted(req)}" + (f" plus optional {sorted(opt)}" if opt else ""), f"{loc}.inputs")
-            for name, v in inputs.items():
-                if isinstance(v, str) and v not in allowed:
+            self._rule_inputs(f, loc, rid, _d(a.get("inputs")), allowed)
+        self._oracle_accepts(f, loc, a, fixture, len(self.out) == found)
+
+    def _rule_inputs(self, f: str, loc: str, rid: str, inputs: dict, allowed: set[str]) -> None:
+        """L-FLW-11 against the 2.8.3 operand table (SD-34): the required operands, no others, each a declared
+        region or, where its type allows, a literal number (whole for an integer); grouped operands all or none."""
+        req, opt = RULE_OPERANDS[rid]
+        if not req <= set(inputs) or not set(inputs) <= req | opt:
+            self.add("L-FLW-11", f, f"inputs of {rid} must be {sorted(req)}" + (f" plus optional {sorted(opt)}" if opt else ""), f"{loc}.inputs")
+        for group in RULE_OPERAND_GROUPS.get(rid, ()):
+            if group & set(inputs) and not group <= set(inputs):
+                self.add("L-FLW-11", f, f"operands {sorted(group)} of {rid} are given all together or not at all", f"{loc}.inputs")
+        for name, v in inputs.items():
+            typ = RULE_OPERAND_TYPES.get(rid, {}).get(name)
+            if isinstance(v, str):
+                if v not in allowed:
                     self.add("L-FLW-11", f, f"operand {name} region {v} is not declared on the checkpoint", f"{loc}.inputs.{name}")
+            elif _num(v) is None:
+                self.add("L-FLW-11", f, f"operand {name} is neither a region nor a number", f"{loc}.inputs.{name}")
+            elif typ is not None and typ not in LITERAL_OPERAND_TYPES:
+                self.add("L-FLW-11", f, f"operand {name} is {typ}; bind it to a region, a literal cannot stand for it", f"{loc}.inputs.{name}")
+            elif typ == "integer" and not float(v).is_integer():
+                self.add("L-FLW-11", f, f"operand {name} is an integer, not {v}", f"{loc}.inputs.{name}")
+
+    def _oracle_accepts(self, f: str, loc: str, a: dict, fixture: dict, clean: bool) -> None:
+        """2.8.3, 4.7: an assertion the lint accepts is one the Oracle evaluates. The Oracle's own parser
+        (`oracle.assertions.Assertion.from_dict`) refusing it is L-FLW-11 for a rule (when the operand checks above
+        found nothing) and L-FLW-00 for a field-shape problem of any other kind; a `pattern` that does not compile, a
+        `value_ref` the flow's fixture does not resolve and an `expected` that is not a value of its `format` are
+        L-FLW-00 too (choice 5)."""
+        from ..oracle.assertions import Assertion           # lazy: sentinel.oracle imports this module
+        from ..oracle.tables import resolve_ref
+        from ..oracle.values import FormatError, coerce
+
+        rule = a.get("kind") == "rule"
+        try:
+            Assertion.from_dict(a)
+        except (ValueError, TypeError, AttributeError, ArithmeticError) as exc:     # OracleConfigError is a ValueError
+            if clean or not rule:
+                self.add("L-FLW-11" if rule else "L-FLW-00", f, f"the Oracle refuses this assertion: {exc}", loc)
+            return
+        if isinstance(a.get("pattern"), str):
+            try:
+                re.compile(a["pattern"])
+            except re.error as exc:
+                self.add("L-FLW-00", f, f"pattern {a['pattern']!r} does not compile: {exc}", f"{loc}.pattern")
+        if isinstance(a.get("value_ref"), str):
+            try:
+                resolve_ref(fixture, a["value_ref"])
+            except ValueError as exc:
+                self.add("L-FLW-00", f, f"value_ref does not resolve in the flow's fixture: {exc}", f"{loc}.value_ref")
+        if a.get("kind") in ("equals", "within_tol") and a.get("format") and a.get("expected") is not None:
+            try:
+                coerce(_s(a.get("format")), a.get("expected"))
+            except FormatError as exc:
+                self.add("L-FLW-00", f, f"expected {a.get('expected')!r} is not a valid {a.get('format')}: {exc}", f"{loc}.expected")
 
     def _confirm_and_send(self, target: Any) -> bool:
-        """A target that resolves to Confirm and Send: control id `confirm-and-send` or OCR text "Confirm and Send"."""
+        """A target that resolves to Confirm and Send: control id `confirm-and-send`, or OCR text or JAB name
+        (the control's title under branch A) "Confirm and Send" (L-FLW-07)."""
         ctl = self.controls.get(_s(target))
-        return ctl is not None and (ctl[1].get("id") == "confirm-and-send" or _s(ctl[1].get("ocr_text")).strip().casefold() == "confirm and send")
+        return ctl is not None and (ctl[1].get("id") == "confirm-and-send" or "confirm and send" in _labels(ctl[1]))
 
     def _flow_safety(self, fl: dict, f: str) -> None:
         seq = self._seq(fl)
@@ -1478,8 +1975,10 @@ class _Linter:
             ids = [x.get("id") for x in regions]
             for x in sorted({i for i in ids if ids.count(i) > 1}, key=str):
                 self.add("L-RGN-01", f, f"region id {x} is not unique", "regions")
+            self._landmark_list(f, [_d(x) for x in _l(rf.get("landmarks"))], "L-RGN-00")
             landmarks = {_d(x).get("id") for x in _l(rf.get("landmarks"))}
             for i, x in enumerate(regions):
+                self._region_rule(f, f"regions[{i}]", x)
                 if x.get("landmark") not in landmarks:
                     self.add("L-RGN-00", f, f"region landmark {x.get('landmark')} is not a landmark of this file", f"regions[{i}].landmark")
             for i, a in enumerate(regions):
@@ -1491,7 +1990,7 @@ class _Linter:
                         ok = (a.get("type") == "mask" and _inside(ra, rb)) or (b.get("type") == "mask" and _inside(rb, ra))
                         if not ok:
                             self.add("L-RGN-02", f, f"{a.get('id')} ({a.get('type')}) overlaps {b.get('id')} ({b.get('type')})", "regions")
-            mode = self._cp_mode(cid)
+            mode, c = self._cp_mode(cid), self.defined.get(cid)
             for i, x in enumerate(regions):
                 at, t, rid = f"regions[{i}]", x.get("type"), x.get("id")
                 if ("rule" in x) != (t == "rule"):
@@ -1510,21 +2009,76 @@ class _Linter:
                 if fe is not None:
                     fe = _d(fe)
                     exp = _ts(fe.get("expires_at"))
-                    if not all(fe.get(k) for k in ("approved_by", "reason", "ticket")) or exp is None or exp <= self.now:
+                    if not all(fe.get(k) for k in ("approved_by", "reason", "ticket")) or exp is None:
                         self.add("L-RGN-05", f, "floor_exception carries approved_by, reason, ticket and a future expires_at", f"{at}.floor_exception")
+                    elif exp <= self.now:
+                        self.expiry(ExpiredRecord("floor_exception_expired", _s(rid), cid, f, f"{at}.floor_exception",
+                                                  _s(fe.get("expires_at")), "L-RGN-05", _s(fe.get("owner"))),
+                                    f"floor_exception on {rid} expired at {fe.get('expires_at')}")
                     if t != "diff":
                         self.add("L-RGN-05", f, "floor_exception is allowed on diff regions only", f"{at}.floor_exception")
-                if x.get("money_cell") is True:
-                    if t not in ("diff", "freeze"):
-                        self.add("L-RGN-04", f, f"money cell {rid} is {t}; money cells are diff or freeze", at)
-                    if "floor_exception" in x:
-                        self.add("L-RGN-04", f, f"money cell {rid} carries a floor_exception", f"{at}.floor_exception")
-                    c = self.defined.get(cid)
-                    if c and c.kind == "flow" and rid not in self._asserted_regions(c):
-                        self.add("L-RGN-04", f, f"money cell {rid} is not named by an assertion of {cid}", at)
-                if t == "mask" and mode == "frozen" and _s(rid).rsplit(".", 1)[-1] not in FROZEN_MASK_SEGMENTS:
-                    self.add("L-RGN-07", f, f"mask {rid} on a frozen checkpoint; only the clock, connection indicator, caret or parking rectangle", at)
+                if _is_money_cell(x):
+                    self._money_cell(f, at, x, cid, c)
+                if t == "mask" and mode == "frozen":
+                    seg = _s(rid).rsplit(".", 1)[-1]
+                    if seg not in FROZEN_MASK_SEGMENTS:
+                        self.add("L-RGN-07", f, f"mask {rid} on a frozen checkpoint; only the clock, connection indicator, "
+                                                "parking rectangle or, with keep_focus, the caret", at)
+                    elif seg == CARET_SEGMENT and not (c and c.keep_focus):
+                        self.add("L-RGN-07", f, f"caret mask {rid} on a frozen checkpoint without keep_focus: true (3.5, SD-27)", at)
             self._mask_budget(cid, f, regions)
+        red = self.r.one("redaction")
+        if red:
+            self._landmark_list(red.rel, [_d(x) for x in _l(_d(red.data).get("landmarks"))], "L-MSK-03")
+
+    def _landmark_list(self, f: str, landmarks: list[dict], rule: str) -> None:
+        """Landmarks of a regions file or of redaction/anchors.yaml: ids unique, templates PNG of 16x16 to
+        400x400 that exist (4.1), confidence_min in (0, 1] (3.7)."""
+        ids = [x.get("id") for x in landmarks]
+        for x in sorted({i for i in ids if ids.count(i) > 1}, key=str):
+            self.add(rule, f, f"landmark id {x} is not unique", "landmarks")
+        for i, x in enumerate(landmarks):
+            err, w, h, _ = self.png(x.get("template"))
+            if err or not (16 <= w <= 400 and 16 <= h <= 400):
+                self.add(rule, f, err or f"template {x.get('template')} is {w}x{h}; templates are 16x16 to 400x400",
+                         f"landmarks[{i}].template")
+            cm = x.get("confidence_min")
+            if cm is not None and not ((v := _num(cm)) is not None and 0 < v <= 1):
+                self.add(rule, f, f"confidence_min {cm!r} is not in (0, 1]", f"landmarks[{i}].confidence_min")
+
+    def _region_rule(self, f: str, at: str, x: dict) -> None:
+        """A region's `rule` block (4.8): its pattern compiles, min <= max, must_advance only on a time field."""
+        rule = _d(x.get("rule"))
+        if isinstance(rule.get("pattern"), str):
+            try:
+                re.compile(rule["pattern"])
+            except re.error as exc:
+                self.add("L-RGN-00", f, f"rule pattern does not compile: {exc}", f"{at}.rule.pattern")
+        lo, hi = _num(rule.get("min")), _num(rule.get("max"))
+        if lo is not None and hi is not None and lo > hi:
+            self.add("L-RGN-00", f, f"rule min {lo:g} is above max {hi:g}", f"{at}.rule")
+        if rule.get("must_advance") is True and rule.get("field") != "time":
+            self.add("L-RGN-00", f, f"must_advance is for time fields, not {rule.get('field')}", f"{at}.rule.must_advance")
+
+    def _money_cell(self, f: str, at: str, x: dict, cid: str, c: CheckpointDef | None) -> None:
+        """L-RGN-04: a money cell is never a mask and keeps a zero floor. On a flow checkpoint it is diff or freeze
+        and named by an assertion of the checkpoint; on a census checkpoint, which has no assertions, a money cell of
+        the closed list (a `money_role`, or a money_cell on an order panel) is a rule region, which the census
+        Oracle checks run (SD-29). On a sweep or split checkpoint the spec names no kind beyond never mask (choice 16)."""
+        t, rid = x.get("type"), x.get("id")
+        if t == "mask":
+            self.add("L-RGN-04", f, f"money cell {rid} is a mask; a money cell is never masked", at)
+        if "floor_exception" in x:
+            self.add("L-RGN-04", f, f"money cell {rid} carries a floor_exception", f"{at}.floor_exception")
+        if c and c.kind == "flow":
+            if t not in ("diff", "freeze"):
+                self.add("L-RGN-04", f, f"money cell {rid} is {t}; on a flow checkpoint money cells are diff or freeze", at)
+            if rid not in self._asserted_regions(c):
+                self.add("L-RGN-04", f, f"money cell {rid} is not named by an assertion of {cid}", at)
+        elif c and c.kind == "census" and t != "rule" and (
+                x.get("money_role") is not None or x.get("panel") in MONEY_PANELS):
+            self.add("L-RGN-04", f, f"money cell {rid} is {t} on census checkpoint {cid}; on a census checkpoint every "
+                                    "money cell is a rule region, so the census Oracle checks assert it (SD-29)", at)
 
     def _asserted_regions(self, c: CheckpointDef) -> set[str]:
         """Regions named by the checkpoint's expect entries and by assert steps before the next checkpoint."""
@@ -1547,31 +2101,18 @@ class _Linter:
         return out
 
     def _mask_budget(self, cid: str, f: str, regions: list[dict]) -> None:
+        """L-MSK-03 by the run-time geometry (choice 9): every mask region and non-identity redaction box on a
+        landmark covers the panels on it whatever its own panel label, overlaps counted once; budgets from the Diff
+        Engine parameters file. No mask or box, identity or not, touches a money cell (4.8 mask budget, S-21)."""
         doc = self.regions.get(cid)
         landmarks = {_d(x).get("id") for x in _l(_d(doc.data).get("landmarks") if doc else [])}
-        masks = [x for x in regions if x.get("type") == "mask"]
         boxes = [x for x in self.redaction if x.get("landmark") in landmarks]
-        # identity_field exempts a redaction box from the panel share only; no mask or box ever covers a money cell
-        # (4.8 mask budget, S-21)
-        for m in masks + boxes:
-            rm = _rect(m.get("rect"))
-            for x in regions:
-                rx = _rect(x.get("rect"))
-                if x.get("money_cell") is True and rm and rx and x.get("landmark") == m.get("landmark") and _overlap(rm, rx):
-                    self.add("L-MSK-03", f, f"mask or redaction box {m.get('id')} covers money cell {x.get('id')} (budget 0 percent)")
-        masks += [x for x in boxes if x.get("identity_field") is not True]
-        for panel, budget in MASK_BUDGET.items():
-            for lm in landmarks:
-                members = [x for x in regions + masks if x.get("panel", "other") == panel and x.get("landmark") == lm and _rect(x.get("rect"))]
-                masked = sum(_rect(x["rect"])[2] * _rect(x["rect"])[3] for x in masks if x in members)  # type: ignore[index]
-                if not masked:
-                    continue
-                rects = [_rect(x["rect"]) for x in members]
-                x0, y0 = min(r[0] for r in rects), min(r[1] for r in rects)  # type: ignore[index]
-                x1, y1 = max(r[0] + r[2] for r in rects), max(r[1] + r[3] for r in rects)  # type: ignore[index]
-                share = masked / max(1, (x1 - x0) * (y1 - y0))
-                if share > budget:
-                    self.add("L-MSK-03", f, f"{panel} panel is {share:.1%} masked; the budget is {budget:.0%} (mask budget, 4.8)")
+        for cell, by in money_cells_covered(regions, boxes):
+            self.add("L-MSK-03", f, f"mask or redaction box {by} covers money cell {cell} (budget 0 percent)")
+        for p in panel_share(regions, boxes, budgets=self.budgets):
+            if p.exceeded:
+                self.add("L-MSK-03", f, f"{p.panel} panel on {p.landmark} is {p.share:.1%} masked; the budget is "
+                                        f"{p.budget:.0%} (mask budget, 4.8)")
 
     def check_masks(self) -> None:
         for doc in self.r.of("mask"):
@@ -1580,7 +2121,9 @@ class _Linter:
                 self.add("L-MSK-01", f, "created_by is human; the Reviewer may propose a mask, never create one", "created_by")
             exp = _ts(m.get("expires_at"))
             if exp is not None and exp <= self.now:
-                self.add("L-MSK-02", f, f"mask expired at {m.get('expires_at')}; renew it with the latest A/A result or remove it", "expires_at")
+                self.expiry(ExpiredRecord("mask_expired", _s(m.get("mask_id")), _s(m.get("checkpoint_id")), f, "expires_at",
+                                          _s(m.get("expires_at")), "L-MSK-02", _s(m.get("owner"))),
+                            f"mask expired at {m.get('expires_at')}; renew it with the latest A/A result or remove it")
             want = f"masks/{m.get('checkpoint_id')}/{m.get('mask_id')}.yaml"
             cid = _s(m.get("checkpoint_id"))
             if f != want:
@@ -1619,9 +2162,10 @@ class _Linter:
                 self.add("L-FIX-02", f, f"exactly one golden and at most one empty account (found {roles.count('golden')} and {roles.count('empty')})", "accounts")
             for sid, s in symbols.items():
                 if s.get("asset") == "future" and set(_l(s.get("purpose"))) & {"ticket", "ladder"}:
-                    rd = _date(s.get("roll_date"))
-                    if not FUTURE_MONTH.match(_s(s.get("symbol"))) or rd is None or rd <= self.today:
-                        self.add("L-FIX-03", f, f"futures symbol {sid} needs a month code, year and a future roll_date (expired contracts fail)", "symbols")
+                    problem = self._contract_problem(_s(s.get("symbol")), _date(s.get("roll_date")))
+                    if problem:
+                        self.add("L-FIX-03", f, f"futures symbol {sid} {problem}; ticket and ladder futures carry a month "
+                                                "code, year and a future roll_date, and expired contracts fail", "symbols")
             if not _s(fx.get("login_ref")).startswith("vault://"):
                 self.add("L-FIX-04", f, "login_ref is a vault:// reference, never the value", "login_ref")
             for loc, line in _walk_strings(fx):
@@ -1643,6 +2187,21 @@ class _Linter:
                 self.add("L-FIX-05", f, f"order_defaults_profile {fx.get('order_defaults_profile')} is not an order_defaults profile in profiles/", "order_defaults_profile")
             self._fixture_epoch(fx, f, symbols)
             self._fixture_positions(fx, f, accounts, symbols, ids)
+
+    def _contract_problem(self, symbol: str, roll: date | None) -> str | None:
+        """L-FIX-03 on one futures symbol: month code and year present, contract month not before today's month,
+        roll_date in the future and not after the contract month (a roll falls before the contract expires)."""
+        m = FUTURE_MONTH.match(symbol)
+        if not m:
+            return f"{symbol!r} has no month code and year"
+        year, month = 2000 + int(m.group("year")), MONTH_CODES.index(m.group("month")) + 1
+        if (year, month) < (self.today.year, self.today.month):
+            return f"{symbol} is an expired contract ({year}-{month:02d})"
+        if roll is None or roll <= self.today:
+            return f"roll_date {roll} is not in the future"
+        if (roll.year, roll.month) > (year, month):
+            return f"roll_date {roll} falls after the contract month {year}-{month:02d}"
+        return None
 
     def _fixture_epoch(self, fx: dict, f: str, symbols: dict[Any, dict]) -> None:
         ep = fx.get("epoch")
@@ -1747,8 +2306,13 @@ class _Linter:
             except re.error as exc:
                 self.add("L-POP-01", f, f"title_regex does not compile: {exc}", f"{at}.title_regex")
             action, oa = p.get("action"), p.get("on_abort")
-            if action == "dismiss_key" and _s(p.get("key")).replace(" ", "").casefold() in ENTER_KEYS:
+            if action == "dismiss_key" and isinstance(p.get("key"), str) and _chord(p["key"]) in ENTER_KEYS:
                 self.add("L-POP-02", f, f"dismiss key {p.get('key')} is Enter, Space or Ctrl+Enter", f"{at}.key")
+            for fld, owner in (("key", "dismiss_key"), ("target", "click"), ("wait_timeout_ms", "wait")):
+                if action == owner and p.get(fld) is None and owner != "click":   # a click target is checked below
+                    self.add("L-POP-04", f, f"action {owner} requires {fld}", f"{at}.{fld}")
+                elif action != owner and p.get(fld) is not None:
+                    self.add("L-POP-04", f, f"{fld} belongs to action {owner}, not {action}", f"{at}.{fld}")
             if rx and any(rx.search(t) for t in ("Order Confirmation", "Confirm", "Send")):
                 oad = _d(oa)
                 if not (p.get("class") == "safety" and action not in ("dismiss_key", "click") and oad.get("outcome") == "aborted_run"
@@ -1806,7 +2370,9 @@ class _Linter:
             if ids.count(mid) > 1:
                 self.add("L-MUT-01", f, f"mutant_id {mid} is not unique", f"{at}.mutant_id")
             gen = _d(m.get("generator"))
-            if gen.get("seed", MUTANT_SEED) != MUTANT_SEED:
+            if "seed" not in gen:
+                self.add("L-MUT-01", f, f"generator seed is missing; every entry carries seed {MUTANT_SEED}", f"{at}.generator.seed")
+            elif gen.get("seed") != MUTANT_SEED:
                 self.add("L-MUT-01", f, f"generator seed {gen.get('seed')} is not the catalog seed {MUTANT_SEED}", f"{at}.generator.seed")
             cid = _s(m.get("checkpoint_id"))
             if m.get("region_ref") not in self.region_map(cid):
@@ -2044,15 +2610,19 @@ def run_check_modules(repo: Repo, add: Callable[..., None], phase: int, today: d
 
 
 def lint_repo(repo: Repo, phase: int = 0, today: date | None = None,
-              flow_p50_s: dict[str, float] | None = None) -> LintReport:
+              flow_p50_s: dict[str, float] | None = None, run_start: bool = False) -> LintReport:
     """Lint a loaded repository (4.1, 4.15). `flow_p50_s` gives measured flow p50s for L-FLW-10. The rule modules
-    of sentinel.lint.checks run after the built-in rules; a pending row a module implements is not skipped."""
-    linter = _Linter(repo, phase, today or date.today(), flow_p50_s)
+    of sentinel.lint.checks run after the built-in rules; a pending row a module implements is not skipped.
+
+    `run_start=True` is the Orchestrator's run-start lint: an expired mask, floor exception or invariant exception
+    is not a violation there (L-MSK-02 "ignored at run start", L-RGN-05, L-SRF-11) but an `ExpiredRecord` in
+    `LintReport.expired`, which the run drops and lists in run health (see `sentinel.lint.runstart`)."""
+    linter = _Linter(repo, phase, today or date.today(), flow_p50_s, run_start)
     linter.run()
     implemented = run_check_modules(linter.r, linter.add, linter.phase, linter.today)
     skipped = {rid: r.skipped for rid, r in RULES.items()
                if r.skipped and not (r.skipped == _PENDING and rid in implemented)}
-    return LintReport(sorted(set(linter.out)), skipped)
+    return LintReport(sorted(set(linter.out)), skipped, sorted(set(linter.expired)))
 
 
 def lint(root: str | Path, phase: int = 0, today: date | None = None) -> LintReport:
@@ -2062,6 +2632,52 @@ def lint(root: str | Path, phase: int = 0, today: date | None = None) -> LintRep
 
 def _fpr(rule: str, file: str, message: str, path: str = "") -> Violation:
     return Violation(file, rule, RULES[rule].severity, path, message)
+
+
+# 4.2 L-BLD-04: run type -> (base_rule, candidate channel, base channel)
+PAIR_RULES = {
+    "pr": ("merge_base_main", "branch", "main"), "merge": ("previous_main", "main", "main"),
+    "rc": ("last_released", "rc", "released"), "nightly": ("same_build", None, None),
+    "calibration": ("same_build", None, None),
+}
+
+
+def check_pair(pair: Any, builds: Mapping[str, Any], file: str = "build_pair") -> list[Violation]:
+    """L-BLD-04 and L-BLD-05 on one build pair record, the check run at run creation (4.2): a pair with any
+    violation is refused, the run is never queued, and the requester gets the rule ids.
+
+    `pair` is the 4.2 `build_pair` (run_type, candidate, base, base_rule, lineage_baseline_set); `builds` maps a
+    build id to its 4.2 `build` record (channel, commit_sha, merge_base_sha). A build absent from `builds` is read
+    by its id's channel prefix. The config lint runs the same check on every `builds/*.yaml` pair."""
+    p = _d(pair)
+    out: list[Violation] = []
+
+    def add(rule: str, message: str, path: str) -> None:
+        out.append(_fpr(rule, file, message, path))
+
+    cand, base, rule, rt = p.get("candidate"), p.get("base"), p.get("base_rule"), p.get("run_type")
+    if rt in PAIR_RULES:
+        want_rule, want_c, want_b = PAIR_RULES[rt]
+        if rule != want_rule:
+            add("L-BLD-04", f"run_type {rt} requires base_rule {want_rule}, not {rule}", "build_pair.base_rule")
+        cc = _d(builds.get(cand)).get("channel", _channel(cand))
+        bc = _d(builds.get(base)).get("channel", _channel(base))
+        if want_c and cc != want_c:
+            add("L-BLD-04", f"run_type {rt} requires a {want_c} candidate, not {cc}", "build_pair.candidate")
+        if want_b and bc != want_b:
+            add("L-BLD-04", f"run_type {rt} requires a {want_b} base, not {bc}", "build_pair.base")
+        if rt == "pr":
+            mb = _s(_d(builds.get(cand)).get("merge_base_sha"))
+            base_sha = _s(_d(builds.get(base)).get("commit_sha"))
+            if not mb:
+                add("L-BLD-04", f"candidate {cand} has no merge_base_sha in builds/", "build_pair.candidate")
+            elif (base_sha and base_sha != mb) or (not base_sha and not mb.startswith(_short_sha(base))):
+                add("L-BLD-04", f"base {base} is not the candidate's merge base {mb[:7]}", "build_pair.base")
+        if rt == "rc" and not p.get("lineage_baseline_set"):
+            add("L-BLD-04", "rc pairs carry lineage_baseline_set", "build_pair.lineage_baseline_set")
+    if cand == base and rule != "same_build":
+        add("L-BLD-05", f"candidate equals base ({cand}) without base_rule same_build", "build_pair")
+    return out
 
 
 def lint_fingerprint(fp: Any, file: str = "fingerprint") -> list[Violation]:

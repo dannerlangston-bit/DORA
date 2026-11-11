@@ -103,10 +103,11 @@ def test_journal_lines_equal_the_dropped_rows(tmp_path):
     g = GatewayState(armed=True)
     g.stamp_watcher(Flag.SET, T)
     g.issue_key(0x0D, T)
+    g.issue_click(50, 50, T)                                                        # pending until its down
     buf = segment(g)
     d = drainer(tmp_path)
     decide_from_segment(buf, HookEvent("key_down", vk=0x0D), to_ns(T))              # blocked under the flag
-    decide_from_segment(buf, HookEvent("move", 5, 5), to_ns(T))                     # token pending: dropped
+    decide_from_segment(buf, HookEvent("move", 5, 5), to_ns(T))                     # click token pending: dropped
     g2_rows = d.drain_ring(buf)
     dropped = [r for r in g2_rows if r.gate_decision == "dropped"]
     assert [r.gate_reason for r in dropped] == ["blocked_key_dialog", "move_outside_allow"]

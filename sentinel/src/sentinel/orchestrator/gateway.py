@@ -109,6 +109,23 @@ Choices where the spec is ambiguous (reported):
 16. Incident severities (6.12): the per-flow threshold's quarantine is S3 ("drop or refusal count above the per-flow
    threshold"); every result that runs the kill switch is S2 at least ("kill switch tripped with a clean proof"),
    which the proof raises to S1 when it finds an undeclared row (6.6).
+17. Token lifecycle on drops and expiry (5.4.2, 5.4.3 stage 7, 5.4.4, 5.4.5). Expiry ends an armed token: tokens
+   "expire on monotonic time, so a stalled emitter cannot leave a live token behind" (5.4.2, 5.4.5). So an armed
+   token past its expiry is not "pending" for the move rule (`Token.pending`), and its slot can be reused
+   (`GatewayState._slot`, when all sixteen are taken). A half consumed token stays pending past expiry: its up is
+   still accepted, and moves stay dropped until that up or `reset_input_state` (the drag case of 5.4.5). A rule 1
+   or rule 2 drop (`deny_all`, `not_armed`, `blocked_key_dialog`, `blocked_chord_dialog`, `shift_click_dialog`) of
+   the emitter's button down, key down or wheel spends the token rule 3 would have used. That token becomes
+   `dropped` with the reason, so stage 7 reads the token "in state `dropped`" with its safety reason. The hook
+   cannot tell which token another origin's event or an up belongs to, so those drops spend none. Every other
+   unused token (after `no_token` or `token_mismatch_coords`, or when the event never came) ends at its expiry.
+   Without this rule, one click dropped under deny-all left its token armed forever, and every later move was
+   dropped `move_outside_allow`.
+18. Several matching tokens (5.4.4 Button down and Key down rows: allowed when "a token with the same button,
+   abs(dx) and abs(dy) <= tol_px, unexpired, state `armed`" exists). Rule 3 takes the first unexpired armed match in
+   issue order and falls back to the first expired one only when every match has expired, which keeps the
+   `token_expired` drop (5.4.5). So a dead token left armed after `token_mismatch_coords` or `no_token` cannot drop
+   a fresh token's down `token_expired`. A wheel match is unexpired already (choice 5).
 """
 from __future__ import annotations
 
@@ -281,7 +298,14 @@ class Token:
 
     @property
     def live(self) -> bool:
+        """The hook has not finished with the token: `armed` or `half_consumed`, whatever the time."""
         return self.state in ("armed", "half_consumed")
+
+    def pending(self, now: float) -> bool:
+        """Still pending at `now` (choice 17): `half_consumed` (its up is accepted expired or not, 5.4.4), or
+        `armed` and unexpired. An armed token past its expiry is dead (5.4.2, 5.4.5): it blocks no move and its
+        slot can be reused."""
+        return self.state == "half_consumed" or (self.state == "armed" and now <= self.expires)
 
 
 @dataclass(frozen=True)
@@ -345,9 +369,17 @@ class GatewayState:
         return self.hook_host_alive and now - self.hook_alive_mono_ts < HOOK_ALIVE_MAX_S
 
     # -- stage 5: token write -------------------------------------------------------------------------
-    def _slot(self) -> int:
+    def _slot(self, now: float) -> int:
+        """The next token id, after freeing slots (5.4.5 "Sixteen slots suffice"; choice 17). A token the hook has
+        finished with (consumed, dropped, expired) leaves at once. When all sixteen slots are still taken, every
+        armed token past its expiry leaves too: expiry ends a token (5.4.2), so a token whose event never came
+        cannot hold a slot for the rest of the session. A half consumed token keeps its slot until its up or
+        `reset_input_state`."""
         for tid in [t.id for t in self.tokens.values() if not t.live]:
             del self.tokens[tid]
+        if len(self.tokens) >= TOKEN_SLOTS:
+            for tid in [t.id for t in self.tokens.values() if not t.pending(now)]:
+                del self.tokens[tid]
         if len(self.tokens) >= TOKEN_SLOTS:
             raise GatewayError("all 16 token slots hold live tokens")
         tid = self._next_id
@@ -362,7 +394,7 @@ class GatewayState:
         A `send_ok` token (the gated branch's single-use send token, 6.7) opens one pass through the Send deny
         rectangle for its own button down; the token is then half consumed, so a second click is `no_token`."""
         expiry = TOKEN_EXPIRY_S if hold_ms is None else hold_ms / 1000 + DRAG_EXTRA_S
-        t = Token(self._slot(), "click", x, y, button=button, expires=now + expiry, dialog_ok=dialog_ok,
+        t = Token(self._slot(now), "click", x, y, button=button, expires=now + expiry, dialog_ok=dialog_ok,
                   send_ok=send_ok)
         if send_ok:
             self.send_rect_passed = False
@@ -374,12 +406,12 @@ class GatewayState:
         self.move_allow = MoveAllow(now + hold_ms / 1000 + DRAG_EXTRA_S, path)
 
     def issue_key(self, vk: int, now: float, *, secret: bool = False) -> Token:
-        t = Token(self._slot(), "key", vk=vk, expires=now + TOKEN_EXPIRY_S, secret=secret)
+        t = Token(self._slot(now), "key", vk=vk, expires=now + TOKEN_EXPIRY_S, secret=secret)
         self.tokens[t.id] = t
         return t
 
     def issue_wheel(self, x: int, y: int, sign: int, now: float) -> Token:
-        t = Token(self._slot(), "wheel", x, y, sign=1 if sign > 0 else -1, expires=now + TOKEN_EXPIRY_S)
+        t = Token(self._slot(now), "wheel", x, y, sign=1 if sign > 0 else -1, expires=now + TOKEN_EXPIRY_S)
         self.tokens[t.id] = t
         return t
 
@@ -387,10 +419,10 @@ class GatewayState:
         """`reset_input_state`: release tokens for Shift, Ctrl, Alt, Win and every mouse button (5.4.10)."""
         out = []
         for vk in (VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN):
-            out.append(Token(self._slot(), "release", vk=vk, expires=now + TOKEN_EXPIRY_S))
+            out.append(Token(self._slot(now), "release", vk=vk, expires=now + TOKEN_EXPIRY_S))
             self.tokens[out[-1].id] = out[-1]
         for b in ("left", "right", "middle"):
-            out.append(Token(self._slot(), "release", button=b, expires=now + TOKEN_EXPIRY_S))
+            out.append(Token(self._slot(now), "release", button=b, expires=now + TOKEN_EXPIRY_S))
             self.tokens[out[-1].id] = out[-1]
         return out
 
@@ -445,7 +477,9 @@ class HookDecision:
 
 
 def _drop(reason: str, token: Token | None = None) -> HookDecision:
-    if token is not None and reason in ("token_expired", "deny_rect", "dialog_not_ok"):
+    """Drop the event; a token the drop belongs to is spent: `expired` on `token_expired`, else `dropped`, with the
+    reason it carries to stage 7 of 5.4.3."""
+    if token is not None:
         token.state = "expired" if reason == "token_expired" else "dropped"
         token.drop_reason = reason
     return HookDecision(False, reason, token.id if token else None)
@@ -455,12 +489,45 @@ def _near(t: Token, e: InputEvent) -> bool:
     return abs(t.x - e.x) <= t.tol_px and abs(t.y - e.y) <= t.tol_px
 
 
+def _unexpired_first(cands: list[Token], now: float) -> Token:
+    """The first unexpired token in issue order, else the first (expired) one (choice 18)."""
+    return next((t for t in cands if now <= t.expires), cands[0])
+
+
+def _match(state: GatewayState, e: InputEvent, now: float) -> tuple[str | None, Token | None]:
+    """The token rule 3 acts on for the emitter's button down, key down or wheel event (5.4.4): the first unexpired
+    match in issue order, else the first expired one (choice 18), or the reason none matches (`no_token`,
+    `token_mismatch_coords`). Moves, ups and every other origin match none here."""
+    if e.origin != "emitter" or e.type not in ("button_down", "key_down", "wheel"):
+        return "no_token", None
+    if e.type == "key_down":
+        keys = [t for t in state.tokens.values() if t.kind == "key" and t.vk == e.vk and t.state == "armed"]
+        return (None, _unexpired_first(keys, now)) if keys else ("no_token", None)
+    if e.type == "button_down":
+        cands = [t for t in state.tokens.values()
+                 if t.kind == "click" and t.button == e.button and t.state == "armed"]
+    else:
+        sign = 1 if e.delta > 0 else -1
+        cands = [t for t in state.tokens.values()
+                 if t.kind == "wheel" and t.state == "armed" and t.sign == sign and now <= t.expires]
+    if not cands:
+        return "no_token", None
+    near = [t for t in cands if _near(t, e)]
+    return (None, _unexpired_first(near, now)) if near else ("token_mismatch_coords", None)
+
+
+def _spend(state: GatewayState, e: InputEvent, now: float, reason: str) -> HookDecision:
+    """A rule 1 or rule 2 drop (choice 17): the token the event would have used is spent `dropped` with the
+    reason, so stage 7 reads the safety reason (5.4.3) and the token no longer counts as pending (5.4.4 move rule)."""
+    return _drop(reason, _match(state, e, now)[1])
+
+
 def hook_decide(state: GatewayState, e: InputEvent, now: float) -> HookDecision:
     """The fast half (5.4.4; 6.2 rules 1 to 4). Updates token states in `state` as the hook does."""
     if state.deny_all:                                                       # rule 1
-        return _drop("deny_all")
+        return _spend(state, e, now, "deny_all")
     if not state.armed:
-        return _drop("not_armed")
+        return _spend(state, e, now, "not_armed")
     if e.origin == "console":                                                # rule 4
         return _drop("foreign_input")
     flag = state.effective_flag(now)
@@ -468,40 +535,19 @@ def hook_decide(state: GatewayState, e: InputEvent, now: float) -> HookDecision:
         if e.type == "key_down":
             mods = e.mods | ({MODIFIER_VK[e.vk]} if e.vk in MODIFIER_VK else set())
             if mods & CHORD_MODS or Chord(frozenset(e.mods), e.vk) in state.chords:
-                return _drop("blocked_chord_dialog")
+                return _spend(state, e, now, "blocked_chord_dialog")
             if e.vk in state.blocked_vk:
-                return _drop("blocked_key_dialog")
+                return _spend(state, e, now, "blocked_key_dialog")
         if e.type == "button_down" and "shift" in e.mods:
-            return _drop("shift_click_dialog")
+            return _spend(state, e, now, "shift_click_dialog")
     tokened = e.origin == "emitter"                                          # rule 3
     if e.type == "move":
         ma = state.move_allow
         if ma is not None and now <= ma.until and ma.bbox.contains(e.x, e.y):
             return HookDecision(True)
-        if not any(t.live and t.kind != "release" for t in state.tokens.values()):
+        if not any(t.kind != "release" and t.pending(now) for t in state.tokens.values()):
             return HookDecision(True)
         return _drop("move_outside_allow")
-    if e.type == "button_down":
-        cands = [t for t in state.tokens.values()
-                 if tokened and t.kind == "click" and t.button == e.button and t.state == "armed"]
-        if not cands:
-            return _drop("no_token")
-        near = [t for t in cands if _near(t, e)]
-        if not near:
-            return _drop("token_mismatch_coords")
-        t = near[0]
-        if now > t.expires:
-            return _drop("token_expired", t)
-        for d in state.deny_rects:
-            if d.rect.contains(e.x, e.y):
-                if t.send_ok and d.label.lower() == "send" and not state.send_rect_passed:
-                    state.send_rect_passed = True                            # 6.7: once
-                    continue
-                return _drop("deny_rect", t)
-        if flag != Flag.CLEAR and not t.dialog_ok:
-            return _drop("dialog_not_ok", t)
-        t.state = "half_consumed"
-        return HookDecision(True, token_id=t.id)
     if e.type in ("button_up", "key_up"):
         key = "button" if e.type == "button_up" else "vk"
         val = e.button if e.type == "button_up" else e.vk
@@ -515,24 +561,23 @@ def hook_decide(state: GatewayState, e: InputEvent, now: float) -> HookDecision:
                 t.state = "consumed"                                         # a release alone activates nothing
                 return HookDecision(True, token_id=t.id)
         return _drop("no_token")
+    miss, t = _match(state, e, now)                                          # button down, key down, wheel
+    if t is None:
+        return _drop(miss or "no_token")
     if e.type == "wheel":
-        sign = 1 if e.delta > 0 else -1
-        cands = [t for t in state.tokens.values() if tokened and t.kind == "wheel" and t.state == "armed"
-                 and t.sign == sign and now <= t.expires]
-        if not cands:
-            return _drop("no_token")
-        near = [t for t in cands if _near(t, e)]
-        if not near:
-            return _drop("token_mismatch_coords")
-        near[0].state = "consumed"
-        return HookDecision(True, token_id=near[0].id)
-    # key_down
-    cands = [t for t in state.tokens.values() if tokened and t.kind == "key" and t.vk == e.vk and t.state == "armed"]
-    if not cands:
-        return _drop("no_token")
-    t = cands[0]
+        t.state = "consumed"
+        return HookDecision(True, token_id=t.id)
     if now > t.expires:
         return _drop("token_expired", t)
+    if e.type == "button_down":
+        for d in state.deny_rects:
+            if d.rect.contains(e.x, e.y):
+                if t.send_ok and d.label.lower() == "send" and not state.send_rect_passed:
+                    state.send_rect_passed = True                            # 6.7: once
+                    continue
+                return _drop("deny_rect", t)
+        if flag != Flag.CLEAR and not t.dialog_ok:
+            return _drop("dialog_not_ok", t)
     t.state = "half_consumed"
     return HookDecision(True, token_id=t.id)
 

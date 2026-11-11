@@ -638,6 +638,26 @@ def money_cells_covered(regions: Iterable[Any], masks: Iterable[Any] = (),
     return hits
 
 
+def _labels(control: dict) -> set[str]:
+    """The casefolded texts a control is known by: its OCR text and its JAB name, the accessible title (4.5)."""
+    return {t.strip().casefold() for t in (_s(control.get("ocr_text")), _s(_d(control.get("jab")).get("name"))) if t.strip()}
+
+
+def _is_cancel_all(control: dict) -> bool:
+    """Cancel All by id, OCR text or JAB name (L-FLW-19)."""
+    return control.get("id") == "cancel-all" or "cancel all" in _labels(control)
+
+
+def _is_send(control: dict) -> bool:
+    """The Order Confirmation dialog's Send button by id, OCR text or JAB name (6.7)."""
+    return control.get("id") in ("send", "send-button") or "send" in _labels(control)
+
+
+def _is_cancel(control: dict) -> bool:
+    """A cancel action other than Cancel All: id, OCR text or JAB name naming cancel (6.7 "the row's cancel action")."""
+    return not _is_cancel_all(control) and ("cancel" in _s(control.get("id")) or any("cancel" in t for t in _labels(control)))
+
+
 def _channel(build_id: str) -> str:
     return build_id.split("-", 1)[0] if isinstance(build_id, str) else ""
 
@@ -1157,7 +1177,7 @@ class _Linter:
             controls = [_d(x) for x in _l(s.get("controls"))]
             if s.get("tier") == 1:
                 missing = [what for what, ok in (
-                    ("owner", bool(s.get("owner"))), ("smoke: true", s.get("smoke") is True),
+                    ("owner", bool(s.get("owner"))),
                     ("a must_see landmark", any(x.get("must_see") is True for x in landmarks)),
                     ("anti_anchors", bool(_l(s.get("anti_anchors")))), ("labels", bool(_l(s.get("labels")))),
                     ("a required control", any(c.get("required") is True for c in controls))) if not ok]
@@ -1238,10 +1258,13 @@ class _Linter:
                     if cur in chain:
                         self.add("L-SRF-11", f, f"parent chain of {sid} has a cycle at {cur}", "parent")
             for i, x in enumerate(map(_d, _l(s.get("invariant_exceptions")))):
-                exp = _ts(x.get("expires_at"))
-                if not (x.get("owner") and x.get("reason")) or exp is None or exp <= self.now:
-                    self.add("L-SRF-11", f, "an invariant exception carries owner, reason and a future expires_at",
-                             f"invariant_exceptions[{i}]")
+                exp, at = _ts(x.get("expires_at")), f"invariant_exceptions[{i}]"
+                if not (x.get("owner") and x.get("reason")) or exp is None:
+                    self.add("L-SRF-11", f, "an invariant exception carries owner, reason and a future expires_at", at)
+                elif exp <= self.now:
+                    self.expiry(ExpiredRecord("invariant_exception_expired", _s(x.get("invariant_id")), sid, f, at,
+                                              _s(x.get("expires_at")), "L-SRF-11", _s(x.get("owner"))),
+                                f"invariant exception {x.get('invariant_id')} expired at {x.get('expires_at')}")
             for i, sp in enumerate(splitters):
                 if sp.get("host") not in hosts:
                     self.add("L-SRF-13", f, f"splitter host {sp.get('host')} is not in hosts", f"splitters[{i}].host")
@@ -1440,8 +1463,7 @@ class _Linter:
                     self.add("L-FLW-13", f, f"step targets {t}, a denied control", f"{at}.{k}")
                 if self.rungs(t) < 2:
                     self.add("L-FLW-17", f, f"target {t} resolves on fewer than two rungs (template plus jab or ocr_text)", f"{at}.{k}")
-                cancel_all = c.get("id") == "cancel-all" or _s(c.get("ocr_text")).strip().casefold() == "cancel all"
-                if cancel_all and st.get("type") in ("click_named", "rclick", "dblclick"):
+                if _is_cancel_all(c) and st.get("type") in ("click_named", "rclick", "dblclick"):
                     self.add("L-FLW-19", f, f"{st.get('type')} targets Cancel All; only the cancel_all teardown may", f"{at}.{k}")
         if cls == "login" and fl.get("agent_fallback") != "disabled":
             self.add("L-FLW-06", f, "login flows have agent_fallback: disabled", "agent_fallback")
@@ -1563,9 +1585,10 @@ class _Linter:
                     self.add("L-FLW-11", f, f"operand {name} region {v} is not declared on the checkpoint", f"{loc}.inputs.{name}")
 
     def _confirm_and_send(self, target: Any) -> bool:
-        """A target that resolves to Confirm and Send: control id `confirm-and-send` or OCR text "Confirm and Send"."""
+        """A target that resolves to Confirm and Send: control id `confirm-and-send`, or OCR text or JAB name
+        (the control's title under branch A) "Confirm and Send" (L-FLW-07)."""
         ctl = self.controls.get(_s(target))
-        return ctl is not None and (ctl[1].get("id") == "confirm-and-send" or _s(ctl[1].get("ocr_text")).strip().casefold() == "confirm and send")
+        return ctl is not None and (ctl[1].get("id") == "confirm-and-send" or "confirm and send" in _labels(ctl[1]))
 
     def _flow_safety(self, fl: dict, f: str) -> None:
         seq = self._seq(fl)
@@ -1636,8 +1659,10 @@ class _Linter:
             ids = [x.get("id") for x in regions]
             for x in sorted({i for i in ids if ids.count(i) > 1}, key=str):
                 self.add("L-RGN-01", f, f"region id {x} is not unique", "regions")
+            self._landmark_list(f, [_d(x) for x in _l(rf.get("landmarks"))], "L-RGN-00")
             landmarks = {_d(x).get("id") for x in _l(rf.get("landmarks"))}
             for i, x in enumerate(regions):
+                self._region_rule(f, f"regions[{i}]", x)
                 if x.get("landmark") not in landmarks:
                     self.add("L-RGN-00", f, f"region landmark {x.get('landmark')} is not a landmark of this file", f"regions[{i}].landmark")
             for i, a in enumerate(regions):
@@ -1649,7 +1674,7 @@ class _Linter:
                         ok = (a.get("type") == "mask" and _inside(ra, rb)) or (b.get("type") == "mask" and _inside(rb, ra))
                         if not ok:
                             self.add("L-RGN-02", f, f"{a.get('id')} ({a.get('type')}) overlaps {b.get('id')} ({b.get('type')})", "regions")
-            mode = self._cp_mode(cid)
+            mode, c = self._cp_mode(cid), self.defined.get(cid)
             for i, x in enumerate(regions):
                 at, t, rid = f"regions[{i}]", x.get("type"), x.get("id")
                 if ("rule" in x) != (t == "rule"):
@@ -1668,21 +1693,76 @@ class _Linter:
                 if fe is not None:
                     fe = _d(fe)
                     exp = _ts(fe.get("expires_at"))
-                    if not all(fe.get(k) for k in ("approved_by", "reason", "ticket")) or exp is None or exp <= self.now:
+                    if not all(fe.get(k) for k in ("approved_by", "reason", "ticket")) or exp is None:
                         self.add("L-RGN-05", f, "floor_exception carries approved_by, reason, ticket and a future expires_at", f"{at}.floor_exception")
+                    elif exp <= self.now:
+                        self.expiry(ExpiredRecord("floor_exception_expired", _s(rid), cid, f, f"{at}.floor_exception",
+                                                  _s(fe.get("expires_at")), "L-RGN-05", _s(fe.get("owner"))),
+                                    f"floor_exception on {rid} expired at {fe.get('expires_at')}")
                     if t != "diff":
                         self.add("L-RGN-05", f, "floor_exception is allowed on diff regions only", f"{at}.floor_exception")
-                if x.get("money_cell") is True:
-                    if t not in ("diff", "freeze"):
-                        self.add("L-RGN-04", f, f"money cell {rid} is {t}; money cells are diff or freeze", at)
-                    if "floor_exception" in x:
-                        self.add("L-RGN-04", f, f"money cell {rid} carries a floor_exception", f"{at}.floor_exception")
-                    c = self.defined.get(cid)
-                    if c and c.kind == "flow" and rid not in self._asserted_regions(c):
-                        self.add("L-RGN-04", f, f"money cell {rid} is not named by an assertion of {cid}", at)
-                if t == "mask" and mode == "frozen" and _s(rid).rsplit(".", 1)[-1] not in FROZEN_MASK_SEGMENTS:
-                    self.add("L-RGN-07", f, f"mask {rid} on a frozen checkpoint; only the clock, connection indicator, caret or parking rectangle", at)
+                if _is_money_cell(x):
+                    self._money_cell(f, at, x, cid, c)
+                if t == "mask" and mode == "frozen":
+                    seg = _s(rid).rsplit(".", 1)[-1]
+                    if seg not in FROZEN_MASK_SEGMENTS:
+                        self.add("L-RGN-07", f, f"mask {rid} on a frozen checkpoint; only the clock, connection indicator, "
+                                                "parking rectangle or, with keep_focus, the caret", at)
+                    elif seg == CARET_SEGMENT and not (c and c.keep_focus):
+                        self.add("L-RGN-07", f, f"caret mask {rid} on a frozen checkpoint without keep_focus: true (3.5, SD-27)", at)
             self._mask_budget(cid, f, regions)
+        red = self.r.one("redaction")
+        if red:
+            self._landmark_list(red.rel, [_d(x) for x in _l(_d(red.data).get("landmarks"))], "L-MSK-03")
+
+    def _landmark_list(self, f: str, landmarks: list[dict], rule: str) -> None:
+        """Landmarks of a regions file or of redaction/anchors.yaml: ids unique, templates PNG of 16x16 to
+        400x400 that exist (4.1), confidence_min in (0, 1] (3.7)."""
+        ids = [x.get("id") for x in landmarks]
+        for x in sorted({i for i in ids if ids.count(i) > 1}, key=str):
+            self.add(rule, f, f"landmark id {x} is not unique", "landmarks")
+        for i, x in enumerate(landmarks):
+            err, w, h, _ = self.png(x.get("template"))
+            if err or not (16 <= w <= 400 and 16 <= h <= 400):
+                self.add(rule, f, err or f"template {x.get('template')} is {w}x{h}; templates are 16x16 to 400x400",
+                         f"landmarks[{i}].template")
+            cm = x.get("confidence_min")
+            if cm is not None and not ((v := _num(cm)) is not None and 0 < v <= 1):
+                self.add(rule, f, f"confidence_min {cm!r} is not in (0, 1]", f"landmarks[{i}].confidence_min")
+
+    def _region_rule(self, f: str, at: str, x: dict) -> None:
+        """A region's `rule` block (4.8): its pattern compiles, min <= max, must_advance only on a time field."""
+        rule = _d(x.get("rule"))
+        if isinstance(rule.get("pattern"), str):
+            try:
+                re.compile(rule["pattern"])
+            except re.error as exc:
+                self.add("L-RGN-00", f, f"rule pattern does not compile: {exc}", f"{at}.rule.pattern")
+        lo, hi = _num(rule.get("min")), _num(rule.get("max"))
+        if lo is not None and hi is not None and lo > hi:
+            self.add("L-RGN-00", f, f"rule min {lo:g} is above max {hi:g}", f"{at}.rule")
+        if rule.get("must_advance") is True and rule.get("field") != "time":
+            self.add("L-RGN-00", f, f"must_advance is for time fields, not {rule.get('field')}", f"{at}.rule.must_advance")
+
+    def _money_cell(self, f: str, at: str, x: dict, cid: str, c: CheckpointDef | None) -> None:
+        """L-RGN-04: a money cell is never a mask and keeps a zero floor. On a flow checkpoint it is diff or freeze
+        and named by an assertion of the checkpoint; on a census checkpoint, which has no assertions, a money cell of
+        the closed list (a `money_role`, or a money_cell on an order panel) is a rule region, which the census
+        Oracle checks run (SD-29). On a sweep or split checkpoint the spec names no kind beyond never mask (choice 16)."""
+        t, rid = x.get("type"), x.get("id")
+        if t == "mask":
+            self.add("L-RGN-04", f, f"money cell {rid} is a mask; a money cell is never masked", at)
+        if "floor_exception" in x:
+            self.add("L-RGN-04", f, f"money cell {rid} carries a floor_exception", f"{at}.floor_exception")
+        if c and c.kind == "flow":
+            if t not in ("diff", "freeze"):
+                self.add("L-RGN-04", f, f"money cell {rid} is {t}; on a flow checkpoint money cells are diff or freeze", at)
+            if rid not in self._asserted_regions(c):
+                self.add("L-RGN-04", f, f"money cell {rid} is not named by an assertion of {cid}", at)
+        elif c and c.kind == "census" and t != "rule" and (
+                x.get("money_role") is not None or x.get("panel") in MONEY_PANELS):
+            self.add("L-RGN-04", f, f"money cell {rid} is {t} on census checkpoint {cid}; on a census checkpoint every "
+                                    "money cell is a rule region, so the census Oracle checks assert it (SD-29)", at)
 
     def _asserted_regions(self, c: CheckpointDef) -> set[str]:
         """Regions named by the checkpoint's expect entries and by assert steps before the next checkpoint."""
@@ -1725,7 +1805,9 @@ class _Linter:
                 self.add("L-MSK-01", f, "created_by is human; the Reviewer may propose a mask, never create one", "created_by")
             exp = _ts(m.get("expires_at"))
             if exp is not None and exp <= self.now:
-                self.add("L-MSK-02", f, f"mask expired at {m.get('expires_at')}; renew it with the latest A/A result or remove it", "expires_at")
+                self.expiry(ExpiredRecord("mask_expired", _s(m.get("mask_id")), _s(m.get("checkpoint_id")), f, "expires_at",
+                                          _s(m.get("expires_at")), "L-MSK-02", _s(m.get("owner"))),
+                            f"mask expired at {m.get('expires_at')}; renew it with the latest A/A result or remove it")
             want = f"masks/{m.get('checkpoint_id')}/{m.get('mask_id')}.yaml"
             cid = _s(m.get("checkpoint_id"))
             if f != want:
@@ -2189,15 +2271,19 @@ def run_check_modules(repo: Repo, add: Callable[..., None], phase: int, today: d
 
 
 def lint_repo(repo: Repo, phase: int = 0, today: date | None = None,
-              flow_p50_s: dict[str, float] | None = None) -> LintReport:
+              flow_p50_s: dict[str, float] | None = None, run_start: bool = False) -> LintReport:
     """Lint a loaded repository (4.1, 4.15). `flow_p50_s` gives measured flow p50s for L-FLW-10. The rule modules
-    of sentinel.lint.checks run after the built-in rules; a pending row a module implements is not skipped."""
-    linter = _Linter(repo, phase, today or date.today(), flow_p50_s)
+    of sentinel.lint.checks run after the built-in rules; a pending row a module implements is not skipped.
+
+    `run_start=True` is the Orchestrator's run-start lint: an expired mask, floor exception or invariant exception
+    is not a violation there (L-MSK-02 "ignored at run start", L-RGN-05, L-SRF-11) but an `ExpiredRecord` in
+    `LintReport.expired`, which the run drops and lists in run health (see `sentinel.lint.runstart`)."""
+    linter = _Linter(repo, phase, today or date.today(), flow_p50_s, run_start)
     linter.run()
     implemented = run_check_modules(linter.r, linter.add, linter.phase, linter.today)
     skipped = {rid: r.skipped for rid, r in RULES.items()
                if r.skipped and not (r.skipped == _PENDING and rid in implemented)}
-    return LintReport(sorted(set(linter.out)), skipped)
+    return LintReport(sorted(set(linter.out)), skipped, sorted(set(linter.expired)))
 
 
 def lint(root: str | Path, phase: int = 0, today: date | None = None) -> LintReport:

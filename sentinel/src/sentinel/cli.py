@@ -2,6 +2,8 @@
 
 Subcommands:
   sentinel lint <config-dir> [--phase N] [--today YYYY-MM-DD] [--json] [--show-skipped]
+  sentinel lint --code [ROOT] [--drill-allowlist FILE] [--json]
+                                              the gateway single-entry-point lint over ROOT/src (5.4.1, 5.4.9, 6.2)
   sentinel schemas [--check] [--out DIR]      write or check the generated JSON Schemas (L-XREF-09)
   sentinel taxonomy --check                   check config/taxonomy.yaml against the spec (L-XREF-08)
   sentinel demo <scenario|all> [--out DIR] [--today YYYY-MM-DD] [--reviewer simulated|live]
@@ -11,6 +13,11 @@ Subcommands:
   sentinel review [--live] <scenario> [--out DIR] [--today YYYY-MM-DD] [--config DIR]
                                               the Reviewer items of a simulated PR run; with --live they go to
                                               the real Reviewer (reviewer.review_live; ANTHROPIC_API_KEY needed)
+  sentinel stop <rig> [--reason TEXT] [--by NAME] [--root DIR]
+                                              trip the kill switch on a rig: write its file flag (6.6); --root for
+                                              simulated rigs (orchestrator.killflag)
+  sentinel reenable --db PATH {login|rig|quarantine|proof|incident} ...
+                                              the human safety actions of 6.6 and 6.12 (sentinel.reenable)
 """
 from __future__ import annotations
 
@@ -130,6 +137,12 @@ def main(argv: list[str] | None = None) -> int:
         return _run(rest)
     if cmd == "review":
         return _review(rest)
+    if cmd == "stop":
+        from .orchestrator.killflag import main as stop_main
+        return stop_main(rest)
+    if cmd == "reenable":
+        from .reenable import main as reenable_main
+        return reenable_main(rest)
     print(f"unknown command {cmd!r}\n{__doc__}", file=sys.stderr)
     return 2
 

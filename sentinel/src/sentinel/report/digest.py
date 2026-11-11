@@ -23,7 +23,8 @@ Choices where the spec is ambiguous (each is reported):
    the finding kind as the alert, the category as the outcome, the finding page as the report link and the candidate
    capture (`outcomes.cand_capture_sha256`) as the crop link.
 2. Decisions without tickets are active `confirm_bug` decisions with no `ticket_ref` decided 24 hours or more before
-   the digest (9.9: "after 24 hours the digest ... list decisions without tickets"); abandoned outbox jobs are those no
+   the digest (9.9: "after 24 hours the digest ... list decisions without tickets"; `jira_sync.decisions_without_tickets`
+   and its `without_ticket_line`, the Decisions page's list too); abandoned outbox jobs are those no
    human has closed. P3 alerts are those of the runs that started in the 24 hours before the digest (from their
    summary `alerts`, collapsed by `alerting.raise_run_alerts`), plus any the caller passes (a P3 alert with no run).
 3. Links: the triage queue is `<base>/triage` and the baseline approval queue `<base>/baselines` (9.5 names the
@@ -47,14 +48,12 @@ from ..orchestrator.alerts import TRIAGE_CHANNEL
 from ..sla import BusinessClock, OnCall, OpenItem, breaches, business_age, iso, open_items
 from ..store import Store
 from ..store.lifecycle import suspect_decisions
-from ..store.store import decision_ref
-from . import slack
+from . import jira_sync, slack
 from .alerting import EMAIL_DESTINATION, Alert, RunRef, raise_run_alerts
 from .inline import Urls, is_artifact_hash
 
 DIGEST_AT = time(8, 0)                         # 9.10, 11.6: 08:00 America/New_York
 OLDEST = 10                                    # 9.10: the ten oldest items
-TICKET_GRACE = timedelta(hours=24)             # 9.9: decisions without tickets after 24 hours
 PROPOSAL_REMINDER = timedelta(hours=2)         # 9.9: pending proposals older than 2 business hours
 BASELINE_LEAD = 3                              # 9.9: 3 business days before an RC run
 Line = str | slack.MessageFields
@@ -154,12 +153,9 @@ def daily(store: Store, now: datetime, *, clock: BusinessClock | None = None, on
         f"proposal {i.proposal_id} on {i.finding_id}: {i.proposal_action} by {i.proposed_by}, open "
         f"{business_age(c, i.item.created_at, now)} business, awaiting {member or 'the triage rotation'}"
         for i in items if i.proposal_id is not None])
-    cutoff = iso(cal.to_utc(now) - TICKET_GRACE)
-    lines += _section("Decisions without tickets", [
-        f"{decision_ref(r['decision_id'])}: confirm_bug by {r['decided_by']}, decided {r['decided_at']}"
-        for r in store.query("SELECT decision_id, decided_by, decided_at FROM decisions WHERE action = 'confirm_bug' "
-                             "AND ticket_ref IS NULL AND status = 'active' AND decided_at <= ? ORDER BY decided_at",
-                             (cutoff,))])
+    at = iso(now) or ""
+    lines += _section("Decisions without tickets", [                  # 9.9 (`jira_sync`, one definition)
+        jira_sync.without_ticket_line(d, at) for d in jira_sync.decisions_without_tickets(store, at)])
     lines += _section("Abandoned outbox jobs", [
         f"job {r['job_id']}: {r['kind']} to {r['destination']}, last error {r['last_error'] or 'none'}, queued "
         f"{r['created_at']}"

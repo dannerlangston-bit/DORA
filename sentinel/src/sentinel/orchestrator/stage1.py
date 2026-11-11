@@ -8,8 +8,8 @@ never has: the Windows rig implements it with scripted clicks, `SimulatedRig` gr
    `settings_attested`, S2, before anything is corrected (something changed a safety setting since the last run).
 2. Application Settings and each Order Defaults asset-class page are read against the checked-in profiles. A
    default quantity above the fixture size (the profile's quantity for that asset class) is a safety row (7.5):
-   the same abort, still before any correction. Every other differing control is corrected once and the page read
-   again; still wrong is drift.
+   the same abort, still before any correction, and on the page's re-read after its correction too (choice 6).
+   Every other differing control is corrected once and the page read again; still wrong is drift.
 3. Non-fixture watchlists are deleted; missing fixture watchlists, and fixture lists whose symbols differ, are
    imported from the checked-in files; the lists read again must equal the fixture.
 4. to 6. Alerts, saved orders and order templates, and notes on fixture symbols are deleted and counted again
@@ -35,9 +35,16 @@ Choices (reported):
 4. The fixture names no custom studies or scans (4.9 has no field), so the expected lists come from the checked-in
    exports the caller passes (`Stage1Profile.studies`, `.scans`); compared as sets.
 5. `watchlists()` returns the login's own lists (name -> symbols by Copy All), not the app's public lists.
+6. The Order Defaults quantity is the one control 7.5 makes a safety row, and the attestation never reads it, so
+   choice 1 cannot cover it. Its read is a number (an int or float, or OCR text that reads as one); an unreadable
+   first read is read once more before anything is corrected, as the safety rows' two reads (6.3). A quantity above
+   the fixture size on any read (the first two, or the re-read after the page's correction) aborts. A quantity still
+   unreadable is never set by a scripted click, since that would hide a changed value: it is drift ("unreadable on
+   two reads"), `env_error (gate: settings_attested, reason: fixture_drift)` for the shard.
 """
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -167,6 +174,37 @@ def _differs(read: Mapping[str, Any], expected: Mapping[str, Any]) -> dict[str, 
     return {k: v for k, v in expected.items() if k not in read or read[k] != v}
 
 
+def _quantity(read: Mapping[str, Any]) -> float | None:
+    """An Order Defaults page's default quantity as a number: an int or float, or OCR text that reads as a finite
+    number (choice 6); None when unreadable."""
+    q = read.get("quantity")
+    if isinstance(q, str):
+        try:
+            q = float(q.replace(",", "").strip())
+        except ValueError:
+            return None
+    if isinstance(q, bool) or not isinstance(q, (int, float)) or not math.isfinite(q):
+        return None
+    return float(q)
+
+
+def _guarded(page: str, expected: Mapping[str, Any]) -> bool:
+    """The page's default quantity is the 7.5 safety row: an Order Defaults page whose profile sets a quantity."""
+    return page.startswith(ORDER_DEFAULTS_PAGE) and expected.get("quantity") is not None
+
+
+def _above(page: str, read: Mapping[str, Any], expected: Mapping[str, Any]) -> str | None:
+    """A default quantity above the fixture size (7.5: a safety row), as the abort detail; None otherwise."""
+    q = _quantity(read)
+    if _guarded(page, expected) and q is not None and q > float(expected["quantity"]):
+        return f"{page} quantity {read.get('quantity')} above the fixture size {expected['quantity']}"
+    return None
+
+
+def _unread(page: str, read: Mapping[str, Any], expected: Mapping[str, Any]) -> bool:
+    return _guarded(page, expected) and _quantity(read) is None
+
+
 @dataclass
 class _Run:
     port: ProfileResetPort
@@ -200,22 +238,32 @@ def run_stage1(port: ProfileResetPort, fixture: Mapping[str, Any], profile: Stag
     pages = {APP_SETTINGS_PAGE: dict(profile.app_settings)} | {
         f"{ORDER_DEFAULTS_PAGE}{asset}": dict(v) for asset, v in profile.order_defaults.items()}
     first = {page: dict(port.read_page(page)) for page in pages}
-    above = [f"{page} quantity {first[page].get('quantity')} above the fixture size {exp['quantity']}"
-             for page, exp in pages.items() if page.startswith(ORDER_DEFAULTS_PAGE) and exp.get("quantity") is not None
-             and isinstance(first[page].get("quantity"), (int, float))
-             and first[page]["quantity"] > exp["quantity"]]
+    for page, exp in pages.items():
+        if _unread(page, first[page], exp):                     # choice 6: read once more, before any correction
+            first[page] = dict(port.read_page(page))
+    above = [a for page, exp in pages.items() if (a := _above(page, first[page], exp))]
     if above:
         return Stage1Result(_abort("Order Defaults: " + "; ".join(above), {"pages": first, "screenshots": shots}),
                             False, steps=(run.steps[0], "step 2: an Order Defaults quantity above the fixture size"))
     for page, expected in pages.items():
-        wrong = _differs(first[page], expected)
+        blind = {"quantity"} if _unread(page, first[page], expected) else set()
+        if blind:
+            run.drift.append(f"{page}.quantity unreadable on two reads, never corrected blind")
+        wrong = {c: v for c, v in _differs(first[page], expected).items() if c not in blind}
         if not wrong:
             continue
         for control, value in wrong.items():
             port.apply_setting(page, control, value)
             run.corrections += 1
-        still = _differs(dict(port.read_page(page)), expected)
-        run.drift += [f"{page}.{c} still wrong after one correction" for c in still]
+        again = dict(port.read_page(page))
+        late = _above(page, again, expected)
+        if late:
+            return Stage1Result(_abort("Order Defaults: " + late, {"pages": {**first, page: again},
+                                                                   "screenshots": shots}), False,
+                                steps=(*run.steps, "step 2: an Order Defaults quantity above the fixture size after "
+                                                   "the correction"), corrections=run.corrections)
+        run.drift += [f"{page}.{c} still wrong after one correction" for c in _differs(again, expected)
+                      if c not in blind]
     run.steps.append(f"step 2: settings pages, {run.corrections} correction(s)")
 
     symbols = {s["id"]: str(s["symbol"]) for s in fixture.get("symbols") or ()}

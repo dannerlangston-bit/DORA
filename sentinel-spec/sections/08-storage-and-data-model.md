@@ -553,7 +553,8 @@ CREATE TABLE step_events (
                                             -- capture, popup, relogin, reset_input_state, relaunch, resume,
                                             -- watchdog_hang, watchdog_crash, kill_switch, gateway_decision, size_step,
                                             -- probe, oracle_source_fallback, focus_correction, hook_reinstalled,
-                                            -- foreign_window, export, clipboard, recovery_login, explorer_action
+                                            -- foreign_window, export, clipboard, recovery_login, explorer_action,
+                                            -- main_frame_missing
   locator_level     TEXT CHECK (locator_level IN ('jab','image','ocr','agent')),
   attempt           INTEGER NOT NULL DEFAULT 1,   -- 2 = the single permitted retry
   step_outcome      TEXT CHECK (step_outcome IN ('passed','passed_after_retry','passed_via_agent_fallback','failed',
@@ -1043,7 +1044,7 @@ CREATE TABLE egress_log (                   -- 6.10: every outbound request
   sent_at           TEXT NOT NULL,
   destination       TEXT NOT NULL,          -- host name
   purpose           TEXT NOT NULL CHECK (purpose IN ('review','batch_review','agent_step',
-                      'explorer_step','pr_comment','jira','slack','digest','preflight','model_check')),
+                      'explorer_step','pr_comment','jira','slack','digest','preflight','model_check','page')),
   status            TEXT NOT NULL CHECK (status IN ('sent','refused','failed')),
   response_status   INTEGER,
   artifact_sha256   TEXT,                   -- redacted artifact that left, when one did
@@ -1059,7 +1060,8 @@ CREATE TABLE outbox (                       -- 9.1: every outbound post is a job
   run_id          TEXT REFERENCES runs(run_id),
   kind            TEXT NOT NULL CHECK (kind IN ('pr_comment','commit_status','jira_create','jira_comment',
                                                 'jira_transition',
-                    'slack','page','digest','manifest_pr','mask_pr','quarantine_pr')),   -- quarantine_pr: 10.5
+                    'slack','page','digest','manifest_pr','mask_pr','quarantine_pr','flow_pr','anchor_pr')),
+                                            -- quarantine_pr: 10.5; flow_pr, anchor_pr: 9.6
   destination     TEXT NOT NULL,
   payload_sha256  TEXT NOT NULL,            -- the payload is an artifact; the row carries its hash
   attempts        INTEGER NOT NULL DEFAULT 0,
@@ -1278,8 +1280,8 @@ CREATE UNIQUE INDEX ux_proposal_open ON proposals(finding_id) WHERE state = 'pro
 CREATE TABLE system_state (                 -- keys: last_backup_at, last_backup_error, last_integrity_check_at,
   key TEXT PRIMARY KEY,                     --   last_restore_drill_at, last_artifact_audit_at, kill_switch_state,
   value TEXT NOT NULL,                      --   detector_state, canaries_pending, nightly_skipped_for, reviewer_disabled,
-  updated_at TEXT NOT NULL                  --   harness_freeze, schema_version, schema_sha256, free_bytes_at_last_preflight
-);
+  updated_at TEXT NOT NULL                  --   harness_freeze, schema_version, schema_sha256, free_bytes_at_last_preflight,
+);                                          --   alert_undelivered
 ```
 
 **Indexes.** Run health counts (env errors, harness errors, not settled, quarantined, agent fallbacks, gateway drops, store failures) are computed by the Reporter over these indexes and stored in the run's summary JSON.

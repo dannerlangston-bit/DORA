@@ -193,7 +193,8 @@ def test_no_main_frame_for_30_s_while_running_is_main_frame_missing_once():
     assert w.sample(1000.0, obs(1000.0, main_frame=None)) is None
     assert w.sample(1029.0, obs(1029.0, main_frame=None)) is None
     r = w.sample(1030.0, obs(1030.0, main_frame=None))
-    assert r.trigger == "main_frame_missing" and r.steps == ()
+    assert r.trigger == "main_frame_missing"
+    assert [(s.name, s.args["action"]) for s in r.steps] == [("journal", "main_frame_missing")]   # 10.2, CD-4
     assert w.sample(1040.0, obs(1040.0, main_frame=None)) is None
     w.sample(1042.0, obs(1042.0))                                                  # the frame is back
     assert w.sample(1072.0, obs(1072.0, main_frame=None)).trigger == "main_frame_missing"
@@ -299,8 +300,9 @@ def test_journal_lines_parse_back_into_step_events(tmp_path):
     assert events[0].checkpoint_id == CID and events[0].mono_ms == 184233118
     again = Journal(j.path)                                    # a restarted reader continues the ids
     assert again.entry("relaunch", at=T0, mono=1.0)["event_id"] == "wd-0004" and again.restarts() == 1
+    assert again.entry("main_frame_missing", at=T0, mono=2.0)["event_id"] == "wd-0005"   # 10.2 (CD-4)
     with pytest.raises(ValueError):
-        j.entry("main_frame_missing", at=T0, mono=1.0)                              # not in the closed vocabulary
+        j.entry("frame_lost", at=T0, mono=1.0)                                      # not in the closed vocabulary
 
 
 # -- running a reaction ------------------------------------------------------------------------------------------

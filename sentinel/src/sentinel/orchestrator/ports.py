@@ -281,8 +281,10 @@ class DesktopPort(Protocol):
 class InputPort(Protocol):
     """`SendInput` for the gateway's tokened events (5.4.3 stage 6); never called outside the emitter."""
 
-    def send(self, events: Sequence[InputEvent]) -> int:
-        """Inject the events; returns how many the OS accepted."""
+    def send(self, events: Sequence[InputEvent], chars: Sequence[str | None] | None = None) -> int:
+        """Inject the events; returns how many the OS accepted. `chars` runs parallel to `events`: the typed character
+        of each `VK_PACKET` key event (the planner's `Emit.char`, 5.4.3), None for every other event; an
+        `InputEvent` carries no character, so the port takes it here (windows-adapters choice 2)."""
 
     def cursor(self) -> tuple[int, int]:
         """The cursor position."""

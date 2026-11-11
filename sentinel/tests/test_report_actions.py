@@ -10,7 +10,8 @@ import pytest
 from sentinel.records import CheckpointOutcome, Finding, RunOutcome
 from sentinel.report.actions import (RULES, ActionContext, ActionRefused, ActionRequest, Actor, PullRequest,
                                      RoleDirectory, apply, authorize, check_table, confirm, decline, finding_target,
-                                     mask_pr_opened, open_proposals, propose, rule_for, table, ticket_landed)
+                                     mask_pr_opened, open_proposals, propose, rule_for, table)
+from sentinel.report import jira, jira_sync
 from sentinel.store import RunPlan, ScopeEntry, Store, StoreRefused
 from sentinel.store.mirror import MaskBudgetExceeded, load_config_mirror
 
@@ -261,27 +262,55 @@ def test_confirm_bug_writes_the_decision_and_a_jira_job_whose_key_lands_on_decis
     assert (d.action, d.decided_by, d.role, d.ticket) == ("confirm_bug", "tess", "triage_rotation", None)
     assert s.get_finding("F-t2").triage_state == "confirmed_bug"
     job = s.outbox_job(r.jobs[0])
-    assert (job.kind, job.destination, job.state) == ("jira_create", "jira", "queued")
+    assert (job.kind, job.destination, job.state) == ("jira_create", "TOS#bug", "queued")   # the product Bug (9.9)
     payload = json.loads(r.payloads[job.payload_sha256])
-    assert payload["decision"] == d.decision_id
+    assert payload["op"] == "bug" and payload["decisions"] == [d.decision_id]
+    assert payload["issue"]["project"] == "TOS" and jira.cp_label(FLOW) in payload["issue"]["labels"]
     again = apply("confirm_bug", s, ctx(), ActionRequest("tess", finding="F-t2", reason="ladder overlaps"))
     assert again.decisions == [d.decision_id] and again.jobs == []           # idempotent per finding and action
-    ticket_landed(s, payload, "TOS-77")
+    jira_sync.record(s, payload, jira.Delivered("bug", "TOS-77", created=True), at=TS)   # the outbox's write-back
     assert s.get_decision(d.decision_id).ticket == "TOS-77" and s.get_finding("F-t2").ticket == "TOS-77"
 
 
 def test_confirm_bug_with_a_ticket_links_it_instead_of_filing(s):
     r = apply("confirm_bug", s, ctx(), ActionRequest("pat", finding="F-t2", ticket="TOS-9", reason="bug"))
     job = s.outbox_job(r.jobs[0])
-    assert (job.kind, job.destination) == ("jira_comment", "TOS-9")
+    assert (job.kind, job.destination) == ("jira_comment", "TOS-9#link")
+    assert json.loads(r.payloads[job.payload_sha256])["op"] == "link"
     assert s.get_decision(r.decisions[0]).role == "pr_author"
+    with pytest.raises(ActionRefused, match="L-MAN-05"):
+        apply("confirm_bug", s, ctx(), ActionRequest("pat", finding="F-t3", ticket="tos 9", reason="bug"))
+    assert s.get_finding("F-t3").triage_state == "open"                       # refused before any write
+
+
+def test_confirm_bug_searches_jira_offers_open_tickets_and_records_label_collisions(s):
+    client = jira.MemoryJira()
+    client.add("TOS-31", labels=[jira.BASE_LABEL, jira.cp_label(FLOW)], description="no identity block")
+    r = apply("confirm_bug", s, ctx(jira=client), ActionRequest("tess", finding="F-t2", reason="bug"))
+    assert s.outbox_job(r.jobs[0]).kind == "jira_create"                       # the Bug is queued all the same
+    summary = s.run_summary(PR_RUN)
+    assert summary["jira_collisions"] == [{"ticket": "TOS-31", "checkpoint": FLOW}]
+    down = apply("confirm_bug", s, ctx(jira=jira.MemoryJira(unreachable=True)),
+                 ActionRequest("tess", finding="F-qty", reason="bug"))
+    assert down.offers == [] and s.outbox_job(down.jobs[0]).kind == "jira_create"   # ticket pending (9.9)
+
+
+def test_a_cluster_confirm_bug_files_one_product_bug_for_every_member(s):
+    find(s, "F-k1", region="rgn.confirm.symbol", cluster="cl-9")
+    find(s, "F-k2", region="rgn.confirm.title", cluster="cl-9", phash="fedcba9876543210")
+    r = apply("confirm_bug", s, ctx(), ActionRequest("tess", finding="F-k1", reason="bug", cluster=True))
+    (job,) = [s.outbox_job(j) for j in r.jobs]
+    assert job.kind == "jira_create"
+    assert json.loads(r.payloads[job.payload_sha256])["decisions"] == r.decisions and len(r.decisions) == 2
 
 
 def test_mark_intended_on_an_undeclared_surface_queues_the_manifest_amendment_and_the_ticket_comment(s):
     r = apply("mark_intended", s, ctx(), ActionRequest("tess", finding="F-t2", ticket="TOS-5", reason="new look"))
-    kinds = sorted(s.outbox_job(j).kind for j in r.jobs)
-    assert kinds == ["jira_comment", "manifest_pr"]
+    kinds = sorted((s.outbox_job(j).kind, s.outbox_job(j).destination) for j in r.jobs)
+    assert kinds == [("jira_comment", "TOS-5#intended"), ("manifest_pr", "sentinel-config")]
     assert s.get_finding("F-t2").triage_state == "intended"
+    with pytest.raises(ActionRefused, match="L-MAN-05"):
+        apply("mark_intended", s, ctx(), ActionRequest("tess", finding="F-qty", ticket="TOS5", reason="x"))
     with pytest.raises(ActionRefused, match="L-DEC-02"):
         apply("mark_intended", s, ctx(), ActionRequest("tess", finding="F-t3", reason="no ticket"))
 
@@ -497,13 +526,18 @@ def test_fixed_in_build_by_hand_supersedes_the_confirm_bug(s):
     assert s.get_finding("F-t2").triage_state == "fixed_pending_verify"
 
 
-def test_quarantine_queues_its_pr_and_promote_flow_opens_one(s):
+def test_quarantine_promote_flow_and_anchor_patch_queue_their_pull_requests(s):
     r = apply("quarantine", s, ctx(), ActionRequest("fo2", finding="F-t2", reason="flaky", ticket="TOS-2"))
     assert s.outbox_job(r.jobs[0]).kind == "quarantine_pr"
-    repo = FakeRepo()
-    p = apply("promote_flow", s, ctx(repo), ActionRequest("fo2", finding="F-t2", reason="trimmed",
-                                                          files={"flows/x.yaml": "steps: []"}))
-    assert p.pr == 41 and repo.opened[0][:2] == ("flow", "fo2")
+    p = apply("promote_flow", s, ctx(), ActionRequest("fo2", finding="F-t2", reason="trimmed",
+                                                      files={"flows/x.yaml": "steps: []"}))
+    job = s.outbox_job(p.jobs[0])
+    assert (job.kind, job.destination, p.pr) == ("flow_pr", "sentinel-config", None)   # CD-3: opened on delivery
+    body = json.loads(p.payloads[job.payload_sha256])
+    assert (body["author"], body["files"]) == ("fo2", {"flows/x.yaml": "steps: []"})
+    a = apply("accept_anchor_patch", s, ctx(), ActionRequest("fo2", finding="F-t2", reason="moved",
+                                                             files={"anchors/x.yaml": "x: 1"}))
+    assert s.outbox_job(a.jobs[0]).kind == "anchor_pr"
 
 
 def test_assign_and_close_an_abandoned_job(s):

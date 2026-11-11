@@ -214,7 +214,9 @@ def test_paper_mode_mismatch_aborts_safety_before_any_capture(runs):
     assert outs and {(o.outcome, o.reason, o.gate) for o in outs} == {("env_error", "live_identity",
                                                                        "paper_mode_asserted")}
     assert n_artifacts == 0 and not (out / "calibration").exists() and r.reviewer_calls == []
-    assert not [p for p in (out / "artifacts").rglob("*") if p.is_file() and p.name != "manifest.json"]
+    # nothing captured: the run's only objects are its outbox payloads, the pages and posts of its alerts (9.10)
+    assert not [p for p in (out / "artifacts").rglob("*") if p.is_file() and p.name != "manifest.json"
+                and p.suffix != ".json"]
     with Store(out / "sentinel.db") as store:
         run = store.run_outcome(r.run_id)
     assert (run.status, run.reason, run.last_gate) == ("aborted_safety", "live_identity", "paper_mode_asserted")
@@ -306,7 +308,8 @@ def test_an_order_that_got_out_is_orders_sent_and_the_run_stays_aborted_safety(t
     assert f"Cancel All verified, proof {line}; shard " in safety_row and "; an order reached the account" in safety_row
     assert "UNPROVEN" not in text and r.commit_status["state"] == "error"
     *_, page = [a for a in alerts(tmp_path) if a["run_reason"] == "undeclared_order_row"]   # the kill switch's proof
-    assert page["incident"] == "S1" and "login_owner" in page["paged"] and page["detail"] == line
+    assert page["incident"] == "S1" and "login_owner" in page["paged"] and page["detail"].startswith(line)
+    assert page["shards"]                              # one alert per run and reason, naming its shards (9.10)
 
 
 def test_app_crash_fails_app_alive_skips_the_ladder_and_resumes_after_a_relaunch(runs):

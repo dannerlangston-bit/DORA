@@ -56,6 +56,8 @@ TIMER_S = 120.0                                 # the two-minute timer
 DEFERRAL_MAX_S = 300.0                          # a deferral past five minutes takes the unreadable path
 SEND_FRAME_MAX_S = 0.5                          # a frame no older than 500 ms before a paper_send_ok send
 PAPER_MODE = "paperMoney"                       # the stamp's mode (4.13 worked example)
+ONDEMAND_MODE = "onDemand"                       # the stamp's mode for the allowlisted OnDemand account (7.9, CD)
+STAMP_MODES = (PAPER_MODE, ONDEMAND_MODE)
 ONDEMAND_ENTRY = "ondemand_virtual_account"     # the proof's allowlist entry for the OnDemand account (7.9)
 
 
@@ -220,19 +222,22 @@ def account_id_sha256(text: str) -> str:
     return "sha256:" + hashlib.sha256(text.encode()).hexdigest()
 
 
-def paper_stamp(account_id: str, asserted_at: datetime) -> dict[str, str]:
+def paper_stamp(account_id: str, asserted_at: datetime, *, mode: str = PAPER_MODE) -> dict[str, str]:
     """The stamp `{account_id_sha256, mode, asserted_at}` of a passing assertion of `account_id` (6.4); its shape is
-    the one `records.CheckpointOutcome.paper_assertion` accepts."""
+    the one `records.CheckpointOutcome.paper_assertion` accepts. `mode` is `onDemand` for the allowlisted OnDemand
+    virtual account while its toolbar shows (7.9: paperMoney is not the true mode there; coordinator decision)."""
     if asserted_at.tzinfo is None:
         raise ValueError("asserted_at must be an aware time (4.13 ts)")
-    return {"account_id_sha256": account_id_sha256(account_id), "mode": PAPER_MODE,
+    if mode not in STAMP_MODES:
+        raise ValueError(f"stamp mode {mode!r}; one of {STAMP_MODES}")
+    return {"account_id_sha256": account_id_sha256(account_id), "mode": mode,
             "asserted_at": asserted_at.isoformat()}
 
 
 def stamp_current(stamp: Mapping[str, str] | None, session_started_at: datetime | None) -> bool:
     """True when `stamp` is a paper-asserted stamp of the session that logged in at `session_started_at`: Capture
     releases no frame to the Reviewer, the agent or a report without one (6.4 Schedule)."""
-    if not stamp or session_started_at is None or stamp.get("mode") != PAPER_MODE:
+    if not stamp or session_started_at is None or stamp.get("mode") not in STAMP_MODES:
         return False
     try:
         asserted = datetime.fromisoformat(stamp["asserted_at"])

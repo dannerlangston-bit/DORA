@@ -11,9 +11,10 @@ import json
 import numpy as np
 import pytest
 
-from sentinel.executor.emitter import (DEGRADED_TEXT, Effect, ExecContext, Foreground, ModalState, Rescue,
+from sentinel.executor.emitter import (DEGRADED_TEXT, NO_NEUTRAL, Effect, ExecContext, Foreground, ModalState, Rescue,
                                        agent_rung_block, click_crop, declares_guarded, emit, targets_dialog)
 from sentinel.executor.heartbeat import AppLife, HeartbeatPolicy
+from sentinel.executor.primitives import Planner
 from sentinel.gateway.drainer import DrainContext, Drainer
 from sentinel.orchestrator.budgets import ShardBudgets
 from sentinel.orchestrator.clock import ManualClock
@@ -22,6 +23,7 @@ from sentinel.orchestrator.gateway import (VK_RETURN, VK_TAB, Action, DropLedger
 from sentinel.orchestrator.ports import Frame, LocateResult
 from sentinel.orchestrator.results import ControlResult, FindingSpec, Outcome, step_failed
 from sentinel.orchestrator.rig import EmitResult
+from sentinel.orchestrator.watchdog import HeartbeatUnwritable
 from sentinel.records import StepOutcome
 
 FLOW = "flow.trade.order-ticket.stock.limit"
@@ -556,6 +558,20 @@ def test_a_safety_drop_by_the_hook_is_an_attempted_send():
     assert r.consequences[0].run_reason == "attempted_send"
 
 
+def test_the_order_stage_declaration_holds_once_the_click_got_past_stage_4():
+    """executor:0 (5.4.6 source 3, 6.2, choice 9): set when an order-stage action is not refused, whatever the step's
+    post-condition then says; a refused click leaves it as it was."""
+    ports, loc, plan, ctx = make()
+    ports.effects = [Effect(False)]
+    r = emit(dict(CLICK, id="oc", order_stage=True, timeout_ms=500), ports, loc, plan, ctx)
+    assert (r.status, r.reason) == ("failed", "postcondition") and ctx.order_stage is True
+    safety = SafetyContext(dismiss_allowlist=frozenset({"Delete"}), attestation_passed=True)    # no paper assertion
+    ports, loc, plan, ctx = make(safety=safety)
+    ctx.resolve_target = lambda t: {"name": t, "label": "Confirm and Send", "window": "main"}
+    r = emit(dict(CLICK, id="oc", order_stage=True), ports, loc, plan, ctx)
+    assert r.status == "blocked_by_gateway" and ctx.order_stage is False
+
+
 # -- stage 8 --------------------------------------------------------------------------------------------------------
 def test_a_postcondition_that_never_holds_fails_the_step():
     ports, loc, plan, ctx = make()
@@ -582,18 +598,39 @@ def test_retry_once_retries_a_failed_postcondition():
     assert r.status == "passed_after_retry" and r.attempt == 2 and len(ports.sent) == 2
 
 
-def test_an_export_that_produced_nothing_is_export_timeout():
+class _BreakingWriter:
+    """A heartbeat writer whose writes fail from the second on (10.2: the write and its one retry both fail)."""
+
+    def __init__(self):
+        self.n = 0
+
+    def write(self, hb):
+        self.n += 1
+        if self.n >= 2:
+            raise HeartbeatUnwritable(5, "EIO")
+
+
+@pytest.mark.parametrize("effects", [[Effect(False)], [Effect(False), Effect(True)]])
+def test_retry_once_never_retries_after_a_stop_during_the_postcondition_poll(effects):
+    """executor:1 (10.2 "never a retry loop", choice 3): a heartbeat that cannot be written during the poll stops the
+    run; the step is not re-run, no input follows, and it never ends passed_after_retry."""
+    clock = ManualClock()
+    ports, loc, plan, ctx = make(clock, heartbeat=HeartbeatPolicy(_BreakingWriter(), clock, run_id="r", shard=1,
+                                                                  period_s=0.1))
+    ctx.heartbeat.write()
+    ports.effects = list(effects)
+    r = emit(dict(CLICK, on_fail="retry_once", timeout_ms=1000), ports, loc, plan, ctx)
+    assert (r.status, r.attempt, len(ports.sent)) == ("failed", 1, 1)
+    assert r.stops_run and r.consequences[0].run_reason == "heartbeat_unwritable"
+    assert r.led_to is None and r.rest is None
+
+
+def test_a_final_reason_from_the_postcondition_read_ends_the_poll_at_once():
     ports, loc, plan, ctx = make()
-    ports.effects = [Effect(False)]
-    r = emit({"id": "x1", "type": "export", "target": "monitor.grid", "kind": "file", "timeout_ms": 1000}, ports, loc,
-             plan, ctx)
-    assert r.status == "failed" and r.reason == "export_timeout"
-    ports.effects = [Effect(False, reason="export_unavailable")]
+    ports.effects = [Effect(False, reason="effect_impossible")]
     started = ctx.clock.monotonic()
-    r = emit({"id": "x2", "type": "export", "target": "monitor.grid", "kind": "file", "timeout_ms": 9000}, ports, loc,
-             plan, ctx)
-    assert r.reason == "export_unavailable" and ctx.clock.monotonic() == started       # a final answer, no waiting
-    assert next(e for e in r.events if e.step_id == "x2").action == "export"
+    r = emit(dict(CLICK, timeout_ms=9000), ports, loc, plan, ctx)
+    assert (r.status, r.reason) == ("failed", "effect_impossible") and ctx.clock.monotonic() == started
 
 
 def test_on_fail_values_are_checked():
@@ -608,9 +645,30 @@ def test_screen_changing_input_sets_the_expectation_and_a_park_does_not(tmp_path
     hb = HeartbeatPolicy(None, clock, run_id="r", shard=1)
     ports, loc, plan, ctx = make(clock, heartbeat=hb)
     emit({"id": "n2", "type": "park_mouse"}, ports, loc, plan, ctx)
-    assert hb.expect_since is None
+    assert hb.expect_mono is None
     emit(CLICK, ports, loc, plan, ctx)
-    assert hb.expect_since == clock.now().isoformat()
+    assert hb.expect_mono == clock.monotonic()
+    assert hb.heartbeat().expect_screen_change_since == clock.now().isoformat()
+
+
+def test_park_wheel_and_a_targetless_focus_neutral_run_with_the_real_planner():
+    """executor:3 (4.7, 5.4.10, 3.5, choices 10 and 11): park_mouse and wheel get the parking coordinate, the dead area
+    8 px inside the grab's bottom-right corner (FakePorts grabs 400 x 300 at the origin); a focus_neutral naming no
+    neutral control sends nothing and leaves condition 2 to the settle rule."""
+    park = (400 - 8, 300 - 8)
+    ports, loc, _, ctx = make()
+    r = emit({"id": "n2", "type": "park_mouse"}, ports, loc, Planner(), ctx)
+    assert r.status == "passed" and ports.sent[-1].units[0].lead[0].x == park[0]
+    assert (ports.sent[-1].units[0].lead[0].y, ports.sent[-1].point) == (park[1], park)
+    r = emit({"id": "z1", "type": "wheel", "at": [120, 90], "notches": -2}, ports, loc, Planner(), ctx)
+    a = ports.sent[-1]
+    assert r.status == "passed" and a.point == (120, 90) and len(a.units) == 3
+    assert [(e.x, e.y) for e in a.units[-1].lead] == [park]                           # parked after the notches
+    sent = len(ports.sent)
+    r = emit({"id": "n3", "type": "focus_neutral"}, ports, loc, Planner(), ctx)
+    assert (r.status, r.detail, len(ports.sent), loc.calls[-1:]) == ("passed", NO_NEUTRAL, sent, [])
+    r = emit({"id": "n4", "type": "focus_neutral", "target": "shell.status-bar.neutral"}, ports, loc, Planner(), ctx)
+    assert r.status == "passed" and ports.sent[-1].kind == "click" and ports.sent[-1].point == POINT
 
 
 def test_a_postcondition_wait_keeps_the_heartbeat_fresh():

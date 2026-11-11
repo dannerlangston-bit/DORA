@@ -26,8 +26,8 @@ over those observations is here, and every decision is a `ControlResult` in the 
   rebuilds a run's counts from those rows and `BuildCounts` aggregates runs of one build; `popup_rate_findings(history)`
   gives the `popup_rate_increase` findings (7.8 policy 3, 4.13).
 - `error_title_patterns(catalog)`: the INV-14 error title regexes (the `title_regex` of the matchable `app_failure`
-  entries, 5.9, 2.7) for `invariants.CheckerConfig.error_title_patterns`; `order_dialog_regexes` and
-  `order_event_regexes` feed `windows.TitleSets.compile` (7.8 policy 5, 5.4.6, 6.6).
+  entries, 5.9, 2.7) for `invariants.CheckerConfig.error_title_patterns`; `order_dialog_regexes`,
+  `DETACHED_TICKET_REGEXES` and `order_event_regexes` feed `windows.TitleSets.compile` (7.8 policy 5, 5.4.6, 6.6).
 - `dismiss_action(entry)`: the gateway action of a `dismiss_key` entry; `TemplateMatcher`: the small-template half of
   the match on a grab.
 
@@ -68,7 +68,10 @@ Choices where the spec is ambiguous or silent (reported):
    (`aborted_safety` through the kill switch sequence with an S2 incident, as the gateway's unknown dialog does;
    `aborted_harness` with `on_abort.reason`). An `env_error` without `on_abort.gate` takes the gate in force.
 5. Starter rows whose 12.8 outcome goes beyond their class and action are keyed by data where the data says it:
-   `version_mismatch` becomes `version_changed_mid_run` after a relaunch (POP-01); `occluded` is the foreign-window path
+   `version_mismatch` becomes `version_changed_mid_run` after a relaunch (POP-01), and a `version_mismatch` left as
+   such ends the shard whatever the entry's class and asks for `disable_rig`, the scheduler's hold (7.3 "nothing
+   else runs on that rig until a human looks", 7.7 step 1, as `gates.check_launched` does for the update progress);
+   a change within the run holds nothing; `occluded` is the foreign-window path
    (POP-19); `ondemand_timeout` is the OnDemand stall (POP-12: before a capture it is `not_settled (reason:
    anti_anchor_present)`, at setup it waits); a `relogin` entry whose `on_abort.reason` is `authentication_challenge`
    is the challenge prompt (POP-21: the LOGIN flow's Branch B recovery once, inside phase `login`; anywhere else or a
@@ -85,8 +88,12 @@ Choices where the spec is ambiguous or silent (reported):
    gone or an EDT that is frozen is never decided here: it is the Watchdog's `app_alive` path (10.2).
 7. `safety` (POP-14) and `order_event` (POP-22) windows are never closed and never get input: an unowned Order
    Confirmation waits with no input until the kill switch's 30 s rule (6.6; `wait_expired` gives the same decision);
-   an order event is the kill switch at once. An unmatched window whose title matches either set is never handed to
-   the agent and never closed (7.8 policy 5).
+   an order event is the kill switch at once. An unmatched window whose title matches either set, or the detached
+   Order Entry window, is never handed to the agent and never closed (7.8 policy 5). 5.4.6 source 1 and 6.2 put the
+   detached Order Entry window in the order-dialog set, but the 12.8 starter catalog has no entry for it, so its
+   title regex is `DETACHED_TICKET_REGEXES` (`^Order Entry\b`, a draft until Phase 0 reads the title, 5.19), the
+   Window Watcher's detached-ticket set (`windows.TitleSets.detached_ticket`); `unknown_window` and `PopupSentinel`
+   take it as `detached_ticket`, so the two sets agree.
 8. The proposed catalog entry of an `unknown_popup` (4.10, 7.8 policy 5) is drafted from the window: the next free id
    (from POP-23, 12.8), a slug name, an anchored escaped `title_regex`, `seed_titles`, `window_class_hint`, the phase,
    `status: unverified`, the build, and the registry owner from the context (`sentinel-ops` by default, the example
@@ -161,6 +168,7 @@ AGENT_DISMISS_LABELS = ("OK", "Close", "Later", "Not now", "Dismiss", "Cancel") 
 AGENT_NEVER_LABELS = ("Accept", "Agree", "Confirm", "Send", "Yes", "Save")
 POPUP_TEMPLATE_FLOOR = 0.90                      # choice 12
 DRAFT_OWNER = "sentinel-ops"                     # choice 8
+DETACHED_TICKET_REGEXES = (r"^Order Entry\b",)   # the detached Order Entry window (5.4.6 source 1, 6.2; choice 7)
 
 
 class CatalogError(ValueError):
@@ -524,11 +532,13 @@ def _abort(entry: PopupEntry, ctx: PopupContext, window: Any) -> ControlResult:
                              alert=_env_alert(gate, reason), evidence={**ev, "ondemand_timeouts": streak},
                              detail=f"OnDemand buffering timeout {streak} in a row"
                                     + ("; OnDemand abandoned for the run (7.9)" if streak >= ONDEMAND_ABANDON else ""))
-    if entry.cls in SHARD_CLASSES:
+    if entry.cls in SHARD_CLASSES or reason == "version_mismatch":
+        hold = ("disable_rig",) if reason == "version_mismatch" else ()
         return ControlResult(CONTROL, False, gate, run=RunVerdict("complete_with_env_errors"), checkpoint=o,
-                             unreached=o, step="failed", actions=("end_flow", "teardown"),
+                             unreached=o, step="failed", actions=("end_flow", "teardown") + hold,
                              alert=_env_alert(gate, reason), evidence=ev,
-                             detail=f"{entry.popup_id} ({entry.cls}): the shard ends env_error ({gate}, {reason})")
+                             detail=f"{entry.popup_id} ({entry.cls}): the shard ends env_error ({gate}, {reason})"
+                                    + ("; the rig is held until a human looks (7.3)" if hold else ""))
     return ControlResult(CONTROL, False, gate, checkpoint=o, outcomes=(rest,), step="failed", actions=("end_flow",),
                          alert=_env_alert(gate, reason), evidence=ev,
                          detail=f"{entry.popup_id}: the flow ends env_error ({gate}, {reason})")
@@ -619,14 +629,16 @@ def proposed_entry(window: Any, ctx: PopupContext, popup_id: str, *, safety: boo
     return draft
 
 
-def unknown_window(window: Any, ctx: PopupContext, catalog: PopupCatalog, *,
-                   popup_id: str | None = None) -> ControlResult:
+def unknown_window(window: Any, ctx: PopupContext, catalog: PopupCatalog, *, popup_id: str | None = None,
+                   detached_ticket: Sequence[str] = DETACHED_TICKET_REGEXES) -> ControlResult:
     """An unmatched window (4.10, 7.8 policy 5): `aborted_safety (reason: unknown_dialog_in_order_stage)` while the
     step's `order_stage` is set; otherwise the flow is quarantined and the window goes to the agent's dismiss-only
-    toolset, or WM_CLOSE with agent mode off, unless its title is in the order-dialog or order-event set, which is never
+    toolset, or WM_CLOSE with agent mode off, unless its title is in the order-dialog set (the catalog's `safety`
+    entries and the detached Order Entry window, `detached_ticket`, choice 7) or the order-event set, which is never
     handed to the agent and never closed. Either way an `unknown_popup` finding carries the proposed entry."""
     title = window.title or ""
-    safety_title = any(re.search(p, title) for p in order_dialog_regexes(catalog) + order_event_regexes(catalog))
+    safety_title = any(re.search(p, title) for p in (*order_dialog_regexes(catalog), *detached_ticket,
+                                                       *order_event_regexes(catalog)))
     draft = proposed_entry(window, ctx, popup_id or catalog.next_popup_id(), safety=ctx.order_stage or safety_title)
     finding = FindingSpec("unknown_popup", f"unknown window {title!r} ({window.cls}) in phase {ctx.phase}",
                           detail=canonical_json(draft))
@@ -709,10 +721,13 @@ def _passive(entry: PopupEntry) -> bool:
 
 class PopupSentinel:
     """One shard's popup sentinel (7.8): the catalog, the run's hit counter, the OnDemand and challenge streaks, the
-    windows present at the last sweep and the proposed ids of unknown titles."""
+    windows present at the last sweep and the proposed ids of unknown titles. `detached_ticket` is the detached Order
+    Entry title set `unknown_window` keeps from the agent and WM_CLOSE (choice 7): the Window Watcher's."""
 
-    def __init__(self, catalog: PopupCatalog, counter: PopupCounter | None = None):
+    def __init__(self, catalog: PopupCatalog, counter: PopupCounter | None = None, *,
+                 detached_ticket: Sequence[str] = DETACHED_TICKET_REGEXES):
         self.catalog = catalog
+        self.detached_ticket = tuple(detached_ticket)
         self.counter = counter if counter is not None else PopupCounter()
         self.ondemand_timeouts = 0
         self.challenge_recoveries = 0
@@ -746,7 +761,7 @@ class PopupSentinel:
             if entry is None:
                 pid = self._proposed.get(key) or self.catalog.next_popup_id(self._proposed.values())
                 self._proposed[key] = pid
-                result = unknown_window(w, ctx, self.catalog, popup_id=pid)
+                result = unknown_window(w, ctx, self.catalog, popup_id=pid, detached_ticket=self.detached_ticket)
             else:
                 result = decide(entry, ctx, w)
             if new and (entry is None or entry.action != "ignore"):

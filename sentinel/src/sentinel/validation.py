@@ -7,8 +7,8 @@ probe read (`ProbeListing`, one per build) and decides everything 2.2.3 derives 
 - `normalize_label` folds a label for comparison (case fold, collapsed whitespace, hotkey underscores and a trailing
   count such as "(3)" stripped); `label_distance` is the normalized edit distance of two labels.
 - `classify_windows(windows, registry)` sorts one build's probe listings into labels that name a registry entry
-  (title or alias, among the entries whose `enumerable_by` is the probe) and labels that name none. It is the pure
-  classifier both `validate` and the self-test run.
+  (title or alias, among the entries whose `enumerable_by` is the probe) and labels no entry is left for (choice
+  2). It is the pure classifier both `validate` and the self-test run.
 - `pair_renames(cand, base, entries)` applies the 2.2.3 pairing rule: an unmatched candidate label L and an
   unmatched entry E (on the base, absent on the candidate) pair when the normalized edit distance is at most 0.3 or
   their list positions are equal. `substitute_label` puts L in E's OCR rung for E's census visit.
@@ -29,9 +29,16 @@ Choices where the spec is ambiguous (each is reported):
 
 1. Normalization (2.2.3) also applies NFKC, as the locator ladder compares OCR text (5.5). Every underscore is a
    hotkey underscore; one trailing parenthesized count is stripped.
-2. Matching is by set: a label names every entry of the probe whose normalized title or alias equals it, an entry
-   is on a build when any of its names is in that build's list, and a label repeated in one list counts once (its
-   first position is its position).
+2. Matching is by count: each listed label stands for one entry of the probe whose normalized title or alias equals
+   it, and each entry for at most one label (the largest such matching, earlier labels first, entries in id order).
+   A label no entry is left for, because it names none or because the list holds it more often than entries carry
+   it, is a candidate label with no entry (2.2.3 row 1), once per occurrence: a new surface that repeats a
+   registered label of its probe (P2's two "Product Depth" rows, P6's "All") is reported. An entry is on a build
+   when any of its names is listed there. When a label is listed fewer times than entries carry it, the flat list
+   cannot say which of those entries it shows: all of them count as on the build, so the census visits each (the
+   one that is gone fails at its locator) rather than the probe guessing which was removed, and run health prints
+   "validation incomplete for P<n>" with the label and the entries. A probe's list holds each row it read once (a
+   probe that scrolls drops the rows it read twice).
 3. Pairing (2.2.3) is one to one. The edit-distance criterion is applied first, closest pair first (ties by
    candidate position, then entry id), then the position criterion for what is left, since a label inserted before
    a renamed one shifts positions while the rename keeps its spelling close. E's label is the label that named E on
@@ -44,11 +51,11 @@ Choices where the spec is ambiguous (each is reported):
    the registry stays truth for its area; `harness_error` and `landmark_missing` print "validation incomplete for
    P<n>" (the two 2.2.3 names), `not_run` prints nothing. `identical` compares the normalized lists in order.
 5. "The row's parent surface" (2.2.3) for a probe whose lists differ: each differing label (in one list's multiset
-   and not the other's; for a pure reorder, each label whose position changed) has as row parent the `parent` of
-   every entry it names, or, naming none, the probe surface's `parent`. The outcome is `intended` only when every
-   differing label has a row parent the manifest declares, with the declaring entry as `manifest_entry_ref`;
-   otherwise, or without a manifest, `collateral`. The record carries a rule classification and the two probe
-   screenshots as artifacts.
+   and not the other's; for a pure reorder, each label whose position changed) has as row parents the `parent` of
+   every entry it names, and the probe surface's `parent` when a build lists it more often than entries carry it
+   (a label naming none included). The outcome is `intended` only when the manifest declares every row parent of
+   every differing label, with the declaring entry as `manifest_entry_ref`; otherwise, or without a manifest,
+   `collateral`. The record carries a rule classification and the two probe screenshots as artifacts.
 6. A label on the base only that names no entry produces nothing (2.2.3's table has no row for it).
 7. Stub PRs: `registry/surfaces/unregistered/<synthetic id>.yaml` with title, the probe's usual kind (P2 sub-tab,
    P6 ticket variant: the human corrects it), tier 1, `enumerable_by` and the probe surface's parent and owner when
@@ -62,14 +69,20 @@ Choices where the spec is ambiguous (each is reported):
    surface it removes the first entry (by id) a complete probe lists on both builds under a label no other entry
    of that probe carries. A failure lands on the census checkpoint of the removed surface's probe (P1 when no
    surface qualifies).
-10. Synthetic slugs: the normalized label in ASCII (accents dropped), runs of other characters as `-`; an empty
-    slug, or one another label of the same probe already took, gets the first 8 hex digits of the label's sha256.
+10. Synthetic slugs are a function of the label alone (2.2.1: never derived from list position), so a label keeps
+    its id from run to run whatever else the probe lists: a normalized label of ASCII letters and digits in words
+    joined by single spaces is its slug with `-` for the spaces; any other label (punctuation, accents, symbols,
+    hyphens) loses characters in the folding (ASCII, accents dropped, other runs as `-`), so its slug gets `-` and
+    the first 8 hex digits of the label's sha256 (`label-` and the digits when nothing is left). Two labels never
+    share a slug (up to a sha256 prefix collision). The k-th unregistered occurrence of one label in a list (k > 1,
+    choice 2) adds `-` and the first 8 hex digits of the sha256 of the label, `#` and k.
 """
 from __future__ import annotations
 
 import hashlib
 import re
 import unicodedata
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Protocol
@@ -95,6 +108,7 @@ GATE = "running"                                 # SD-15: at entry to running, a
 MAINTENANCE_KIND = "registry_entry_not_found"    # 11.5 maintenance kind of the entry owner's task
 _TRAILING_COUNT = re.compile(r"\s*\(\s*\d+\s*\)\s*$")
 _NON_SLUG = re.compile(r"[^a-z0-9]+")
+_PLAIN_LABEL = re.compile(r"[a-z0-9]+(?: [a-z0-9]+)*")          # choice 10: folds to a slug losing nothing
 
 
 # --------------------------------------------------------------------------------------------
@@ -149,6 +163,14 @@ def _sha8(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:8]
 
 
+def _synthetic_slug(normalized: str, ordinal: int = 1) -> str:
+    """The `<slug>` of `unregistered.<probe>.<slug>` for the `ordinal`-th unregistered occurrence of a normalized
+    label in its list: the label and the ordinal alone decide it (choice 10)."""
+    slug = (normalized.replace(" ", "-") if _PLAIN_LABEL.fullmatch(normalized)
+            else f"{_slug(normalized) or 'label'}-{_sha8(normalized)}")
+    return slug if ordinal == 1 else f"{slug}-{_sha8(f'{normalized}#{ordinal}')}"
+
+
 # --------------------------------------------------------------------------------------------
 # registry entries
 # --------------------------------------------------------------------------------------------
@@ -200,8 +222,38 @@ def _index(entries: Iterable[Entry]) -> dict[str, tuple[str, ...]]:
     return {n: tuple(ids) for n, ids in out.items()}
 
 
+def _occurrences(labels: Sequence[str]) -> list[tuple[int, str, str]]:
+    """(position, normalized label, label as read) of every listed label that is not empty, list order."""
+    return [(i, n, raw) for i, raw in enumerate(labels) if (n := normalize_label(raw))]
+
+
+def _match(labels: Sequence[str], entries: Sequence[Entry]
+           ) -> tuple[dict[str, tuple[int, str]], list[tuple[int, str, str]]]:
+    """Choice 2: the largest matching of listed labels to entries carrying them (title or alias), one entry per label
+    and one label per entry, earlier labels first and entries in id order. Returns entry id -> (position, label as
+    read) of the matched entries, and the occurrences (`_occurrences`) no entry is left for, list order."""
+    occ = _occurrences(labels)
+    carriers = _index(entries)
+    owner: dict[str, int] = {}                     # entry id -> the index in `occ` of the label standing for it
+
+    def augment(k: int, seen: set[str]) -> bool:
+        for eid in carriers.get(occ[k][1], ()):
+            if eid not in seen:
+                seen.add(eid)
+                if eid not in owner or augment(owner[eid], seen):
+                    owner[eid] = k
+                    return True
+        return False
+
+    for k in range(len(occ)):
+        augment(k, set())
+    used = set(owner.values())
+    return ({eid: (occ[k][0], occ[k][2]) for eid, k in owner.items()},
+            [o for k, o in enumerate(occ) if k not in used])
+
+
 def _positions(labels: Sequence[str]) -> dict[str, tuple[int, str]]:
-    """Normalized label -> (first position, the label as read), list order (choice 2)."""
+    """Normalized label -> (first position, the label as read), list order."""
     out: dict[str, tuple[int, str]] = {}
     for i, raw in enumerate(labels):
         n = normalize_label(raw)
@@ -219,15 +271,23 @@ class ProbeClasses:
     """One probe's list on one build, sorted against the registry (choice 2).
 
     `registered`: each label (as first read) that names entries, with their ids, list order. `unregistered`: each
-    label that names none, list order."""
+    listed label no entry is left for, list order, once per occurrence. `matched`: the entries a listed label stands
+    for."""
 
     registered: tuple[tuple[str, tuple[str, ...]], ...] = ()
     unregistered: tuple[str, ...] = ()
+    matched: frozenset[str] = frozenset()
 
     @property
     def present(self) -> frozenset[str]:
         """The ids of the entries this list names."""
         return frozenset(i for _, ids in self.registered for i in ids)
+
+    @property
+    def unresolved(self) -> frozenset[str]:
+        """Entries a listed label names but none stands for: the list holds their label fewer times than entries
+        carry it, so it cannot say which of them it shows (choice 2)."""
+        return self.present - self.matched
 
 
 def classify_windows(windows: Mapping[str, Sequence[str]], registry: Registry) -> dict[str, ProbeClasses]:
@@ -236,15 +296,12 @@ def classify_windows(windows: Mapping[str, Sequence[str]], registry: Registry) -
     out: dict[str, ProbeClasses] = {}
     for probe, labels in windows.items():
         _check_probe(probe)
-        index = _index(_entries(registry, probe))
-        reg: list[tuple[str, tuple[str, ...]]] = []
-        unreg: list[str] = []
-        for n, (_, raw) in sorted(_positions(labels).items(), key=lambda kv: kv[1][0]):
-            if n in index:
-                reg.append((raw, index[n]))
-            else:
-                unreg.append(raw)
-        out[probe] = ProbeClasses(tuple(reg), tuple(unreg))
+        ents = _entries(registry, probe)
+        index = _index(ents)
+        matched, loose = _match(labels, ents)
+        reg = tuple((raw, index[n]) for n, (_, raw) in sorted(_positions(labels).items(), key=lambda kv: kv[1][0])
+                    if n in index)
+        out[probe] = ProbeClasses(reg, tuple(raw for _, _, raw in loose), frozenset(matched))
     return out
 
 
@@ -255,7 +312,8 @@ def classify_windows(windows: Mapping[str, Sequence[str]], registry: Registry) -
 @dataclass(frozen=True)
 class RenamePair:
     """A rename candidate (2.2.3): candidate label L, entry E and E's label on the base. `by` is the criterion that
-    paired them (`edit_distance` or `position`); `old_names` are E's normalized title and aliases."""
+    paired them (`edit_distance` or `position`); `old_names` are E's normalized title and aliases; `position` is L's
+    position in the candidate list."""
 
     label: str
     entry_id: str
@@ -263,6 +321,7 @@ class RenamePair:
     by: str
     distance: float
     old_names: frozenset[str] = frozenset()
+    position: int | None = None
 
 
 def pair_renames(cand: Sequence[str], base: Sequence[str], entries: Iterable[Entry | Mapping[str, Any]]
@@ -271,14 +330,14 @@ def pair_renames(cand: Sequence[str], base: Sequence[str], entries: Iterable[Ent
     are the entries whose `enumerable_by` is the probe."""
     ents = [e if isinstance(e, Entry) else Entry.from_doc(e) for e in entries]
     index = _index(ents)
-    cpos, bpos = _positions(cand), _positions(base)
-    loose = sorted(((pos, raw) for n, (pos, raw) in cpos.items() if n not in index))
-    on_cand = {i for n in cpos for i in index.get(n, ())}
+    loose = [(pos, raw) for pos, _, raw in _match(cand, ents)[1]]          # choice 2: no entry left for them
+    on_cand = {i for _, n, _ in _occurrences(cand) for i in index.get(n, ())}
+    on_base, bpos = _match(base, ents)[0], _positions(base)
     gone: list[tuple[Entry, int, str]] = []
     for e in ents:
-        hits = sorted(bpos[n] for n in e.names if n in bpos)
-        if e.id not in on_cand and hits:
-            gone.append((e, hits[0][0], hits[0][1]))
+        at = on_base.get(e.id) or min((bpos[n] for n in e.names if n in bpos), default=None)
+        if e.id not in on_cand and at is not None:
+            gone.append((e, at[0], at[1]))
     pairs: list[RenamePair] = []
     used_l: set[int] = set()
     used_e: set[str] = set()
@@ -288,7 +347,7 @@ def pair_renames(cand: Sequence[str], base: Sequence[str], entries: Iterable[Ent
         if d <= RENAME_DISTANCE_MAX and lpos not in used_l and eid not in used_e:
             used_l.add(lpos)
             used_e.add(eid)
-            pairs.append(RenamePair(raw, eid, blabel, "edit_distance", d, e.names))
+            pairs.append(RenamePair(raw, eid, blabel, "edit_distance", d, e.names, lpos))
     for lpos, raw in loose:
         if lpos in used_l:
             continue
@@ -297,8 +356,8 @@ def pair_renames(cand: Sequence[str], base: Sequence[str], entries: Iterable[Ent
             e, blabel = hit
             used_l.add(lpos)
             used_e.add(e.id)
-            pairs.append(RenamePair(raw, e.id, blabel, "position", label_distance(raw, blabel), e.names))
-    return tuple(sorted(pairs, key=lambda p: cpos[normalize_label(p.label)][0]))
+            pairs.append(RenamePair(raw, e.id, blabel, "position", label_distance(raw, blabel), e.names, lpos))
+    return tuple(sorted(pairs, key=lambda p: p.position or 0))
 
 
 def substitute_label(target: Mapping[str, Any], pairs: Iterable[RenamePair]) -> dict[str, Any]:
@@ -402,7 +461,8 @@ class ProbeResult:
     `removed` (3.11 rows 24 to 26). `appeared`: entries on the candidate only, whose checkpoints take `needs_baseline`
     (`absent (new_surface)`). `subsets`: `not_run (reason: entitlement)` and `harness_error (reason:
     registry_entry_not_found)` on every checkpoint of an entry absent on both builds. `missing`: the entries of the
-    latter, for their owners' tasks."""
+    latter, for their owners' tasks. `notes`: run-health lines for labels more entries carry than a build lists
+    (choice 2)."""
 
     probe: str
     record: ValidationRecord
@@ -413,6 +473,7 @@ class ProbeResult:
     subsets: tuple[SubsetOutcome, ...] = ()
     missing: tuple[Entry, ...] = ()
     proposals: tuple[RegistryProposal, ...] = ()
+    notes: tuple[str, ...] = ()
 
     @property
     def complete(self) -> bool:
@@ -473,8 +534,8 @@ class ValidationReport:
 
     @property
     def health(self) -> tuple[str, ...]:
-        """The run-health lines, probe order."""
-        return tuple(p.health for p in self.probes if p.health)
+        """The run-health lines, probe order: each probe's outcome line (`ProbeResult.health`), then its notes."""
+        return tuple(line for p in self.probes for line in ((p.health,) if p.health else ()) + p.notes)
 
     def b_input(self, checkpoint: _Checkpoint) -> BInput | None:
         """Input B registry validation sets for one checkpoint, or None: `removed` on a census checkpoint of a
@@ -556,9 +617,11 @@ def _compared(probe: str, cand: ProbeListing, base: ProbeListing, ents: Sequence
     declared = manifest.surfaces if manifest is not None else frozenset()
     refs: list[str] = []
     for n in diff:
-        parents = {index[i].parent for i in names.get(n, ())} if n in names else {host.parent if host else None}
+        parents = {index[i].parent for i in names.get(n, ())}
+        if max(c.count(n), b.count(n)) > len(names.get(n, ())):          # a row no entry is left for (choice 2)
+            parents.add(host.parent if host else None)
         hit = sorted(p for p in parents if p and p in declared)
-        if not hit:
+        if len(hit) < len(parents):
             refs = []
             break
         entry = manifest.entry_declaring(hit[0]) if manifest is not None else None
@@ -627,32 +690,41 @@ def validate(probe: str, cand: ProbeListing, base: ProbeListing, registry: Regis
                 subsets.append(SubsetOutcome(SURFACE_PREFIX + e.id, Outcome(
                     "harness_error", "registry_entry_not_found",
                     detail=f"{probe} lists \"{e.title}\" on neither build while its entitlements are present")))
-    unregistered, proposals = _unregistered(probe, cand, base, classes, base_classes, pairs, ents, host,
-                                            workspace_id, persona, shots)
+    unregistered, proposals = _unregistered(probe, cand, base, pairs, ents, host, workspace_id, persona, shots)
     return ProbeResult(probe, record, unregistered, pairs, tuple(removed), tuple(appeared), tuple(subsets),
-                       tuple(missing), proposals)
+                       tuple(missing), proposals, _unresolved(probe, cand, base, ents, classes, base_classes))
 
 
-def _unregistered(probe: str, cand: ProbeListing, base: ProbeListing, classes: ProbeClasses,
-                  base_classes: ProbeClasses, pairs: Sequence[RenamePair], ents: Sequence[Entry], host: Entry | None,
-                  workspace_id: str, persona: str, shots: Mapping[str, str]
+def _unresolved(probe: str, cand: ProbeListing, base: ProbeListing, ents: Sequence[Entry], classes: ProbeClasses,
+                base_classes: ProbeClasses) -> tuple[str, ...]:
+    """The run-health lines for labels a build lists fewer times than entries carry them (choice 2)."""
+    odd = classes.unresolved | base_classes.unresolved
+    if not odd:
+        return ()
+    c = Counter(n for _, n, _ in _occurrences(cand.labels))
+    b = Counter(n for _, n, _ in _occurrences(base.labels))
+    return tuple(f"validation incomplete for {probe}: \"{n}\" is the label of {len(ids)} entries ({', '.join(ids)}) "
+                 f"but is listed {c[n]} time(s) on the candidate and {b[n]} on the base, so the probe cannot tell "
+                 "which; the census visits each" for n, ids in sorted(_index(ents).items())
+                 if odd.intersection(ids) and (c[n] or b[n]))
+
+
+def _unregistered(probe: str, cand: ProbeListing, base: ProbeListing, pairs: Sequence[RenamePair],
+                  ents: Sequence[Entry], host: Entry | None, workspace_id: str, persona: str, shots: Mapping[str, str]
                   ) -> tuple[tuple[Unregistered, ...], tuple[RegistryProposal, ...]]:
-    """The first row of 2.2.3's table: one record and one PR payload per unregistered candidate label."""
-    by_label = {normalize_label(p.label): p for p in pairs}
-    on_base = {normalize_label(x) for x in base_classes.unregistered}
+    """The first row of 2.2.3's table: one record and one PR payload per candidate label no entry is left for, the
+    k-th of one spelling under the k-th id of choice 10."""
+    by_position = {p.position: p for p in pairs}
+    on_base = Counter(n for _, n, _ in _match(base.labels, ents)[1])
     entries = {e.id: e for e in ents}
-    taken: dict[str, str] = {}
+    seen: Counter[str] = Counter()
     out: list[Unregistered] = []
     props: list[RegistryProposal] = []
-    for raw in classes.unregistered:
-        n = normalize_label(raw)
-        slug = _slug(n)
-        if not slug or taken.get(slug, n) != n:
-            slug = f"{slug}-{_sha8(n)}" if slug else f"label-{_sha8(n)}"
-        taken[slug] = n
-        sid = f"unregistered.{probe.lower()}.{slug}"
-        pair = by_label.get(n)
-        sides = "candidate and base" if n in on_base else "candidate only"
+    for pos, n, raw in _match(cand.labels, ents)[1]:
+        seen[n] += 1
+        sid = f"unregistered.{probe.lower()}.{_synthetic_slug(n, seen[n])}"
+        pair = by_position.get(pos)
+        sides = "candidate and base" if on_base[n] >= seen[n] else "candidate only"
         detail = f"label \"{raw}\" listed by {probe} ({PROBE_ROWS[probe]}) on {sides} in {workspace_id}"
         if pair is not None:
             detail += f"; rename_candidate: {pair.entry_id} (base label \"{pair.base_label}\", by {pair.by})"

@@ -181,6 +181,20 @@ def _duration(r: sqlite3.Row) -> str:
     return f"{s // 60} min {s % 60} s"
 
 
+def _undelivered(conn: sqlite3.Connection) -> str:
+    """9.10: pages no channel accepted within 5 minutes (`system_state.alert_undelivered`), listed above the runs,
+    since this local page is always available."""
+    row = _rows(conn, "SELECT value FROM system_state WHERE key = 'alert_undelivered'")
+    lost = json.loads(row[0]["value"]) if row else []
+    if not lost:
+        return ""
+    items = "".join(f"<li>{e(str(x.get('rule')))} ({e(str(x.get('key')))}), run {e(str(x.get('run_id') or '-'))}, "
+                    f"due {e(str(x.get('due_at')))}, found undelivered {e(str(x.get('detected_at')))}</li>"
+                    for x in lost)
+    return (f'<div class="banner" role="alert"><p>alert_undelivered: {len(lost)} page(s) no channel accepted</p>'
+            f"<ul>{items}</ul></div>")
+
+
 def run_list(conn: sqlite3.Connection, params: Mapping[str, str]) -> Page:
     """Runs by type: outcome, build pair, counts per outcome, duration, cost, open items by tier, outbox state."""
     page = _page(params.get("page"))
@@ -206,7 +220,8 @@ def run_list(conn: sqlite3.Connection, params: Mapping[str, str]) -> Page:
                     e(f"${cost:.2f}"), e(", ".join(f"tier {t[0]}: {t[1]}" for t in tiers) or "none"),
                     e(", ".join(f"{s[0]} {s[1]}" for s in outbox) or "-"),
                     e(f"alert_undelivered {undelivered}" if undelivered else "-")])
-    body = (f"<h1>Runs</h1><p>{' | '.join(a('/runs?type=' + t, t) for t in ('pr', 'merge', 'rc', 'nightly', 'calibration'))}"
+    types = " | ".join(a("/runs?type=" + t, t) for t in ("pr", "merge", "rc", "nightly", "calibration"))
+    body = (f"<h1>Runs</h1>{_undelivered(conn)}<p>{types}"
             f"</p>" + table(["Run", "Type", "Outcome", "Build pair", "Counts", "Duration", "Cost", "Open items",
                              "Outbox", "Alerts"], out) + _pager("/runs", page, more, {"type": kind}))
     return Page("Runs", body, _newest((r["run_id"] for r in rows), conn))

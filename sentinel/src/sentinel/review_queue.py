@@ -9,7 +9,7 @@
   checkpoints it collapsed become `needs_human (reason: global_shift)` (one report cluster, `report.cluster`), and
   the Reviewer queue of the run is stopped, so no item is sent (10.6: "with zero Reviewer calls").
 - `nightly_global_shift(pairs)` is the Nightly A/A form (10.6): more than 2 percent of checkpoints above floor, or
-  the pre-pass raised, is `harness_error (reason: aa_drift_global)`.
+  the pre-pass raised, is `harness_error (reason: aa_drift_global)`; both count only calibrated results (choice 3).
 
 Choices where the spec is ambiguous (reported):
 
@@ -28,7 +28,11 @@ Choices where the spec is ambiguous (reported):
 3. Nightly (10.6). The run-level `harness_error (reason: aa_drift_global)` is the outcome of every compared A/A pair
    of the pass (`applies_to`): the thresholds are invalid until a Calibration run passes, so no pair is judged
    against them, and per-checkpoint `aa_drift` results under it do not count toward quarantine. Without it, each
-   frozen checkpoint above its floor keeps its `not_settled (reason: aa_drift)` from `calibration.aa_drift`.
+   frozen checkpoint above its floor keeps its `not_settled (reason: aa_drift)` from `calibration.aa_drift`. The
+   pre-pass reads "above floor" as `calibration.aa_drift` does: a checkpoint whose result is `uncalibrated` (no
+   floor, an incomplete Calibration, a region added after it) has no floor to be above, so it stays `needs_human
+   (reason: uncalibrated)` (10.6) and neither trips the global rule nor invalidates the floors that exist; it still
+   counts in the denominator.
 """
 from __future__ import annotations
 
@@ -162,11 +166,14 @@ def nightly_global_shift(pairs: Mapping[str, DiffResult], *, frozen: Iterable[st
                          params: Mapping[str, Any] | None = None) -> NightlyShift:
     """10.6 over the Nightly A/A pairs (pass 1 against pass 2, by checkpoint id; `frozen` names the frozen
     checkpoints): more than 2 percent of checkpoints above floor, or the 3.7 pre-pass raised, is `harness_error
-    (reason: aa_drift_global)` for every compared pair. Synthetic results (canary mutants) never count."""
+    (reason: aa_drift_global)` for every compared pair; only a calibrated result is above floor in either (choice
+    3). Synthetic results (canary mutants) never count."""
     p = params or load_params()
     drift = aa_drift(pairs, frozen, p)
     real = {cid: r for cid, r in pairs.items() if not (r.synthetic or (r.signal is not None and r.signal.synthetic))}
-    prepass = global_shift_prepass([r.signal for r in real.values() if r.signal is not None], nightly=True, params=p)
+    signals = [replace(r.signal, above_floor=r.signal.above_floor and r.threshold_source == "calibrated")
+               for r in real.values() if r.signal is not None]                     # choice 3: aa_drift's rule
+    prepass = global_shift_prepass(signals, nightly=True, params=p)
     terminal = drift.global_drift or prepass.terminal
     applies = tuple(sorted(cid for cid, r in real.items() if r.terminal is None)) if terminal is not None else ()
     return NightlyShift(terminal, applies, drift, prepass)

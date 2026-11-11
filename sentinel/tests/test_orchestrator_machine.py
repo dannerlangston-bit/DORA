@@ -367,3 +367,68 @@ def test_orchestrator_writes_through_the_real_store(tmp_path, scenario, status, 
         assert {(o.outcome, o.reason, o.gate) for o in store.outcomes("pr-48213-3")} == {outcome}
         ended = store.end_run(report.to_run_outcome())
         assert (ended.status, ended.reason) == (report.verdict.status, report.verdict.reason)
+
+
+class SurvivingRig(SimulatedRig):
+    """A rig whose tree kills leave a process from the install folder alive where `survivors` says so, one entry per
+    kill in order, then every kill works (6.6 step 3, 10.2 step 4: `kill_process_tree` False)."""
+
+    def __init__(self, *a, survivors: tuple[bool, ...] = (True,), **kw):
+        super().__init__(*a, **kw)
+        self.survivors = list(survivors)
+
+    def kill_process_tree(self) -> bool:
+        if self.survivors and self.survivors.pop(0):
+            self._log("kill_process_tree:survivor")
+            return False
+        return super().kill_process_tree()
+
+
+def run_surviving(scenario: SimScenario | None = None, work=None, survivors=(True,)):
+    clock = ManualClock()
+    rig = SurvivingRig(scenario, clock=clock, survivors=survivors)
+    sink = MemorySink(SCOPE)
+    orch = Orchestrator(rig, default_context(), sink, clock=clock)
+    return orch.run(work), rig, sink, orch
+
+
+def test_a_launch_retry_whose_kill_leaves_a_survivor_fails_the_launched_gate_closed():
+    """K1 (10.2 step 4, killswitch choice 20): the crash at the first launch asks for a relaunch; the kill leaves a
+    process alive, so no second launch starts from it: env_error (gate: launched) on the shard."""
+    crash = LaunchObservation(False, crash=CrashSignal("jvm_crash", "crash_file"))
+    report, rig, sink, orch = run_surviving(SimScenario(launches=[crash]))
+    assert rig.calls.count("launch") == 1 and orch.tree_survived
+    assert report.verdict.status == "complete_with_env_errors" and filled(sink) == {("env_error", "gate", "launched")}
+    assert report.proof.verdict == PROVEN_NO_SESSION and disarmed(rig)          # no session was ever established
+
+
+def test_a_relaunch_whose_kill_leaves_a_survivor_stops_and_hands_over_without_a_recovery_login():
+    """K1 (7.7, 10.2, 6.6 Cancel All failure; killswitch choice 20): the app failure's relaunch cannot kill the tree, so
+    it stops at launched; the end of the run tries the kill again, the survivor stays, and no recovery login is made:
+    UNPROVEN recovery_login_failed with the hand-over, the survivor named."""
+    def work(orch: Orchestrator) -> None:
+        orch.sink.record(SCOPE[0], "identical")
+        r = orch.apply(app_failure(CrashSignal("hang", "screenshot_staleness"), orch.budgets, phase="running"))
+        assert r.has("relaunch") and not orch.relaunch("app_failure")
+    report, rig, sink, orch = run_surviving(work=work, survivors=(True, True))
+    assert rig.calls.count("login") == 1 and rig.calls.count("launch") == 1 and "teardown" not in rig.calls
+    assert rig.calls.count("kill_process_tree:survivor") == 2 and "reset_input_state" not in rig.calls
+    assert {sink.outcomes[c][:3] for c in SCOPE[1:]} == {("env_error", "gate", "launched")}
+    assert (report.proof.verdict, report.proof.reason) == (UNPROVEN, "recovery_login_failed")
+    proof = report.gate("teardown")
+    assert proof.evidence["tree_survived"] is True and "login_owner" in proof.alert.paged and disarmed(rig)
+
+
+def test_a_kicked_session_whose_tree_survives_gets_no_proof_login():
+    """K1 (killswitch choice 20): the kicked session's tree is killed before the proof's login; a survivor at that
+    kill, or at the close of a failed first proof login, means no (further) login from it."""
+    def work(orch: Orchestrator) -> None:
+        orch.sink.record(SCOPE[0], "identical")
+        orch.apply(session_kicked())
+    report, rig, _, _ = run_surviving(work=work)
+    assert rig.calls.count("login") == 1 and (report.proof.verdict, report.proof.reason) == (UNPROVEN,
+                                                                                            "recovery_login_failed")
+    assert report.gate("teardown").evidence["tree_survived"] is True
+    report, rig, _, orch = run_surviving(SimScenario(recovery_login_fails=2), work=work, survivors=(False, True))
+    assert rig.calls.count("login") == 2 and orch.tree_survived            # one proof login, not the second
+    assert (report.proof.verdict, report.proof.reason) == (UNPROVEN, "recovery_login_failed")

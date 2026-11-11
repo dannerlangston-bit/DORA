@@ -32,7 +32,7 @@ Choices where the spec is ambiguous or silent (reported):
    and rolls back a write transaction. The git checkout at the pinned commit with the CI lint hash (also G1) is not a
    storage read: the caller adds `config_commit_ok` and `lint_hash_ok` to the H7 read, and H7 fails without them.
 5. The usage alarm fires at 70 percent of the volume used or more; it routes as the 9.10 store health row, P2 to the
-   on-call channel.
+   on-call channel and the system owner (`alerts.store_health`).
 """
 from __future__ import annotations
 
@@ -47,7 +47,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..orchestrator.alerts import ON_CALL_CHANNEL, P2, AlertRoute
+from ..orchestrator import alerts
+from ..orchestrator.alerts import AlertRoute
 from ..orchestrator.ports import PreflightRead
 from .store import StoreError, WriterLock, WriterLockError, check_local_volume
 
@@ -294,14 +295,10 @@ def write_refusal(heartbeat_path: str | os.PathLike, result: StoragePreflight, a
 
 
 # -- the control-host disk alarm (8.8, 11.4) --------------------------------------------------------------------
-def store_health_alert() -> AlertRoute:
-    """The 9.10 store health row: P2 to the on-call channel (choice 5)."""
-    return AlertRoute("store_health", P2, (), (ON_CALL_CHANNEL,))
-
-
 def usage_alarm(total_bytes: int, free_bytes: int) -> AlertRoute | None:
-    """The store volume alarm at 70 percent used (8.8, 11.4): the store health route, or None below it."""
+    """The store volume alarm at 70 percent used (8.8, 11.4): the 9.10 store health route (`alerts.store_health`),
+    or None below it."""
     if total_bytes <= 0:
         raise ValueError("a volume has a positive size")
     used = (total_bytes - free_bytes) / total_bytes
-    return store_health_alert() if used >= USAGE_ALARM_FRACTION else None
+    return alerts.store_health() if used >= USAGE_ALARM_FRACTION else None

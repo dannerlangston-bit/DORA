@@ -60,10 +60,10 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from .artifacts import QUARANTINE_MARKER, SHA256_RE
-from .store import Store, utc
+from .store import RELEASING_TRIAGE, Store, utc
 
 PIN_STATES = ("open", "confirmed_bug", "fixed_pending_verify")          # SD-83; intended pins until its baseline
-RELEASE_STATES = ("closed", "noise", "agent_mistake", "expected_behavior")
+RELEASE_STATES = RELEASING_TRIAGE
 RELEASE_DAYS = 180
 STEP_EVENT_DAYS = 90
 RIG_KEEP_DAYS = 7

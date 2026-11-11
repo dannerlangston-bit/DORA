@@ -443,6 +443,25 @@ def test_recalibration_keeps_the_opened_date_and_closes_fixed_items(store):
     assert len(store.query("SELECT 1 FROM calibration_floors WHERE superseded_at IS NULL")) == 3
 
 
+def test_recalibration_keeps_the_opened_date_when_the_cause_class_changes(store):
+    """3.9 step 6, 10.5 (review calibration:6): the same region still non-zero on a re-calibration is the same item
+    even when its cause class reads differently (settle, then unknown): it keeps its first opened date, takes the new
+    cause and is overdue after 5 business days."""
+    r6 = synth.perturb(IMG, 9, count=3, amplitude=90, rect=NOISE)
+    first = calibrate_checkpoint([Capture(IMG.copy())] * 5 + [Capture(r6)], registry(), data_mode="frozen", now=NOW,
+                                 owner="jdoe")
+    assert [(i.region_id, i.cause) for i in first.fix_list] == [(G, "settle")]
+    first.fix_list[0].ticket = "TOS-1"
+    _write(store, [first])
+    later = NOW + timedelta(days=8)                                 # 6 business days later
+    store.begin_run(_plan("cal-20261118"))
+    _write(store, [calibrate_checkpoint(noisy_captures(), registry(), data_mode="frozen", now=later, owner="jdoe")],
+           run_id="cal-20261118", now=later)
+    [item] = open_fixes(store, KEY)
+    assert (item.region_id, item.cause, item.opened_at, item.ticket) == (G, "unknown", NOW, "TOS-1")
+    assert item.age_business_days(later) == 6 and overdue([item], later) == [item]
+
+
 def test_a_failed_capture_item_belongs_to_the_key_of_its_runs_fingerprint(store):
     """Choice 8: an item without a floor is linked to its key through the run's recorded fingerprint."""
     store.write_fingerprint(Fingerprint(run_id=RUN, side="candidate", rig_id="rig-01", read_at=TS, match=MATCH,
@@ -472,6 +491,65 @@ def test_floors_carry_over_to_a_new_jre_after_a_passing_aa(store):
     assert carry_over(store, k_old, k_new, aa_passed=True, now=NOW) == 3
     assert StoreCalibration(store, k_new).lookup(CID, G)[1] == "calibrated"
     assert StoreCalibration(store, k_old).lookup(CID, G)[1] == "calibrated"
+
+
+def test_carried_floors_bring_their_open_fix_items_to_the_new_key(store):
+    """7.13, SD-69, 3.9 steps 5 and 6 (review calibration:2): floors carried to a new JRE key keep their open fix
+    items, so once the floor exception that made the old key complete expires, the new key is incomplete too and
+    its export does not claim an exception."""
+    fp = Fingerprint(run_id=RUN, side="candidate", rig_id="rig-01", read_at=TS, match=MATCH, shard_id=f"{RUN}/1")
+    store.write_fingerprint(fp)
+    new = {**MATCH, "jre_release": {"sha256": "sha256:" + "8" * 64, "java_version": "17.0.13"}}
+    k_old, k_new = calibration_key(MATCH), calibration_key(new)
+    cal = calibrate_checkpoint(noisy_captures(), registry(), data_mode="frozen", now=NOW, owner="jdoe")
+    _write(store, [cal], key=k_old, fingerprint_id=fp.fingerprint_id)
+    doc = _exception_doc(NOW + timedelta(days=30))                  # the exception lands after the calibration
+    day1, day31 = NOW + timedelta(days=1), NOW + timedelta(days=31)
+    assert StoreCalibration(store, k_old, exceptions=live_exceptions(doc, day1)).complete
+    assert carry_over(store, k_old, k_new, aa_passed=True, now=day1) == 3
+    [item] = open_fixes(store, k_new)
+    assert (item.region_id, item.cause, item.owner, item.opened_at) == (G, "unknown", "jdoe", NOW)
+    assert StoreCalibration(store, k_new, exceptions=live_exceptions(doc, day1)).complete
+    expired = live_exceptions(doc, day31)
+    for key in (k_old, k_new):
+        sc = StoreCalibration(store, key, exceptions=expired)
+        assert not sc.complete and sc.lookup(CID, G) == (UNCALIBRATED, "uncalibrated")
+        out = export_file(store, key, exported_at=day31, exceptions=expired)
+        assert not out.complete and out.to_dict()["checkpoints"][0]["regions"][0]["floor_exception"] is False
+
+
+def _exception_doc(expires_at):
+    return {CID: {"regions": [{"id": G, "floor_exception": {"ticket": "TOS-48200", "expires_at": expires_at.isoformat()}}]}}
+
+
+def test_an_expired_floor_exception_reopens_its_item_and_the_quarantine_clock(store):
+    """3.9 steps 5 and 6, 4.8, L-RGN-05 (review calibration:0): an exception that covered a non-zero frozen floor at
+    calibration closes the item only while it is in force; once it expires the key is incomplete again (every region
+    uncalibrated), the item is back on the fix list and export, and it quarantines the checkpoint."""
+    from sentinel import quarantine as Q
+    exc = FloorException("jdoe", "quote flash", "TOS-48200", NOW + timedelta(days=30))
+    reg = registry(exc)
+    cal = calibrate_checkpoint(noisy_captures(), reg, data_mode="frozen", now=NOW, owner="jdoe")
+    assert cal.accepted
+    _write(store, [cal], live={CID: vers(reg)})
+    [row] = store.query("SELECT closed_at, floor_exception_ref FROM calibration_fixes")
+    assert (row["closed_at"], row["floor_exception_ref"]) == (None, "TOS-48200")
+    doc = _exception_doc(exc.expires_at)
+    day1, day45 = NOW + timedelta(days=1), NOW + timedelta(days=45)
+    sc = StoreCalibration(store, KEY, live={CID: vers(reg)}, exceptions=live_exceptions(doc, day1))
+    assert sc.complete and sc.lookup(CID, G) == (cal.thresholds[G], "calibrated")
+    assert export_file(store, KEY, exported_at=day1, exceptions=live_exceptions(doc, day1)).complete
+    assert Q.inputs(store, day1.date(), exceptions=live_exceptions(doc, day1)).fixes == ()
+    expired = live_exceptions(doc, day45)
+    assert expired == {}
+    sc = StoreCalibration(store, KEY, live={CID: vers(registry())}, exceptions=expired)
+    assert not sc.complete and [i.region_id for i in sc.fix_list()] == [G]
+    assert sc.lookup(CID, G) == (UNCALIBRATED, "uncalibrated") and sc.request().to_dict()["reasons"] == {"incomplete": 1}
+    assert not export_file(store, KEY, exported_at=day45, exceptions=expired).complete
+    fixes = Q.inputs(store, day45.date(), exceptions=expired).fixes
+    assert [f.checkpoint_id for f in fixes] == [CID]
+    ev = Q.evaluate([], [], fixes, {}, day45.date())
+    assert [(p.target, p.reason) for p in ev.proposals] == [(CID, "aa_floor")]
 
 
 def test_the_nightly_retunes_a_regions_tolerance(store):
@@ -563,9 +641,10 @@ def test_a_canary_miss_on_a_floor_excepted_region_revokes_the_exception(store):
     store.write_finding(f)
     assert revoked_exceptions(store) == {(CID, G, "TOS-48200")}
     _write(store, [calibrate_checkpoint(noisy_captures(), reg, data_mode="masked_live", now=NOW)])
-    sc = StoreCalibration(store, KEY, live={CID: checkpoint_versions(reg)}, revoked=revoked_exceptions(store))
+    sc = StoreCalibration(store, KEY, live={CID: checkpoint_versions(reg)}, exceptions={CID: {G: "TOS-48200"}},
+                          revoked=revoked_exceptions(store))
     assert sc.complete and sc.lookup(CID, G) == (UNCALIBRATED, "uncalibrated")
     assert sc.lookup(CID, "_rest")[1] == "calibrated" and sc.request().regions == ((CID, G, "revoked"),)
     redeclared = checkpoint_versions(registry(dataclasses.replace(exc, ticket="TOS-48999")))   # a new approval
-    assert StoreCalibration(store, KEY, live={CID: redeclared},
+    assert StoreCalibration(store, KEY, live={CID: redeclared}, exceptions={CID: {G: "TOS-48999"}},
                             revoked=revoked_exceptions(store)).lookup(CID, G)[1] == "calibrated"

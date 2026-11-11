@@ -434,7 +434,8 @@ def render_run_report_html(report: RunReport, *, objects_dir: str | os.PathLike 
             d: Decision | None = r.decision
             rows.append([f"<code>{_e(r.checkpoint_id)}</code>", f"<code>{_e(r.region or '')}</code>", _e(r.decision_id),
                          _e(f"{d.action} ({d.verdict})" if d else "decision record not loaded"),
-                         _e(f"{d.decided_by}, {d.decided_at[:10]}" if d else ""), _e((d.ticket or "") if d else "")])
+                         _e(f"{d.decided_by}, {d.decided_at[:10]}" if d else ""),
+                         _e((d.ticket or report.ticket_notes.get(r.decision_id, "")) if d else "")])
         parts.append(f'<section id="suppressed"><h2>Suppressed by decision ({report.n_suppressed})</h2>'
                      + (_table(["Checkpoint", "Region", "Decision", "Action (verdict)", "By", "Ticket"], rows)
                         if rows else '<p class="muted">0 findings matched an earlier decision.</p>') + "</section>")

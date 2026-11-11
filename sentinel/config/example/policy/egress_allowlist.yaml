@@ -9,6 +9,7 @@ hosts:
   - {host: slack.com, port: 443, purposes: [slack, digest]}
   - {host: scm.example.internal, port: 443, purposes: [pr_comment, preflight]}       # PR comments and commit status (9.2)
   - {host: sentinel-store.example.internal, port: 443, purposes: [preflight]}        # the Central Store (N7)
+  - {host: paging.example.internal, port: 443, purposes: [page]}       # the paging service (9.10; named in Phase 0)
 signed_by: security-contact
 signed_at: "2026-11-01T15:00:00Z"
 signature: "pgp:7be42d05f1c9a2e3"

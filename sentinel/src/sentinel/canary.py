@@ -63,7 +63,10 @@ Choices where the spec is ambiguous (reported to the coordinator):
 6. Hashes are over the decoded pixels (shape header plus raw bytes), not an encoded file, so they
    do not depend on the PNG encoder. A mutant whose base hash and seed equal last night's but whose mutant
    hash differs is `generation_failed` (nondeterministic generator); a catalog whose sha256 is not the one the
-   G3 preflight checked fails every mutant before rendering.
+   G3 preflight checked fails every mutant before rendering. "Last night's" hash is the last one recorded: a key
+   that generated nothing tonight (it failed the check, or anything else) keeps last night's entry in tonight's
+   manifest, and a night that failed G3 keeps the whole previous manifest, so a nondeterministic generator fails
+   every night and the night after a G3 failure is still checked.
 7. Detection is on the final outcome (10.3: "in its expected list"), and a classification confidence below
    `expected.min_confidence` (4.11) does not count. The expected signal is matched against every id that fired
    (`fired_ids`: `invariant_ids`, `assertion_ids`, the reason and the lower-precedence results of 9.1, plus the
@@ -901,15 +904,20 @@ class Mutant:
 @dataclass
 class Generation:
     """What `generate` returns: every mutant in catalog order, failures included, and the catalog's sha256 (the
-    `catalog_sha256` of the night's `canary_manifests` row, 8.3)."""
+    `catalog_sha256` of the night's `canary_manifests` row, 8.3). `carried` holds last night's manifest entries
+    kept as the reference for keys that generated nothing tonight (`generate`)."""
     mutants: list[Mutant]
     catalog_sha256: str = ""
+    carried: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @property
     def manifest(self) -> dict[str, dict[str, Any]]:
-        """The sha256 manifest kept for the next night's check (`canary_manifests.manifest_json`, 8.3)."""
-        return {m.key: {"base_sha256": m.base_sha256, "mutant_sha256": m.mutant_sha256, "seed": m.seed}
-                for m in self.mutants if m.image is not None}
+        """The sha256 manifest kept for the next night's check (`canary_manifests.manifest_json`, 8.3): every mutant
+        generated tonight, and the carried reference of every key that was not, so a key that failed the check is
+        checked again against the same bytes the next night (10.3: nothing is skipped silently)."""
+        return {**self.carried,
+                **{m.key: {"base_sha256": m.base_sha256, "mutant_sha256": m.mutant_sha256, "seed": m.seed}
+                   for m in self.mutants if m.image is not None}}
 
     @property
     def failed(self) -> list[Mutant]:
@@ -1027,6 +1035,9 @@ def generate(catalog_entries: Iterable[MutantEntry], approved_images: Mapping[st
     for m in mutants:
         if m.key in failures:
             m.error, m.image, m.footprint, m.mutant_sha256 = failures[m.key], None, None, None
+    prev = previous_manifest or {}                     # the reference stays until a key generates again (10.3)
+    gen.carried = ({k: dict(v) for k, v in prev.items()} if g3_failed
+                   else {m.key: dict(prev[m.key]) for m in mutants if m.image is None and m.key in prev})
     return gen
 
 

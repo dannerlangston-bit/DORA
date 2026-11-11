@@ -258,6 +258,21 @@ def test_composite_pastes_redacted_crops_fills_the_rest_and_encodes_jpeg():
         composite(frame, [MAIN], {1: red[1][:10]}, fill=(0, 0, 0))
 
 
+def test_composite_paints_bottom_up_so_the_topmost_window_shows_where_windows_overlap():
+    # capture-eval:1, 5.7 Grab: the composite shows the screen's instant, so the target dialog (z 0) over the main
+    # frame (z 2) shows its own redacted crop, whatever order the windows come in (select_windows: topmost first).
+    frame = _screen()
+    kept = select_windows([MAIN, DIALOG], TREE, SCREEN).kept
+    assert [w.hwnd for w in kept] == [2, 1]
+    dlg = np.full((DIALOG.rect[3], DIALOG.rect[2], 3), 255, np.uint8)        # only the target has a redacted crop
+    cx, cy = DIALOG.rect[0] + 400 + 260, DIALOG.rect[1] + 180                  # the dialog's centre on the grab
+    for order in (kept, tuple(reversed(kept))):
+        img = composite(frame, order, {2: dlg}, fill=(7, 7, 7))
+        assert np.array_equal(img[cy, cx], (255, 255, 255))                    # the dialog, not main's fill
+        assert np.array_equal(img[1000, 100 + 400], (7, 7, 7))                 # main outside the dialog: filled
+        assert np.array_equal(img[DIALOG.rect[1], cx], (0, 255, 255))         # the dialog's outline is drawn
+
+
 # -- masked_live (7.9, 3.5) -------------------------------------------------------------------------------------------
 
 def test_masked_live_offsets_from_the_config():

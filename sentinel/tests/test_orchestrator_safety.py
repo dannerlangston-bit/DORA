@@ -18,11 +18,11 @@ from sentinel.orchestrator.gateway import Chord, DropLedger, GatewayDrop
 from sentinel.orchestrator.identity import (Allowlist, assertion_due, classify, judge_fixture_account,
                                             judge_identity, load_allowlist, send_frame_fresh)
 from sentinel.orchestrator.killswitch import (CANCEL_BY_HAND, ORDERS_SENT, PROVEN_DECLARED, PROVEN_NO_SESSION,
-                                              PROVEN_NONE, UNPROVEN, UNPROVEN_BLOCK, Proof, ProofInputs, TripWires,
-                                              account_ref, book_sha256, cancel_new_working, check_tripwires,
-                                              config_invalid_proof,
-                                              execute_kill_switch, kill_switch, masked_account, post_run_proof,
-                                              proof_result, send_lines)
+                                              PROVEN_NONE, TREE_SURVIVED, UNPROVEN, UNPROVEN_BLOCK, Proof,
+                                              ProofInputs, TripWires, account_ref, book_sha256, cancel_new_working,
+                                              check_tripwires, config_invalid_proof, execute_kill_switch, kill_switch,
+                                              masked_account, post_run_proof, proof_result, recovery_login,
+                                              send_lines)
 from sentinel.orchestrator.orderbook import MonitorBook
 from sentinel.orchestrator.ports import KillRequest
 from sentinel.orchestrator.results import RunVerdict
@@ -448,6 +448,57 @@ def test_kill_switch_proof_unproven_recovery_login_failed_and_orders_sent_with_c
     assert (rep2.proof.verdict, rep2.proof.cancel_all) == (ORDERS_SENT, "failed")       # the read itself was clean
     assert rep2.proof.line == "ORDERS SENT: undeclared rows (sim-order-1); Cancel All failed"
     assert rep2.proof_effect.run_reason == "undeclared_order_row" and "login_owner" in rep2.proof_effect.alert.paged
+
+
+class SurvivingRig(SimulatedRig):
+    """A rig whose tree kills leave a process from the install folder alive where `survivors` says so, one entry per
+    kill in order, then every kill works (6.6 step 3, 10.2 step 4: `kill_process_tree` False)."""
+
+    def __init__(self, *a, survivors: tuple[bool, ...] = (True,), **kw):
+        super().__init__(*a, **kw)
+        self.survivors = list(survivors)
+
+    def kill_process_tree(self) -> bool:
+        if self.survivors and self.survivors.pop(0):
+            self._log("kill_process_tree:survivor")
+            return False
+        return super().kill_process_tree()
+
+
+def test_a_kill_switch_whose_kill_leaves_a_survivor_makes_no_recovery_login_and_hands_over():
+    """K1 (6.6 steps 3 and 5, Cancel All failure; killswitch choice 20): the recovery login needs the tree gone, so
+    none is made from a survivor; the hook stays in deny-all, nothing more is sent, the proof is UNPROVEN
+    recovery_login_failed with the hand-over page, and the snapshot revert still ends the survivor."""
+    clock = ManualClock()
+    rig = SurvivingRig(clock=clock)
+    rep = _ks(rig, clock, rig.read_orders())
+    assert [s for s, _ in rep.steps] == ["deny_all", "kill_tree_survived", "proof", "revert_snapshot"]
+    assert rep.tree_survived and "login" not in rig.calls and "reset_input_state" not in rig.calls
+    assert [c for c in rig.calls if c.startswith("set_hook_state")] == ["set_hook_state:False:True",
+                                                                       "set_hook_state:False:False"]
+    assert (rep.proof.verdict, rep.proof.reason) == (UNPROVEN, "recovery_login_failed")
+    e = rep.proof_effect
+    assert e.alert == alerts.safety_abort().plus(paged=("login_owner",)) and e.evidence["tree_survived"] is True
+    assert TREE_SURVIVED in e.detail and CANCEL_BY_HAND in e.detail and e.has("block_login")
+
+
+def test_a_failed_recovery_login_whose_kill_leaves_a_survivor_says_so():
+    """K1 (killswitch choice 19 and 20): the failed login's session cannot be ended by the kill; nothing more is sent
+    into it (no reset_input_state) and the result says the tree survived."""
+    clock = ManualClock()
+    for survivors, survived, last in (((), False, "reset_input_state"), ((True,), True, "kill_process_tree:survivor")):
+        rig = SurvivingRig(SimScenario(recovery_login_fails=1), clock=clock, survivors=survivors)
+        rig.login()                                             # the run's own login; the next one fails
+        rig.set_hook_phase("recovery")
+        login = recovery_login(rig, ALLOW, clock, EMPTY)
+        assert rig.calls.count("login") == 2 and not login.ok
+        assert login.tree_survived is survived and rig.calls[-1] == last
+    rig = SurvivingRig(SimScenario(recovery_login_fails=1), clock=clock, survivors=(False, True))
+    rig.login()
+    rep = _ks(rig, clock, rig.read_orders())                    # step 3 killed the tree; the login's close did not
+    assert rep.tree_survived and (rep.proof.verdict, rep.proof.reason) == (UNPROVEN, "recovery_login_failed")
+    assert rep.proof_effect.evidence["tree_survived"] is True and rig.calls[-2:] == ["revert_snapshot",
+                                                                                     "set_hook_state:False:False"]
 
 
 def test_kill_switch_proof_monitor_unreadable():

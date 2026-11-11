@@ -2,19 +2,22 @@
 from __future__ import annotations
 
 import errno
+from dataclasses import replace
 
 import pytest
 from test_executor_emitter import MISS, FakeLocator, FakePlanner, FakePorts, FakeRescue
+from test_executor_secret import SECRET, FakeCapture, FakeVault
 
-from sentinel.executor.emitter import ExecContext, Rescue
+from sentinel.executor.emitter import Effect, ExecContext, Rescue
 from sentinel.executor.failures import FailureLedger, FaultInjector
-from sentinel.executor.flow import (CENSUS_CHECKS, NO_DIALOG, AssertVerdict, Captured, CheckRead, Unit, UnitHooks,
-                                    WaitPoll, WorkspaceStreak, census_unit, run_unit)
+from sentinel.executor.flow import (CENSUS_CHECKS, NO_DIALOG, AssertVerdict, Captured, CheckRead, ExportPorts,
+                                    SecretPorts, Unit, UnitHooks, WaitPoll, WorkspaceStreak, census_unit, run_unit)
 from sentinel.executor.heartbeat import AppLife, HeartbeatPolicy
+from sentinel.executor.primitives import Planner
 from sentinel.orchestrator.boundary import FlowTimer, flow_budget_cut
 from sentinel.orchestrator.budgets import ShardBudgets
 from sentinel.orchestrator.clock import ManualClock
-from sentinel.orchestrator.gateway import Flag, SafetyContext
+from sentinel.orchestrator.gateway import VK_TAB, Flag, SafetyContext
 from sentinel.orchestrator.ports import LocateResult
 from sentinel.orchestrator.results import ControlResult, Outcome, safety_abort_outcome, step_failed
 from sentinel.orchestrator.rig import CrashSignal
@@ -180,6 +183,169 @@ def test_an_agent_rescue_captures_the_next_checkpoint_after_normalize_flagged_re
     assert r.captured == (CP3, CP6, CP7)
 
 
+def test_a_rescued_checkpoint_is_captured_after_normalize_with_the_real_planner():
+    """executor:3 (5.5, 4.7): with the real primitives.Planner the example's normalize block (Escape, a park_mouse
+    and a focus_neutral naming no target) runs, so the checkpoint after the rescue is captured flagged rescued
+    instead of becoming harness_error (exception:PlanError)."""
+    ports, loc, _, ctx = setup()
+    loc.script = {QTY: [MISS]}
+    ctx.rescue = FakeRescue(Rescue(LocateResult("agent", point=(120, 80))))
+    doc = dict(DOC, normalize=[{"id": "n1", "type": "press", "key": "escape"}, {"id": "n2", "type": "park_mouse"},
+                               {"id": "n3", "type": "focus_neutral"}])
+    doc["steps"] = [s for s in DOC["steps"] if s["id"] in ("s01", "s03", "s04", "s06")]
+    r = run(ports, loc, Planner(), ctx, unit((CP3, CP6), doc))
+    assert [(s.step_id, s.status) for s in r.steps] == [
+        ("s01", "passed"), ("s03", "passed"), ("s04", "passed_via_agent_fallback"), ("n1", "passed"),
+        ("n2", "passed"), ("n3", "passed"), ("s06", "passed")]
+    assert r.captured == (CP3, CP6) and r.rescued == (CP6,) and r.outcomes == {} and ("s06", True) in ports.captured
+
+
+GRID = "monitor.position-statement.grid"
+GRID_TEXT = "Symbol\tQty\nAAPL\t100\n"
+
+
+class CopiedClipboard:
+    """The clipboard holds the grid's text once a Ctrl chord went through the gateway, until it is cleared."""
+
+    def __init__(self, ports, text=GRID_TEXT):
+        self.ports, self.text, self.log = ports, text, []
+
+    def read_text(self):
+        self.log.append("read")
+        copied = any("ctrl" in a.mods for a in self.ports.sent[self.cleared_at:])
+        return self.text if copied else None
+
+    def clear(self):
+        self.log.append("clear")
+        self.cleared_at = len(self.ports.sent)
+
+    cleared_at = 0
+
+
+class NoFiles:
+    def read_text(self, path):
+        return None
+
+
+def export_doc(step):
+    return dict(DOC, steps=[{"id": "s01", "type": "reset_input_state"}, step,
+                            {"id": "s03", "type": "checkpoint", "checkpoint_id": CP3}])
+
+
+def test_an_export_step_runs_through_run_export_and_keeps_its_source():
+    """executor:4 (4.7 export, 5.10, SD-32, choice 8): a copy_grid step with the real Planner clicks the grid, sends
+    Ctrl+C, reads the clipboard and clears it; the step passes and the export reaches the Oracle's source."""
+    ports, loc, _, ctx = setup()
+    clip = CopiedClipboard(ports)
+    step = {"id": "x1", "type": "copy_grid", "target": GRID, "headers": ["Symbol", "Qty"], "timeout_ms": 1000}
+    r = run(ports, loc, Planner(), ctx, unit((CP3,), export_doc(step)), exports=ExportPorts(clip, NoFiles()))
+    x1 = next(s for s in r.steps if s.step_id == "x1")
+    assert (x1.status, x1.reason) == ("passed", None) and r.captured == (CP3,) and r.outcomes == {}
+    assert r.exports["x1"].produced and r.exports["x1"].source().column("Qty") == ("100",)
+    assert [e.step_id for e in x1.events if e.action in ("click", "key_chord")] == ["x1-focus", "x1-copy"]
+    row = x1.events[-1]
+    assert (row.action, row.step_id, row.step_outcome) == ("clipboard", "x1", "passed")
+    assert clip.log[0] == "clear" and clip.log[-1] == "clear"
+
+
+def test_an_export_that_produced_nothing_or_cannot_run_is_a_step_failure_not_a_harness_error():
+    """executor:4 (SD-32): nothing in the clipboard within timeout_ms is export_timeout; a rig without export ports
+    is export_unavailable with no input sent; either way the flow ends like any failed step (2.6.1)."""
+    step = {"id": "x1", "type": "export", "target": GRID, "kind": "copy_all", "headers": ["Symbol", "Qty"],
+            "timeout_ms": 1000}
+    ports, loc, _, ctx = setup()
+    r = run(ports, loc, Planner(), ctx, unit((CP3,), export_doc(step)),
+            exports=ExportPorts(CopiedClipboard(ports, text=None), NoFiles()))
+    x1 = next(s for s in r.steps if s.step_id == "x1")
+    assert (x1.status, x1.reason, r.ended_by) == ("failed", "export_timeout", "x1")
+    assert r.outcomes == {CP3: step_failed("x1")} and x1.events[-1].action == "clipboard"
+    ports, loc, _, ctx = setup()
+    r = run(ports, loc, Planner(), ctx, unit((CP3,), export_doc(step)))
+    x1 = next(s for s in r.steps if s.step_id == "x1")
+    assert (x1.status, x1.reason) == ("failed", "export_unavailable") and r.outcomes == {CP3: step_failed("x1")}
+    assert not any(a.mods for a in ports.sent) and r.exports == {}
+
+
+class BreaksAfter(HeartbeatWriter):
+    """Writes `ok` heartbeats, then every write fails (10.2: the write and its retry)."""
+
+    def __init__(self, path, clock, ok):
+        super().__init__(path, clock)
+        self.ok = ok
+
+    def write(self, hb):
+        if self.ok <= 0:
+            raise HeartbeatUnwritable(errno.EROFS, "read-only")
+        self.ok -= 1
+        super().write(hb)
+
+
+def test_a_run_stop_during_an_export_or_a_secret_wait_ends_the_step_at_once(tmp_path):
+    """executor:4 (10.2, choices 8 and 9): the export's poll and the lease's retry wait write the heartbeat; when it
+    cannot be written the step ends there, nothing more is read, leased or typed."""
+    clock = ManualClock()
+    # five writes: the preconditions, s01 and x1's start; the poll's ticks then fail
+    hb = HeartbeatPolicy(BreaksAfter(tmp_path / "hb.json", clock, ok=5), clock, run_id="pr-1-1", shard=1,
+                         period_s=0.1)
+    ports, loc, _, ctx = setup(clock, heartbeat=hb)
+    clip = CopiedClipboard(ports, text=None)
+    step = {"id": "x1", "type": "copy_grid", "target": GRID, "headers": ["Symbol", "Qty"], "timeout_ms": 60000}
+    r = run(ports, loc, Planner(), ctx, unit((CP3,), export_doc(step)), exports=ExportPorts(clip, NoFiles()))
+    x1 = next(s for s in r.steps if s.step_id == "x1")
+    assert r.stopped and x1.status == "failed" and r.exports == {} and r.undecided == (CP3,)
+    assert r.consequences[-1].run_reason == "heartbeat_unwritable" and clock.monotonic() < 1000 + 60
+    assert clip.log[-1] == "clear"                                       # the clipboard is cleared all the same
+    log = []
+    clock = ManualClock()
+    # five writes: the preconditions, s01 and pw's start; the tick inside the lease's 30 s retry wait fails
+    hb = HeartbeatPolicy(BreaksAfter(tmp_path / "hb2.json", clock, ok=5), clock, run_id="pr-1-1", shard=1)
+    ports, loc, _, ctx = setup(clock, heartbeat=hb)
+    login = dict(export_doc(PW), **{"class": "login"})
+    r = run(ports, loc, Planner(), ctx, unit((CP3,), login),
+            secrets=SecretPorts(FakeVault(log, fail=1), FakeCapture(log)))
+    assert r.stopped and log == ["lease:login.password"] and r.secrets == {}
+    assert r.consequences[-1].run_reason == "heartbeat_unwritable"
+    assert not any(a.kind == "secret" for a in ports.sent)
+
+
+PW = {"id": "pw", "type": "secret", "target": "login.password-field", "vault_ref": "login.password", "commit": "tab"}
+
+
+def test_a_secret_step_is_leased_and_typed_through_run_secret_step_with_the_real_planner():
+    """executor:4 (5.4.10, 6.9, choice 9): the value is leased at the last moment, planned with secret tokens and
+    emitted while Capture is suspended; the rows show the redacted reference, the lease is kept for teardown."""
+    log = []
+    ports, loc, _, ctx = setup()
+    login = dict(export_doc(PW), **{"class": "login"})
+    r = run(ports, loc, Planner(), ctx, unit((CP3,), login), secrets=SecretPorts(FakeVault(log), FakeCapture(log)))
+    pw = next(s for s in r.steps if s.step_id == "pw")
+    assert pw.status == "passed" and r.captured == (CP3,)
+    a = next(a for a in ports.sent if a.kind == "secret")
+    assert a.secret_ref == "login.password" and a.chars() == len(SECRET) and a.keys == (VK_TAB,)
+    assert log == ["lease:login.password", "secret", "suspend", "resume"]
+    row = next(e for e in pw.events if e.action == "secret")
+    assert row.target_text == "<redacted:login.password>" and SECRET not in repr(r.events)
+    assert r.secrets["pw"].lease is not None and r.secrets["pw"].chars == len(SECRET)
+
+
+def test_a_secret_step_without_a_vault_or_with_one_down_types_nothing():
+    """executor:4 (6.9, 7.7, choice 9): no SecretPorts is a failed step; a lease that fails twice is the
+    vault_unreachable run consequence; neither leaves a planner error or types a key."""
+    ports, loc, _, ctx = setup()
+    login = dict(export_doc(PW), **{"class": "login"})
+    r = run(ports, loc, Planner(), ctx, unit((CP3,), login))
+    assert next(s for s in r.steps if s.step_id == "pw").status == "failed"
+    assert r.outcomes == {CP3: step_failed("pw")} and not any(a.kind == "secret" for a in ports.sent)
+    log = []
+    ports, loc, _, ctx = setup()
+    r = run(ports, loc, Planner(), ctx, unit((CP3,), login),
+            secrets=SecretPorts(FakeVault(log, fail=2), FakeCapture(log)))
+    assert r.stopped and r.undecided == (CP3,) and not any(a.kind == "secret" for a in ports.sent)
+    assert (r.consequences[-1].run_status, r.consequences[-1].unreached.reason) == ("complete_with_env_errors",
+                                                                                    "vault_unreachable")
+    assert next(e for e in r.events if e.step_id == "pw").target_text == "<redacted:login.password>"
+
+
 def test_a_wait_for_timeout_is_not_settled_with_the_failing_condition():
     ports, loc, plan, ctx = setup()
     ports.waits = [WaitPoll(False, "anti_anchor_present")]
@@ -330,7 +496,9 @@ def test_a_secret_step_suspends_capture_only_while_it_types(tmp_path):
                        {"id": "pw", "type": "secret", "target": "login.password", "vault_ref": "login.password",
                         "commit": "enter"},
                        {"id": "s04", "type": "reset_input_state"}], "teardown": []}
-    r = run_unit(Unit("flow", "flow.login.primary", login, ()), ports, loc, plan, ctx)
+    log = []
+    r = run_unit(Unit("flow", "flow.login.primary", login, ()), ports, loc, plan, ctx,
+                 secrets=SecretPorts(FakeVault(log), FakeCapture(log)))
     assert [s.status for s in r.steps] == ["passed"] * 4
     suspended = [(h.step_id, h.capture_suspended) for h in w.written]
     assert suspended == [("s01", False), ("s01", False), ("user", False), ("user", False), ("pw", True),
@@ -426,6 +594,29 @@ def test_a_flag_left_up_keeps_the_order_stage_declaration():
     ports.flag_value = Flag.SET
     run(ports, loc, plan, ctx)
     assert ctx.order_stage is True
+
+
+def test_an_order_stage_step_that_fails_after_its_click_holds_the_declaration_into_teardown():
+    """executor:0 (5.4.6 source 3, 6.2, 5.4.8 rule 1): the open-confirm click went out and opened the dialog, then
+    the step failed its post-condition. The declaration is held all the same, so the teardown's click on an order
+    dialog label that is neither allowlisted nor send-like ends the run aborted_safety, not a flow quarantine."""
+    ports, loc, plan, ctx = setup(labels={"dialog.order-confirmation.title-close": "Close"})
+
+    def post(step):
+        if step["id"] != "open-confirm":
+            return Effect(None)
+        ports.safety = replace(ports.safety, flag=Flag.SET, order_dialog_present=True)       # the dialog opened
+        return Effect(False)                                            # but the declared effect never showed
+    ports.postcondition = post
+    r = run(ports, loc, plan, ctx)
+    opened = next(s for s in r.steps if s.step_id == "open-confirm")
+    assert (opened.status, opened.reason, r.ended_by) == ("failed", "postcondition", "open-confirm")
+    assert ports.dialog_open and ctx.order_stage is True
+    t1 = r.teardown[0]
+    assert t1.status == "blocked_by_gateway" and t1.gateway_event["reason"] == "dialog_allowlist"
+    assert r.stopped and (r.consequences[-1].run_status, r.consequences[-1].run_reason) == \
+        ("aborted_safety", "unknown_dialog_in_order_stage")
+    assert not any(f.kind == "unknown_popup" for f in r.findings)
 
 
 def test_rows_after_a_relaunch_carry_the_restart_count_and_a_reset_uptime():

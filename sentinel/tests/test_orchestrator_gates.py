@@ -146,6 +146,19 @@ def test_launched_unreadable_build_id_and_the_rig_hold():
     assert not mid.has("disable_rig") and mid.evidence["launcher_log"] == "l" * 64
 
 
+def test_launcher_update_progress_after_a_relaunch_is_version_changed_mid_run():
+    # popups-gates:5, 7.8/12.8 POP-01: version_mismatch at launch (the rig held), version_changed_mid_run after a
+    # relaunch (the rest of the shard, no hold, 7.3), with the launcher log for the on-call channel.
+    relaunch = check_launched(LaunchObservation(True, BUILD, update_progress=True), expected_build=BUILD,
+                              first_launch=False, budgets=ShardBudgets(), launcher_log_sha256="l" * 64)
+    assert relaunch.unreached == Outcome("env_error", "version_changed_mid_run", "launched", relaunch.unreached.detail)
+    assert relaunch.run == RunVerdict("complete_with_env_errors") and not relaunch.has("disable_rig")
+    assert relaunch.evidence["launcher_log"] == "l" * 64
+    first = check_launched(LaunchObservation(True, BUILD, update_progress=True), expected_build=BUILD,
+                           first_launch=True, budgets=ShardBudgets())
+    assert first.unreached.reason == "version_mismatch" and first.has("disable_rig")
+
+
 def test_build_reread_falls_back_to_about_once_and_carries_both_ids():
     assert check_build_unchanged(None, BUILD, about_build_id=BUILD).passed
     changed = check_build_unchanged(None, BUILD, about_build_id="2026.45.0", launcher_log_sha256="l" * 64)
@@ -189,7 +202,7 @@ def test_launched_crash_at_first_launch_consumes_a_relaunch_f62():
 def test_authenticated_failures(obs, reason):
     r = check_authenticated(obs)
     assert r.run_status == "complete_with_env_errors"
-    assert r.actions == (("block_login",) if reason == "authentication_failed" else ())
+    assert r.actions == (("block_login",) if reason in ("authentication_failed", "authentication_challenge") else ())
     assert (r.unreached.outcome, r.unreached.gate, r.unreached.reason) == ("env_error", "authenticated", reason)
     assert "login_owner" in r.alert.notified and r.alert.priority == "P2"
     assert check_authenticated(obs, repeat=True).alert.priority == "P1"
@@ -289,6 +302,23 @@ def test_fixture_verified_pass_and_working_order_abort():
     r = check_fixture((GOOD[0], AccountState("E", "empty", {}, 1, 2500.0)), FIX)
     assert r.run_reason == "unexpected_working_order" and r.unreached.gate == "fixture_verified"
     assert r.has("kill_tree") and r.alert.is_safety and r.incident == "S1"
+
+
+def test_fixture_account_never_read_is_never_a_pass():
+    # popups-gates:1, 7.6 stage 2 step 1: every fixture account is compared; an account the read did not return
+    # proves neither zero working orders nor its positions and cash (choice 11: nothing passes by default). The gate
+    # fails before running: env_error (gate: fixture_verified), the run complete_with_env_errors (5.2, 12.7, A2).
+    for reads in ((GOOD[1],), (GOOD[0],), ()):
+        r = check_fixture(reads, FIX)
+        assert not r.passed and r.run == RunVerdict("complete_with_env_errors"), reads
+        assert r.unreached == Outcome("env_error", "gate", "fixture_verified", r.unreached.detail)
+        assert not r.has("reset_empty_account") and not r.outcomes
+    missing = check_fixture((GOOD[1],), FIX)
+    assert "G" in missing.unreached.detail and "working orders" in missing.unreached.detail
+    # a working order in the account that was read still aborts first
+    assert check_fixture((AccountState("E", "empty", {}, 1, 2500.0),), FIX).run_reason == "unexpected_working_order"
+    # the same rule after the own-tag Cancel All: the re-read must cover every account again
+    assert not check_fixture((GOOD[1],), FIX, paper_send_ok=True, run_tag="run-7", after_cancel=True).passed
 
 
 def test_fixture_golden_drift_and_reseed_never_reset():

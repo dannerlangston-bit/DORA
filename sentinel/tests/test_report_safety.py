@@ -274,3 +274,16 @@ def test_safety_canaries_banner_incidents_and_the_rc_residuals():
     assert [r.item for r in sec.attestation] == list(ITEMS) and sec.attestation[0].evidence_sha256 == "01" * 32
     assert sec.attestation[-1].evidence_sha256 is None and sec.worst == 0
     assert render(rows, shards=[shard_safety()]).residuals == ()            # the sign-off is the RC report's
+
+
+def test_a_shard_read_back_from_a_sorted_key_summary_keeps_a1_to_a11_in_order():
+    """The run summary stores canonical JSON with sorted keys, so rows come back A1, A10, A11, A2, ...
+    from_dict restores the 6.3 order instead of refusing the shard."""
+    import json
+    rows = {f"A{i}": "match" for i in range(1, 12)}
+    d = {"shard_id": "s1", "run_type": "pr", "attestation": {"result": "passed", "rows": rows, "evidence_sha256": {}},
+         "identity": {}}
+    back = json.loads(json.dumps(d, sort_keys=True))
+    assert list(back["attestation"]["rows"])[:3] == ["A1", "A10", "A11"]
+    shard = ShardSafety.from_dict(back)
+    assert tuple(shard.rows) == tuple(f"A{i}" for i in range(1, 12))

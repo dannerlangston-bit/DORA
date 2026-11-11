@@ -15,8 +15,8 @@ system owner; nothing here un-quarantines anything.
 
 - `evaluate(stats, step_events, fixes, aa_history, today)`: the proposals (one per target, its reason the first of
   `taxonomy.quarantine_reasons` that fired, every trigger in `detail`) and the exempt triggers to page.
-- `inputs(store, today)`: the store-side inputs of `evaluate` (step events, open fixes, A/A history, open safety
-  quarantines); the statistics come from `flake.refresh`.
+- `inputs(store, today, exceptions=)`: the store-side inputs of `evaluate` (step events, open fixes less those a live
+  floor exception closes, A/A history, open safety quarantines); the statistics come from `flake.refresh`.
 - `render_patch(proposals, current_text)`: the new `quarantine.yaml` content with the proposals added, and the PR
   payload for the outbox (with its `sha256:` id). A proposal without an owner or ticket waits in `pending`.
 - `mirror(store, doc, commit=...)`: at run start, the file at the pinned commit mirrored into `flake_stats`
@@ -33,9 +33,11 @@ Choices where the spec is ambiguous (reported to the coordinator):
    (`flake.FlakeStats.by_build`), evaluated per build; the trigger fires above 0.10 with at least 5 of them.
 2. "3 consecutive Nightly runs" are the checkpoint's last three non-synthetic Nightly rows (a rotating checkpoint is
    not selected every night); any of the three that is not `not_settled (reason: aa_drift)` breaks the streak.
-3. The fix-list trigger follows 3.9 step 6: any open item (no `closed_at`, no `floor_exception_ref`) on a frozen
-   checkpoint, a failed-capture item included, quarantines it on the 6th business day after it opened (Monday to
-   Friday, minus the caller's holidays); the item's owner is the record's owner.
+3. The fix-list trigger follows 3.9 step 6: any open item (no `closed_at`) on a frozen checkpoint, a failed-capture
+   item included, quarantines it on the 6th business day after it opened (Monday to Friday, minus the caller's
+   holidays); the item's owner is the record's owner. A floor exception closes a region item only while it is in
+   force (`inputs(exceptions=)`, `diff.calibration.live_exceptions`): the ticket stored on the row
+   (`floor_exception_ref`) does not, so an expired or removed exception lets the item quarantine its checkpoint.
 4. The fallback rate of a flow is `passed_via_agent_fallback` step rows over its step outcome rows in the 30 days
    ending `today` (fire-drill rows left out), with no minimum count.
 5. Owners: `owners` maps a checkpoint or flow id to its owner (a checkpoint falls back to its flow's owner); with
@@ -263,13 +265,17 @@ def _mirrored(by_cp: Mapping[str, FlakeStats], cid: str) -> bool:
     return s is not None and s.quarantined
 
 
-def inputs(store: Store, today: date) -> Inputs:
-    """The store-side inputs of `evaluate` for the 30 days ending `today`."""
+def inputs(store: Store, today: date, *, exceptions: Mapping[str, Mapping[str, str]] | None = None) -> Inputs:
+    """The store-side inputs of `evaluate` for the 30 days ending `today`. `exceptions` (checkpoint -> region ->
+    ticket, `diff.calibration.live_exceptions` at run start) are the floor exceptions in force: an open region item
+    they name is closed (choice 3). Without them every open item counts."""
+    live = exceptions or {}
     fixes = tuple(OpenFix(r["fix_id"], r["checkpoint_id"], r["data_mode"], r["opened_at"], r["owner"],
                           r["ticket_ref"]) for r in store.query(
-        "SELECT x.fix_id, x.checkpoint_id, c.data_mode, x.opened_at, x.owner, x.ticket_ref FROM calibration_fixes x "
-        "JOIN checkpoints c ON c.checkpoint_id = x.checkpoint_id "
-        "WHERE x.closed_at IS NULL AND x.floor_exception_ref IS NULL ORDER BY x.fix_id"))
+        "SELECT x.fix_id, x.checkpoint_id, x.region_id, c.data_mode, x.opened_at, x.owner, x.ticket_ref "
+        "FROM calibration_fixes x JOIN checkpoints c ON c.checkpoint_id = x.checkpoint_id "
+        "WHERE x.closed_at IS NULL ORDER BY x.fix_id")
+        if r["region_id"] is None or r["region_id"] not in live.get(r["checkpoint_id"], {}))
     first, last = window(today)
     history: dict[str, list[AANight]] = defaultdict(list)
     for r in store.query(

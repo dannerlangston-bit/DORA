@@ -276,6 +276,22 @@ def test_unresolved_branch_warns_past_its_deadline_in_phase0_and_errors_after(ba
         assert sorted(set(found)) == sevs, (phase, deadline, found)
 
 
+def test_dr07_alone_may_stay_undecided_after_phase0(base):
+    """config-lint:2, 1.4 G4: "DR-07 alone may stay open, in which case Phase 1 starts on its Branch B" (6.11: zero
+    model calls and `unreviewed` reports). An undecided computer_use is no error in Phase 1 or later; past its
+    deadline it warns, as in Phase 0, and the other six records stay errors."""
+    for phase, deadline, sevs in ((1, "2026-12-01", []), (2, "2026-12-01", []), (1, "2026-11-01", ["warn"])):
+        r = copy.deepcopy(base)
+        r.docs[BRANCHES].data["computer_use"] = {"branch": "undecided", "deadline": deadline}
+        found = [v.severity for v in lint_repo(r, phase, TODAY).violations if v.rule == "L-XREF-15"]
+        assert found == sevs, (phase, deadline, found)
+    r = copy.deepcopy(base)
+    r.docs[BRANCHES].data["computer_use"] = {"branch": "undecided", "deadline": "2026-12-01"}
+    r.docs[BRANCHES].data["jab"] = {"branch": "undecided", "deadline": "2026-12-01"}
+    found = [(v.severity, v.path) for v in lint_repo(r, 1, TODAY).violations if v.rule == "L-XREF-15"]
+    assert found == [("error", "jab")]
+
+
 def test_golden_list_is_warn_until_phase2(base):
     for phase, sev in ((1, "warn"), (2, "error")):
         r = copy.deepcopy(base)
@@ -605,6 +621,48 @@ def test_flw07_other_keys_while_the_order_is_staged(base, step_):
         i = next(k for k, st in enumerate(d["steps"]) if st.get("id") == "w-confirm")
         d["steps"].insert(i + 1, {"id": "k-other", **step_})
     assert "L-FLW-07" not in _apply(base, FLOW, fn)
+
+
+_STAGE2 = {"id": "stage2", "type": "click_named", "target": "trade.order-entry.stock.confirm-and-send", "order_stage": True}
+_MID_CLOSE = [{"id": "mid-close", "type": "teardown", "action": "close_dialog",
+               "target": "dialog.order-confirmation.title-close"},
+              {"id": "mid-empty", "type": "assert",
+               "assertions": [{"id": "mid_empty", "kind": "absent", "region": "rgn.order-entry.qty", "pattern": "[0-9]"}]}]
+
+
+def test_flw07_checks_every_order_stage_step_not_only_the_first(base):
+    """config-lint:0, 4.7 L-FLW-07: each step that targets Confirm and Send arms the rule. After a mid-flow close and
+    a second order stage, an Enter, Ctrl+Enter or a missing close of the second stage is still an error."""
+    def enter_after_second(d):
+        d["steps"] += [*copy.deepcopy(_MID_CLOSE), dict(_STAGE2), {"id": "x3", "type": "press", "key": "enter"}]
+    got = [v for v in _violations(base, FLOW, enter_after_second, 1) if v.rule == "L-FLW-07"]
+    assert [v.path for v in got] == ["steps[x3]"] and "x3" in got[0].message
+
+    def chord_and_no_close(d):
+        d["steps"] += [*copy.deepcopy(_MID_CLOSE), dict(_STAGE2),
+                       {"id": "x4", "type": "key_chord", "keys": ["ctrl", "enter"]}]
+        d["teardown"] = [t for t in d["teardown"] if t["id"] not in ("t1", "t2")]
+    got = {(v.path, v.message) for v in _violations(base, FLOW, chord_and_no_close, 1) if v.rule == "L-FLW-07"}
+    assert ("steps[x4]", "step x4 presses Enter or Space while the order is staged") in got
+    assert any(p == "teardown" and "stage2" in m and "no close_dialog" in m for p, m in got)
+
+    def no_absent_after_second_close(d):
+        d["steps"] += [*copy.deepcopy(_MID_CLOSE), dict(_STAGE2),
+                       {"id": "close2", "type": "teardown", "action": "close_dialog",
+                        "target": "dialog.order-confirmation.title-close"}]
+        d["teardown"] = [t for t in d["teardown"] if t["type"] != "assert"]
+    got = [v.message for v in _violations(base, FLOW, no_absent_after_second_close, 1) if v.rule == "L-FLW-07"]
+    assert got == ["no absent assertion proves the ticket empty after close_dialog or clear_ticket (close2)"]
+
+    def clean_second_stage(d):
+        d["steps"] += [*copy.deepcopy(_MID_CLOSE), dict(_STAGE2), {"id": "k-tab", "type": "press", "key": "tab"}]
+    assert "L-FLW-07" not in {v.rule for v in _violations(base, FLOW, clean_second_stage, 1)}
+
+    def one_enter_two_stages(d):                                   # overlapping stages report the key once
+        i = next(k for k, st in enumerate(d["steps"]) if st.get("id") == "w-confirm")
+        d["steps"][i + 1:i + 1] = [dict(_STAGE2), {"id": "x5", "type": "press", "key": "enter"}]
+    got = [v.path for v in _violations(base, FLOW, one_enter_two_stages, 1) if v.rule == "L-FLW-07"]
+    assert got == ["steps[x5]"]
 
 
 # -- w1 lint safety and correctness: pairs at run creation ------------------------------------------------------------

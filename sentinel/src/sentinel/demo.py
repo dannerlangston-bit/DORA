@@ -43,6 +43,13 @@ and its calibration):
 - `unregistered-tab`: the candidate build gains a main window tab the Surface Registry does not list; registry
   validation at entry to running (P1, SD-15) records a tier-1 `unregistered_surface` with a registry stub PR, and
   the PR comment lists it (2.2.3).
+- `report-ui`: the control host of `sentinel serve` in process (`service.serve.compose`, no browser): after the
+  ui-no-manifest PR run, the triage page is requested, a confirm_bug goes through the UI's action endpoint to the
+  Reporter service, which writes the decision, queues the product Bug and re-posts the PR comment and status; the
+  outbox posts them to the simulated Jira and PR host (9.1, 9.2, 9.5, 9.6, 9.9).
+- `outbox-outage`: the same, with the PR host down: the re-posted comment and status fail and are retried at 1, 2,
+  5 and 15 minutes; at 15 minutes the integration outage alert goes to the on-call Slack channel and the paging
+  service; the host comes back and the jobs are sent (9.1, 9.10).
 
 `sentinel demo all` runs every scenario, prints one line each and writes `DIR/index.html`, a page that
 links each scenario's report, PR comment, summary and alerts with what to check.
@@ -69,7 +76,7 @@ import cv2
 
 import yaml
 
-from . import synth
+from . import demo_ops, synth
 from .pairs import MainCommit
 from .pipeline.orchestration import RigScript
 from .pipeline.reviewer import SIMULATED_MODEL_ID
@@ -83,7 +90,7 @@ SCENARIOS = ("flexgrid-ladder", "clean-pr", "backend-only", "ui-no-manifest", "n
              "wrong-number", "paper-mode-mismatch", "attempted-send", "app-crash", "config-invalid", "expired-mask",
              "operator-stop", "redaction-miss", "popups", "fingerprint-mismatch", "clamped-gadget", "fixed-reopens",
              "occluded-capture", "base-distance", "base-missing", "base-reuse", "lockstep-slip", "calibrated-floors",
-             "unregistered-tab")
+             "unregistered-tab", "report-ui", "outbox-outage") + tuple(demo_ops.DEMOS)   # + the runtime scenarios (demo_ops)
 AT = "charts.flexible-grid.active-trader-cell"
 LADDER = "trade.active-trader.ladder"
 STOCK_FLOW = "flow.trade.order-ticket.stock.limit"
@@ -1340,6 +1347,140 @@ def demo_fixed_reopens(out: Path, today: date = DEFAULT_TODAY, config: Path = EX
     return [r1, r2]
 
 
+TRIAGER = "triage.lead"                          # the example's triage rotation member (ops/oncall.yaml)
+
+
+def _control_host(out: Path, r: RunResult, clock: Callable[[], datetime]) -> Any:
+    """The control host of `sentinel serve` over the scenario's store, with the simulated integrations; its PR host
+    is the run's own `pr-host.json`, where the run's comment already is."""
+    from .service.serve import compose
+    return compose(out / "sentinel.db", out / "artifacts", out / "config" / r.run_id, integrations="simulated",
+                   state_dir=out, clock=clock, background=False)
+
+
+def _ui(app: Any, method: str, path: str, form: Mapping[str, str] | None = None) -> Any:
+    """One request to a WSGI application in process, as the triage rotation member (the SSO header, 8.7)."""
+    from urllib.parse import urlencode
+
+    from .service.shipper import WsgiTransport
+    body = urlencode(form).encode() if form else b""
+    headers = {"X-Forwarded-User": TRIAGER}
+    if form:
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    return WsgiTransport(app).request(method, f"http://ui.local{path}", headers=headers, body=body)
+
+
+def _outbox_rows(c: Any, run_id: str) -> list[str]:
+    rows = c.writer.submit(lambda s: s.query("SELECT job_id, kind, destination, state, attempts, last_error FROM "
+                                             "outbox WHERE run_id = ? OR run_id IS NULL ORDER BY job_id", (run_id,)))
+    return [f"  job {r['job_id']}: {r['kind']} to {r['destination']}, {r['state']}, {r['attempts']} attempt(s)"
+            + (f", last error {r['last_error']}" if r["last_error"] else "") for r in rows]
+
+
+def _collateral(r: RunResult) -> str:
+    return next(f.finding_id for f in r.findings if f.kind == "collateral" and f.phash and f.region_id)
+
+
+def _run_end(r: RunResult) -> datetime:
+    with Store(r.out_dir / "sentinel.db") as s:
+        return datetime.fromisoformat(s.query("SELECT finished_at FROM runs WHERE run_id = ?", (r.run_id,))[0][0])
+
+
+def demo_report_ui(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                   ) -> list[RunResult]:
+    r = run_pipeline(config, ui_no_manifest_scenario(today), out, today, **_rev(reviewer))
+    now = _run_end(r) + timedelta(minutes=30)
+    finding = _collateral(r)
+    c = _control_host(out, r, lambda: now)
+    try:
+        before = _ui(c.ui, "GET", "/triage")
+        acted = _ui(c.ui, "POST", "/act/confirm_bug", {"f": finding, "reason": "Level II sizes print as 22x100"})
+        after = _ui(c.ui, "GET", "/triage")
+        page = _ui(c.ui, "GET", f"/runs/{r.run_id}")
+        jobs = _outbox_rows(c, r.run_id)
+        decision = c.writer.submit(lambda s: s.query("SELECT decision_id, action, decided_by, ticket_ref FROM "
+                                                     "decisions WHERE source_finding_id = (SELECT finding_id FROM "
+                                                     "findings WHERE natural_key = ?)", (finding,)))
+        issues = sorted(c.transports.jira.issues)
+    finally:
+        c.close()
+    from .report.prhost import FilePrHost
+    host = FilePrHost(out / "pr-host.json")
+    (comment,) = host.comments[ui_no_manifest_scenario(today).pr or 0]
+    d = decision[0] if decision else None
+    story = [
+        "The control host of `sentinel serve` (the Reporter service, the report UI and the outbox loop) built in",
+        "process over this scenario's store, with the simulated integrations; no browser and no network.",
+        "",
+        "- The triage page lists the run's open collateral; the triage rotation member (triage.lead) confirms the",
+        "  Level II finding as a bug through the UI's action endpoint, which calls the Reporter service.",
+        "- The service writes the confirm_bug decision, queues the product Bug (outbox kind jira_create), then",
+        "  re-posts the PR comment and status (9.2: within one minute of a decision write).",
+        "- The outbox posts them at once: the Bug to the simulated Jira, whose key the Jira sender writes back on",
+        "  the decision (9.9), and the comment edited in place on the simulated PR host (pr-host.json).",
+    ]
+    extra = ["Report UI and service", "-" * 21,
+             f"GET /triage before: HTTP {before.status}, {finding} listed: {finding.encode() in before.body}",
+             f"POST /act/confirm_bug f={finding}: HTTP {acted.status}",
+             f"GET /triage after: HTTP {after.status}, {finding} listed: {finding.encode() in after.body}",
+             f"GET /runs/{r.run_id}: HTTP {page.status}",
+             f"Decision: {d['action']} by {d['decided_by']}, ticket {d['ticket_ref']}" if d else "Decision: none",
+             f"Simulated Jira issues: {', '.join(issues) or 'none'}",
+             f"PR comment on the simulated host: comment {comment.comment_id}, "
+             + ("re-rendered with the decision" if "Suppressed by decision (1)" in comment.body else "as the run "
+                "posted it"),
+             "Outbox:", *jobs, ""]
+    _write_summary(out, "Scenario report-ui: the report UI and the Reporter service in process", story, [r], extra)
+    (out / "report-ui-comment.md").write_text(comment.body, encoding="utf-8")
+    return [r]
+
+
+def demo_outbox_outage(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                       ) -> list[RunResult]:
+    r = run_pipeline(config, ui_no_manifest_scenario(today), out, today, **_rev(reviewer))
+    t0 = _run_end(r) + timedelta(minutes=30)
+    clock = [t0]
+    c = _control_host(out, r, lambda: clock[0])
+    timeline: list[str] = []
+    try:
+        c.transports.pr_host.down = True                  # the PR host answers 503 to every request
+        acted = _ui(c.ui, "POST", "/act/confirm_bug", {"f": _collateral(r), "reason": "Level II sizes"})
+        timeline.append(f"+0 min: confirm_bug (HTTP {acted.status}); the re-posted comment and status fail at once")
+        for minutes in (1, 2, 5, 15):
+            clock[0] = t0 + timedelta(minutes=minutes)
+            rep = c.tick(clock[0])
+            assert rep.dispatch is not None
+            failed = [a for a in rep.dispatch.attempts if not a.ok]
+            timeline.append(f"+{minutes} min: {len(failed)} failed attempt(s), {len(rep.dispatch.alerts)} outage "
+                            "alert(s) raised")
+        c.transports.pr_host.down = False
+        clock[0] = t0 + timedelta(minutes=60)
+        rep = c.tick(clock[0])
+        assert rep.dispatch is not None
+        timeline.append(f"+60 min: the PR host is back; {sum(1 for a in rep.dispatch.attempts if a.ok)} job(s) sent")
+        posts = [p for p in c.transports.slack.posts if "integration outage" in p["text"]]
+        pages = [p for p in c.transports.pager.pages if p["key"].startswith("integration_outage")]
+        jobs = _outbox_rows(c, r.run_id)
+    finally:
+        c.close()
+    story = [
+        "The same control host as report-ui, with the simulated PR host down (HTTP 503) when a decision is written.",
+        "",
+        "- The re-posted comment and status are outbox jobs; each failed attempt is retried at 1, 2, 5 and 15",
+        "  minutes after the job was written (9.1).",
+        "- At 15 minutes the integration outage alert (P2) goes to every other alert channel: the on-call Slack",
+        "  channel and the paging service (9.10); it is raised once for the outage.",
+        "- When the host answers again the next pass sends the jobs, in order (a stale status never overwrites a",
+        "  newer one).",
+    ]
+    extra = ["Timeline", "-" * 8, *timeline, "",
+             f"Slack (#sentinel-oncall): {posts[0]['text'] if posts else 'no outage post'}",
+             f"Paging service: {pages[0]['key'] + ', ' + pages[0]['severity'] if pages else 'no page'}",
+             "Outbox:", *jobs, ""]
+    _write_summary(out, "Scenario outbox-outage: a PR host outage and its alert", story, [r], extra)
+    return [r]
+
+
 DEMOS: dict[str, Callable[..., list[RunResult]]] = {
     "flexgrid-ladder": demo_flexgrid_ladder, "clean-pr": demo_clean_pr, "backend-only": demo_backend_only,
     "ui-no-manifest": demo_ui_no_manifest, "nightly-canary": demo_nightly_canary,
@@ -1351,7 +1492,8 @@ DEMOS: dict[str, Callable[..., list[RunResult]]] = {
     "fixed-reopens": demo_fixed_reopens, "occluded-capture": demo_occluded_capture,
     "base-distance": demo_base_distance, "base-missing": demo_base_missing, "base-reuse": demo_base_reuse,
     "lockstep-slip": demo_lockstep_slip, "calibrated-floors": demo_calibrated_floors,
-    "unregistered-tab": demo_unregistered_tab,
+    "unregistered-tab": demo_unregistered_tab, "report-ui": demo_report_ui, "outbox-outage": demo_outbox_outage,
+    **demo_ops.DEMOS,
 }
 
 # One sentence per scenario for out/index.html: what it demonstrates, and what a tester should check.
@@ -1440,9 +1582,18 @@ INDEX = {
                           "the store (3.9, 7.13).",
                           "every threshold of the PR run is calibrated from the store, no Calibration is requested "
                           "in Run health, and the outcomes match clean-pr's."),
+    "report-ui": ("The report UI and the Reporter service in process: a confirm_bug from the triage page writes the "
+                  "decision, files the Bug and re-posts the PR comment (9.5, 9.6, 9.9).",
+                  "summary.txt shows HTTP 200 for the pages and the action, the decision with ticket TOS-1, the "
+                  "jira_create, pr_comment and commit_status jobs sent, and report-ui-comment.md has the decision."),
+    "outbox-outage": ("The PR host is down when a decision re-posts the comment; the outbox retries and alerts "
+                      "(9.1, 9.10).",
+                      "the timeline shows failed attempts at 1, 2 and 5 minutes, two outage alerts at 15 minutes "
+                      "(Slack on-call and the paging service), and the jobs sent once the host is back."),
     "expired-mask": ("An expired mask stops applying at run start and the run goes on (4.1, 4.8).",
                      "the run is complete, Run health lists \"mask expired: msk.ps.last-update-01\" and the store "
                      "holds a mask_expired finding."),
+    **demo_ops.INDEX,
 }
 
 

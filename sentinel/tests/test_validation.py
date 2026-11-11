@@ -103,8 +103,9 @@ def test_classify_windows_matches_titles_and_aliases_of_the_probes_entries_only(
     got = v.classify_windows({"P1": ("Monitor", "_Trading", "Risk Profile", "Monitor (2)", "Futures")}, registry())
     p1 = got["P1"]
     assert p1.registered == (("Monitor", ("monitor.tab",)), ("_Trading", ("trade.tab",)))
-    assert p1.unregistered == ("Risk Profile", "Futures")       # a P2 entry's title is not a P1 entry
-    assert p1.present == {"monitor.tab", "trade.tab"}
+    assert p1.unregistered == ("Risk Profile", "Monitor (2)", "Futures")   # a P2 title is not a P1 entry; the
+    assert p1.present == {"monitor.tab", "trade.tab"}                      # second "Monitor" has no entry left
+    assert p1.matched == {"monitor.tab", "trade.tab"} and p1.unresolved == frozenset()
 
 
 def test_classify_windows_refuses_an_unknown_probe():
@@ -200,6 +201,50 @@ def test_row_parents_per_label_on_a_multi_row_probe():
     both = ("All Products", "Risk Profile", "thinkBack")              # and thinkBack (under Analyze) added
     assert run("P2", both, SUBTABS, reg, manifest("trade.tab")).record.outcome.outcome == "collateral"
     assert run("P2", both, SUBTABS, reg, manifest("trade.tab", "analyze.tab")).record.outcome.outcome == "intended"
+
+
+DEPTH_TRADE = entry("trade.all-products.product-depth", "Product Depth", "P2", parent="trade.subtab.all-products",
+                    kind="subtab")
+DEPTH_CHARTS = entry("charts.product-depth", "Product Depth", "P2", parent="charts.tab", kind="subtab")
+
+
+def test_a_new_surface_repeating_a_registered_label_is_unregistered():
+    """2.2.3 row 1, G1, choice 2 (review validation:0): a second "Product Depth" (a Charts sub-tab) beside the
+    registered All Products section is an unregistered surface on every run until the registry changes, and the
+    probe is not intended because the manifest declares the registered row's parent."""
+    reg = registry(DEPTH_TRADE)
+    base = (*SUBTABS, "Product Depth")
+    cand = (*SUBTABS, "Product Depth", "Product Depth")
+    r = run("P2", cand, base, reg, manifest("trade.subtab.all-products"))
+    (u,) = r.unregistered
+    assert u.surface_id == "unregistered.p2.product-depth" and "candidate only" in u.record.outcome.detail
+    assert [(p.kind, p.surface_id) for p in r.proposals] == [("stub", "unregistered.p2.product-depth")]
+    assert r.record.outcome.outcome == "collateral" and r.removed == () and r.appeared == ()
+    again = run("P2", cand, cand, reg)
+    assert again.record.outcome.outcome == "identical" and [u.surface_id for u in again.unregistered] == [
+        "unregistered.p2.product-depth"]
+    assert v.ValidationReport((again,)).control().alert.rule == "unregistered_surface"
+    twice = run("P2", (*cand, "Product Depth"), base, reg)                   # each extra row has its own id
+    assert len({u.surface_id for u in twice.unregistered}) == 2
+
+
+def test_a_removed_surface_sharing_its_label_is_never_silently_accepted():
+    """2.2.3, choices 2 and 5 (review validation:0): with both "Product Depth" entries registered and one row gone,
+    the flat list cannot say which: neither is guessed removed, run health says validation is incomplete, the census
+    visits both, and the probe is intended only when the manifest declares both rows' parents."""
+    reg = registry(DEPTH_TRADE, DEPTH_CHARTS)
+    base = (*SUBTABS, "Product Depth", "Product Depth")
+    cand = (*SUBTABS, "Product Depth")
+    r = run("P2", cand, base, reg, manifest("trade.subtab.all-products"))
+    assert r.record.outcome.outcome == "collateral" and r.unregistered == () and r.removed == ()
+    assert r.notes == (('validation incomplete for P2: "product depth" is the label of 2 entries '
+                        '(charts.product-depth, trade.all-products.product-depth) but is listed 1 time(s) on the '
+                        'candidate and 2 on the base, so the probe cannot tell which; the census visits each'),)
+    report = v.ValidationReport((r,))
+    assert report.health == r.notes and report.b_input(cp("charts.product-depth")) is None
+    both = run("P2", cand, base, reg, manifest("trade.subtab.all-products", "charts.tab"))
+    assert both.record.outcome.outcome == "intended"
+    assert run("P2", base, base, reg).notes == ()                             # every entry has its row
 
 
 def test_a_pure_reorder_is_judged_on_the_moved_labels():
@@ -343,13 +388,27 @@ def test_control_routes_new_entries_to_the_system_owner_and_is_quiet_otherwise()
 
 
 def test_synthetic_ids_are_slugs_and_unique_within_a_probe():
-    r = run("P1", (*TABS, "P/L", "P L", "★", "Café"), TABS)
+    r = run("P1", (*TABS, "P/L", "P L", "★", "Café", "Trade History"), TABS)
     ids = [u.surface_id for u in r.unregistered]
-    assert ids[0] == "unregistered.p1.p-l" and ids[1].startswith("unregistered.p1.p-l-") and len(ids[1]) == 28
-    assert ids[2].startswith("unregistered.p1.label-") and ids[3] == "unregistered.p1.cafe"
-    assert len(set(ids)) == 4
+    assert ids[0].startswith("unregistered.p1.p-l-") and len(ids[0]) == 28 and ids[1] == "unregistered.p1.p-l"
+    assert ids[2].startswith("unregistered.p1.label-") and ids[3].startswith("unregistered.p1.cafe-")
+    assert ids[4] == "unregistered.p1.trade-history"
+    assert len(set(ids)) == 5
     for u in r.unregistered:                                          # each id is a valid checkpoint id
         assert isinstance(u.record.to_outcome(RUN), CheckpointOutcome)
+
+
+def test_a_synthetic_id_depends_on_its_label_alone():
+    """Choice 10, 2.2.3 row 1, 10.3 (review validation:3): a label's id does not move when another label folding to
+    the same slug is listed before it, so the self-test that removes "P&L" while "P/L" is unregistered passes in
+    either list order."""
+    def ids(*labels):
+        return {u.label: u.surface_id for u in run("P1", (*TABS, *labels), TABS).unregistered}
+    assert ids("P/L")["P/L"] == ids("P&L", "P/L")["P/L"] != ids("P&L", "P/L")["P&L"]
+    reg = registry(entry("monitor.account-statement.pl", "P&L", "P2", parent="monitor.tab", kind="subtab"))
+    for order in (("P&L", *SUBTABS, "P/L"), ("P/L", *SUBTABS, "P&L")):
+        r = self_test(reg, lists(P2=(order, order)), "monitor.account-statement.pl")
+        assert r.passed and len(r.added) == 1, order
 
 
 def test_an_alias_match_is_not_flagged():

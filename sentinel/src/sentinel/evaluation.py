@@ -5,8 +5,8 @@ simulated run and a real rig share them:
 
 - `settle_spec_for(cfg, checkpoint)` builds the 3.5 `SettleSpec` of one checkpoint from the configuration: the
   checkpoint's `max_settle_ms`, else its surface's `settle.max_wait_ms`, else the 3.5 default (long for chart and
-  scan checkpoints); `keep_focus` (4.7, SD-27); the surface's `must_see` landmarks (4.5, SD-37) and the regions
-  file's landmarks as must-see anchors; the 3.5 anti-anchor texts, the surface's `anti_anchors` and the platform's
+  scan checkpoints); `keep_focus` (4.7, SD-27); the surface's `must_see` landmarks (4.5, SD-37) as must-see
+  anchors; the 3.5 anti-anchor texts, the surface's `anti_anchors` and the platform's
   spinner and empty-grid templates; the regions file's masks (a `keep_focus` caret mask among them); the flow's
   neutral control.
 - `base_side_outcome(step_results, manifest, surface)` applies the step-failure rules of 3.1, 2.4 and 2.6.1 to
@@ -33,11 +33,13 @@ Choices where the spec is ambiguous (reported):
    parameters `max_wait_ms` and `max_wait_long_ms`). 4.5's 8000 is not applied.
 2. "Chart and scan checkpoints" (3.5): a checkpoint whose surface has `kind: chart`, or whose surface id's area
    segment is `scan` (4.5 has no scan kind; thinkorswim's Scan tab is an area).
-3. Must-see anchors (3.5 condition 3, SD-37): the regions file's landmarks (searched at their `search_rect`, else
-   their position plus or minus the 3.7 search margin, else the whole frame) and the surface's landmarks with
-   `must_see: true` (searched in the whole frame); a surface landmark whose id a regions-file landmark already
-   has is one anchor. Every anchor matches at the 3.5 confidence of 0.92: a landmark's `confidence_min` is a 3.7
-   (landmark location) override and is not read by settle.
+3. Must-see anchors (3.5 condition 3, SD-37, 4.5, 5.7 Inputs): the surface's registry landmarks with
+   `must_see: true`, searched in the whole frame at the 3.5 confidence of 0.92. The regions file's landmarks are
+   not anchors: SD-37 gives them to the 3.7 diff alignment, and 5.7 takes the Region Registry entry into settle only
+   for its masks. So a regions-file landmark missing on a build settles and reaches the Diff Engine, which refuses
+   the pair `landmark_missing (reason: landmark:<id>)` with the side and both crops (3.7, SD-21) for the PR
+   comment's Unexpected list, never `not_settled`; and a landmark's `confidence_min` (a 3.7 override) is read only
+   there.
 4. Anti-anchors (3.5 condition 4): the three 3.5 texts, the surface's `anti_anchors`, and the spinner and
    empty-grid templates, which no configuration file declares, so the caller passes them; duplicate texts are
    compared case-insensitively.
@@ -75,8 +77,7 @@ import cv2
 import numpy as np
 
 from .classify import Condition, EnvFailure
-from .diff import load_params
-from .diff.regions import Landmark, Rect, RegionsFile
+from .diff.regions import Rect, RegionsFile
 from .diff.settle import (
     DEFAULT_ANTI_ANCHOR_TEXTS, Anchor, Frame, Recapture, RerunBudget, SettleResult, SettleSpec, Stability,
     diff_stability, invariant_stability, recaptures_allowed, settle,
@@ -152,31 +153,20 @@ def neutral_control(cfg: ConfigView, checkpoint: PlannedCheckpoint) -> str | Non
     return None
 
 
-def _regions_anchor(lm: Landmark, pos: tuple[int, int] | None, margin: int) -> Anchor:
-    th, tw = lm.template.shape[:2]
-    if lm.search_rect is not None:
-        box = lm.search_rect
-    elif pos is not None:
-        box = Rect(pos[0] - margin, pos[1] - margin, tw + 2 * margin, th + 2 * margin)
-    else:
-        box = None
-    return Anchor(lm.id, template=lm.template, search=box)
-
-
 def settle_spec_for(cfg: ConfigView, checkpoint: PlannedCheckpoint, *, regfile: RegionsFile | None = None,
                     park: tuple[int, int] | None = None, positions: Mapping[str, tuple[int, int]] | None = None,
                     template: TemplateResolver | None = None, anti_anchor_templates: Sequence[Anchor] = (),
                     params: Mapping[str, Any] | None = None) -> SettleSpec:
     """The 3.5 settle parameters of one checkpoint (module docstring, choices 1 to 6).
 
-    `regfile` is the checkpoint's Region Registry entry (its landmarks become must-see anchors and its masks are
-    ignored by frame stability); `park` the parking coordinate; `positions` where each landmark sits on the frame
-    (default: its `expected` position); `template(landmark_id, path)` resolves a surface landmark's template
-    (default: the PNG under `cfg.root`; a resolver may return None to leave that anchor out where the platform
-    cannot show it, as the simulation does); `anti_anchor_templates` are the platform's spinner and empty-grid
-    templates."""
-    p = params or load_params()
-    margin = int(p["landmarks"]["search_margin_px"])
+    `regfile` is the checkpoint's Region Registry entry: its masks are ignored by frame stability (5.7 Inputs), placed
+    at its landmarks; its landmarks are never must-see anchors (choice 3); `park` the parking coordinate; `positions`
+    where each landmark sits on the frame (default: its `expected` position); `template(landmark_id, path)` resolves
+    a surface landmark's template (default: the PNG under `cfg.root`; a resolver may return None to leave that
+    anchor out where the platform cannot show it, as the simulation does); `anti_anchor_templates` are the
+    platform's spinner and empty-grid templates. `params` is accepted for the callers and not read: no settle input
+    here comes from the diff parameters."""
+    del params
     surface = cfg.surfaces.get(checkpoint.surface_id, {})
     step = flow_step(cfg, checkpoint)
     resolve = template or read_template(cfg.root)
@@ -184,8 +174,8 @@ def settle_spec_for(cfg: ConfigView, checkpoint: PlannedCheckpoint, *, regfile: 
     pos = {lm.id: lm.expected for lm in landmarks if lm.expected is not None}
     pos.update(positions or {})
 
-    anchors: list[Anchor] = [_regions_anchor(lm, pos.get(lm.id), margin) for lm in landmarks]
-    seen = {a.name for a in anchors}
+    anchors: list[Anchor] = []
+    seen: set[str] = set()
     for lm in surface.get("landmarks") or ():
         if lm.get("must_see") is True and str(lm["id"]) not in seen:
             img = resolve(str(lm["id"]), str(lm["template"]))

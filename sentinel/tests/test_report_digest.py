@@ -105,7 +105,7 @@ def test_the_daily_digest_has_the_910_layout(store):
     body = "\n".join(text[15:])
     assert "F-01 (tier 1): step 2, assigned to triage.lead" in body
     assert "proposal 1 on F-12: mark_intended by dev.author, open 2h 00m business, awaiting triage.lead" in body
-    assert "dec-000007: confirm_bug by alice" in body
+    assert "dec-000007: confirm_bug on " in body and " by alice, no ticket for " in body
     assert "jira_create to TOS, last error 503 from Jira" in body
     assert f"[Sentinel] P3 coverage_loss | merge {RUN} | m1 vs m0 | - | 3 checkpoints not_run (budget)" in body
     assert text[-1] == "Queue: https://sentinel.internal/triage"

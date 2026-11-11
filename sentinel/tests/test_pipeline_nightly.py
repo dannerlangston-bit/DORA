@@ -146,7 +146,8 @@ def test_the_detector_state_carries_across_nights_and_a_green_night_clears_it(tm
                                           (n3.run_id,))[0][0])
     assert {"mutants", "popups"} <= set(versions)
     alerts = json.loads((tmp_path / "alerts.json").read_text())
-    assert [(a["run_id"], a["rule"], a["priority"]) for a in alerts if a["control"] != "fingerprint"] == \
+    assert [(a["run_id"], a["rule"], a["priority"]) for a in alerts                    # less the store check's
+            if a["control"] not in ("fingerprint", "store_health")] == \
         [(n1.run_id, "canary_failure", "P1"), (n2.run_id, "canary_failure", "P1")]          # less G5's notices
 
 
@@ -250,8 +251,8 @@ def test_a_complete_quarantine_proposal_becomes_a_pr_payload_and_an_outbox_job(t
     monkeypatch.setattr(pr.quarantine, "evaluate", evaluate)
     n = nightly(tmp_path, "M01")
     with Store(tmp_path / "sentinel.db") as store:
-        (job,) = store.query("SELECT kind, destination, payload_sha256, state FROM outbox WHERE run_id = ?",
-                             (n.run_id,))
+        (job,) = store.query("SELECT kind, destination, payload_sha256, state FROM outbox WHERE run_id = ? AND "
+                             "kind = 'quarantine_pr'", (n.run_id,))   # beside the run's alert pages and posts (9.10)
         block = store.run_summary(n.run_id)["health"]["quarantine"]
     assert (job["kind"], job["destination"], job["state"]) == ("quarantine_pr", "sentinel-config/quarantine.yaml",
                                                                "queued")

@@ -14,7 +14,10 @@ Choices where the spec is ambiguous (reported):
    the family's id `-00` (for example `L-SRF-00`); a schema failure of an auxiliary file (ladders,
    renames, policies, branches, profiles, allowed configs, redaction) carries the rule that reads it.
 2. `--phase`: the TBD-glob rule (L-DEP-01) and unresolved Phase 0 branches (L-XREF-15) warn in
-   Phase 0 and are errors from Phase 1; L-FIX-09 warns until Phase 2 (11.8, 4.9).
+   Phase 0 and are errors from Phase 1; L-FIX-09 warns until Phase 2 (11.8, 4.9). An undecided record
+   warns in Phase 0 only past its deadline (checks/branches.py). DR-07 (`computer_use`) is exempt from
+   the Phase 1 error: "DR-07 alone may stay open, in which case Phase 1 starts on its Branch B" (1.4
+   G4, 6.11: zero model calls, `unreviewed` reports), so it only warns past its deadline.
 3. Order surfaces (L-FLW-12) are the surfaces that list `OrderTicketCore`; ticket surfaces (L-FLW-15)
    are `kind: ticket_variant`; Active Trader surfaces (L-WSP-06) are `kind: active_trader_panel`.
 4. The derived hosted-surface list (L-SRF-14) is a tier A workspace's `gadgets_present` and
@@ -502,6 +505,7 @@ MUTANT_SEED = 20260101
 BRIEF_CLASSES = ("erased_control", "shifted_panel", "swapped_digit", "color_swap", "clipped_label", "overlapped_panels")
 PERSONAS = ("active_trader", "options_trader", "futures_trader", "swing_trader", "beginner")
 BRANCH_KEYS = ("jab", "data_fixture", "login_mfa", "pinned_install", "aa_floor", "session_rule", "computer_use")
+MAY_STAY_OPEN = ("computer_use",)   # 1.4 G4: DR-07 alone may stay undecided after Phase 0 (Phase 1 runs its Branch B)
 SPLIT_FULL = (0.00, 0.15, 0.30, 0.50, 0.70, 0.85, 1.00)          # 2.5.2
 SPLIT_SHORT = (0.15, 0.50, 0.85)
 LADDER_S = tuple((w, h) for w in (960, 640, 480, 320) for h in (720, 480, 360))
@@ -2215,38 +2219,54 @@ class _Linter:
         return ctl is not None and (ctl[1].get("id") == "confirm-and-send" or "confirm and send" in _labels(ctl[1]))
 
     def _flow_safety(self, fl: dict, f: str) -> None:
+        """L-FLW-07 for every step that targets Confirm and Send (4.7): each carries order_stage: true and arms the
+        rule on its own, so a flow that closes the dialog and stages again is checked from each stage to the next
+        close_dialog or clear_ticket teardown, and that close needs an absent assertion after it. A key pressed
+        while two stages overlap is reported once."""
         seq = self._seq(fl)
-        start = None
+        stages = []
         for k, st in enumerate(seq):
             if self._confirm_and_send(st.get("target")):
                 if st.get("order_stage") is not True:
                     self.add("L-FLW-07", f, f"step {st.get('id')} targets Confirm and Send without order_stage: true", f"steps[{st.get('id')}]")
-                start = k if start is None else start
-        if start is None:
-            return
-        closed = None
-        for k in range(start + 1, len(seq)):
-            st = seq[k]
-            if st.get("type") == "teardown" and st.get("action") in ("close_dialog", "clear_ticket"):
-                closed = k
-                break
-            # every spelling folded as L-POP-02 folds it (`_chord`): return, spacebar, numpad enter, Control+Return
-            if st.get("type") == "press":
-                keys = [_chord(_s(st.get("key")))]
-            elif st.get("type") == "key_chord":
-                raw = [_s(x) for x in _l(st.get("keys"))]
-                keys = [_chord("+".join(raw))] + [_chord(x) for x in raw]
-            else:
-                keys = []
-            # a type_fixture (or secret) step that commits with Enter presses Enter too (6.2)
-            if st.get("type") in ("type_fixture", "secret") and _s(st.get("commit")).casefold() == "enter":
-                keys.append("enter")
-            if any(x in ENTER_KEYS for x in keys):
-                self.add("L-FLW-07", f, f"step {st.get('id')} presses Enter or Space while the order is staged", f"steps[{st.get('id')}]")
-        if closed is None:
-            self.add("L-FLW-07", f, "no close_dialog or clear_ticket teardown follows the order-stage step", "teardown")
-        elif not any(st.get("type") == "assert" and any(_d(a).get("kind") == "absent" for a in _l(st.get("assertions"))) for st in seq[closed + 1:]):
-            self.add("L-FLW-07", f, "no absent assertion proves the ticket empty after close_dialog or clear_ticket", "teardown")
+                stages.append(k)
+        pressed: set[int] = set()
+        unproven: set[int] = set()
+        for start in stages:
+            closed = None
+            for k in range(start + 1, len(seq)):
+                st = seq[k]
+                if st.get("type") == "teardown" and st.get("action") in ("close_dialog", "clear_ticket"):
+                    closed = k
+                    break
+                if k not in pressed and self._presses_enter(st):
+                    pressed.add(k)
+                    self.add("L-FLW-07", f, f"step {st.get('id')} presses Enter or Space while the order is staged", f"steps[{st.get('id')}]")
+            if closed is None:
+                where = "" if len(stages) == 1 else f" {seq[start].get('id')}"
+                self.add("L-FLW-07", f, f"no close_dialog or clear_ticket teardown follows the order-stage step{where}", "teardown")
+            elif closed not in unproven and not any(
+                    st.get("type") == "assert" and any(_d(a).get("kind") == "absent" for a in _l(st.get("assertions")))
+                    for st in seq[closed + 1:]):
+                unproven.add(closed)
+                where = "" if len(stages) == 1 else f" ({seq[closed].get('id')})"
+                self.add("L-FLW-07", f, f"no absent assertion proves the ticket empty after close_dialog or clear_ticket{where}", "teardown")
+
+    @staticmethod
+    def _presses_enter(st: dict) -> bool:
+        """L-FLW-07: the step sends Enter, Space or Ctrl+Enter, every spelling folded as L-POP-02 folds it (`_chord`:
+        return, spacebar, numpad enter, Control+Return); a type_fixture (or secret) step that commits with Enter
+        presses Enter too (6.2)."""
+        if st.get("type") == "press":
+            keys = [_chord(_s(st.get("key")))]
+        elif st.get("type") == "key_chord":
+            raw = [_s(x) for x in _l(st.get("keys"))]
+            keys = [_chord("+".join(raw))] + [_chord(x) for x in raw]
+        else:
+            keys = []
+        if st.get("type") in ("type_fixture", "secret") and _s(st.get("commit")).casefold() == "enter":
+            keys.append("enter")
+        return any(x in ENTER_KEYS for x in keys)
 
     def _flow_budget(self, fl: dict, f: str, fid: str) -> None:
         b = _d(fl.get("budget"))
@@ -3038,7 +3058,9 @@ class _Linter:
             v = self.branches.get(k)
             if k not in self.branches:
                 self.add("L-XREF-15", f, f"no branch for unknown {k}", k)
-            elif v not in ("A", "B") and self.phase >= 1:     # Phase 0: only past its deadline (checks/branches.py)
+            # Phase 0, and DR-07 in any phase (1.4 G4: it alone may stay open), warn only past the deadline
+            # (checks/branches.py)
+            elif v not in ("A", "B") and self.phase >= 1 and k not in MAY_STAY_OPEN:
                 self.add("L-XREF-15", f, f"unknown {k} is unresolved ({v!r}); choose A or B", k, "error")
         data = self.branches.get("data_fixture")
         for doc in self.r.of("fixture"):

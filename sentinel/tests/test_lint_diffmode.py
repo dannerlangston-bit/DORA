@@ -119,6 +119,31 @@ def test_a_removed_approved_checkpoint_needs_a_renames_entry(base):
     assert [v.file for v in D.history_violations(base, head) if v.rule == "L-XREF-10"] == [rel]
 
 
+LADDER = "registry/surfaces/trade/trade.active-trader.ladder.yaml"
+
+
+def test_an_approved_checkpoint_without_a_regions_file_that_disappears_needs_a_renames_entry(base):
+    """config-lint:3, 4.15 L-XREF-10: renaming a splitter changes the split checkpoint ids, none of which has a
+    regions file; the approved ones need a RENAMES entry (or `retired`) so their baselines are not orphaned. Without
+    an approved list every checkpoint the base defines counts as approved (choice 2)."""
+    head = copy.deepcopy(base)
+    head.docs[LADDER].data["splitters"][0]["id"] = "side-splitter"
+    gone = sorted(c for c in D.checkpoint_definitions(base)[0] if c not in D.checkpoint_definitions(head)[0])
+    assert len(gone) == 5 and all(c.startswith("split/trade.active-trader.ladder/side-panel/") for c in gone)
+    for approved in (gone, None):
+        got = [v for v in D.history_violations(base, head, approved=approved) if v.rule == "L-XREF-10"]
+        assert sorted(v.message.split()[2] for v in got) == gone, approved
+        assert {v.file for v in got} == {LADDER}
+    assert "L-XREF-10" not in rules(D.history_violations(base, head, approved=[]))         # none approved
+    for cid in gone:
+        rename(head, cid, cid.replace("/side-panel/", "/side-splitter/"))
+    assert "L-XREF-10" not in rules(D.history_violations(base, head, approved=gone))
+    sweep = next(c for c in sorted(D.checkpoint_definitions(base)[0])
+                 if c.startswith("sweep/") and f"regions/{c}.yaml" not in base.docs)
+    head.docs[f"regions/{sweep}.yaml"] = Doc(f"regions/{sweep}.yaml", "regions", copy.deepcopy(base.docs[S06].data))
+    assert "L-XREF-10" not in rules(D.history_violations(base, head, approved=[sweep]))   # a regions file added
+
+
 # -- L-MSK-05 and L-MSK-04 ---------------------------------------------------------------------------------------------
 
 def _renew(r: Repo, reason: str | None = None) -> None:
@@ -319,6 +344,27 @@ def test_changed_reports_the_edited_flow_errors_and_only_changed_warnings(checko
     comment = tmp_path / "comment.json"
     assert main([str(checkout), "--changed", "HEAD", "--review-comment", str(comment), "--today", "2026-11-10"]) == 1
     assert json.loads(comment.read_text())["body"].startswith("sentinel lint")
+
+
+def test_changed_reports_an_expiry_only_on_the_pr_that_touches_the_record(checkout):
+    """config-lint:5, 4.8 L-MSK-02: "in CI, error on the PR that adds or renews it; at run start the mask simply stops
+    applying" (3.8). After msk.ps.last-update-01 expires (2026-12-05), a PR that leaves it alone is not blocked: the
+    record is listed as expired; a PR that renews it to a date still past is."""
+    later = date(2026, 12, 10)
+    assert ("L-MSK-02", MASK) in {(v.rule, v.file) for v in lint(checkout, 1, later).violations}   # the full CI lint
+    p = checkout / "policy/explorer_budget.yaml"
+    p.write_text(p.read_text() + "# a comment\n")
+    report, changed = D.lint_changed(checkout, "HEAD", 1, later)
+    assert changed == {"policy/explorer_budget.yaml"}
+    assert "L-MSK-02" not in rules(report.violations)
+    assert [(e.record_id, e.file) for e in report.expired] == [("msk.ps.last-update-01", MASK)]
+    m = checkout / MASK
+    m.write_text(m.read_text().replace("expires_at: 2026-12-05T15:20:00-05:00", "expires_at: 2026-12-06T15:20:00-05:00"))
+    report, changed = D.lint_changed(checkout, "HEAD", 1, later)
+    assert MASK in changed
+    assert [(v.rule, v.severity) for v in report.violations if v.file == MASK and v.rule == "L-MSK-02"] == [
+        ("L-MSK-02", "error")]
+    assert report.expired == []
 
 
 def test_changed_runs_the_history_rules_against_base_and_a_month_ago(checkout):

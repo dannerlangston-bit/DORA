@@ -252,6 +252,12 @@ def integration_outage() -> AlertRoute:
     return AlertRoute("integration_outage", P2, (), (ON_CALL_CHANNEL,))
 
 
+def jira_reopen_forbidden() -> AlertRoute:
+    """A fixed ticket whose regression the Jira workflow will not let the Reporter reopen (9.9: the comment and the
+    `sentinel-reopened` label go on it instead); P2 to the on-call channel, the Integration outage row's routing."""
+    return AlertRoute("jira_reopen_forbidden", P2, (), (ON_CALL_CHANNEL,))
+
+
 def quarantine_ceiling() -> AlertRoute:
     """"Quarantine ceiling": above 2 percent of tier-1 checkpoints quarantined (10.5); P2 to the system owner."""
     return AlertRoute("quarantine_ceiling", P2, (), ("system_owner", ON_CALL_CHANNEL))

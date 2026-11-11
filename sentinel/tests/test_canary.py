@@ -389,6 +389,32 @@ def test_a_mutant_that_changes_bytes_on_the_same_base_fails_generation():
     assert not m02.failed and m02.base_sha256 == C.image_sha256(new_base)
 
 
+def test_a_nondeterministic_generator_fails_every_night_and_after_a_g3_failure(monkeypatch):
+    """10.3 Determinism (review pipeline-nightly:2): a failed key keeps last night's hash as its reference, so a
+    generator that changes one pixel on every call fails on every night after the first, and a night whose
+    catalog failed G3 keeps the whole previous manifest for the next night's check."""
+    entries = C.parse_catalog(CATALOG).entries
+    m02 = next(e for e in entries if e.mutant_id == "M02")
+    recipe, calls = C.RECIPES[m02.defect_class], iter(range(1, 100))
+
+    def flaky(base, box, rng, **kw):
+        out = recipe(base, box, rng, **kw).copy()
+        out[0, 0] = (7 * next(calls) % 256, 1, 2)
+        return out
+    monkeypatch.setitem(C.RECIPES, m02.defect_class, flaky)
+    key, prev, errors = f"M02@{CONFIRM}", None, []
+    for _ in range(4):
+        gen = C.generate(entries, APPROVED, REGIONS, previous_manifest=prev)
+        errors.append(next(m.error for m in gen.mutants if m.key == key))
+        assert key in gen.manifest
+        prev = gen.manifest
+    assert errors[0] is None and all(e and "nondeterministic" in e for e in errors[1:])
+    g3 = C.generate(entries, APPROVED, REGIONS, previous_manifest=prev, g3_hash="sha256:" + "0" * 64)
+    assert len(g3.failed) == len(g3.mutants) and g3.manifest == prev
+    after = C.generate(entries, APPROVED, REGIONS, previous_manifest=g3.manifest)
+    assert "nondeterministic" in next(m.error for m in after.mutants if m.key == key)
+
+
 def test_generation_failed_on_missing_or_degenerate_targets():
     entries = C.parse_catalog(CATALOG).entries
     regions = {

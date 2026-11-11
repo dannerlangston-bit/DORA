@@ -121,7 +121,8 @@ def test_matrix_from_a_flexgrid_pr_plan(registry):
     outcomes = [cp.outcome("run-pr", "identical") for cp in plan.planned]
     m = build_matrix("run-pr", registry, [MARGIN], {MARGIN.id: outcomes}, plan.cuts)
     assert m.cell(CHART, "swing_trader", MARGIN.id).display == "identical (1)"
-    assert m.cell(AT_CELL, "active_trader", MARGIN.id).display == "identical (13)"   # canonical census + 12 sweep steps
+    assert m.cell(AT_CELL, "active_trader", MARGIN.id).display == "identical (14)"   # census in both its workspaces
+                                                                                     # (a change surface) + 12 steps
     assert m.cell("analyze.risk-profile", "options_trader", MARGIN.id).display == "not_run (scope)"
     assert m.cell(FUTURES, "futures_trader", MARGIN.id).display == "not_run (entitlement)"
     t1 = m.tier_coverage(1)

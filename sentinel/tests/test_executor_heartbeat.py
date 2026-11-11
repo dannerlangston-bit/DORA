@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import errno
 import json
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -145,6 +146,34 @@ def test_hang_detection_reads_the_expectation_from_the_heartbeat(tmp_path):
     assert not hang_detected(hb, now=clock.monotonic(), last_hash_change=since + 1, anti_anchor=False)
     assert not hang_detected(hb, now=clock.monotonic(), last_hash_change=since - 1, anti_anchor=True)
     assert p.hang_detected(now=clock.monotonic(), last_hash_change=since - 1, anti_anchor=False)
+
+
+class SteppedClock(ManualClock):
+    """A wall clock a time-sync correction steps (W32Time, NTP) while the monotonic clock runs on."""
+
+    def step_wall(self, seconds):
+        self._wall += timedelta(seconds=seconds)
+
+
+@pytest.mark.parametrize("step_s", [0, 120, -300])
+def test_a_wall_clock_step_neither_fakes_nor_hides_the_expectation(tmp_path, step_s):
+    """executor:5 (10.2: the monotonic clock, "so a wall-clock correction cannot fake or hide staleness"): the
+    expectation reads back as the input's monotonic time whatever the wall clock did after the input."""
+    p, w, clock = policy(tmp_path, SteppedClock())
+    p.step_start("f", "cp1", checkpoint_id="flow/a.b/flow.a.b/cp1", max_wait_s=10)
+    p.expect_screen_change()
+    since = clock.monotonic()
+    clock.advance(1)
+    clock.step_wall(step_s)
+    clock.advance(1)
+    p.step_end()
+    hb = read_heartbeat(tmp_path / "heartbeat.json")
+    assert expect_since_mono(hb) == pytest.approx(since)
+    assert datetime.fromisoformat(hb.expect_screen_change_since) == clock.now() - timedelta(seconds=2)
+    frozen = dict(now=since + 91, last_hash_change=since - 1, anti_anchor=False)        # the app froze at the input
+    assert hang_detected(hb, **frozen)
+    loading = dict(now=since + 3, last_hash_change=since - 200, anti_anchor=False)      # a screen still loading
+    assert not hang_detected(hb, **loading)
 
 
 def test_no_hang_while_capture_is_suspended_or_nothing_is_expected(tmp_path):

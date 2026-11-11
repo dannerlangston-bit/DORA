@@ -16,7 +16,9 @@ the injected `importer`, the run queue (`orchestrator.queue.RunQueue`) the injec
 | `PUT /v1/artifacts/{sha256}` | one redacted object (8.2): its hash recomputed, its redaction version required for a picture |
 | `POST /v1/rigs/{rig_id}/heartbeat` | the rig heartbeat summary (5.1) |
 | `POST /v1/webhook` | the pipeline webhook (PR, merge, RC builds) into the run queue (5.1, 11.2) |
-| `POST /v1/actions/{action}` | a report UI action with the SSO identity (8.7, 9.6): `report.actions.apply` |
+| `POST /v1/actions/{action}` | a report UI action with the SSO identity (8.7, 9.6): `report.actions.apply`; then `on_action` (the control host re-posts the PR runs it decided on, 9.2) |
+| `POST /v1/jobs/restore-drill` | record a passing restore drill (8.6): `by`, `compared`, `matched` |
+| `POST /v1/jobs/{job}` | run a store maintenance job now (`backup`, `audit`) when the control host gave one |
 
 Answers are JSON. Status codes: 200 done (a replay of a stored item is done too: every endpoint is idempotent),
 400 a malformed request, 403 an action refused by the 9.6 table, 404 an unknown run or shard, 409 an import conflict
@@ -61,10 +63,11 @@ from urllib.parse import parse_qs
 from ..canonical import sha256_id
 from ..orchestrator.queue import RunFinished, RunReachedRunning, WebhookError, webhook_to_request
 from ..records import CheckpointOutcome, Finding, RunOutcome, StepOutcome, from_dict
-from ..report.actions import ActionContext, ActionRefused, ActionRequest, apply as apply_action
+from ..report.actions import ActionContext, ActionRefused, ActionRequest, ActionResult, apply as apply_action
 from ..store.artifacts import (SHA256_RE, ArtifactError, ArtifactHashMismatch, ArtifactStore, Redaction,
                                RedactionRefused, SecretLeaked, StoredArtifact, TextScanner)
 from ..store.mirror import MaskBudgetExceeded
+from ..store.health import record_restore_drill
 from ..store.store import ActiveDecisionExists, ImportConflict, Store, StoreError, StoreRefused
 from ..taxonomy import TaxonomyError
 from .deadman import DeadmanTimer, Fired, fire
@@ -226,7 +229,9 @@ class ReporterService:
                  actions: ActionContext | None = None, timer: DeadmanTimer | None = None,
                  on_queue: Callable[[list[Any]], None] | None = None,
                  payload_sink: Callable[[str, bytes], None] | None = None, scanner: TextScanner | None = None,
-                 require_local: bool = True, clock: Callable[[], datetime] = _utc_now):
+                 require_local: bool = True, clock: Callable[[], datetime] = _utc_now,
+                 on_action: Callable[[ActionResult, ActionRequest], Any] | None = None,
+                 jobs: Mapping[str, Callable[[], Any]] | None = None):
         self.writer = writer
         self.importer = importer
         self.queue = queue
@@ -239,6 +244,8 @@ class ReporterService:
         self.scanner = scanner
         self.require_local = require_local
         self.clock = clock
+        self.on_action = on_action
+        self.jobs = dict(jobs or {})
         self._lock = threading.RLock()                 # the incoming index; re-entered by the import
         self.tick_errors: list[tuple[str, str]] = []   # dead-man closes the writer refused (retried next tick)
         r = self.router = Router()
@@ -252,6 +259,8 @@ class ReporterService:
         r.add("POST", "/v1/rigs/{rig_id}/heartbeat", self.heartbeat)
         r.add("POST", "/v1/webhook", self.webhook)
         r.add("POST", "/v1/actions/{action}", self.action)
+        r.add("POST", "/v1/jobs/restore-drill", self.restore_drill)
+        r.add("POST", "/v1/jobs/{job}", self.job)
 
     def __call__(self, environ: Mapping[str, Any], start_response: Callable[..., Any]) -> list[bytes]:
         return self.router.wsgi(environ, start_response)
@@ -554,7 +563,31 @@ class ReporterService:
             return self._refusal(e)
         for sha_id, data in result.payloads.items():
             self.payload_sink(sha_id, data)
+        if self.on_action is not None:
+            self.on_action(result, ar)
         return respond(200, result.to_dict())
+
+    def restore_drill(self, req: Request) -> Response:
+        """A passing restore drill (8.6), recorded through the writer (`store.health.record_restore_drill`)."""
+        doc = req.json() or {}
+        try:
+            by, compared, matched = str(doc["by"]), int(doc["compared"]), int(doc["matched"])
+        except (KeyError, TypeError, ValueError) as e:
+            raise BadRequest(f"a restore drill names by, compared and matched: {e}") from e
+        at = doc.get("at") or self.clock().isoformat(timespec="seconds")
+        try:
+            recorded = self.writer.submit(lambda s: record_restore_drill(s, by, compared=compared, matched=matched,
+                                                                         at=at))
+        except StoreRefused as e:
+            return self._refusal(e)
+        return respond(200, {"recorded_at": recorded})
+
+    def job(self, req: Request) -> Response:
+        """Run a store maintenance job of the control host now (`backup`, `audit`)."""
+        run = self.jobs.get(req.params["job"])
+        if run is None:
+            return respond(404, {"error": f"no job {req.params['job']!r}; one of {sorted(self.jobs)}"})
+        return respond(200, {"job": req.params["job"], "result": run()})
 
     # -- the dead-man timer -------------------------------------------------------------------------------------
     def tick(self, now: datetime | None = None) -> list[Fired]:

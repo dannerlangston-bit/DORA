@@ -427,6 +427,7 @@ step_event_actions:
 - clipboard
 - recovery_login
 - explorer_action
+- main_frame_missing
 decision_statuses:
 - active
 - expired

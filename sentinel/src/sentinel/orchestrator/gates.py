@@ -41,12 +41,13 @@ Choices (reported):
 8. Build id (7.3): both reads missing (the title regex did not match and the About OCR did not either) is
    `env_error (gate: launched, reason: fingerprint_unreadable:build_id)`. A `version_mismatch` asks for
    `disable_rig`, the scheduler's hold ("nothing else runs on that rig until a human looks"); the POP-01 update
-   progress is that case too. `check_build_unchanged` takes the About read once when the title misses, and a
+   progress at the shard's first launch is that case too, and after a relaunch it is `version_changed_mid_run`
+   with no hold (7.8/12.8 POP-01 row). `check_build_unchanged` takes the About read once when the title misses, and a
    change carries both ids and the launcher log hash in `evidence` for the on-call channel.
 9. Login (7.7, SD-62): `agreement_pending` (POP-03, a `ports.LoginObservation` field) is checked after the session
    checks, in the popup step 5, and notifies the accounts owner. `authentication_failed` and
-   `authentication_challenge` page the login owner and the accounts owner; `authentication_failed` also asks for
-   `block_login`, the hold the accounts owner clears; `vault_unreachable` pages the system owner. `repeat` (the
+   `authentication_challenge` page the login owner and the accounts owner and ask for `block_login`, the hold the
+   accounts owner clears, which takes the rig out of the pool (11.6); `vault_unreachable` pages the system owner. `repeat` (the
    `authenticated` gate failed in the login's previous run, 9.10) makes the route P1. The Branch B trusted-device
    prompt is decided by `mfa_recovery` in the MFA position: the accounts owner's code inside the window (default
    600 s), once, passes; else `authentication_challenge`. Under Branch A any prompt is the challenge.
@@ -59,7 +60,10 @@ Choices (reported):
     default); a read of the base `rig.AccountState` has no buying power cell and is compared without it. Under
     `paper_send_ok` working rows that all carry the run's own tag ask for `cancel_all` (the verified Cancel All)
     and a re-verification passed as `after_cancel=True`; a foreign row, or any row left after that cancel, aborts.
-    An `OnDemand` toolbar seen after login is `check_ondemand` (7.7 step 8, 7.9).
+    Every fixture account must be in the read (`first`): one the read did not return proves neither zero working
+    orders nor its positions and cash, so after the working-order abort (a row seen in a read account still aborts
+    first) it is the gate's own failure, `env_error (gate: fixture_verified, reason: gate)` for the shard, as A2
+    gives a fixture account that cannot be confirmed (6.3). An `OnDemand` toolbar seen after login is `check_ondemand` (7.7 step 8, 7.9).
 """
 from __future__ import annotations
 
@@ -179,8 +183,12 @@ def check_launched(obs: LaunchObservation, *, expected_build: str, first_launch:
     ev = {"windows": [w.title for w in obs.windows], "processes": list(obs.processes),
           "screenshot": obs.screenshot_sha256}
     if obs.update_progress:
-        return _env_fail("launch", "launched", "version_mismatch", detail="launcher update progress (POP-01)",
-                         evidence=ev, actions=("disable_rig",))
+        if first_launch:
+            return _env_fail("launch", "launched", "version_mismatch", detail="launcher update progress (POP-01)",
+                             evidence=ev, actions=("disable_rig",))
+        return _env_fail("launch", "launched", "version_changed_mid_run",
+                         detail="launcher update progress after a relaunch (POP-01)",
+                         evidence={**ev, "launcher_log": launcher_log_sha256})
     if not obs.frame_found or obs.waited_s > LAUNCH_WAIT_S:
         if not first_launch:
             return app_failure(CrashSignal("hang", "main_frame_missing"), budgets, phase=phase)
@@ -252,7 +260,7 @@ def mfa_recovery(prompt: MfaPrompt, *, branch: str, window_s: float = MFA_WINDOW
         detail = f"no code inside the {window_s:.0f} s window"
     return _env_fail("login", "authenticated", "authentication_challenge", detail=detail, evidence=ev,
                      alert=alerts.env_error(repeat=repeat, notified=("login_owner", "accounts_owner")).plus(
-                         paged=("login_owner", "accounts_owner")))
+                         paged=("login_owner", "accounts_owner")), actions=("block_login",))      # 11.6
 
 
 def check_authenticated(obs: LoginObservation, *, repeat: bool = False, mfa_branch: str = "A",
@@ -293,8 +301,8 @@ def check_authenticated(obs: LoginObservation, *, repeat: bool = False, mfa_bran
             route = route.plus(paged=login_cause)              # SD-62
         elif reason == "vault_unreachable":
             route = route.plus(paged=("system_owner",))       # SD-62, 6.9
-        if reason == "authentication_failed":
-            acts = ("block_login",)                            # a lockout blocks every later run on the rig (7.7)
+        if reason in ("authentication_failed", "authentication_challenge"):
+            acts = ("block_login",)                    # 7.7, 11.6: the rig leaves the pool until the owner clears it
         return _env_fail("login", "authenticated", reason, detail=detail, alert=route, actions=acts, evidence=shot)
     return ControlResult("login", True, "authenticated", evidence=shot)
 
@@ -424,6 +432,11 @@ def check_fixture(first: Sequence[AccountState], expected: Mapping[str, AccountE
                              actions=("kill_tree", "kill_switch"), incident="S1",
                              detail="working orders present; a sent order is never fixture drift"
                              + ("; still working after the own-tag Cancel All" if after_cancel else ""))
+    unread = sorted(set(expected) - {a.account_id for a in first})
+    if unread:
+        return _env_fail("fixture", "fixture_verified",
+                         detail=f"verify_account_fixture did not read fixture account(s) {', '.join(unread)}: "
+                                "working orders, positions and cash unproven (7.6 stage 2 step 1)")
     by_role = {a.role: a for a in first}
     subsets: list[SubsetOutcome] = []
     acts: list[str] = []

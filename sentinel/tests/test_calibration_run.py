@@ -223,6 +223,27 @@ def test_failed_sessions_and_a_changed_key_are_fix_items_never_dropped(cfg, stor
     assert len(res.summary["fix_list"]) == 2 and res.keys[LEVEL2.checkpoint_id] is None
 
 
+def test_a_second_night_on_another_key_ends_the_shards_and_the_run_with_env_errors(cfg, store, tmp_path):
+    """1.10, 3.9 step 2, 8.2 (review calibration:4): when both night-2 sessions run on another rendering key every
+    r6 is env_error (rig_spec_mismatch) and nothing is calibrated, so those shards and the run end
+    complete_with_env_errors, not complete, and `sentinel calibrate` exits 1."""
+    rigs = FakeRigs(other_key=frozenset({("rig-01", 2), ("rig-02", 2)}))
+    res = run_calibration(cfg, rigs, store, plan(("rig-01", [CHART]), ("rig-02", [LEVEL2])))
+    assert all(c.failed for c in res.calibrations.values()) and res.summary["calibrated"] == 0
+    assert (res.outcome.status, res.outcome.reason) == ("complete_with_env_errors", None)
+    shards = store.query("SELECT shard_id, shard_outcome FROM shards WHERE run_id = ? ORDER BY shard_id", (RUN,))
+    assert [tuple(r) for r in shards] == [(f"{RUN}/1", "complete"), (f"{RUN}/2", "complete"),
+                                          (f"{RUN}/3", "complete_with_env_errors"),
+                                          (f"{RUN}/4", "complete_with_env_errors")]
+    assert [(s["night"], s["status"]) for s in res.sessions] == [(1, "complete"), (1, "complete"),
+                                                                 (2, "complete_with_env_errors"),
+                                                                 (2, "complete_with_env_errors")]
+    p = plan(("rig-01", [CHART]), ("rig-02", [LEVEL2]), run_id="cal-20261120")
+    plan_file = tmp_path / "plan.json"
+    plan_file.write_text(json.dumps(p.to_dict()))
+    assert main([str(EXAMPLE), str(plan_file), "--out", str(tmp_path / "out")], rig_factory=rigs) == 1
+
+
 # -- sentinel calibrate on the simulated rig --------------------------------------------------------------------
 
 def test_sentinel_calibrate_on_the_simulated_rig(tmp_path):

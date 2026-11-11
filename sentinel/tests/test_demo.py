@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -186,12 +187,14 @@ def test_nightly_canary_goes_blind_on_a_money_cell(runs):
     assert n1.shards[0]["gates"][3]["control"] == "paper_mode"
     # 9.10 Canary failure: night 2's blind state pages the harness on-call at P1; night 1 pages nobody
     alerts = json.loads((out / "alerts.json").read_text())
-    assert [(a["run_id"], a["rule"], a["priority"], a["paged"]) for a in alerts if a["control"] != "fingerprint"] == \
+    assert [(a["run_id"], a["rule"], a["priority"], a["paged"]) for a in alerts      # less the Nightly store check
+            if a["control"] not in ("fingerprint", "store_health")] == \
         [(n2.run_id, "canary_failure", "P1", ["harness_on_call"])]
     # 12.7 G5 with the store's calibrated keys: no Calibration run wrote floors, so each run queues one and tells the
     # on-call channel once (10.7), without paging anyone
+    # on-call channel once (10.7), without paging anyone; night 2's repeats night 1's gate, so it is P1 (9.10, 11.6)
     assert [(a["run_id"], a["rule"], a["priority"], a["paged"]) for a in alerts if a["control"] == "fingerprint"] == \
-        [(r, "env_error", "P2", []) for r in (n1.run_id, n2.run_id, pr.run_id)]
+        [(n1.run_id, "env_error", "P2", []), (n2.run_id, "env_error", "P1", []), (pr.run_id, "env_error", "P2", [])]
     assert [b["priority"] for b in n2.canary["sent_bugs"]] == ["Highest"] and n1.canary["sent_bugs"] == []
 
 
@@ -439,3 +442,33 @@ def test_a_pr_run_without_floors_in_the_store_requests_the_calibration(runs):
     assert rows["Calibration"].startswith("Calibration run requested for key sha256:")
     (g5,) = [a for a in r.alerts if a["control"] == "fingerprint"]             # 12.7 G5 with calibrated_keys: once
     assert (g5["rule"], g5["priority"]) == ("env_error", "P2") and "no calibration" in g5["detail"]
+
+
+# -- w4/w5 part B: the control host in process (9.1, 9.2, 9.5, 9.6, 9.9, 9.10) --------------------------------------
+
+def test_report_ui_confirms_a_bug_through_the_ui_and_the_service_files_it_and_re_posts(runs):
+    """The report UI and the Reporter service of `sentinel serve`, in process: the triage page, a confirm_bug through
+    the UI's action endpoint, the product Bug filed with its key written back, and the PR comment edited in place."""
+    out, (r,) = runs("report-ui")
+    assert r.status == "complete" and r.commit_status["state"] == "success"
+    text = (out / "summary.txt").read_text()
+    assert "POST /act/confirm_bug f=F-483501-001: HTTP 200" in text
+    assert "GET /triage after: HTTP 200, F-483501-001 listed: False" in text
+    assert "Decision: confirm_bug by triage.lead, ticket TOS-1" in text and "Simulated Jira issues: TOS-1" in text
+    assert "comment c1, re-rendered with the decision" in text
+    with Store(out / "sentinel.db") as s:
+        jobs = [tuple(j) for j in s.query("SELECT kind, state FROM outbox WHERE run_id = ? ORDER BY job_id",
+                                          (r.run_id,)) if j["kind"] not in ("slack", "page", "digest")]
+    assert jobs == [("commit_status", "sent"), ("pr_comment", "sent"), ("commit_status", "sent"),   # + 9.10 alerts
+                    ("jira_create", "sent"), ("pr_comment", "sent"), ("commit_status", "sent")]
+    assert "**Suppressed by decision (1)**" in (out / "report-ui-comment.md").read_text()
+
+
+def test_outbox_outage_retries_and_alerts_slack_and_the_pager_at_15_minutes(runs):
+    out, (r,) = runs("outbox-outage")
+    text = (out / "summary.txt").read_text()
+    assert "+5 min: 2 failed attempt(s), 0 outage alert(s) raised" in text
+    assert "+15 min: 2 failed attempt(s), 2 outage alert(s) raised" in text
+    assert "+60 min: the PR host is back; 2 job(s) sent" in text
+    assert "Slack (#sentinel-oncall): [Sentinel] P2 integration outage | pr run-2026-11-10-pr-4835-01" in text
+    assert re.search(r"Paging service: integration_outage:\d+, P2", text)        # keyed by the failing job

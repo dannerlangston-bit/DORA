@@ -198,6 +198,32 @@ class SimVault:
         self.released.append(lease)
 
 
+class SimInput:
+    """The simulated `ports.InputPort` (5.4.3 stage 6): every tokened event the emitter injects is accepted and kept
+    with its typed character (`chars`, parallel to the events: a `VK_PACKET` key's character, None otherwise), so a
+    test reads exactly what reached the OS; the cursor follows the last absolute move."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[Any, str | None]] = []
+        self._cursor = (0, 0)
+
+    def send(self, events: Sequence[Any], chars: Sequence[str | None] | None = None) -> int:
+        if chars is not None and len(chars) != len(events):
+            raise ValueError(f"{len(chars)} characters for {len(events)} events: chars runs parallel to events")
+        for k, ev in enumerate(events):
+            self.sent.append((ev, None if chars is None else chars[k]))
+            if getattr(ev, "type", None) == "move":
+                self._cursor = (int(ev.x), int(ev.y))
+        return len(events)
+
+    def cursor(self) -> tuple[int, int]:
+        return self._cursor
+
+    def typed(self) -> str:
+        """The characters typed so far, in order."""
+        return "".join(c for _, c in self.sent if c)
+
+
 class SimLadder(Ladder):
     """`executor.locator.Ladder` over the desk (module docstring), one scripted attempt per `locate` (the emitter
     owns the step's retry, locator choice 9): it hides a control `misses` asks for and records the label of the

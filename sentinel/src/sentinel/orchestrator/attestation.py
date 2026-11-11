@@ -178,6 +178,12 @@ def a9_passed(check: ConfirmationCheck) -> bool:
     return check.dialog_appeared and check.working_new_rows == 0
 
 
+def _with_rows(extra: Mapping[str, object], rows: Mapping[str, str], evidence: Mapping[str, str | None]) -> dict:
+    """A result's evidence with the A rows decided so far and the evidence hashes present (`report.safety` reads the
+    states and hashes from them, never from the detail text, 6.3, 6.6)."""
+    return {**extra, "rows": dict(rows), "hashes": {k: v for k, v in evidence.items() if v}}
+
+
 def attest(reads: Mapping[str, RowReads], profile: AttestationProfile, *, a9: ConfirmationCheck | None,
            evidence: Mapping[str, str | None], a10: NotificationsRead | None = None, rc_run: bool = False,
            profile_drift: bool = False, previous_unreadable: bool = False,
@@ -200,7 +206,8 @@ def attest(reads: Mapping[str, RowReads], profile: AttestationProfile, *, a9: Co
         return AttestationResult(ControlResult(
             "attestation", False, GATE, run=run, unreached=un, alert=alerts.safety_abort(),
             actions=("kill_switch",), incident="S1" if "A8" in mism else "S2",
-            detail="settings mismatch on " + ", ".join(mism), evidence={"screenshots": shots}), rows, chords)
+            detail="settings mismatch on " + ", ".join(mism),
+            evidence=_with_rows({"screenshots": shots}, rows, evidence)), rows, chords)
     unread = [i for i in SAFETY_ROWS if rows[i] == "unreadable"]
     if unread:
         return AttestationResult(ControlResult(
@@ -209,13 +216,15 @@ def attest(reads: Mapping[str, RowReads], profile: AttestationProfile, *, a9: Co
             alert=alerts.env_error(repeat=previous_unreadable),
             actions=("maintenance_task",) if previous_unreadable else (),
             detail="unreadable after one re-navigation: " + ", ".join(unread),
-            evidence={"screenshots": {i: [reads[i].first.screenshot_sha256, reads[i].second.screenshot_sha256
-                                          if reads[i].second else None] for i in unread}}), rows, chords)
+            evidence=_with_rows({"screenshots": {i: [reads[i].first.screenshot_sha256, reads[i].second.screenshot_sha256
+                                                     if reads[i].second else None] for i in unread}},
+                                rows, evidence)), rows, chords)
     if profile_drift:
         return AttestationResult(ControlResult(
             "attestation", False, GATE, run=RunVerdict("complete_with_env_errors"),
             unreached=Outcome("env_error", "fixture_drift", GATE), alert=alerts.env_error(),
-            detail="a non-safety profile row still wrong after the one re-apply (7.6 stage 1)"), rows, chords)
+            detail="a non-safety profile row still wrong after the one re-apply (7.6 stage 1)",
+            evidence=_with_rows({}, rows, evidence)), rows, chords)
     if a9 is None:
         raise ValueError("A3 to A8 passed: A9 must run next")
     checks = [("A9", a9)]
@@ -234,7 +243,7 @@ def attest(reads: Mapping[str, RowReads], profile: AttestationProfile, *, a9: Co
             actions=("kill_switch",), incident="S1" if new_row else "S2",
             detail=f"{name}: a new Working row after Confirm and Send" if new_row
             else f"{name}: the Order Confirmation dialog did not appear; the confirmation path is unproven",
-            evidence={"screenshot": check.screenshot_sha256}), rows, chords)
+            evidence=_with_rows({"screenshot": check.screenshot_sha256}, rows, evidence)), rows, chords)
     rows["A9"] = "match"
     explorer_stage = None
     outcomes: tuple[SubsetOutcome, ...] = ()
@@ -256,10 +265,11 @@ def attest(reads: Mapping[str, RowReads], profile: AttestationProfile, *, a9: Co
         run, un = harness_abort_outcome("artifact_persist_failed", detail="A11: no evidence hash for " + ", ".join(absent))
         return AttestationResult(ControlResult(
             "attestation", False, GATE, run=run, unreached=un, alert=alerts.aborted_harness(),
-            detail="A11: evidence hashes missing for " + ", ".join(absent)), rows, chords, explorer_stage)
+            detail="A11: evidence hashes missing for " + ", ".join(absent),
+            evidence=_with_rows({}, rows, evidence)), rows, chords, explorer_stage)
     rows["A11"] = "match"
     alert = alerts.safety_abort().plus(paged=("explorer_owner",)) if explorer_stage == "aborted_safety" else None
     return AttestationResult(ControlResult(
         "attestation", True, GATE, outcomes=outcomes, alert=alert,
         detail="A10 mismatch: the Explorer stage is aborted, the RC run continues" if alert else None,
-        evidence={"profile_sha256": profile.sha256, "hashes": dict(evidence)}), rows, chords, explorer_stage)
+        evidence=_with_rows({"profile_sha256": profile.sha256}, rows, evidence)), rows, chords, explorer_stage)

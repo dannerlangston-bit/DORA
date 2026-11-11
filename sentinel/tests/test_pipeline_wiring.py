@@ -426,7 +426,8 @@ def test_the_nightly_runs_the_safety_canaries_the_denied_action_test_and_the_fir
     assert len([r for r in rows if r.kind == "fire_drill"]) == 5 and safety["banner"] is None
     pr = run_pipeline(EXAMPLE, clean_scenario(TODAY), tmp_path, today=TODAY)
     with Store(tmp_path / "sentinel.db") as store:
-        assert store.run_summary(pr.run_id)["safety"] == {"banner": None, "nightly_run_id": n.run_id}
+        safety = store.run_summary(pr.run_id)["safety"]
+        assert {k: v for k, v in safety.items() if k != "shards"} == {"banner": None, "nightly_run_id": n.run_id}
     assert "Fire drill (last Nightly)" in pr.comment and "Safety canaries (last Nightly)" in pr.comment
 
 

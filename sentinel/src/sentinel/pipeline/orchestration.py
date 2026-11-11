@@ -49,6 +49,9 @@ Choices (reported):
   starts with the settings pages and watchlists those profiles and the fixture name, so Stage 1 corrects nothing on a
   clean rig), the MFA branch of `phase0/branches.yaml`, whether the fixture's `reseed_due` has passed on the run's
   date (`churn.reseed_due_passed`) and the login's history from the store (`login_history`).
+- The Rig Manager (`SimRigManager`) reverts every shard's rig before its gates; a shard handed on keeps its id and
+  takes the next attempt (`Store.requeue_shard`); the snapshot names use one base-os generation for the whole fleet,
+  and the spare is the fleet's rig 6, substituting once per run with the failed rig's login (`Store.reassign_login`).
 - A login is named by a readable label, `<rig> paper login` (the rig's one scripted paperMoney login, 6.4),
   wherever a person reads it (9.2 "login {alias}", the persisted `block_login` action). Its vault path is a
   `vault://` reference (4.9 `login_ref`, L-FIX-04): the store keys `logins` by it (8.3), and nothing a person
@@ -64,6 +67,8 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from ..orchestrator.alerts import AlertRoute
+from ..orchestrator.snapshots import SimulatedHypervisor, pair_revert_plan, revert_with_retry, snapshot_name
+from ..rigmanager import RigPool, RigSlot
 from ..orchestrator.attestation import AttestationProfile
 from ..orchestrator.gates import AccountExpectation, WorkspaceExpectation
 from ..orchestrator.gateway_config import (DEFAULT_ORDER_HOTKEYS_PATH, DefaultOrderHotkeys, GatewayConfigError,
@@ -138,6 +143,12 @@ class RigScript:
     probe_hidden: tuple[tuple[str, str], ...] = ()
     probe_renamed: tuple[tuple[str, str, str], ...] = ()
     probe_unlocated: tuple[tuple[str, str], ...] = ()
+    # the Rig Manager and preflight (7.2, 7.11, 10.7, 12.7): rigs whose snapshot reverts fail twice (the shard is
+    # re-queued), (rig, n): the rig powers off once its shard captured n checkpoints (lost, re-queued to the spare),
+    # (item, minutes): a preflight item unreadable for that long from the shard's start (a backend outage)
+    revert_failures: tuple[str, ...] = ()
+    power_off_at: tuple[str, int] | None = None
+    preflight_down: tuple[tuple[str, float], ...] = ()
 
 
 class ShardSink:
@@ -248,6 +259,77 @@ def probe_lists(cfg: SentinelConfig) -> dict[str, tuple[str, ...]]:
     registry entry the probe enumerates (`enumerable_by`), in entry id order."""
     return {p: tuple(str(doc.get("title") or sid) for sid, doc in sorted(cfg.surfaces.items())
                      if str(doc.get("enumerable_by") or "none") == p) for p in PROBES}
+
+
+# -- the Rig Manager (5.3, 7.2, 10.7) -------------------------------------------------------------------------
+SIM_GEN = "w11-23h2-a"                       # the simulated pool's base-os generation (7.2 snapshot names)
+SIM_FLEET = (("rig-01", "pool"), ("rig-02", "pool"), ("rig-03", "pool"), ("rig-04", "pool"), ("rig-05", "nightly"),
+             ("rig-06", "explorer"))         # 11.2: rigs 1 to 4 the pool, 5 the Nightly rig, 6 Explorer and spare
+
+
+@dataclass(frozen=True)
+class Reverted:
+    """What the Rig Manager did before a shard: the rig it runs on, the run-health lines, the rig it left."""
+
+    rig_id: str
+    lines: tuple[str, ...]
+    left: str | None = None
+
+
+class SimRigManager:
+    """The Rig Manager of the simulated fleet (5.3, 7.2, 10.7; `rigmanager.RigPool` over `SIM_FLEET`): each shard's
+    rig reverts its snapshots through a `snapshots.SimulatedHypervisor` (the base build's upgrade snapshot first on a
+    frozen pair's rig, `pair_revert_plan`; one retry after 60 s, `revert_with_retry`). A rig whose reverts fail twice,
+    or a rig lost mid-run, gives the shard to a compatible rig: a free pool rig of the same base-os generation
+    (`RigPool.requeue_target`), else the spare substituting for it with its login (`RigPool.substitute`), once per
+    run (choices in the module docstring)."""
+
+    def __init__(self, revert_failures: Sequence[str] = (), *, base_build: str, candidate_build: str):
+        self.pool = RigPool.of([RigSlot(r, role, None if role == "explorer" else login_alias(r), SIM_GEN,
+                                        snapshot_name("base-os", SIM_GEN)) for r, role in SIM_FLEET])
+        self.failing = set(revert_failures)
+        self.base, self.candidate = base_build, candidate_build
+
+    def snapshot(self, build_id: str) -> str:
+        """The upgrade snapshot of `build_id` on this generation (7.2)."""
+        return snapshot_name("upgrade", SIM_GEN, build_id.replace(".", "_"))
+
+    def requeue(self, failed: str, *, busy: Sequence[str], at: str) -> str | None:
+        """The rig a shard of `failed` moves to (10.7): a free compatible pool rig, else the spare; None when the
+        spare already stands in for another rig."""
+        target = self.pool.requeue_target(failed, busy=busy)
+        if target is not None:
+            return target
+        if self.pool.substituted is not None or failed not in self.pool.rigs or \
+                self.pool.rigs[failed].role != "pool":
+            return None
+        self.pool.substitute(failed, operator="rig-manager", snapshot_id=f"{snapshot_name('base-os', SIM_GEN)}."
+                             f"{failed}-login", at=at)
+        return self.pool.spare
+
+    def revert(self, shard_id: str, rig_id: str, side: str, clock: Any, *, busy: Sequence[str]) -> Reverted:
+        """Revert the shard's snapshots on `rig_id` (class docstring); a rig that cannot revert hands the shard on."""
+        builds = {"both": (self.base, self.candidate), "base": (self.base,), "candidate": (self.candidate,)}[side]
+        plan = pair_revert_plan(base=self.snapshot(builds[0]), candidate=self.snapshot(builds[-1]),
+                                base_reused=False) if side == "both" else (self.snapshot(builds[0]),)
+        hv = SimulatedHypervisor(plan, revert_failures=2 * len(plan) if rig_id in self.failing else 0)
+        lines: list[str] = []
+        for sid in plan:
+            target = self.pool.requeue_target(rig_id, busy=busy) or (
+                self.pool.spare if self.pool.substituted is None and rig_id != self.pool.spare else None)
+            r = revert_with_retry(hv, sid, clock, requeue_rig=target, budget_allows=True)
+            if r.passed:
+                lines.append(f"{shard_id} on {rig_id}: snapshot {sid} reverted"
+                             + (f" after one retry ({r.detail})" if r.detail else ""))
+                continue
+            moved = self.requeue(rig_id, busy=busy, at=clock.now().isoformat()) if r.has("requeue_shard") else None
+            if moved is None:
+                lines.append(f"{shard_id} on {rig_id}: {r.detail}")
+                return Reverted(rig_id, tuple(lines))
+            lines.append(f"{shard_id}: {r.detail}")
+            again = self.revert(shard_id, moved, side, clock, busy=[*busy, rig_id])
+            return Reverted(again.rig_id, tuple(lines) + again.lines, left=rig_id)
+        return Reverted(rig_id, tuple(lines))
 
 
 # -- logins ---------------------------------------------------------------------------------------------------

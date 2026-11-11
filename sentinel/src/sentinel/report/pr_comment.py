@@ -214,7 +214,7 @@ def _suppressed(r: RunReport, collapsed: bool) -> list[str]:
         by = f"{md_text(d.decided_by, True)}, {md_text(d.decided_at[:10], True)}" if d else ""
         lines.append(_row([md_code(row.checkpoint_id, True), md_code(row.region, True) if row.region else "",
                            md_text(row.decision_id, True), action, by,
-                           md_text(d.ticket, True) if d and d.ticket else ""]))
+                           md_text(d.ticket or r.ticket_notes.get(row.decision_id, ""), True) if d else ""]))
     lines.append("</details>")
     return lines
 

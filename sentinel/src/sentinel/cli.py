@@ -34,6 +34,24 @@ Subcommands:
   sentinel depmap --jdeps FILE --config DIR --build ID --now TIME [--out FILE] [--patch FILE] [--status FILE]
                                               derive the Dependency Map from a bytecode scan and write the proposed
                                               map and its patch (2.10.1, 4.4; sentinel.depscan)
+  sentinel schemas --migrate DIR [--dry-run]  bring the config files of a sentinel-config tree to the schema versions
+                                              this harness knows (4.1; sentinel.config_migrations)
+  sentinel store rebuild DB --ledger PATH [--ledger PATH ...] [--exports DIR]
+                                              rebuild a database from its ledgers and nightly exports (8.1, 8.9)
+  sentinel store backup --db PATH --backup-root DIR --artifact-root DIR [--now TIME]
+                                              the nightly Central Store backup (8.6); exit 4: the store would not
+                                              open for writing (the Reporter service holds it)
+  sentinel store audit --db PATH --artifact-root DIR [--artifact-root DIR ...] --backup-root DIR [--seed N]
+                                              the weekly artifact audit (8.6)
+  sentinel store restore-drill --db PATH --by NAME --compared N --matched N [--at TIME]
+                                              record a passing restore drill (8.6, 8.9)
+  sentinel serve --db PATH --artifact-root DIR --config DIR [--backup-root DIR] [--integrations none|simulated]
+                 [--host H] [--port N] [--ui-port N] [--tick SECONDS] [--once]
+                                              the control host: the Reporter service, the report UI and the timed
+                                              work (outbox, digests, SLA, backup) on localhost (sentinel.service)
+  sentinel digest --db PATH --config DIR --artifact-root DIR [--now TIME] [--weekly] [--print-only]
+                                              queue the needs_human daily digest (or the weekly summary) to the
+                                              triage channel and the digest email, and print it (9.10)
 """
 from __future__ import annotations
 
@@ -48,6 +66,9 @@ ROOT = Path(__file__).resolve().parents[2]
 def _schemas(argv: list[str]) -> int:
     from .lint import schemas
 
+    if "--migrate" in argv:                       # `sentinel schemas --migrate DIR [--dry-run]` (4.1)
+        from .config_migrations import main as migrate_main
+        return migrate_main([a for a in argv if a != "--migrate"])
     p = argparse.ArgumentParser(prog="sentinel schemas")
     p.add_argument("--check", action="store_true")
     p.add_argument("--out", default=str(ROOT / "schemas"))
@@ -140,6 +161,91 @@ def _review(argv: list[str]) -> int:
     return 0
 
 
+def _store(argv: list[str]) -> int:
+    """`sentinel store rebuild|backup|audit|restore-drill ...`: each subcommand's exit code passed through (8.6, 8.9;
+    4 when the Central Store would not open for writing: the Reporter service holds it)."""
+    from .store import audit, backup, health
+    from .store.store import main as rebuild_main
+
+    subs = {"backup": backup.main, "audit": audit.main, "restore-drill": health.main}
+    if argv and argv[0] in subs:
+        return subs[argv[0]](argv[1:])
+    if not argv or argv[0] in ("-h", "--help"):
+        print("usage: sentinel store {rebuild,backup,audit,restore-drill} ...\n" + "\n".join(
+            line for line in (__doc__ or "").splitlines() if "sentinel store" in line))
+        return 0 if argv else 2
+    return rebuild_main(argv)
+
+
+def _serve(argv: list[str]) -> int:
+    """`sentinel serve`: the control host (`sentinel.service.serve`)."""
+    from .service.serve import INTEGRATIONS, compose, serve
+
+    p = argparse.ArgumentParser(prog="sentinel serve", description=_serve.__doc__)
+    p.add_argument("--db", required=True, help="the Central Store")
+    p.add_argument("--artifact-root", required=True)
+    p.add_argument("--config", required=True, help="the sentinel-config tree (ops/oncall.yaml, policy/)")
+    p.add_argument("--backup-root", help="the backup location; without it the backup and the audit do not run")
+    p.add_argument("--integrations", choices=INTEGRATIONS, default="none",
+                   help="none: jobs stay queued; simulated: in-memory transports (the live ones are Phase 2)")
+    p.add_argument("--state", help="where the simulated PR host keeps its file (default: beside the database)")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8780, help="the Reporter service (0: any free port)")
+    p.add_argument("--ui-port", type=int, default=8781, help="the report UI (0: any free port)")
+    p.add_argument("--tick", type=float, default=60.0, help="seconds between timer ticks")
+    p.add_argument("--once", action="store_true", help="bind, run one tick and stop")
+    a = p.parse_args(argv)
+    c = compose(a.db, a.artifact_root, a.config, backup_root=a.backup_root, integrations=a.integrations,
+                state_dir=a.state)
+    return serve(c, host=a.host, port=a.port, ui_port=a.ui_port, tick_s=a.tick, once=a.once)
+
+
+def _digest(argv: list[str]) -> int:
+    """`sentinel digest`: queue the needs_human daily digest (or `--weekly` the weekly metrics summary) through the
+    outbox and print it (9.10). Exit 0, also on a day with no digest (a weekend or holiday: nothing is queued)."""
+    from datetime import datetime, timezone
+
+    from .lint.repo import Repo
+    from .pipeline.config import SentinelConfig
+    from .report import digest, slack
+    from .service.serve import CentralPayloads
+    from .sla import OnCall
+    from .store.store import Store
+
+    p = argparse.ArgumentParser(prog="sentinel digest", description=_digest.__doc__)
+    p.add_argument("--db", required=True)
+    p.add_argument("--config", required=True, help="the sentinel-config tree (ops/oncall.yaml, policy/)")
+    p.add_argument("--artifact-root", required=True, help="where the outbox payloads are kept")
+    p.add_argument("--now", help="ISO time (default: now)")
+    p.add_argument("--weekly", action="store_true")
+    p.add_argument("--print-only", action="store_true", help="print the digest; queue nothing")
+    a = p.parse_args(argv)
+    now = datetime.fromisoformat(a.now) if a.now else datetime.now(timezone.utc)
+    now = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    if not Path(a.db).is_file():
+        print(f"sentinel digest: no database at {a.db}", file=sys.stderr)
+        return 2
+    cfg = SentinelConfig.load(a.config)
+    oncall = Repo.load(a.config).one("oncall")
+    with Store(a.db) as store:
+        d = digest.weekly(store, now) if a.weekly else digest.daily(
+            store, now, oncall=OnCall.from_doc(oncall.data) if oncall is not None else None)
+        if d is None:
+            print(f"no daily digest on {now.date().isoformat()}: not a business day (9.10)")
+            return 0
+        print(d.render())
+        if a.print_only:
+            return 0
+        channels = slack.SlackChannels.from_reporting({"slack": cfg.reporting.slack}) if cfg.reporting else \
+            slack.SlackChannels()
+        queued = digest.post(store, d, channels, now, email_to=cfg.reporting.email if cfg.reporting else ())
+        payloads = CentralPayloads(a.artifact_root)
+        for q in queued:
+            payloads.put(q.payload, name=q.payload_sha256, kind="request", media_type="application/json")
+    print(f"queued {len(queued)} outbox job(s): {', '.join(f'{q.kind} to {q.destination}' for q in queued)}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or argv[0] in ("-h", "--help"):
@@ -172,6 +278,12 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "depmap":
         from .depscan import main as depmap_main
         return depmap_main(rest)
+    if cmd == "store":
+        return _store(rest)
+    if cmd == "serve":
+        return _serve(rest)
+    if cmd == "digest":
+        return _digest(rest)
     print(f"unknown command {cmd!r}\n{__doc__}", file=sys.stderr)
     return 2
 

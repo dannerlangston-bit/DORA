@@ -104,6 +104,18 @@ Choices (reported):
 19. A recovery login that fails, at authentication or after it (A1 or A2), ends its session before it returns: the hook
     enters deny-all and the tree is killed (6.4 "an unidentified session must not stay logged in"; 6.6 step 5 "on
     failure, stop"), so no caller leaves it running and a second attempt (the kicked rule) starts from a fresh tree.
+20. A kill that leaves a process from the install folder alive (`Rig.kill_process_tree` False; 6.6 step 3, 10.2 step
+    4 "confirm nothing from the install folder survives") never lets the sequence go on as though the tree were gone.
+    The recovery login needs a fresh tree (6.6 step 5), so none is made from a survivor: the hook stays in deny-all,
+    nothing more is sent (no `reset_input_state`), and the proof is UNPROVEN `recovery_login_failed` with the hand-over
+    of 6.6 Cancel All failure ("on failure, stop and hand to a human"); the snapshot revert (step 6) still runs and is
+    what ends the survivor. A failed recovery login whose closing kill leaves a survivor says so
+    (`RecoveryLogin.tree_survived`), so no caller starts a second login (the kicked rule) from it. The proof effect's
+    detail and evidence name the survivor (`tree_survived`, `TREE_SURVIVED`) for the human it pages. Outside the kill
+    switch (a relaunch, a launch retry, the kill before a recovery proof) the launch needs the tree gone too:
+    `survivor()` fails the `launched` gate closed, `env_error (gate: launched)` (the gate's own check, no finer cause)
+    on the rest of the shard, run `complete_with_env_errors`, and the proof makes no recovery login. The spec has no
+    outcome code of its own for a survivor, so none is added (4.13, 12.2).
 """
 from __future__ import annotations
 
@@ -119,10 +131,12 @@ from .clock import Clock
 from .identity import READ_GAP_S, Allowlist, judge_identity
 from .orderbook import MonitorBook
 from .ports import KillRequest
-from .results import ControlResult, FindingSpec, RunVerdict, safety_abort_outcome
+from .results import ControlResult, FindingSpec, Outcome, RunVerdict, safety_abort_outcome
 from .rig import GatewayLog, OrderBook, OrderRow, Rig, SelectorRead
 
 DIALOG_OPEN_MAX_S = 30.0
+TREE_SURVIVED = ("a process from the install folder survived the kill (6.6 step 3, 10.2 step 4): no launch, "
+                 "relaunch or recovery login starts from it")                                           # choice 20
 CANCEL_REREAD_S = 60.0
 CANCEL_POLL_S = 5.0
 NET_LIQ_TOLERANCE = 0.50
@@ -530,6 +544,7 @@ class KillSwitchReport:
     proof_effect: ControlResult
     steps: list[tuple[str, float]] = field(default_factory=list)
     identity: ControlResult | None = None
+    tree_survived: bool = False                 # choice 20
 
 
 def masked_account(account_id: str) -> str:
@@ -560,6 +575,7 @@ class RecoveryLogin:
 
     ok: bool
     identity: ControlResult | None = None
+    tree_survived: bool = False                 # choice 20: the closing kill left a process alive
 
     def __bool__(self) -> bool:
         """True when the session is usable for the proof, as the bool `recovery_login` used to return."""
@@ -601,11 +617,28 @@ def recovery_login(rig: Rig, allowlist: Allowlist, clock: Clock, fixture_account
 
 
 def _close(rig: Rig, login: RecoveryLogin) -> RecoveryLogin:
-    """A failed recovery login's session ends at once (choice 19): deny-all, the tree killed, a fresh gateway."""
+    """A failed recovery login's session ends at once (choice 19): deny-all, the tree killed, a fresh gateway; a kill
+    that leaves a survivor sends nothing more and says so (choice 20)."""
     rig.set_hook_phase("kill_switch")
-    rig.kill_process_tree()
+    if not rig.kill_process_tree():
+        return replace(login, tree_survived=True)
     rig.reset_input_state()
     return login
+
+
+def survivor() -> ControlResult:
+    """A kill outside the kill switch left a process from the install folder alive (choice 20): no launch starts from
+    it, so the `launched` gate fails closed and the shard stops."""
+    return ControlResult("kill_tree", False, "launched", run=RunVerdict("complete_with_env_errors"),
+                         unreached=Outcome("env_error", "gate", "launched", TREE_SURVIVED), alert=alerts.env_error(),
+                         detail=TREE_SURVIVED, evidence={"tree_survived": True})
+
+
+def tree_survived(effect: ControlResult) -> ControlResult:
+    """A proof effect after a kill that left a process from the install folder alive: its detail and evidence say so
+    (choice 20)."""
+    return replace(effect, detail=f"{effect.detail}; {TREE_SURVIVED}" if effect.detail else TREE_SURVIVED,
+                   evidence={**effect.evidence, "tree_survived": True})
 
 
 def cancel_new_working(rig: Rig, start: OrderBook | None, end: OrderBook, *, clock: Clock,
@@ -640,24 +673,29 @@ def execute_kill_switch(rig: Rig, decision: ControlResult, *, clock: Clock, allo
     """Drive steps 1, 3, 5 and 6 of the 6.6 sequence on `rig` after `kill_switch` decided (steps 2 and 4 are
     the decision's unreached outcome and alert, written by the caller), with the hook in the phase each step needs
     (choice 17). After `live_identity` (the decision's or the run's so far) no recovery login is made and the proof
-    is UNPROVEN `session_unavailable` (SD-64)."""
+    is UNPROVEN `session_unavailable` (SD-64); after a kill that left a survivor none is made either and the proof is
+    UNPROVEN `recovery_login_failed` with the hand-over (choice 20)."""
     steps: list[tuple[str, float]] = []
     rig.set_hook_phase("kill_switch")
     steps.append(("deny_all", clock.monotonic()))
-    rig.kill_process_tree()
-    rig.reset_input_state()                     # a fresh gateway instance before the relaunch (7.7, 10.2 step 4)
-    steps.append(("kill_tree", clock.monotonic()))
+    gone = rig.kill_process_tree()
+    if gone:
+        rig.reset_input_state()                 # a fresh gateway instance before the relaunch (7.7, 10.2 step 4)
+    steps.append(("kill_tree" if gone else "kill_tree_survived", clock.monotonic()))
     sends = tuple(declared_sends)
     end: OrderBook | None = None
     so_far = run_so_far or decision.run
     login = RecoveryLogin(False)
     if live_identity_blocked(decision, run_so_far):
         inputs = ProofInputs(start=start, end=None, session="blocked", declared_sends=sends)
+    elif not gone:                              # choice 20: no recovery login from a survivor
+        inputs = ProofInputs(start=start, end=None, recovery_login_ok=False, declared_sends=sends)
     else:
         cancel = "not_needed"
         rig.set_hook_phase("recovery")
         login = recovery_login(rig, allowlist, clock, fixture_account)
         steps.append(("recovery_login", clock.monotonic()))
+        gone = not login.tree_survived
         found = None
         if login.ok:
             cancel, end, found = cancel_new_working(rig, start, rig.read_orders(), clock=clock, steps=steps)
@@ -672,9 +710,10 @@ def execute_kill_switch(rig: Rig, decision: ControlResult, *, clock: Clock, allo
     steps.append(("revert_snapshot", clock.monotonic()))
     rig.set_hook_phase("between_runs")
     shot = end.screenshot_sha256 if isinstance(end, MonitorBook) else None
-    return KillSwitchReport(decision, proof, proof_result(proof, run_so_far=so_far, unproven_streak=unproven_streak,
-                                                          account=account_ref(allowlist, fixture_account),
-                                                          screenshot_sha256=shot), steps, identity=login.identity)
+    effect = proof_result(proof, run_so_far=so_far, unproven_streak=unproven_streak,
+                          account=account_ref(allowlist, fixture_account), screenshot_sha256=shot)
+    return KillSwitchReport(decision, proof, effect if gone else tree_survived(effect), steps, identity=login.identity,
+                            tree_survived=not gone)
 
 
 def teardown_proof(found: Proof, ks: KillSwitchReport) -> Proof:

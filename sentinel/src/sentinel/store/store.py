@@ -272,7 +272,7 @@ _IDENT = re.compile(r"^[a-z_][a-z0-9_]*$")
 SYSTEM_STATE_KEYS = frozenset({
     "last_backup_at", "last_backup_error", "last_integrity_check_at", "last_restore_drill_at",
     "last_artifact_audit_at", "kill_switch_state", "detector_state", "canaries_pending", "nightly_skipped_for",
-    "reviewer_disabled", "harness_freeze", "free_bytes_at_last_preflight"})
+    "reviewer_disabled", "harness_freeze", "free_bytes_at_last_preflight", "alert_undelivered"})
 OUTBOX_OPEN = ("queued", "failed")             # 9.1: states a job is retried from
 PAIR_KINDS = ("pr", "merge", "rc", "aa")       # 8.3 build_pairs.pair_kind
 SUMMARY_RESERVED = frozenset({"counts", "last_gate", "summary", "refs"})   # summary_json keys end_run owns
@@ -928,6 +928,14 @@ ORDER BY hamming(d.phash, :phash), d.decided_at DESC""")   # 8.3: no LIMIT, the 
 RELATED_SQL = (_LOOKUP_FROM + _LOOKUP_WHERE + """
   AND hamming(d.phash, :phash) > d.hamming_tolerance AND hamming(d.phash, :phash) <= :related
 ORDER BY hamming(d.phash, :phash), d.decided_at DESC""")
+# 9.6, 9.7: the active agent_mistake and expected_behavior decisions within tolerance of an Explorer finding's
+# signature, nearest then newest; they hold the finding (`lifecycle.lookup_explorer_dispositions`) and are active
+# decisions for the Two-humans refusal (`Store._check_signature_free`), but act on no checkpoint outcome.
+DISPOSITION_SQL = (_LOOKUP_FROM + """
+WHERE d.checkpoint_id IN (SELECT value FROM json_each(:cps)) AND d.region_id = :region AND d.category = :cat
+  AND d.action IN ('agent_mistake','expected_behavior') AND d.status = 'active' AND d.revoked_at IS NULL
+  AND (d.expires_at IS NULL OR d.expires_at > :now) AND hamming(d.phash, :phash) <= d.hamming_tolerance
+ORDER BY hamming(d.phash, :phash), d.decided_at DESC""")
 FREEZE_DAYS = 30               # 9.7: two supersessions within 30 days on one signature freeze it
 WAIVER_CATEGORIES = ("invariant_violation", "assertion_failed")   # mark_intended on these is a waiver (9.7)
 # 1.10 precedence: the computed diff outcomes a noise or intended verdict may replace (S-06). Everything ranked
@@ -1006,6 +1014,15 @@ def rename_chain(conn: sqlite3.Connection, checkpoint_id: str) -> tuple[str, ...
         if r is None or r[0] is None or r[0] in chain:
             return tuple(chain)
         chain.append(r[0])
+
+
+def disposition_matches(conn: sqlite3.Connection, signature: Signature, *, at: str | None = None
+                        ) -> tuple[DecisionMatch, ...]:
+    """The active agent_mistake and expected_behavior decisions within tolerance of `signature` (checkpoint along
+    its rename chain, region, category) at `at` (now when unset), nearest then newest (9.6, 9.7)."""
+    args = {"cps": json.dumps(list(rename_chain(conn, signature.checkpoint_id))), "region": signature.region_id,
+            "cat": signature.category, "phash": phash_bytes(signature.phash), "now": utc(at) or now()}
+    return tuple(_match(r) for r in conn.execute(DISPOSITION_SQL, args))
 
 
 def candidate_build_of(conn: sqlite3.Connection, run_id: str | None) -> str | None:
@@ -2057,8 +2074,9 @@ class Store:
 
     def _check_decision_reason(self, o: CheckpointOutcome, code: str | None) -> None:
         """4.13 required fields: `decision:<id>` names a decision the lookup could have matched for this record: active
-        (or reopened), not expired at the record's `recorded_at` (now when unset), on the record's checkpoint, with
-        the verdict the outcome claims (noise, intended, or confirmed_bug for a known-bug collateral) and an action
+        (or reopened), not expired at the record's `recorded_at` (now when unset), on the record's checkpoint or an id
+        it was renamed from (`rename_chain`, the chain the lookup follows; 8.3 gap G33), with the verdict the outcome
+        claims (noise, intended, or confirmed_bug for a known-bug collateral) and an action
         that acts through the signature (`DECISION_REASON_ACTIONS`; 9.7); a decision_ref exists."""
         did = None
         if code == "decision":
@@ -2075,7 +2093,7 @@ class Store:
             elif (row["action"] not in DECISION_REASON_ACTIONS.get(o.outcome, ())
                   or (row["action"] == "request_mask" and row["mask_ref"] is None)):
                 why = f"is a {row['action']} decision, which acts on no checkpoint outcome through the signature"
-            elif row["checkpoint_id"] != o.checkpoint_id:
+            elif row["checkpoint_id"] not in rename_chain(self.conn, o.checkpoint_id):
                 why = f"is on checkpoint {row['checkpoint_id']}"
             elif row["expires_at"] is not None and datetime.fromisoformat(row["expires_at"]) <= at:
                 why = f"expired at {row['expires_at']}"
@@ -2872,6 +2890,7 @@ class Store:
                        evidence=json.loads(r["evidence_json"]), triage_state=r["triage_state"],
                        decision_ref=decision_ref(r["decision_id"]), ticket=r["ticket_ref"],
                        created_at=r["created_at"], severity=r["severity"], side=r["side"], step_id=r["step_id"],
+                       synthetic=bool(r["synthetic"]),
                        detail=r["detail"], pre_existing=bool(r["pre_existing"]), cluster_id=r["cluster_id"],
                        contested=bool(r["contested"]), held=bool(r["held"]), closed_at=r["closed_at"],
                        explorer=(ExplorerFinding(**json.loads(r["explorer_json"])) if r["explorer_json"] else None))
@@ -3254,7 +3273,8 @@ class Store:
         """9.7 Two humans, one signature: on a frozen signature only a system owner decides, in that role (the role
         to store is returned: `system_owner` there, the decision's own elsewhere; only a configured system owner
         claims that role, since it ends a freeze); a plain decision made on a finding is refused while an applicable
-        active decision matches the signature."""
+        active decision matches the signature, an active Explorer disposition (agent_mistake, expected_behavior)
+        included (`disposition_matches`), although the outcome lookup leaves those out."""
         role = d.role
         if role == "system_owner" and d.decided_by not in self.system_owners:
             raise StoreRefused(f"{d.decided_by} is not a system owner of this store and cannot decide in that role "
@@ -3269,7 +3289,7 @@ class Store:
                 raise StoreRefused(f"the decision on a frozen signature is the system owner's: role system_owner, not "
                                    f"{role} (9.7)")
             role = "system_owner"
-        active = [m.decision for m in look.applicable]
+        active = [m.decision for m in (*look.applicable, *disposition_matches(self._conn, d.signature, at=at))]
         if supersedes is None and source_finding is not None and active:
             ids = ", ".join(f"{a.decision_id} ({a.action} by {a.decided_by})" for a in active)
             raise ActiveDecisionExists(f"the signature already has an active decision: {ids}; supersede or revoke "
@@ -4071,11 +4091,3 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     return 0
 
-
-def __getattr__(name: str) -> Any:
-    """`SweepResult` is the retention sweep's result, `store.retention.RetentionResult`: the sweep moved there with
-    the per-set rules of SD-82 and SD-83 (PEP 562, so the package export keeps working)."""
-    if name == "SweepResult":
-        from .retention import RetentionResult
-        return RetentionResult
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

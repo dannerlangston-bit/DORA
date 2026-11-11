@@ -1,5 +1,6 @@
 """Tests for the Invariant Checker (2.7, 12.3, 5.9, 3.10 for invariants, F46)."""
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -145,6 +146,20 @@ def test_inv01_allowlist_and_non_siblings():
     nested = A(UIComponent("a", Rect(0, 0, 200, 200), "panel", parent="frame"),
                UIComponent("b", Rect(50, 50, 100, 100), "panel", parent="a"))
     assert "INV-01" not in ids(nested)
+
+
+def test_registry_control_ids_key_the_allowlist_and_allowed_scrollbars():
+    """SD-08: the registry's overlap_allowlist and allowed_scrollbars name controls by id; a component matches by
+    its frame name or by the control_id its bounds source resolved."""
+    m = A(UIComponent("a", Rect(0, 0, 100, 100), "panel", parent="frame", control_id="ladder-grid"),
+          UIComponent("b", Rect(50, 50, 100, 100), "panel", parent="frame", control_id="crosshair"))
+    assert ids(m) == ["INV-01"]
+    assert ids(m, replace(RULES, allowlist=(("crosshair", "ladder-grid"),))) == []
+    assert ids(m, replace(RULES, allowlist=(("crosshair", "other"),))) == ["INV-01"]
+    grid = A(UIComponent("p", Rect(10, 10, 100, 100), "panel", parent="frame", control_id="positions-grid"),
+             UIComponent("sb", Rect(100, 10, 10, 100), "scrollbar", parent="p"))
+    assert ids(grid) == ["INV-06"]
+    assert ids(grid, replace(RULES, allowed_scrollbars={"positions-grid": (2000, 2000)})) == []   # none expected only from 2000x2000
 
 
 def test_inv01_branch_b_ignores_text_kinds():
@@ -608,6 +623,17 @@ def test_calibration_pending_and_exceptions_are_listed_never_silently_off():
     assert fc.violations == () and fc.excepted == ("INV-01",)
     live, expired = active_exceptions(replace(RULES, exceptions=(exc,)), "2026-12-02T00:00:00+00:00")
     assert live.exceptions == () and expired == (exc,)
+
+
+def test_exception_expiry_compares_instants_not_strings():
+    """L-SRF-11: 16:02 at UTC-5 is 21:02 UTC, so at 21:00 UTC the exception is still in force; a naive time is UTC."""
+    exc = InvariantException("INV-06", "tos-ui", "scrolls by design", "2026-12-08T16:02:00-05:00")
+    rules = replace(RULES, exceptions=(exc,))
+    live, expired = active_exceptions(rules, datetime(2026, 12, 8, 21, 0, tzinfo=timezone.utc))
+    assert live.exceptions == (exc,) and expired == ()
+    live, expired = active_exceptions(rules, "2026-12-08T21:02:00Z")
+    assert live.exceptions == () and expired == (exc,)
+    assert not exc.expired("2026-12-08T21:01:59") and exc.expired(datetime(2026, 12, 8, 21, 2))
 
 
 def test_unreadable_bounds_are_unioned_across_frames():

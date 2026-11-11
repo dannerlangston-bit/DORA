@@ -61,6 +61,9 @@ Choices where the spec is ambiguous (each cites the section it reads):
 - INV-10 counts template-located controls at or above `template_floor` (0.92, the 3.7 default).
 - INV-11 Branch B allowlists a word pair when the components that contain the two words are an
   allowlisted pair. An allowlist entry may use "*" for "any component".
+- Allowlist and allowed-scrollbar keys (4.5 `invariants` block, SD-08). The registry names
+  controls by id, so an allowlist entry or an `allowed_scrollbars` container matches a component
+  by its frame name or by the registry `control_id` its bounds source resolved.
 - INV-12. A cell is aligned when its edge is within 2 px of the column's median edge; the header
   spans the cells when it covers their horizontal extent within the same 2 px.
 - INV-13 fires when the observed focus sequence does not start with the declared sequence.
@@ -72,6 +75,8 @@ Choices where the spec is ambiguous (each cites the section it reads):
   bounds_unreadable)` unless a higher-precedence outcome applies (3.11 row 9a).
 - Re-capture (3.10). The re-capture is stable when at least one first-capture violation fires
   again; violations that do not reproduce are kept as evidence. None reproducing is `unstable`.
+- Exception expiry (L-SRF-11). `expires_at` is an RFC 3339 timestamp compared as an instant (a
+  naive one is UTC); an exception expires at its `expires_at`, as masks and floor exceptions do.
 - Missing configuration fails loudly, never silently off (2.7): an error-template window with no
   error title patterns, a signed-column value with no palette, or windows with no virtual screen
   raise `ValueError`.
@@ -83,6 +88,7 @@ import statistics
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from itertools import combinations
 
 INVARIANT_IDS: tuple[str, ...] = tuple(f"INV-{i:02d}" for i in range(1, 16))
@@ -382,6 +388,12 @@ class RuleRegion:
         return (self.min is None or value >= self.min) and (self.max is None or value <= self.max)
 
 
+def _instant(ts: datetime | str) -> datetime:
+    """An RFC 3339 timestamp or a datetime as an aware instant; a naive one is UTC."""
+    t = ts if isinstance(ts, datetime) else datetime.fromisoformat(ts)
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
 @dataclass(frozen=True)
 class InvariantException:
     """A registry exception for an invariant that is wrong for one surface (4.5, 1.10)."""
@@ -389,7 +401,11 @@ class InvariantException:
     invariant_id: str
     owner: str
     reason: str
-    expires_at: str                     # ISO timestamp
+    expires_at: str                     # RFC 3339 timestamp
+
+    def expired(self, now: datetime | str) -> bool:
+        """True from `expires_at` on (L-SRF-11): the run drops it and lists it in run health."""
+        return _instant(now) >= _instant(self.expires_at)
 
 
 @dataclass(frozen=True)
@@ -693,11 +709,14 @@ class _Frame:
                  if (c.kind in kinds or (include_opaque and c.opaque)) and c.showing and c.bbox.contains_point(point)]
         return min(found, key=lambda c: c.bbox.area, default=None)
 
+    def keys_of(self, name: str) -> tuple[str, ...]:
+        """The names a rule key may use for a component: its frame name and its registry control id."""
+        comp = self.by_name.get(name)
+        return (name, comp.control_id) if comp is not None and comp.control_id else (name,)
+
     def allowlisted(self, a: str, b: str) -> bool:
-        for x, y in self.rules.allowlist:
-            if (x in (a, "*") and y in (b, "*")) or (x in (b, "*") and y in (a, "*")):
-                return True
-        return False
+        ka, kb = ("*", *self.keys_of(a)), ("*", *self.keys_of(b))
+        return any((x in ka and y in kb) or (x in kb and y in ka) for x, y in self.rules.allowlist)
 
     def clipped_by_design(self, name: str | None, rect: Rect) -> bool:
         for entry in self.rules.clipped_by_design:
@@ -770,7 +789,8 @@ def _inv06(f: _Frame) -> list[Violation]:
         if c.kind != "scrollbar" or not c.showing:
             continue
         container = c.parent or ""
-        allowed = f.rules.allowed_scrollbars.get(container)
+        allowed = next((f.rules.allowed_scrollbars[k] for k in f.keys_of(container) if k in f.rules.allowed_scrollbars),
+                       None)
         if allowed is not None and not (w >= allowed[0] and h >= allowed[1]):
             continue
         why = "not allowed to scroll" if allowed is None else f"none expected at {w}x{h} (from {allowed[0]}x{allowed[1]})"
@@ -1194,11 +1214,11 @@ def confirm(comparison: Comparison, recapture: InvariantResult | None, *, cause:
     return Persistence("stable" if confirmed else "unstable", None, confirmed, unconfirmed)
 
 
-def active_exceptions(rules: SurfaceRules, now: str) -> tuple[SurfaceRules, tuple[InvariantException, ...]]:
+def active_exceptions(rules: SurfaceRules, now: datetime | str) -> tuple[SurfaceRules, tuple[InvariantException, ...]]:
     """Drop registry exceptions expired at run start (L-SRF-11); the dropped ones go to run health
-    as `invariant_exception_expired` findings."""
-    live = tuple(e for e in rules.exceptions if e.expires_at > now)
-    expired = tuple(e for e in rules.exceptions if e.expires_at <= now)
+    as `invariant_exception_expired` findings. `now` is the run start, compared as an instant."""
+    live = tuple(e for e in rules.exceptions if not e.expired(now))
+    expired = tuple(e for e in rules.exceptions if e.expired(now))
     return replace(rules, exceptions=live), expired
 
 

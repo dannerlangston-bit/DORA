@@ -152,9 +152,9 @@ def test_secret_scan_canary_is_blind_when_the_scan_misses_sqlite_and_withholds_t
 
 
 # -- the denied-action test (6.8) ------------------------------------------------------------------------------
-def explorer_rig() -> SimulatedRig:
+def explorer_rig(scenario: simrig_module.SimScenario | None = None) -> SimulatedRig:
     """The Explorer login's rig with the ticket and dialog flag clear (two clear Watcher polls, 5.4.6)."""
-    rig = SimulatedRig()
+    rig = SimulatedRig(scenario)
     rig.launch()
     return rig
 
@@ -167,15 +167,16 @@ def test_denied_action_test_passes_against_the_default_deny_list():
 
 def test_denied_action_test_drives_the_example_file_and_every_deny_control():
     entries, registry = load_deny_list(EXAMPLE)
-    r = sc.denied_action_test(explorer_rig(), entries, deny_controls=registry.deny_controls)
+    rig = explorer_rig(simrig_module.SimScenario(config_root=EXAMPLE))     # the rig enforces the file itself
+    assert rig.deny_list == entries
+    r = sc.denied_action_test(rig, entries, deny_controls=registry.deny_controls)
     assert_passed(r)
     assert "control:charts.flexible-grid.active-trader-cell.buy-mkt-button control" in {c.case for c in r.cases}
 
 
-def test_removing_an_entry_from_the_enforced_list_makes_the_test_blind(monkeypatch):
+def test_removing_an_entry_from_the_enforced_list_makes_the_test_blind():
     enforced = tuple(e for e in DEFAULT_DENY_LIST if e.name != "chat")
-    monkeypatch.setattr(simrig_module, "match_deny", lambda **kw: match_deny(**kw, deny_list=enforced))
-    r = sc.denied_action_test(explorer_rig(), DEFAULT_DENY_LIST)
+    r = sc.denied_action_test(explorer_rig(simrig_module.SimScenario(deny_list=enforced)), DEFAULT_DENY_LIST)
     assert_blind(r, "deny_list")
     assert {c.case for c in r.missed} == {"chat title", "chat label"} and {c.observed for c in r.missed} == {"allowed"}
     assert r.result.outcomes[0].selector == "explorer_stage"

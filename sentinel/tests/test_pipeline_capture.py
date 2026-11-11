@@ -35,7 +35,7 @@ def _run(tmp_path, **script):
 def clean(tmp_path_factory):
     out = tmp_path_factory.mktemp("capture-clean")
     r, by = _run(out)
-    rows = ArtifactStore.read_manifest(out / "artifacts")["entries"]       # 8.4: names to hashes
+    rows = ArtifactStore.read_manifest(out / "artifacts" / "runs" / r.run_id)["entries"]   # 8.4: the run's own set
     return out, r, by, rows
 
 
@@ -44,7 +44,7 @@ def test_every_capture_is_stored_with_its_metadata(clean):
     caps = {(x["checkpoint_id"], x["side"]): x for x in rows if x["kind"] == "capture" and "capture-" in x["name"]}
     metas = {(x["checkpoint_id"], x["side"]): x for x in rows if x["kind"] == "bounds_json"}
     assert (S07, "candidate") in caps and (S07, "base") in caps and set(metas) == set(caps)
-    arts = ArtifactStore(out / "artifacts", f"runs/{r.run_id}")
+    arts = ArtifactStore.at(out / "artifacts", f"runs/{r.run_id}")
     meta = meta_from_json(arts.get(metas[(S07, "candidate")]["sha256"]))
     assert meta.window_class == "SunAwtDialog" and meta.title == "Order Confirmation"       # the dialog target
     assert meta.sha256 == caps[(S07, "candidate")]["sha256"] and meta.fingerprint_id == by[S07].fingerprint_id

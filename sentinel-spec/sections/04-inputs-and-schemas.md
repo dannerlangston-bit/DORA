@@ -570,6 +570,9 @@ flow:
   requires: list[entitlement enum]
   workspace: ref:workspace.id
   fixture: ref:fixture.fixture_id
+  account_role: enum[golden|empty] = empty   # the fixture account the flow selects (4.9)
+  state_scope: id?                     # flows touching the same server-side state share it; such flows run in one shard (2.11)
+  requires_window: enum[none|all_quiet|equities_quiet|futures_break] = none   # the quiet window of schedule/windows.yaml the flow runs in (7.10); a checkpoint may override
   data_mode: enum[frozen|masked_live]  # default for checkpoints that do not override
   agent_fallback: enum[allowed|disabled]
   budget: {max_duration_s: int, max_steps: int}
@@ -580,7 +583,7 @@ flow:
   teardown: list[step]
 ```
 
-**Step common fields and locators.** Every step has `id` (unique in the file, `^[a-z][a-z0-9-]*$`), `type`, `timeout_ms? = 5000`, `on_fail: enum[fail|retry_once|teardown] = fail`, `order_stage: bool = false` (true on the step that opens the Order Confirmation dialog; it arms the gateway's order-stage deny state, 6.2 and 5.4.6, and is required by L-FLW-07) and `note?`. Steps that act on a control take a `target`, which is `<surface id>.<control id>` from the registry; the Executor resolves it down the locator ladder JAB, image anchor, OCR text anchor, agent, in that order (5.5 Locator ladder), and records the rung used on the step record. The agent rung is skipped when the flow says `agent_fallback: disabled`, when the API preflight failed, when `phase0/branches.yaml` says DR-07 is Branch B, or inside a `secret` step, a `login` flow or any `teardown` step. Retries are capped at one per step and never cross a checkpoint.
+**Step common fields and locators.** Every step has `id` (unique in the flow, `^[a-z][a-z0-9_-]*$`; a checkpoint step's id is the last segment of its checkpoint id and so has no underscore, 4.1), `type`, `timeout_ms? = 5000`, `on_fail: enum[fail|retry_once|teardown] = fail`, `order_stage: bool = false` (true on the step that opens the Order Confirmation dialog; it arms the gateway's order-stage deny state, 6.2 and 5.4.6, and is required by L-FLW-07) and `note?`. Steps that act on a control take a `target`, which is `<surface id>.<control id>` from the registry; the Executor resolves it down the locator ladder JAB, image anchor, OCR text anchor, agent, in that order (5.5 Locator ladder), and records the rung used on the step record. The agent rung is skipped when the flow says `agent_fallback: disabled`, when the API preflight failed, when `phase0/branches.yaml` says DR-07 is Branch B, or inside a `secret` step, a `login` flow or any `teardown` step. Retries are capped at one per step and never cross a checkpoint.
 
 What a step failure produces is fixed, whatever the step type: the step is `failed` (or `blocked_by_gateway` when the gateway dropped its event); the checkpoint the step led to is `landmark_missing (reason: locator:<step>)` when the locator was exhausted on every rung, `assertion_failed` when an assertion failed, or `env_error` with the gate in force and the cause's reason when a catalog popup, a disconnect or a modal caused it (for example `env_error (gate: connectivity)` for a disconnect past 15 minutes, `env_error (gate: connectivity, reason: maintenance)` for the POP-09 maintenance notice; every `env_error` names its gate, 4.13); every later checkpoint of the flow is `not_run (reason: step_failed:<step>)` with the step id; teardown runs; a `locator_failure` finding records every rung's result. A step that reaches its target only on the agent rung is `passed_via_agent_fallback`, also with a `locator_failure` finding, and the next checkpoint is captured after `normalize` and flagged `rescued`, so its outcome is `needs_human (reason: rescued_capture)` unless a higher-precedence outcome applies (1.10 precedence).
 
@@ -597,9 +600,9 @@ What a step failure produces is fixed, whatever the step type: the step is `fail
 | `key_chord` | `keys: list[str]` | Held modifiers plus one key; the gateway releases all modifiers afterwards. |
 | `reset_input_state` | none | Key-up Shift, Ctrl, Alt, Win; mouse-up; one Escape only if no ticket or dialog is foreground. Required first step, last teardown step, and run by the Orchestrator on any crash recovery. |
 | `secret` | `target`, `vault_ref`, `commit` | Value pulled at the last moment, typed with the Recorder hook paused and Capture suspended; log shows `<redacted:<vault field>>`. Allowed only in `login` flows. |
-| `wait_for` | `anchor: {landmark?, window_title_regex?}`, `anti_anchors?`, `timeout_ms` | Polls until the anchor is present and anti-anchors absent; timeout is step `failed` and the next checkpoint `not_settled (reason: anchor_missing)` or `(reason: anti_anchor_present)`, whichever held at timeout. |
+| `wait_for` | `anchor: {landmark?, window_title_regex?}`, `anti_anchors?`, `timeout_ms` | Polls until the anchor is present and anti-anchors absent; timeout is step `failed` and the next checkpoint `not_settled` with the reason of the condition still failing at expiry (`unexpected_window:<title>`, `anti_anchor_present`, `anchor_missing` or `frames_unstable`); `timeout` only when no frame was obtained at all (3.5). |
 | `park_mouse`, `focus_neutral` | none, or `target` for the neutral control | The settle rule's two normalizing moves, available as explicit steps for `normalize` blocks. |
-| `export` | `target` (the grid), `kind: enum[file|copy_all]`, `path?` | Drives the grid's export action through the gateway; the file or clipboard text becomes an Oracle source (`source: export`). 02's "copy grid" step is this type with `kind: copy_all`. An export the build does not offer (the Phase 0 list of 2.8.1) makes the flow's entries `not_run (reason: scope)`; an export action that fails at run time is step `failed` with reason `export_unavailable`; a header set that differs from the declared one is `harness_error (reason: export_header_mismatch)` on that checkpoint (2.8.1). |
+| `export` | `target` (the grid), `kind: enum[file|copy_all]`, `path?`, `headers: list[str]` (the column headers the export must carry, in order) | Drives the grid's export action through the gateway; the file or clipboard text becomes an Oracle source (`source: export`). 02's "copy grid" step is this type with `kind: copy_all`. An export the build does not offer (the Phase 0 list of 2.8.1) makes the flow's entries `not_run (reason: scope)`; an export action that fails at run time is step `failed` with step reason `export_unavailable`, or `export_timeout` when no file or clipboard text arrived within `timeout_ms` (4.13 `step_outcome.reason`); a header set that differs from `headers` is `harness_error (reason: export_header_mismatch)` on every checkpoint whose assertions read the export (2.8.1). |
 | `checkpoint` | see below | Settle, capture, redact, diff, invariants. Produces exactly one checkpoint outcome. |
 | `assert` | `assertions: list[assertion]` | Oracle evaluation against the last capture or extraction; any failure sets the enclosing checkpoint to `assertion_failed` and the step to `failed`. |
 | `precondition` | `check: enum[paper_mode|workspace_loaded|no_modal|single_main_frame|main_window_rect|fixture_symbol_linked|working_orders|settings_attested|app_alive]`, `expect?` | Evaluated before the first step; a failure triggers one `reset_ui`, then one `reset_profile`; if it still fails, every checkpoint of the flow is `env_error (gate: workspace_loaded, reason: precondition:<check>)`, posted to run health and the flow owner, and the next flow re-checks. `paper_mode` mismatch is not a flow failure: the hook enters deny-all, the process tree is killed and the run is `aborted_safety (reason: paper_mode_mismatch)`. `working_orders` above `expect` is `aborted_safety (reason: unexpected_working_order)`. |
@@ -618,6 +621,8 @@ checkpoint_step:
   tier: enum[1|2|3]?                   # overrides the surface tier
   max_settle_ms: int?                  # overrides the surface settle
   recapturable: bool = true            # false for states a re-capture would destroy (a ticket after Cancel); 3.10
+  keep_focus: bool = false             # the state needs a focused field: settle skips its focus-neutral move and a caret mask is allowed (3.5, L-RGN-07)
+  requires_window: enum[none|all_quiet|equities_quiet|futures_break]?   # overrides the flow's requires_window (7.10)
   account_state: bool?                 # overrides the surface flag (4.5)
   required_labels: list[str]?          # adds to the surface's labels for INV-05 at this state
   expect: list[assertion]?             # evaluated by the Oracle right after capture; same as an assert step here
@@ -727,6 +732,7 @@ steps:
       - {id: cost_math, kind: rule, rule_id: R01, tol: 0.01,
          inputs: {qty: rgn.confirm.qty, price: rgn.confirm.price, multiplier: 5, total: rgn.confirm.cost}}
       - {id: bp_effect, kind: present, region: rgn.confirm.bp-effect, format: money}
+      - {id: send_label, kind: equals, region: rgn.confirm.send-button, expected: Send}
       - {id: no_placeholder, kind: absent, region: rgn.confirm.bp-effect, pattern: "(?i)loading|n/a|--"}
       - {id: price_changed, kind: changed_since_previous_step, region: rgn.order-entry.price, since_step: cp1}
 teardown:
@@ -790,6 +796,7 @@ steps:
       - {id: type_limit, kind: equals, region: rgn.order-entry.order-type, expected: LMT}
       - {id: qty, kind: equals, region: rgn.order-entry.qty, format: int, expected: 100}
       - {id: price, kind: equals, region: rgn.order-entry.price, format: price, value_ref: fixture.prices.aapl_far_below.value}
+      - {id: send_label, kind: equals, region: rgn.order-entry.confirm-button, expected: Confirm and Send}
   - {id: open-confirm, type: click_named, target: trade.order-entry.stock.confirm-and-send, order_stage: true}
   - {id: w-confirm, type: wait_for, anchor: {window_title_regex: "^Order Confirmation", landmark: lm.order-confirmation-title}, timeout_ms: 6000}
   - id: s07                                              # Order Confirmation checkpoint; M02 to M06 and M22 bind here
@@ -809,9 +816,10 @@ steps:
       - {id: cost_math, kind: rule, rule_id: R01, tol: 0.01,
          inputs: {qty: rgn.confirm.qty, price: rgn.confirm.price, multiplier: 1, total: rgn.confirm.cost}}
       - {id: R02, kind: rule, rule_id: R02, inputs: {bp_effect: rgn.confirm.bp-effect, notional: rgn.confirm.cost}}
+      - {id: send_label, kind: equals, region: rgn.confirm.send-button, expected: Send}
 ```
 
-The side and order type come from the fixture's fresh-install order-defaults profile (4.9), which stages a BUY LMT DAY ticket; a ticket that opens otherwise fails `side` or `type_limit` at `s06` as `assertion_failed`, and the flow stops before `open-confirm`. Every money cell on both checkpoints (quantity, price, Buying Power Effect, the Confirm and Send and Send buttons) is a `diff` region asserted by an `expect` entry, as L-RGN-04 requires.
+The side and order type come from the fixture's fresh-install order-defaults profile (4.9), which stages a BUY LMT DAY ticket; a ticket that opens otherwise fails `side` or `type_limit` at `s06` as `assertion_failed`, and the flow stops before `open-confirm`. Money cells come from the one closed list of 4.8 (`money_role`: `qty`, `price`, `bp_effect`, `max_loss`, `send`, `cancel`, `delete`). Here `s06` carries the quantity, the limit price and the ticket's Confirm and Send button (roles `qty`, `price` and `send`), and `s07` the quantity, the price, the Buying Power Effect and the Send button (`qty`, `price`, `bp_effect` and `send`). Each is a `diff` region named by an `expect` entry, directly or as a rule input, as L-RGN-04 requires; a dialog that also shows Max Loss, Cancel or Delete declares those cells with their roles and asserts them the same way.
 
 **Validation rules.**
 
@@ -829,7 +837,7 @@ The side and order type come from the fixture's fresh-install order-defaults pro
 | L-FLW-10 | `budget.max_duration_s` is within the flow budget rule of 11.2 Cadence and time budgets per run type (3 x measured p50, 5 minutes until measured) | error |
 | L-FLW-11 | assertion `region` ids exist in the regions file of the nearest preceding checkpoint; `since_step` names an earlier checkpoint; `rule_id` is one of R01 to R10 (2.8.3) and its `inputs` match the rule's operand list; a rule whose operand regions are not all declared on the checkpoint fails here, never silently skips | error |
 | L-FLW-12 | preconditions include `paper_mode` and `no_modal`; flows whose `surfaces` include an order surface include `working_orders` with `expect: 0` and a `working_orders_check` teardown | error |
-| L-FLW-13 | no step targets a control with `deny: true`, clicks `auto-send-checkbox`, or targets any surface on the Explorer deny list of 6.8 | error |
+| L-FLW-13 | no step targets a control with `deny: true` or clicks `auto-send-checkbox`; on steps run by the agent or the Explorer profile (agent-rescue goals, `explorer_candidate` flows) no target is on the Explorer deny list of 6.8 (`policy/explorer_deny_list.yaml`) | error |
 | L-FLW-14 | `origin.kind: explorer` flows carry `origin.run_id`, `origin.finding_ref` and `class: explorer_candidate` until a human promotes them; they live under `flows/quarantine/` | error |
 | L-FLW-15 | a flow whose `surfaces` include a ticket surface has a checkpoint on that surface before the first `type_fixture` or `click_named` into a ticket field other than the symbol box (the pre-input checkpoint of 2.6.3) | error |
 | L-FLW-16 | `recapturable: false` on every checkpoint that follows a `clear_ticket`, `close_dialog` or `cancel_all` teardown action within the same flow | error |
@@ -839,7 +847,7 @@ The side and order type come from the fixture's fresh-install order-defaults pro
 
 ### 4.8 Region Registry and mask record
 
-One regions file per checkpoint. Every region is an offset from a landmark located by template match on each capture; a missing landmark yields `landmark_missing (reason: landmark:<id>)` with the side it was missing on, and no diff runs on its regions (3.7: any landmark missing on either side makes the checkpoint `landmark_missing`; there is never a partial or blind diff). Every region is exactly one of `freeze`, `rule`, `mask` or `diff`; pixels no declared region covers belong to the implicit `diff` region `_rest` (3.8 Region Registry semantics).
+One regions file per checkpoint. Every region is an offset from a landmark located by template match on each capture; a missing landmark yields `landmark_missing (reason: landmark:<id>)` with the side it was missing on, and no diff runs on its regions (3.7: any landmark missing on either side makes the checkpoint `landmark_missing`; there is never a partial or blind diff). Every region of a checkpoint's regions file is exactly one of `freeze`, `rule`, `mask` or `diff`; pixels no declared region covers belong to the implicit `diff` region `_rest` (3.8 Region Registry semantics). The fifth type, `redaction`, exists only in the global redaction list `redaction/anchors.yaml`, which uses the same shape (below).
 
 ```yaml
 # schemas/regions.schema.json
@@ -848,16 +856,19 @@ regions_file:
   checkpoint_id: id
   landmarks: list[{id: id, template: path, confidence_min: num = 0.92, search_rect: {x: int, y: int, w: int, h: int}?}]   # one per panel compared (3.7)
   regions: list[region]
+  recalibrate: bool?                    # set by a pull request that changes a landmark template or a region rect of an approved checkpoint; the baseline is re-approved, not orphaned (L-XREF-10)
 
 region:
   id: id                                # rgn.<...>
-  type: enum[freeze|rule|mask|diff]
+  type: enum[freeze|rule|mask|diff|redaction]   # redaction only in redaction/anchors.yaml (L-RGN-03)
   landmark: ref:landmark.id             # the landmark this region is cut from
   rect: {dx: int, dy: int, w: int, h: int}    # offset from that landmark's top-left corner
   panel: enum[order_confirmation|order_ticket|position_statement|account_info|other] = other   # mask budget class
-  money_cell: bool = false              # Qty, Price, Buying Power Effect, Max Loss, Send, Cancel, Delete; always type diff (or freeze) with a zero floor and also asserted by the checkpoint's Oracle assertions (L-RGN-04). Account number and account holder name are identity fields: redacted in Capture, never a region, never diffed (6.10)
+  money_role: enum[qty|price|bp_effect|max_loss|send|cancel|delete]?   # the closed money-cell list: Qty, Price, Buying Power Effect, Max Loss and the Send, Cancel and Delete buttons; the ticket's Confirm and Send button is send; only on panels order_confirmation and order_ticket (L-RGN-08)
+  money_cell: bool = false              # true exactly when money_role is set (L-RGN-08); diff (or freeze) with a zero floor on a flow checkpoint, rule on a census checkpoint, never mask (L-RGN-04). Account number and account holder name are identity fields, not money cells: redacted in Capture, never a comparison region, never diffed (6.10)
+  identity_field: bool = false          # redaction only: the account number or the account holder name; excluded from the mask budget (6.10)
   fixture_dependency: str?              # freeze only: the fixture field that pins this region (3.8)
-  floor_exception: {approved_by: str, reason: str, ticket: str, expires_at: ts, edge_tolerance_px: int = 1}?   # diff only; 3.7
+  floor_exception: {approved_by: str, approved_at: ts, owner: str, reason: str, ticket: str, measured_floor: num, expires_at: ts, edge_tolerance_px: int = 1}?   # diff only; 3.7; expires_at at most 30 days after approved_at (L-RGN-05)
   rule: rule?                           # required for type rule
   mask_ref: ref:mask.mask_id?           # required for type mask
 
@@ -871,7 +882,7 @@ rule:
   must_not_change_when_closed: bool?
   min_rows: int?
   pattern: str?
-  api_window: {field: str, delay_s: int = 1200, slack_s: int = 60}?   # value within the API series over the delay window (7.9)
+  api_window: {field: str, delay_s: int = 1200, tol_ticks: int = 1}?   # the API value as of capture time minus delay_s, within tol_ticks ticks (2.8.2)
 
 # schemas/mask.schema.json  (masks/<checkpoint_id>/<mask_id>.yaml)
 mask:
@@ -898,12 +909,12 @@ landmarks:
   - {id: lm.order-confirmation-title, template: regions/templates/order-confirmation-title.png, confidence_min: 0.93}
 regions:
   - {id: rgn.confirm.side,   type: diff, rect: {dx: 24, dy: 48, w: 60, h: 20}, landmark: lm.order-confirmation-title, panel: order_confirmation}
-  - {id: rgn.confirm.qty,    type: diff, rect: {dx: 90, dy: 48, w: 48, h: 20}, landmark: lm.order-confirmation-title, panel: order_confirmation, money_cell: true}
+  - {id: rgn.confirm.qty,    type: diff, rect: {dx: 90, dy: 48, w: 48, h: 20}, landmark: lm.order-confirmation-title, panel: order_confirmation, money_role: qty, money_cell: true}
   - {id: rgn.confirm.symbol, type: diff, rect: {dx: 144, dy: 48, w: 110, h: 20}, landmark: lm.order-confirmation-title, panel: order_confirmation}
-  - {id: rgn.confirm.price,  type: diff, rect: {dx: 260, dy: 48, w: 90, h: 20}, landmark: lm.order-confirmation-title, panel: order_confirmation, money_cell: true}
+  - {id: rgn.confirm.price,  type: diff, rect: {dx: 260, dy: 48, w: 90, h: 20}, landmark: lm.order-confirmation-title, panel: order_confirmation, money_role: price, money_cell: true}
   - {id: rgn.confirm.cost,   type: diff, rect: {dx: 24, dy: 96, w: 200, h: 20}, landmark: lm.order-confirmation-title, panel: order_confirmation}
-  - {id: rgn.confirm.bp-effect, type: diff, rect: {dx: 24, dy: 120, w: 200, h: 20}, landmark: lm.order-confirmation-title, panel: order_confirmation, money_cell: true}
-  - {id: rgn.confirm.send-button, type: diff, rect: {dx: 380, dy: 200, w: 90, h: 24}, landmark: lm.order-confirmation-title, panel: order_confirmation, money_cell: true}
+  - {id: rgn.confirm.bp-effect, type: diff, rect: {dx: 24, dy: 120, w: 200, h: 20}, landmark: lm.order-confirmation-title, panel: order_confirmation, money_role: bp_effect, money_cell: true}
+  - {id: rgn.confirm.send-button, type: diff, rect: {dx: 380, dy: 200, w: 90, h: 24}, landmark: lm.order-confirmation-title, panel: order_confirmation, money_role: send, money_cell: true}
   - {id: rgn.confirm.timestamp, type: mask, rect: {dx: 260, dy: 200, w: 110, h: 16}, landmark: lm.order-confirmation-title, panel: order_confirmation, mask_ref: msk.confirm.timestamp-01}
 ```
 
@@ -922,22 +933,34 @@ ticket: TOS-48102
 decision_ref: dec-000731
 ```
 
-Notes on the example. Every money cell (`rgn.confirm.qty`, `rgn.confirm.price`, `rgn.confirm.bp-effect`, `rgn.confirm.send-button`) is a `diff` region with a zero floor and is also asserted by the checkpoint's Oracle assertions (`qty`, `price`, `cost_math` and `bp_effect` of the 4.7 flow): a money cell is always pixel-diffed and rule-asserted and never rule-only, so a value change inside an assertion's tolerance or inside R02's bracket still shows as a pixel diff and, on an undeclared surface, is `collateral` (3.11). The `rule` type remains for live cells that are not money cells, such as quote, time and change fields. The cost total is not a money cell; it is a calibrated `diff` region checked by R01. Pixels outside the declared regions fall to the implicit `_rest` region, so no catch-all region overlaps the others (L-RGN-02), and the timestamp mask lies clear of the Send button, since any mask or redaction box on a money cell breaches its zero budget. The timestamp mask satisfies L-RGN-07 because `cp2` is a `masked_live` checkpoint (4.7). On a `frozen` checkpoint, such as `s07` of the stock limit flow that reuses these region ids, L-RGN-07 allows a mask only on the clock, the connection indicator, the caret of a `keep_focus` checkpoint and the parking rectangle, so there the staging timestamp is a `rule` region (`field: time`, `pattern` of the dialog's time format) and no mask record exists.
+Notes on the example. Every money cell (`rgn.confirm.qty`, `rgn.confirm.price`, `rgn.confirm.bp-effect`, `rgn.confirm.send-button`, roles `qty`, `price`, `bp_effect` and `send`) is a `diff` region with a zero floor and is also asserted by the checkpoint's Oracle assertions (`qty`, `price`, `cost_math`, `bp_effect` and `send_label` of the 4.7 flow): on a flow checkpoint a money cell is always pixel-diffed and rule-asserted and never rule-only, so a value change inside an assertion's tolerance or inside R02's bracket still shows as a pixel diff and, on an undeclared surface, is `collateral` (3.11). The `rule` type remains for live cells that are not money cells, such as quote, time and change fields, and for money cells on census checkpoints, which carry no assertions and no flow-typed values: there the money cell is a `rule` region, checked because census and sweep checkpoints run every `rule` region of their regions file (3.8, L-RGN-04). The cost total is not a money cell; it is a calibrated `diff` region checked by R01. Pixels outside the declared regions fall to the implicit `_rest` region, so no catch-all region overlaps the others (L-RGN-02), and the timestamp mask lies clear of the Send button, since any mask or redaction box on a money cell breaches its zero budget. The timestamp mask satisfies L-RGN-07 because `cp2` is a `masked_live` checkpoint (4.7). On a `frozen` checkpoint, such as `s07` of the stock limit flow that reuses these region ids, L-RGN-07 allows a mask only on the clock, the connection indicator, the caret of a checkpoint with `keep_focus: true` and the parking rectangle, so there the staging timestamp is a `rule` region (`field: time`, `pattern` of the dialog's time format) and no mask record exists.
 
-**Threshold source.** A `diff` region carries no threshold of its own. The Diff Engine reads the region's floor from `calibration/<fingerprint_id>.yaml` for the fingerprint of the run (3.9 A/A calibration and threshold derivation), so a recalibration never touches a regions file. The calibration file's record per region is the four derived thresholds of 3.9 (`component_area_min`, `changed_px_min`, `delta_e_min`, `shift_px_min`) plus the measured floors; SSIM is stored for ranking and has no threshold. Three cases: the calibration file exists and has the region, `threshold_source: calibrated`; the file exists but lacks the region (a region added since the last Calibration run), the region is diffed at threshold 0, any changed pixel is `needs_human (reason: uncalibrated)`, the record carries `threshold_source: uncalibrated`, and a Calibration run is queued; no calibration file exists for the fingerprint at all, every region of every checkpoint on it is that same `uncalibrated` case and a Calibration run is queued (3.9 step 6, 4.12 L-FPR-04). A missing calibration is never `not_comparable`, whose only reasons are `fingerprint_mismatch`, `window_mismatch` and `surface_mismatch`. A non-zero floor on a `frozen` checkpoint is a bug to fix (brief 1.4), so the lint warns on it (L-RGN-06). A `floor_exception` is the only way to loosen a region (3.7 `edge_tolerance_px`), is human-approved with a ticket and an expiry, and is refused on `money_cell` regions.
+**Redaction list.** Redaction is not a mask and not a per-checkpoint record. One global file, `redaction/anchors.yaml`, owned by the security contact, uses the regions-file shape without a checkpoint id: landmarks, plus regions of `type: redaction` cut from them. Capture applies every redaction region wherever its landmark is found, on every capture, before anything is stored or released (6.10 Stage 1, which also says when a missing redaction landmark is `landmark_missing (reason: redaction_landmark:<id>)`). Regions marked `identity_field: true` (the account number and the account holder name) are excluded from the mask budget; every other redaction box counts toward it.
 
-**Mask budget.** Masked plus redacted area is computed per checkpoint and per `panel` class on every run: `order_confirmation` 10 percent, `order_ticket` 10 percent, `position_statement` 10 percent, `account_info` 5 percent, any `money_cell` region 0 percent. Masks and redaction boxes both count toward it (3.8), except boxes over the identity fields: the account number and the account holder name are always redacted in Capture (`redaction/anchors.yaml`, each such anchor marked `identity_field: true`), are excluded from the mask budget, are never diffed, are not money cells, and are proven nightly by the redaction canary (6.5, 6.10). The lint enforces the budget on every pull request (L-MSK-03); at run time a landmark move or geometry change that pushes a panel's masked plus non-identity redacted share over its budget, or any mask or redaction box onto a money cell, is `harness_error (reason: mask_budget_exceeded)` on that checkpoint, with the panel and its share in `detail` and a `mask_budget_exceeded` finding (3.8). Account identifiers are never masked; they are redacted in Capture.
+```yaml
+# schemas/redaction.schema.json  (redaction/anchors.yaml)
+redaction_file:
+  schema_version: int = 1
+  owner: str                            # the security contact (6.10)
+  landmarks: list[{id: id, template: path, confidence_min: num = 0.92, search_rect: {x: int, y: int, w: int, h: int}?}]
+  regions: list[region]                 # every one type: redaction (L-RGN-03)
+```
+
+**Threshold source.** A `diff` region carries no threshold of its own. The Calibration Service writes each region's floors and the four thresholds 3.9 derives to `calibration_floors` (8.3), keyed by calibration key, checkpoint and region, and exports them to `calibration/<hex>.yaml`, `<hex>` being the calibration key of the run's fingerprint without its `sha256:` prefix (4.12 Calibration key; one helper computes the name); the Diff Engine reads the region's thresholds from there (3.9 A/A calibration and threshold derivation), so a recalibration never touches a regions file. The record per region is the four derived thresholds of 3.9 (`component_area_min`, `changed_px_min`, `delta_e_min`, `shift_px_min`) plus the measured floors; SSIM is stored for ranking only and has no threshold. Three cases: the calibration exists and has the region, `threshold_source: calibrated`; it exists but lacks the region (a region added since the last Calibration run), the region is diffed at threshold 0, any changed pixel is `needs_human (reason: uncalibrated)`, the record carries `threshold_source: uncalibrated`, and a Calibration run is queued; no calibration exists for the calibration key at all, every region of every checkpoint on it is that same `uncalibrated` case and a Calibration run is queued (3.9 step 6, 4.12 L-FPR-04). The 7.13 rows say which changes invalidate the floors of one checkpoint or one region rather than the whole key. A missing calibration is never `not_comparable`, whose only reasons are `fingerprint_mismatch`, `window_mismatch` and `surface_mismatch`. A non-zero floor on a `frozen` checkpoint is a bug to fix (brief 1.4), so the lint warns on it (L-RGN-06). A `floor_exception` is the only way to loosen a region (3.7 `edge_tolerance_px`), is human-approved with an owner, a ticket, the measured floor and an expiry at most 30 days after approval, and is refused on `money_cell` regions.
+
+**Mask budget.** Masked plus redacted area is computed per checkpoint and per `panel` class on every run: `order_confirmation` 10 percent, `order_ticket` 10 percent, `position_statement` 10 percent, `account_info` 5 percent, any `money_cell` region 0 percent. Masks and redaction boxes both count toward it (3.8), except boxes over the identity fields: the account number and the account holder name are always redacted in Capture (`redaction/anchors.yaml`, each such region marked `identity_field: true`), are excluded from the mask budget, are never diffed, are not money cells, and are proven nightly by the redaction canary (6.5, 6.10). Redaction regions are not masks: they need no mask record and no decision, and only the security contact changes them. The lint enforces the budget on every pull request (L-MSK-03); at run time a landmark move or geometry change that pushes a panel's masked plus non-identity redacted share over its budget, or any mask or redaction box onto a money cell, is `harness_error (reason: mask_budget_exceeded)` on that checkpoint, with the panel and its share in `detail` and a `mask_budget_exceeded` finding (3.8). Account identifiers are never masked; they are redacted in Capture.
 
 | Rule | Check | Severity |
 |---|---|---|
 | L-RGN-01 | region ids unique; file path equals `checkpoint_id`; a flow or census entry references the checkpoint | error |
 | L-RGN-02 | every `rect` lies inside the surface's captured bounds as recorded in the last calibration; regions of different kinds do not overlap except that a `mask` may lie inside another region | error |
-| L-RGN-03 | `rule` present if and only if `type = rule`; `mask_ref` present if and only if `type = mask` and the mask file exists; `fixture_dependency` present if and only if `type = freeze` | error |
-| L-RGN-04 | a `money_cell` region is `diff` (or `freeze`, 3.8) with a zero floor, never `rule` and never `mask`, and carries no `floor_exception`; on a flow checkpoint at least one assertion of that checkpoint (an `expect` entry, or an `assert` step before the next checkpoint) names the region as its `region` or as a rule input, and on a census checkpoint the Oracle checks of 2.8 for the surface do, so a money cell is always pixel-diffed and rule-asserted, never rule-only | error |
-| L-RGN-05 | `floor_exception` carries all four human fields and a future `expires_at`; an expired exception is dropped at run start and listed in run health, never `config_invalid` | error |
+| L-RGN-03 | `rule` present if and only if `type = rule`; `mask_ref` present if and only if `type = mask` and the mask file exists; `fixture_dependency` present if and only if `type = freeze`; `type: redaction` only in `redaction/anchors.yaml`, where every region is of that type; `identity_field` only on `redaction` regions | error |
+| L-RGN-04 | a `money_cell` region is never a `mask` and carries no `floor_exception`. On a flow checkpoint it is `diff` (or `freeze`, 3.8) with a zero floor, never `rule`, and at least one assertion of that checkpoint (an `expect` entry, or an `assert` step before the next checkpoint) names the region as its `region` or as a rule input, so it is always pixel-diffed and rule-asserted, never rule-only. On a census checkpoint, which has no assertions, every money cell is a `rule` region, run because census and sweep checkpoints evaluate every `rule` region of their regions file (3.8) | error |
+| L-RGN-05 | `floor_exception` carries `approved_by`, `approved_at`, `owner`, `reason`, `ticket`, `measured_floor` and a future `expires_at` at most 30 days after `approved_at`; an expired exception is dropped at run start and listed in run health, never `config_invalid` | error |
 | L-RGN-06 | the calibration file records a non-zero floor on a region of a `frozen` checkpoint | warn |
-| L-RGN-07 | `mask` on a `frozen` checkpoint anywhere but the clock, the connection indicator, the caret of a `keep_focus` checkpoint and the parking rectangle (3.2, 3.5) | error |
-| L-MSK-01 | `created_by = human`, `decision_ref` exists and is a `request_mask` decision by a human in the triage roster | error |
+| L-RGN-07 | `mask` on a `frozen` checkpoint anywhere but the clock, the connection indicator, the parking rectangle and the caret, which is allowed only on a checkpoint with `keep_focus: true` (3.2, 3.5) | error |
+| L-RGN-08 | `money_cell: true` if and only if `money_role` is set; `money_role` only on regions whose `panel` is `order_confirmation` or `order_ticket` | error |
+| L-MSK-01 | `created_by = human`, `decision_ref` exists and is a `request_mask` decision by a human in the triage roster of `ops/oncall.yaml` | error |
 | L-MSK-02 | `expires_at` in the past: in CI, `error` on the PR that adds or renews it; at run start the mask simply stops applying, run health lists "mask expired: <id>", the Reporter warned the owner seven days before (3.8), and the run is never `config_invalid` over it | error (CI), ignored at run start |
 | L-MSK-03 | masked plus non-identity redacted area per checkpoint and per `panel` class under the budget table (identity-field redaction excluded, mask budget paragraph above) | error |
 | L-MSK-04 | mask growth over 30 days above 2 percent of a tier-1 checkpoint | warn |

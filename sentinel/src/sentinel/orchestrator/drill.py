@@ -51,24 +51,33 @@ Choices for `run_drill` (reported):
 - Item 5's `Cancel All` counts as located when the recovery read showed no new row and the rig located it,
   or when a new row made the recovery flow click it and the re-read came back clean. The rig counts as
   reverted when `revert_snapshot` returned without an exception. The final Oracle read is item 5's recovery
-  read (taken before the revert): with no usable read the new-row count is 0 and item 5 fails, so the drill
-  is never PROVEN without it.
+  read (taken before the revert), and the clean read that made `Cancel All` click counts too (the larger
+  new-row count wins), so re-reads that go unreadable after the click never hide a sent order: with no usable
+  read the new-row count is 0 and item 5 fails, so the drill is never PROVEN without it.
+- Item 5's `deny_all` is measured when it is seen in effect, not when it is written: right after the deny-all write
+  one drill-tagged raw key down of an inert key (`DENY_ALL_PROBE_VK`) goes to the hook, which must drop it
+  `deny_all`; any other decision leaves `deny_all_s` None, so item 5 fails "hook not in deny-all" (6.5 Failure
+  handling). That drop is drained in the drill's raw phase and recorded in the ledger as exempt (5.4.8).
 - `run_drill` executes the drill's own steps only; the actions of the result (block the login, quarantine,
   the kill switch after a new row) are the caller's, as for every control result.
+- A selector text that is not an allowlist entry at item 5's recovery login is the 6.4 mismatch (killswitch choice
+  18): item 5 fails (the recovery login failed A1), and the drill's one result also carries the mismatch's run
+  outcome (`aborted_safety` with `live_identity` or `paper_mode_mismatch`), unreached outcome, incident, actions
+  (the login blocked for `live_identity`), safety page and selector crop, so persisting that result applies both.
 """
 from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Protocol, runtime_checkable
 
-from . import alerts
+from . import alerts, killflag
 from .clock import Clock
-from .gateway import VK_ESCAPE, VK_RETURN, VK_SPACE, Action, Chord, DropLedger, InputEvent, drain, refusal
+from .gateway import VK_ESCAPE, VK_F24, VK_RETURN, VK_SPACE, Action, Chord, DropLedger, InputEvent, drain, refusal
 from .identity import Allowlist
 from .killswitch import GRIDS, PROVEN_NONE, ProofInputs, cancel_new_working, post_run_proof, recovery_login
-from .ports import KillChannel, KillRequest
+from .ports import KillChannel
 from .results import ControlResult, Outcome, safety_abort_outcome
 from .rig import EmitResult, OrderBook, Rig
 from .simrig import CONFIRM_POINT, DELETE_POINT, SimulatedRig
@@ -151,6 +160,7 @@ class DrillObservation:
     could_not_run: Mapping[int, str] = field(default_factory=dict)   # item -> what was not located or did not open
     dialog_open_after_keys: bool = True         # item 1: the dialog still open by title after the keys
     absent_passed: bool = True                  # item 1: close_dialog, clear_ticket and the absent assertion
+    identity: ControlResult | None = None       # item 5: the 6.4 mismatch its recovery login saw (killswitch choice 18)
 
 
 @dataclass(frozen=True)
@@ -209,15 +219,23 @@ def score_drill(obs: DrillObservation, chords: Sequence[Chord]) -> DrillResult:
         acts.append("maintenance_task")
     if 1 in obs.could_not_run:
         notes.append("the Order Confirmation dialog did not open: also an A9 failure")
-    return DrillResult(ControlResult(
+    result = ControlResult(
         "fire_drill", False, "running", checkpoint=Outcome("harness_error", f"drill_failed:{failed[0]}",
                                                            detail="; ".join(notes) or None),
         alert=alerts.drill_failure(), actions=tuple(acts), incident="S2",
-        detail="fire drill failed: " + ", ".join(failed) + "; the Nightly run stays complete"), tuple(failed))
+        detail="fire drill failed: " + ", ".join(failed) + "; the Nightly run stays complete")
+    i = obs.identity
+    if i is not None:                                    # a 6.4 mismatch at item 5's recovery login (docstring)
+        ev = dict(i.evidence) | ({"blocked_reason": "live_identity"} if i.run_reason == "live_identity" else {})
+        result = replace(result, run=i.run, unreached=i.unreached, alert=alerts.safety_abort(), incident=i.incident,
+                         actions=tuple(dict.fromkeys(result.actions + i.actions)), evidence=ev,
+                         detail=f"fire drill failed: {', '.join(failed)}; item 5's recovery login saw {i.run_reason}")
+    return DrillResult(result, tuple(failed))
 
 
 # -- driving the drill on a rig (6.5) -----------------------------------------------------------------------
 DRILL_UNIT = "flow.fire-drill"          # the drill flow's unit in the DropLedger (its drops are exempt, 5.4.8)
+DENY_ALL_PROBE_VK = VK_F24             # item 5's inert raw key: the hook in deny-all drops it `deny_all` (6.5)
 DRILL_TARGETS = ("confirm_and_send", "delete", "ladder_buy_cell", "ticket_buy_button")
 DIALOG_TITLE = "Order Confirmation"
 CTRL = frozenset({"ctrl"})
@@ -287,6 +305,7 @@ class _Drive:
         self.rig, self.port, self.ledger = rig, port, ledger
         self.records: list[DrillRecord] = []
         self.could_not_run: dict[int, str] = {}
+        self.identity: ControlResult | None = None       # the 6.4 mismatch item 5's recovery login saw
 
     def dialog_up(self) -> bool:
         return any(w.title.startswith(DIALOG_TITLE) for w in self.rig.enumerate_windows())
@@ -314,6 +333,17 @@ class _Drive:
         if p is None:
             self.could_not_run.setdefault(item, f"{what} not located")
         return p
+
+    def deny_all_holds(self) -> bool:
+        """Item 5's "hook in deny-all" (6.5): one drill-tagged raw key down of an inert key, injected after the deny-all
+        write, which the hook must drop `deny_all`. Its drop goes to the ledger as exempt (5.4.8), never into the
+        items 1 to 4 set."""
+        raw = InputEvent("key_down", vk=DENY_ALL_PROBE_VK, origin="drill")
+        r = self.rig.send_input(Action("press", keys=(DENY_ALL_PROBE_VK,), flow_class="canary"), events=(raw,))
+        for d, e in zip(r.decisions, r.events):
+            if not d.allowed:
+                self.ledger.record(drain(d, e, drill_phase=True), unit=DRILL_UNIT, exempt=True)
+        return bool(r.decisions) and all(not d.allowed and d.reason == "deny_all" for d in r.decisions)
 
 
 def _new_rows(start: OrderBook, end: OrderBook | None) -> int:
@@ -374,35 +404,53 @@ def _item4(d: _Drive) -> None:
 
 
 def _item5(d: _Drive, *, clock: Clock, kill_channel: KillChannel, rig_id: str, start: OrderBook,
-           allowlist: Allowlist, fixture_account: str | None) -> tuple[Item5, OrderBook | None]:
-    """The kill switch end to end (6.5 item 5, 6.6): the file flag written mid-ticket, then the sequence, timed."""
+           allowlist: Allowlist, fixture_account: str | None) -> tuple[Item5, tuple[OrderBook | None, ...]]:
+    """The kill switch end to end (6.5 item 5, 6.6): the file flag written mid-ticket, then the sequence, timed.
+    Returns item 5's measurements and its Monitor reads: the last one, and the clean read that made `Cancel All`
+    click (killswitch choice 4), so a row either showed counts. A human stop request pending on the channel is never
+    overwritten, consumed or acknowledged: item 5 does not run and the request stays for the Orchestrator (killflag
+    choice 5)."""
     t0 = clock.monotonic()
-    kill_channel.post(KillRequest(rig_id, "file", "fire_drill", "fire drill item 5", clock.now().isoformat()))
-    req = kill_channel.poll()
-    if req is None:
-        d.could_not_run[5] = "the kill flag did not arrive on the channel"
+    human = killflag.poll(kill_channel)
+    mine = killflag.drill_request(rig_id, clock.now().isoformat())
+    if human is None:
+        try:
+            kill_channel.post(mine)
+        except FileExistsError:                      # the flag holds a request that is not ours (killflag choice 5)
+            human = killflag.poll(kill_channel)
+    req = kill_channel.poll() if human is None else None
+    if req is not None and req != mine and not killflag.is_probe(req):     # a human request came first: leave it
+        human = req
+        kill_channel.acknowledge(mine)
+    if human is not None or req is None:
+        d.could_not_run[5] = ("the kill flag did not arrive on the channel" if human is None else
+                              f"a stop request is pending ({human.requested_by} via {human.channel}: {human.reason}); "
+                              "it is left for the kill switch")
         d.port.clear_drill_ticket()
-        return Item5(None, None, False, False, None, False), None
+        return Item5(None, None, False, False, None, False), ()
     d.rig.set_hook_phase("kill_switch")
-    deny_all_s = clock.monotonic() - t0
+    deny_all_s = clock.monotonic() - t0 if d.deny_all_holds() else None      # seen in effect, not just written
     tree_gone_s = clock.monotonic() - t0 if d.rig.kill_process_tree() else None
     d.rig.reset_input_state()
     d.rig.set_hook_phase("recovery")                 # the recovery-only arm, as in the sequence itself (6.6 step 5)
-    login_ok = recovery_login(d.rig, allowlist, clock, fixture_account)
+    login = recovery_login(d.rig, allowlist, clock, fixture_account)
+    login_ok = login.ok
+    d.identity = login.identity
     end: OrderBook | None = None
+    found: OrderBook | None = None
     cancel, located = "not_needed", False
     if login_ok:
-        cancel, end = cancel_new_working(d.rig, start, d.rig.read_orders(), clock=clock)
+        cancel, end, found = cancel_new_working(d.rig, start, d.rig.read_orders(), clock=clock)
         located = cancel == "done" or (cancel == "not_needed" and d.rig.locate_cancel_all())
-    proof = post_run_proof(ProofInputs(start=start, end=end, recovery_login_ok=login_ok, cancel_all=cancel))
+    proof = post_run_proof(ProofInputs(start=start, end=end, recovery_login_ok=login_ok, cancel_all=cancel, found=found))
     try:
         d.rig.revert_snapshot()
         reverted = True
     except Exception:            # noqa: BLE001 - any revert failure is "rig not reverted" (6.5 item 5), never a crash
         reverted = False
     d.rig.set_hook_phase("between_runs")
-    kill_channel.acknowledge(req)
-    return Item5(deny_all_s, tree_gone_s, login_ok, located, proof.verdict, reverted), end
+    kill_channel.acknowledge(mine)                   # only our own request (killflag choice 4)
+    return Item5(deny_all_s, tree_gone_s, login_ok, located, proof.verdict, reverted), (end, found)
 
 
 def run_drill(rig: Rig, ledger: DropLedger, clock: Clock, chords: Sequence[Chord], start_book: OrderBook,
@@ -429,11 +477,12 @@ def run_drill(rig: Rig, ledger: DropLedger, clock: Clock, chords: Sequence[Chord
     else:
         _item3(d, chords)
         _item4(d)
-    item5, end = _item5(d, clock=clock, kill_channel=kill_channel, rig_id=rig_id, start=start_book,
-                        allowlist=allowlist, fixture_account=fixture_account)
+    item5, reads = _item5(d, clock=clock, kill_channel=kill_channel, rig_id=rig_id, start=start_book,
+                          allowlist=allowlist, fixture_account=fixture_account)
     obs = DrillObservation(True, pre.probe_dropped_age_s, True, True, tuple(d.records), item5,
-                           new_order_rows=_new_rows(start_book, end), could_not_run=dict(d.could_not_run),
-                           dialog_open_after_keys=still_open, absent_passed=absent)
+                           new_order_rows=max((_new_rows(start_book, b) for b in reads), default=0),
+                           could_not_run=dict(d.could_not_run),
+                           dialog_open_after_keys=still_open, absent_passed=absent, identity=d.identity)
     return _with(score_drill(obs, chords), obs)
 
 

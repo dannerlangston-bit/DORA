@@ -31,9 +31,13 @@ Choices where the spec is silent or ambiguous (reported):
   the login-only canary of 6.9 has no `canary_results` kind (reported as a gap). "Passed on the current build"
   is: the latest run on that build (its `env_fingerprints` build, or the candidate of its build pair) holding
   rows of the canary, written at or after the cause, has every required row `detected`.
-- A login blocked by an UNPROVEN proof is re-enabled only when every UNPROVEN proof on it has been cleared by a
-  person (6.6), and by the system owner when the login's last two proofs are UNPROVEN (6.6 "the system owner
-  must sign the re-enable"); a rig disabled after two UNPROVEN proofs needs the system owner too. A rig is
+- A blocked login is re-enabled only when every UNPROVEN proof on it has been cleared by a person (6.6), whatever
+  reason blocked it first (a `live_identity` block, for one, always comes with an UNPROVEN `session_unavailable`
+  proof, SD-64). When the login's last two proofs are UNPROVEN, the re-enable of the login and of its rig needs the
+  system owner and a proof canary that passed on the current build after the block or disable, on top of what the
+  stored reason needs (6.6 "the system owner must sign the re-enable, and no run starts on that login until the
+  proof canary passes"): the rule is read from the login's proof history, since the first block or disable reason
+  stands (a kill switch's `kill_switch` disable or a `recovery_login_failed` block would hide it). A rig is
   re-enabled only once its S1 and S2 incidents are closed (6.6 step 6, 6.12).
 - Re-enable reason and ticket: a quarantine row keeps them in its columns; `logins` and `rigs` have no column
   for them, so the journal row of the batch carries them (`op: human_action`), as for every human action here.
@@ -92,6 +96,7 @@ LOGIN_EVIDENCE: dict[str, Requirement | None] = {
     "explorer_teardown_incomplete": ("safety_canary", ("deny_list",)), "rotation": None}
 RIG_EVIDENCE: dict[str, Requirement] = {"kill_switch": DRILL, "undeclared_order_row": DRILL,
                                         "unproven_twice": ("safety_canary", ("proof",))}
+PROOF_CANARY: Requirement = ("safety_canary", ("proof",))     # after two UNPROVEN proofs in a row, on top (6.6)
 _CAUSE = {"safety_canary": re.compile(rf"^safety_canary_blind:({'|'.join(CANARY_NAMES)})$"),
           "fire_drill": re.compile(r"^drill_failed:[a-z0-9_]+$")}
 
@@ -483,29 +488,42 @@ def unblock_login(store: Store, alias: str, *, by: str, role: str, reason: str, 
         raise SafetyRefused(f"unknown login {alias}")
     if row["blocked_at"] is None or row["unblocked_at"] is not None:
         raise SafetyRefused(f"login {alias} is not blocked")
-    if row["blocked_reason"] in UNPROVEN_BLOCKS:
-        proofs = store.query("SELECT verdict, verified_by FROM post_run_proofs WHERE login_alias = ? "
-                             "ORDER BY produced_at, proof_id", (alias,))
-        if any(p["verdict"] == "unproven" and p["verified_by"] is None for p in proofs):
-            raise SafetyRefused(f"login {alias} has an UNPROVEN proof no person has cleared; clear_proof first (6.6)")
-        if len(proofs) >= 2 and all(p["verdict"] == "unproven" for p in proofs[-2:]) and role != SYSTEM_OWNER:
-            raise SafetyRefused("two UNPROVEN proofs in a row on this login: the system owner signs the re-enable "
-                                "(6.6)")
+    proofs = _login_proofs(store, alias)
+    if any(p["verdict"] == "unproven" and p["verified_by"] is None for p in proofs):    # whatever blocked it first
+        raise SafetyRefused(f"login {alias} has an UNPROVEN proof no person has cleared; clear_proof first (6.6)")
+    twice = _unproven_twice(proofs)
+    if twice and role != SYSTEM_OWNER:
+        raise SafetyRefused("two UNPROVEN proofs in a row on this login: the system owner signs the re-enable (6.6)")
     run = _evidence(store, LOGIN_EVIDENCE[row["blocked_reason"]], build_id, row["blocked_at"])
+    proof_run = _evidence(store, PROOF_CANARY, build_id, row["blocked_at"]) if twice else None
     when = _when(at)
     with store.batch("human:reenable") as b:
         b.update("logins", {"login_alias": alias}, {"unblocked_by": by, "unblocked_at": when})
         _journal(b, "reenable", kind="login", target=alias, by=by, role=role, reason=reason, ticket=ticket,
-                 evidence_run_id=run, at=when)
-    return Reenabled("login", alias, by, reason, ticket, run)
+                 evidence_run_id=run, proof_canary_run_id=proof_run, at=when)
+    return Reenabled("login", alias, by, reason, ticket, run or proof_run)
+
+
+def _login_proofs(store: Store, alias: str) -> list[Any]:
+    """The login's post-run proofs (8.3), oldest first."""
+    return store.query("SELECT verdict, verified_by FROM post_run_proofs WHERE login_alias = ? "
+                       "ORDER BY produced_at, proof_id", (alias,))
+
+
+def _unproven_twice(proofs: list[Any]) -> bool:
+    """The login's last two proofs are UNPROVEN: the proof reader is suspect (6.6), whatever blocked or disabled
+    first."""
+    return len(proofs) >= 2 and all(p["verdict"] == "unproven" for p in proofs[-2:])
 
 
 def enable_rig(store: Store, rig_id: str, *, by: str, role: str, reason: str, ticket: str, build_id: str,
                at: str | None = None) -> Reenabled:
     """Re-enable a disabled rig (6.12): its S1 and S2 incidents closed, the drill or proof canary passed on the
-    current build, the system owner's signature when two UNPROVEN proofs disabled it (6.6)."""
+    current build, and the system owner's signature with the proof canary when two UNPROVEN proofs disabled it or
+    are its login's last two proofs, whatever reason disabled it first (6.6)."""
     by, reason, ticket = _person(by, "enabled_by"), _need(reason, "a reason"), _need(ticket, "a ticket")
-    row = _one(store, "SELECT active, disabled_reason, disabled_at, enabled_at FROM rigs WHERE rig_id = ?", (rig_id,))
+    row = _one(store, "SELECT active, disabled_reason, disabled_at, enabled_at, login_alias FROM rigs WHERE rig_id = ?",
+               (rig_id,))
     if row is None:
         raise SafetyRefused(f"unknown rig {rig_id}")
     if not _rig_disabled(row):
@@ -515,14 +533,18 @@ def enable_rig(store: Store, rig_id: str, *, by: str, role: str, reason: str, ti
     if open_:
         raise SafetyRefused(f"rig {rig_id} stays stopped until incident {open_[0]['incident_id']} is closed "
                             "(6.6, 6.12)")
-    if row["disabled_reason"] == "unproven_twice" and role != SYSTEM_OWNER:
-        raise SafetyRefused("two UNPROVEN proofs disabled this rig: the system owner signs the re-enable (6.6)")
+    twice = row["disabled_reason"] == "unproven_twice" or (
+        row["login_alias"] is not None and _unproven_twice(_login_proofs(store, row["login_alias"])))
+    if twice and role != SYSTEM_OWNER:
+        raise SafetyRefused("two UNPROVEN proofs in a row on this rig's login: the system owner signs the re-enable "
+                            "(6.6)")
     run = _evidence(store, RIG_EVIDENCE[row["disabled_reason"]], build_id, row["disabled_at"])
+    proof_run = _evidence(store, PROOF_CANARY, build_id, row["disabled_at"]) if twice else None
     when = _when(at)
     with store.batch("human:reenable") as b:
         b.update("rigs", {"rig_id": rig_id}, {"active": 1, "enabled_by": by, "enabled_at": when})
         _journal(b, "reenable", kind="rig", target=rig_id, by=by, role=role, reason=reason, ticket=ticket,
-                 evidence_run_id=run, at=when)
+                 evidence_run_id=run, proof_canary_run_id=proof_run, at=when)
     return Reenabled("rig", rig_id, by, reason, ticket, run)
 
 

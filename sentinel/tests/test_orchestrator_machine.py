@@ -122,6 +122,32 @@ def test_a_session_kicked_mid_run_waits_logs_in_once_more_and_proves_normally():
     assert rig.calls.count("login") == 3 and report.gate("teardown").has("block_login")
 
 
+def test_a_live_id_at_the_kicked_sessions_proof_login_is_live_identity_with_no_second_login():
+    """session:0: the kicked session's proof login reads a live-format id. The 6.4 result is applied (aborted_safety
+    live_identity, S1, the login blocked for live_identity), no further login is made on that login, and the proof is
+    UNPROVEN session_unavailable (SD-64)."""
+    def work(orch: Orchestrator) -> None:
+        orch.sink.record(SCOPE[0], "identical")
+        orch.apply(session_kicked())                              # POP-04 mid-run
+    reads = [SelectorRead(EMPTY, crop_sha256="c0"), SelectorRead("12345678SCHW", crop_sha256="c1")]
+    report, rig, sink, _ = run(SimScenario(selector_reads=reads), work=work)
+    assert (report.verdict.status, report.verdict.reason) == ("aborted_safety", "live_identity")
+    assert rig.calls.count("login") == 2 and "read_orders" not in rig.calls[rig.calls.index("kill_process_tree"):]
+    assert report.proof.line == "UNPROVEN: session_unavailable"
+    (live,) = [r for r in report.results if r.run_reason == "live_identity"]
+    assert live.incident == "S1" and live.has("block_login") and live.evidence["crop"] == "c1"
+    assert report.gate("teardown").evidence["blocked_reason"] == "live_identity"
+    assert {sink.outcomes[c][:3] for c in SCOPE[1:]} == {("env_error", "live_identity", "paper_mode_asserted")}
+    # the same read after a result that killed the tree (one attempt, no kicked session)
+    def blind_work(orch: Orchestrator) -> None:
+        orch.sink.record(SCOPE[0], "identical")
+        orch.rig.s.selector_reads[:] = [SelectorRead(None, landmark_found=False)] * 2 + [SelectorRead("12345678SCHW")]
+        orch.flow_boundary()
+    report, rig, _, _ = run(work=blind_work)
+    assert (report.verdict.status, report.verdict.reason) == ("aborted_safety", "live_identity")
+    assert report.proof.line == "UNPROVEN: session_unavailable" and rig.calls.count("login") == 2
+
+
 def test_an_unreadable_read_after_a2_selects_the_account_takes_the_identity_unreadable_path():
     blind = SelectorRead(None, landmark_found=False)
     golden = SelectorRead(GOLDEN, crop_sha256="crop-a1")

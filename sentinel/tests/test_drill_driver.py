@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 
 import pytest
 
@@ -205,12 +206,148 @@ def test_item5_times_the_tree_and_requires_the_revert():
     assert "rig not reverted" in bad.result.checkpoint.detail
 
 
+class StaleHeaderRig(SimulatedRig):
+    """A hook that never applies a deny_all write (a stale shared header): the call is logged, the state unchanged."""
+
+    def set_hook_state(self, *, armed: bool, deny_all: bool, recovery_only: bool = False) -> None:
+        if deny_all:
+            self._log(f"set_hook_state:{armed}:{deny_all}")
+            return
+        super().set_hook_state(armed=armed, deny_all=deny_all, recovery_only=recovery_only)
+
+
+def test_item5_proves_the_hook_is_in_deny_all_and_fails_when_it_is_not():
+    """killswitch:7: after the deny-all write item 5 injects one drill-tagged raw event and needs the hook to drop it
+    `deny_all`; a hook that stays open (it drops `no_token`) fails item 5 and quarantines every flow on the rig."""
+    ledger = DropLedger()
+    clean = drill(ready(SimulatedRig()), ledger=ledger)
+    assert clean.result.passed and ledger.run_count == 0
+    assert sum(n for (_, why), n in ledger.by_reason.items() if why == "deny_all") == 1
+    r = drill(ready(StaleHeaderRig()))
+    assert r.failed == ("item5",) and r.observation.item5.deny_all_s is None
+    assert "deny_all not within 500 ms" in r.result.checkpoint.detail and r.result.has("quarantine_all_flows")
+
+
 def test_a_recovery_login_that_fails_fails_item5_with_no_read():
     rig = ready(SimulatedRig(SimScenario(recovery_login_fails=1)))
     rig.login()                                          # the session's own login; the recovery login is the next
     r = drill(rig)
     assert r.failed == ("item5",) and not r.observation.item5.recovery_login_ok
     assert r.observation.new_order_rows == 0 and "recovery login failed" in r.result.checkpoint.detail
+
+
+def test_an_order_found_by_item5s_clean_read_is_the_s1_case_though_the_rereads_go_unreadable():
+    """killswitch:0: item 5's recovery read finds a stray order and clicks Cancel All; every re-read after the click is
+    unreadable. The clean read that found it still counts, so the drill is the S1 drill_order_placed case."""
+    class BlurAfterCancel(SimulatedRig):
+        blurred = False
+
+        def cancel_all(self):
+            self.blurred = True
+            return super().cancel_all()
+
+        def read_orders(self):
+            book = super().read_orders()
+            return book if not self.blurred else replace(book, readable=False)
+
+    rig = ready(BlurAfterCancel())
+    start = rig.read_orders()
+    rig._send()                                          # a stray order before item 5
+    r = run_drill(rig, DropLedger(), rig.clock, CHORDS, start, MemoryChannel(), port=SimDrillPort(rig),
+                  preconditions=OK, allowlist=CTX.allowlist, rig_id="rig-01", fixture_account=CTX.fixture_account)
+    assert r.observation.new_order_rows == 1 and r.result.incident == "S1"
+    assert (r.result.run_status, r.result.run_reason) == ("aborted_safety", "drill_order_placed")
+
+
+def test_a_live_account_at_item5s_recovery_login_is_live_identity_s1_and_blocks_the_login():
+    """killswitch:3: item 5 fails (the recovery login failed A1), and the 6.4 live identity it saw goes on the
+    drill's result: aborted_safety live_identity, S1, the login blocked for live_identity, the rig quarantined."""
+    from sentinel.orchestrator.rig import SelectorRead
+    from sentinel.orchestrator.safety_canaries import drill_rows
+    from sentinel.store.safety import blocked_reason_for
+
+    rig = ready(SimulatedRig(SimScenario(selector_reads=[SelectorRead("12345678SCHW", crop_sha256="c-live")])))
+    r = drill(rig)
+    res = r.result
+    assert r.failed == ("item5",) and not r.observation.item5.recovery_login_ok
+    assert (res.run_status, res.run_reason, res.incident) == ("aborted_safety", "live_identity", "S1")
+    assert res.has("block_login") and blocked_reason_for(res) == "live_identity"
+    assert res.has("quarantine_all_flows") and res.checkpoint.reason == "drill_failed:item5"
+    assert res.alert == alerts.safety_abort() and res.evidence["crop"] == "c-live"
+    rows = drill_rows(r, CHORDS)
+    assert rows[4].produced_reason == "drill_failed:item5" and rows[0].state == "detected"
+
+
+class StopBetweenItems(SimDrillPort):
+    """A `SimDrillPort` that runs `stop()` when the ticket is rebuilt for items 3 and 4 (between items 2 and 3)."""
+
+    def __init__(self, rig: SimulatedRig, stop):
+        super().__init__(rig)
+        self.stop, self.builds = stop, 0
+
+    def build_drill_ticket(self):
+        self.builds += 1
+        if self.builds == 2:
+            self.stop()
+        return super().build_drill_ticket()
+
+
+HUMAN = KillRequest("rig-01", "cli", "oncall", "stop now", "2026-11-10T14:00:00+00:00")
+
+
+def test_a_stop_written_during_the_drill_is_left_pending_and_item5_does_not_run(tmp_path):
+    """killswitch:2, file flag: `sentinel stop` between items 2 and 3; item 5 neither overwrites, consumes nor
+    acknowledges it, so the request is still pending after the drill."""
+    from sentinel.orchestrator import killflag
+    rig = ready(SimulatedRig(SimScenario(kill_root=tmp_path)))
+    ch, _ = rig.kill_channels()
+    port = StopBetweenItems(rig, lambda: killflag.main(["rig-01", "--root", str(tmp_path), "--by", "oncall"],
+                                                       clock=rig.clock))
+    r = drill(rig, port=port, channel=ch)
+    assert r.failed == ("item5",) and "a stop request is pending (oncall via cli" in r.observation.could_not_run[5]
+    assert ch.poll().requested_by == "oncall" and "kill_process_tree" not in rig.calls
+
+
+def test_item5_never_consumes_a_human_request_on_a_fifo_channel():
+    """killswitch:2, FIFO channel: a request pending before item 5, or one that lands just before item 5's own, stays;
+    item 5's own request never stays behind."""
+    from sentinel.orchestrator.killflag import MemoryKillChannel
+    rig = ready(SimulatedRig())
+    ch = MemoryKillChannel()
+    r = drill(rig, port=StopBetweenItems(rig, lambda: ch.post(HUMAN)), channel=ch)
+    assert ch.requests == [HUMAN] and r.failed == ("item5",)
+
+    class Racy(MemoryKillChannel):
+        def post(self, request):
+            if request.requested_by == "fire_drill":
+                super().post(HUMAN)                        # a stop lands just before item 5's own request
+            super().post(request)
+
+    racy = Racy()
+    r = drill(ready(SimulatedRig()), channel=racy)
+    assert racy.requests == [HUMAN] and "a stop request is pending" in r.observation.could_not_run[5]
+
+
+def test_a_stop_during_the_drill_in_a_running_shard_ends_the_run_aborted_safety_kill_switch(tmp_path):
+    """killswitch:2 end to end: the drill as the shard's last work; the stop it left pending trips the kill switch
+    when the work returns."""
+    from sentinel.orchestrator import killflag
+    from sentinel.orchestrator.machine import Orchestrator
+    from sentinel.orchestrator.simrig import MemorySink
+    rig = SimulatedRig(SimScenario(kill_root=tmp_path))
+    ch, _ = rig.kill_channels()
+    seen = {}
+
+    def work(o: Orchestrator) -> None:
+        port = StopBetweenItems(rig, lambda: killflag.main(["rig-01", "--root", str(tmp_path), "--by", "oncall"],
+                                                           clock=rig.clock))
+        seen["drill"] = run_drill(rig, o.ledger, rig.clock, CHORDS, o.start_book, ch, port=port, preconditions=OK,
+                                  allowlist=CTX.allowlist, rig_id="rig-01", fixture_account=CTX.fixture_account)
+
+    rep = Orchestrator(rig, CTX, MemorySink(["c1"]), clock=rig.clock).run(work)
+    assert seen["drill"].failed == ("item5",)
+    assert (rep.verdict.status, rep.verdict.reason) == ("aborted_safety", "kill_switch")
+    assert rep.kill_switch.result.evidence["request"]["requested_by"] == "oncall" and ch.poll() is None
 
 
 def test_sim_drill_port_names_only_the_drill_targets():

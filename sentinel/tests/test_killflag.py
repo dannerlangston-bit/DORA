@@ -6,9 +6,9 @@ from pathlib import Path, PureWindowsPath
 import pytest
 
 from sentinel.orchestrator.clock import ManualClock
-from sentinel.orchestrator.killflag import (FLAG_PATH, PIPE_NAME, PROBE_REASON, FileFlagChannel, MemoryKillChannel,
-                                            acknowledge, check, h5_passed, h5_round_trip, main, pending, poll,
-                                            rig_flag_path, tripwires)
+from sentinel.orchestrator.killflag import (DRILL_BY, DRILL_REASON, FLAG_PATH, PIPE_NAME, PROBE_REASON, FileFlagChannel,
+                                            MemoryKillChannel, acknowledge, check, drill_request, h5_passed,
+                                            h5_round_trip, is_drill, main, pending, poll, rig_flag_path, tripwires)
 from sentinel.orchestrator.killswitch import PROVEN_NONE, TripWires
 from sentinel.orchestrator.machine import Orchestrator
 from sentinel.orchestrator.ports import KillChannel, KillRequest
@@ -197,3 +197,70 @@ def test_acknowledge_marks_every_pending_request_handled(tmp_path):
     pipe.post(pipe_req)
     assert acknowledge(ch, pipe) == [REQ, pipe_req] and pending(ch, pipe) == {}
     assert acknowledge(ch, None) == []
+
+
+# -- review fixes (wave 1) -------------------------------------------------------------------------------------------
+def test_a_flag_that_is_not_utf8_is_an_unreadable_stop_and_acknowledge_removes_it(tmp_path):
+    """killswitch:8: a flag written as UTF-16 (PowerShell 5 `>`) is the unreadable stop request (choice 2), from the
+    channel's own poll as from the module's, and acknowledging it removes the flag instead of raising."""
+    ch = flag(tmp_path)
+    ch.path.parent.mkdir(parents=True)
+    ch.path.write_bytes("stop\r\n".encode("utf-16"))
+    own = ch.poll()
+    assert own is not None and own.channel == "unreadable" and "not a request" in own.reason
+    assert poll(ch) == own
+    assert acknowledge(ch) == [own] and not ch.path.exists()
+
+
+def test_the_harness_never_overwrites_a_human_request_and_a_human_request_replaces_the_harness(tmp_path):
+    """killswitch:2, killflag choice 5: the drill's and H5's writes are exclusive (a stale probe gives way), a human
+    request replaces whatever is there, and `sentinel stop` refuses the drill's own name and reason."""
+    ch = flag(tmp_path)
+    drill = drill_request("rig-01", "t1")
+    probe = KillRequest("rig-01", "preflight", "sentinel", PROBE_REASON, "earlier")
+    ch.post(REQ)
+    for mine in (drill, probe):
+        with pytest.raises(FileExistsError):
+            ch.post(mine)
+        assert ch.poll() == REQ
+    ch.acknowledge(REQ)
+    ch.post(probe)
+    ch.post(drill)                                         # a stale probe gives way to the drill
+    assert ch.poll() == drill and is_drill(drill) and not is_drill(REQ)
+    ch.post(REQ)                                           # a human stop replaces the drill's request
+    assert ch.poll() == REQ and not list(ch.path.parent.glob("*.tmp"))
+    assert main(["rig-01", "--root", str(tmp_path), "--by", DRILL_BY, "--reason", DRILL_REASON]) == 2
+
+
+def test_a_stop_written_after_the_last_boundary_still_ends_the_run_aborted_safety(tmp_path):
+    """killswitch:2: the Orchestrator polls the human channels once more when the work returns."""
+    clock = ManualClock()
+    rig = SimulatedRig(SimScenario(kill_root=tmp_path), clock=clock)
+
+    def work(o: Orchestrator) -> None:
+        o.sink.record("c1", "identical")
+        main(["rig-01", "--root", str(tmp_path), "--by", "oncall"], clock=clock)
+
+    report = Orchestrator(rig, default_context(), MemorySink(["c1", "c2"]), clock=clock).run(work)
+    assert (report.verdict.status, report.verdict.reason) == ("aborted_safety", "kill_switch")
+    assert report.kill_switch.result.evidence["request"]["requested_by"] == "oncall"
+    assert rig.kill_channels()[0].poll() is None
+
+
+def test_a_non_utf8_flag_written_mid_run_ends_the_run_aborted_safety_with_a_proof(tmp_path):
+    """killswitch:8 end to end: the sequence runs, the proof is produced and the flag is cleared."""
+    clock = ManualClock()
+    rig = SimulatedRig(SimScenario(kill_root=tmp_path), clock=clock)
+    sink = MemorySink(["c1", "c2", "c3"])
+    ch, _ = rig.kill_channels()
+
+    def work(o: Orchestrator) -> None:
+        o.sink.record("c1", "identical")
+        assert o.flow_boundary(flow_id=FLOW) is None
+        ch.path.write_bytes("stop\r\n".encode("utf-16"))
+        assert o.step_boundary() is o.stop is not None
+
+    report = Orchestrator(rig, default_context(), sink, clock=clock).run(work)
+    assert (report.verdict.status, report.verdict.reason) == ("aborted_safety", "kill_switch")
+    assert report.proof.line == PROVEN_NONE and set(report.filled) == {"c2", "c3"}
+    assert not ch.path.exists()

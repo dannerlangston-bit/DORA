@@ -180,20 +180,25 @@ def run_budget(*, now_s: float, wall_budget_s: float, report_margin_s: float, co
     """The run budgets of 5.2 at a flow boundary: None while every budget holds, else the `aborted_budget`.
 
     `now_s` is the time since the run started; `caps` default to RATE_CAPS (6.4)."""
-    caps = RATE_CAPS if caps is None else caps
-    reason = None
-    detail = None
     if superseded:
-        reason = "superseded"
-    elif now_s >= wall_budget_s - report_margin_s:
-        reason = "wall_clock"
-    elif counters:
-        hit = [k for k, cap in caps.items() if counters.get(k, 0) >= cap]
-        if hit:
-            reason = "rate_cap"
-            detail = ", ".join(f"{k} {counters.get(k, 0)} of {caps[k]}" for k in hit)
-    if reason is None:
+        return _spent("superseded")
+    if now_s >= wall_budget_s - report_margin_s:
+        return _spent("wall_clock")
+    return rate_cap(counters or {}, caps)
+
+
+def rate_cap(counters: Mapping[str, int], caps: Mapping[str, int] | None = None) -> ControlResult | None:
+    """The 6.4 rate caps alone: `aborted_budget (reason: rate_cap)` when a count has reached its cap, else None. The
+    Orchestrator checks it at every flow boundary and right before every event that counts toward a cap (a login, an
+    A9 drill ticket, an order-stage step), so the event past the cap is never made."""
+    caps = RATE_CAPS if caps is None else caps
+    hit = [k for k, cap in caps.items() if counters.get(k, 0) >= cap]
+    if not hit:
         return None
+    return _spent("rate_cap", ", ".join(f"{k} {counters.get(k, 0)} of {caps[k]}" for k in hit))
+
+
+def _spent(reason: str, detail: str | None = None) -> ControlResult:
     run, un = budget_abort_outcome(reason)
     return ControlResult("run_budget", False, "running", run=run, unreached=un, alert=alerts.aborted_budget(reason),
                          actions=("teardown",), detail=f"run budget spent: {reason}" + (f" ({detail})" if detail else ""))

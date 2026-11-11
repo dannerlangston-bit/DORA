@@ -8,9 +8,11 @@ scoped checkpoint through the `OutcomeSink` (1.10, L-OUT-07).
 
 Inside `running` the Executor calls, in this order (boundary.py has the check sequences):
 
-- `flow_boundary(obs, now=..., flow_id=..., p50_s=...)` before every flow, census visit or sweep ladder: the
-  trip-wires, the Watchdog's reverse heartbeat, free space, the run budgets, the spend ceiling, the model re-check,
-  the paper-mode assertion and the proactive relaunch; it returns the result that stopped the run, or None;
+- `flow_boundary(obs, now=..., flow_id=..., p50_s=..., account=...)` before every flow, census visit or sweep
+  ladder: the trip-wires, the Watchdog's reverse heartbeat, free space, the run budgets, the spend ceiling, the model
+  re-check, the paper-mode assertion with A2 against `account` (the pinned account of the unit's role, the run's
+  fixture account until the Executor passes one; 6.3 A2 "Same read") and the proactive relaunch; it returns the
+  result that stopped the run, or None;
 - `step_boundary(obs, now=..., order_stage_step=..., session_dialog=...)` before every step of a flow: the
   trip-wires, the flow's own budget (a returned result with `end_flow` ends the flow, the run continues) and the
   paper-mode assertion when due;
@@ -25,7 +27,9 @@ Inside `running` the Executor calls, in this order (boundary.py has the check se
 The 6.4 rate caps count through `counters` (budgets.RateCounters): every login attempt the Orchestrator makes (the
 LOGIN flow, a relaunch login, a recovery login), every A9 drill ticket and every order-stage step a `step_boundary`
 lets run count themselves; the caller adds symbol changes (`counters.symbol_change`) and seeds earlier runs'
-events from the store.
+events from the store. The caps are checked at every flow boundary, right before each login, A9 ticket and
+order-stage step (a cap already reached ends the run `aborted_budget (reason: rate_cap)` and the event is not made),
+after a proactive relaunch and once the work returns; the 6.6 recovery logins are never held back.
 
 The session's safety state is a `ports.SessionSafety` (`safety`, pushed to `safety_listener` on every change; the
 caller passes `rig.set_session_safety` there so the slow half reads it): the attestation stage `a3_a8` before the A9
@@ -46,7 +50,9 @@ How a run ends, by the result that stopped it:
 - an `aborted_safety` (or any result asking for the kill switch): the 6.6 sequence on the rig, its
   recovery login and the proof (killswitch.execute_kill_switch);
 - a result that killed the tree with a session established (identity unreadable, app or hook budget
-  spent): the recovery login and proof of 6.6 step 5;
+  spent), or a relaunch that killed the session and then stopped at one of its own gates (the session
+  `ended`): the recovery login and proof of 6.6 step 5, except after an authentication error at that relaunch's
+  login, which 6.9 never retries: UNPROVEN `recovery_login_failed` with no second login;
 - the login never authenticated: `PROVEN: no session established` when the gateway issued no session
   token, else the recovery path; a kicked session (at the `authenticated` gate or mid-run, `session_kicked`)
   has its tree killed, waits `session_release_wait` and logs in once more for the proof, UNPROVEN
@@ -98,7 +104,8 @@ from . import killflag
 from .attestation import SAFETY_ROWS, AttestationProfile, RowReads, a9_passed, attest, matches, readable
 from .boundary import (BoundaryObservations, DialogTimer, FlowTimer, flow_budget_cut, flow_budget_s, new_order_rows,
                        tripwire_result)
-from .budgets import SESSION_RELEASE_WAIT_S, RateCounters, ReloginBudget, ShardBudgets, WallBudget, run_budget
+from .budgets import (SESSION_RELEASE_WAIT_S, RateCounters, ReloginBudget, ShardBudgets, WallBudget, rate_cap,
+                      run_budget)
 from .clock import Clock, SystemClock
 from .degraded import ModelAvailability, SpendTracker
 from .gateway import Chord, DropLedger
@@ -107,13 +114,13 @@ from .gates import (AccountExpectation, WorkspaceExpectation, check_authenticate
                     check_launched, check_provisioned, check_teardown, check_workspace, decide_run_outcome)
 from .identity import (READ_GAP_S, TIMER_S, Allowlist, assertion_due, deferral_unreadable, judge_fixture_account,
                        judge_identity, paper_stamp, readable as selector_readable, stamp_current)
-from .killswitch import (ORDERS_SENT, KillSwitchReport, Proof, ProofInputs, account_ref, cancel_new_working,
-                         execute_kill_switch, kill_switch, post_run_proof, proof_result, recovery_login,
-                         teardown_incident)
+from .killswitch import (ORDERS_SENT, KillSwitchReport, Proof, ProofInputs, RecoveryLogin, account_ref,
+                         cancel_new_working, execute_kill_switch, kill_switch, post_run_proof, proof_result,
+                         recovery_login, teardown_incident, teardown_proof)
 from .alerts import AlertRoute
 from .orderbook import MonitorBook
 from .ports import SessionSafety
-from .results import ControlResult, OutcomeSink, RunVerdict, write_unreached
+from .results import ControlResult, OutcomeSink, RunVerdict, worse, write_unreached
 from .rig import ConfirmationCheck, OrderBook, Rig, SelectorRead
 from .watchdog import (Heartbeat, HeartbeatUnwritable, HeartbeatWriter, disk_check, heartbeat_failed,
                        proactive_relaunch_due, watchdog_check)
@@ -122,6 +129,8 @@ from .watchdog import (Heartbeat, HeartbeatUnwritable, HeartbeatWriter, disk_che
 # restart, already charged by the control that asked for the relaunch; nothing for the proactive relaunch
 RELAUNCH_BUDGETS = {"environment_relogin": "relogin_k", "app_failure": "app_relaunch", "hook_host": "hook_host",
                     "proactive": None}
+# login failures 6.9 never retries (lockouts): after one at a relaunch no recovery login is made for the proof
+NEVER_RETRIED = ("authentication_failed", "authentication_challenge")
 
 
 @dataclass(frozen=True)
@@ -311,7 +320,33 @@ class Orchestrator:
         if self._gates() and self._gate("running"):
             if work is not None:
                 work(self)
+            self._end_of_work()
         return self._finish()
+
+    def _end_of_work(self) -> None:
+        """The last check of `running`, once the work returned (6.6 Triggers, killflag choice 5; 6.4): a human stop
+        request still pending on the kill channels (written after the last boundary, or left in place by fire drill
+        item 5) ends the run `aborted_safety (reason: kill_switch)` like one seen at a boundary, and a rate cap the
+        last event reached ends it `aborted_budget (reason: rate_cap)`."""
+        if self.stop is not None:
+            return
+        running = self.flow.flow_id if self.flow is not None else self._last_flow
+        human = killflag.check(self.kill_flag, self.kill_pipe, gate=self.state, running_flow=running)
+        if human is not None:
+            self._contain(self.apply(human))
+            return
+        self._rate_cap()
+
+    def _rate_cap(self) -> bool:
+        """6.4: right before an event that counts toward a rate cap (a login, an A9 drill ticket, an order-stage step)
+        and at the end of the work, a cap already reached ends the run `aborted_budget (reason: rate_cap)` and the
+        event is not made; True when it did. The 6.6 recovery logins are never held back, and still count."""
+        if self.stop is not None:
+            return False
+        r = rate_cap(self.counters.counts(self.clock.now()), self.counters.caps)
+        if r is not None:
+            self.apply(r)
+        return r is not None
 
     def _gates(self, start: str = "provisioned") -> bool:
         """The gates from `start` (`provisioned` for the shard, `launched` for a relaunch) to `canary_flow_passed`."""
@@ -341,7 +376,7 @@ class Orchestrator:
         self.launched_mono = self.clock.monotonic()
         self.flows_since_launch = 0
         rig.set_hook_phase("running")
-        if not self._gate("authenticated"):
+        if not self._gate("authenticated") or self._rate_cap():
             return False
         self.counters.login(self.clock.now())
         r = self.apply(check_authenticated(rig.login()))
@@ -442,6 +477,8 @@ class Orchestrator:
         if all_match:
             self._set_safety(replace(self.safety, attestation_stage="a3_a8"))    # SD-57: the A9 click may run
             while len(checks) < ctx.profile.a9_runs and (not checks or a9_passed(checks[-1])):
+                if self._rate_cap():                            # no drill ticket past a reached cap (6.4)
+                    return False
                 self.counters.order_staged(self.clock.now())   # A9 stages the drill ticket (6.4 rate caps)
                 checks.append(rig.confirmation_check())         # twice when A3 is "absent" (6.13 item 3)
         a9 = checks[0] if checks else None
@@ -468,11 +505,13 @@ class Orchestrator:
 
     # -- boundaries inside `running` (boundary.py) -----------------------------------------------------
     def flow_boundary(self, obs: BoundaryObservations | None = None, *, now: float | None = None,
-                      flow_id: str | None = None, p50_s: float | None = None) -> ControlResult | None:
+                      flow_id: str | None = None, p50_s: float | None = None,
+                      account: str | None = None) -> ControlResult | None:
         """The checks before every flow, census visit or sweep ladder, in boundary.py's order; returns the result
         that stopped the run (already applied), or None, in which case the unit may start. `now` is the
         Orchestrator clock's monotonic reading (the default); `flow_id` names a flow, whose budget `p50_s` sets
-        (3 x p50, 5 minutes until measured) and which counts toward the proactive relaunch."""
+        (3 x p50, 5 minutes until measured) and which counts toward the proactive relaunch; `account` is the pinned
+        account of the unit's role for A2 (`assert_paper_mode`)."""
         if self.stop is not None:
             return self.stop
         now = self.clock.monotonic() if now is None else now
@@ -491,12 +530,12 @@ class Orchestrator:
                 self._contain(self.apply(r))
                 if self.stop is not None:
                     return self.stop
-        self.assert_paper_mode()                           # before every flow (6.4 Schedule)
+        self.assert_paper_mode(account=account)            # before every flow (6.4 Schedule), with A2 (6.3)
         if self.stop is not None:
             return self.stop
-        uptime = now - self.launched_mono if self.launched_mono is not None else 0.0
+        uptime =now - self.launched_mono if self.launched_mono is not None else 0.0
         if proactive_relaunch_due(self.flows_since_launch, uptime, inside_flow=False):
-            if not self.relaunch("proactive"):
+            if not self.relaunch("proactive") or self._rate_cap():     # its login and A9 ticket count too (6.4)
                 return self.stop
             now = self.clock.monotonic()
         if flow_id is not None:
@@ -506,11 +545,13 @@ class Orchestrator:
         return None
 
     def step_boundary(self, obs: BoundaryObservations | None = None, *, now: float | None = None,
-                      order_stage_step: bool = False, session_dialog: bool = False) -> ControlResult | None:
+                      order_stage_step: bool = False, session_dialog: bool = False,
+                      account: str | None = None) -> ControlResult | None:
         """The checks before every step of a flow: the trip-wires, the flow's own budget and the paper-mode assertion
-        when 6.4 makes it due (`order_stage_step`: the next step is an order-stage step; `session_dialog`: a re-login
-        or session dialog was just handled). Returns the result that stopped the run, or the flow-budget result
-        (`end_flow`: the flow ends, its remaining checkpoints `not_run (reason: budget)`), else None."""
+        with A2 when 6.4 makes it due (`order_stage_step`: the next step is an order-stage step; `session_dialog`: a
+        re-login or session dialog was just handled; `account`: as for `flow_boundary`). Returns the result that
+        stopped the run, or the flow-budget result (`end_flow`: the flow ends, its remaining checkpoints `not_run
+        (reason: budget)`), else None."""
         if self.stop is not None:
             return self.stop
         now = self.clock.monotonic() if now is None else now
@@ -527,23 +568,33 @@ class Orchestrator:
         due = "now" if last is None else assertion_due(now, last, boundary=order_stage_step or session_dialog,
                                                          main_foreground=obs.main_foreground, modal_up=obs.modal_up)
         if due == "now":
-            self.assert_paper_mode()
+            self.assert_paper_mode(account=account)
         elif due == "unreadable" and last is not None:
             self.rig.set_hook_state(armed=True, deny_all=True)
             self.apply(deferral_unreadable(deferred_s=now - last - TIMER_S,
                                            unreadable_streak=self.ctx.history.identity_unreadable_streak))
-        if order_stage_step and self.stop is None:
+        if order_stage_step and self.stop is None and not self._rate_cap():
             self.counters.order_staged(self.clock.now())  # the step about to run stages an order (6.4 rate caps)
         return self.stop
 
-    def assert_paper_mode(self) -> ControlResult:
+    def assert_paper_mode(self, *, account: str | None = None) -> ControlResult:
         """The paper-mode assertion outside the gate (6.4 Schedule): before every flow, after a re-login or session
         dialog, on the two-minute timer, before every order-stage step. A mismatch is `aborted_safety` with the
-        kill switch; two unreadable reads 1 s apart are the identity-unreadable path."""
+        kill switch; two unreadable reads 1 s apart are the identity-unreadable path. A2 rides on the same read
+        (6.3): an allowlisted account other than `account` (the pinned account of the work item's role; the run's
+        fixture account by default) is selected once and re-read, as at the gate, and still different is `env_error
+        (gate: fixture_verified)`."""
         if self.stop is not None:
             return self.stop
-        r, _ = self._read_identity()
+        r, read = self._read_identity()
         self._contain(r)
+        expected = account if account is not None else self.ctx.fixture_account
+        if r.passed and read.text != expected:
+            self.rig.select_account(expected)
+            r, after = self._read_identity()                # A1 holds for the selected account too (6.4)
+            self._contain(r)
+            if r.passed:
+                r = self.apply(judge_fixture_account(read.text or "", expected, after_select=after.text))
         return r
 
     def _tripwires(self, now: float, obs: BoundaryObservations, *, read_book: bool) -> ControlResult | None:
@@ -614,6 +665,7 @@ class Orchestrator:
                                            "flows_since_launch": self.flows_since_launch}))
         self.rig.set_hook_state(armed=True, deny_all=True)
         self.rig.kill_process_tree()
+        self.session = "ended"                             # until the relaunch's `authenticated` gate passes again
         self.rig.reset_input_state()                       # 7.7: after the kill, before the relaunch
         self._clear_safety()
         self.flow = None
@@ -632,21 +684,28 @@ class Orchestrator:
         kill_switch_path = stop is not None and (stop.run_status == "aborted_safety" or stop.has("kill_switch"))
         sends = rig.declared_sends()                        # the gated branch's declared sends, for every proof (6.7)
         account = account_ref(ctx.allowlist, ctx.fixture_account)
-        if not kill_switch_path and ((stop is not None and stop.has("kill_tree")) or self.session == "kicked"):
+        if not kill_switch_path and ((stop is not None and stop.has("kill_tree")) or self.session in ("kicked",
+                                                                                                       "ended")):
             rig.kill_process_tree()          # a kicked session's tree goes too: the proof's login starts afresh
             rig.reset_input_state()          # as before every relaunch (7.7)
         if kill_switch_path:
             ks = self._kill_switch_sequence(stop, so_far, sends)
             proof = ks.proof
             self.apply(ks.proof_effect)
-        elif self.session == "never" or (self.session == "established" and self.start_book is None
+        elif self.session == "never" or (self.session in ("established", "ended") and self.start_book is None
                                          and rig.gateway_log().tokens_issued == 0):
             tokens = rig.gateway_log().tokens_issued
             proof = post_run_proof(ProofInputs(start=None, end=None, session="never", tokens_issued=tokens))
             self.apply(proof_result(proof, run_so_far=so_far, unproven_streak=streak))
-        elif self.session == "kicked" or (stop is not None and stop.has("kill_tree")):
-            proof, end = self._recovery_proof(kicked=self.session == "kicked", sends=sends)
-            self.apply(proof_result(proof, run_so_far=so_far, unproven_streak=streak, account=account,
+        elif self.session in ("kicked", "ended") or (stop is not None and stop.has("kill_tree")):
+            if self.session == "ended" and stop is not None and stop.unreached is not None \
+                    and stop.unreached.reason in NEVER_RETRIED:          # 6.9: no second login after it
+                proof, end = post_run_proof(ProofInputs(start=self.start_book, end=None, recovery_login_ok=False,
+                                                        declared_sends=sends)), None
+            else:
+                proof, end = self._recovery_proof(kicked=self.session == "kicked", sends=sends)
+            # the run so far includes a 6.4 mismatch the proof's login applied (the login blocked for it, SD-64)
+            self.apply(proof_result(proof, run_so_far=self._run_so_far(), unproven_streak=streak, account=account,
                                     screenshot_sha256=_screenshot(end)))
         else:
             self.state = last_gate = "teardown"
@@ -661,8 +720,8 @@ class Orchestrator:
                 # 1.10, 6.6: an undeclared row at teardown is an aborted_safety; the kill switch sequence cancels it,
                 # and the incident pages once, after the sequence, with what Cancel All finally did (9.10)
                 ks = self._kill_switch_sequence(effect, effect.run, sends)
-                effect = teardown_incident(proof, effect, ks)
-                proof = ks.proof
+                effect = teardown_incident(proof, effect, ks, account=account, screenshot_sha256=_screenshot(end))
+                proof = teardown_proof(proof, ks)
             self.apply(effect)
         rig.set_hook_phase("between_runs")                  # every run ends with the hook disarmed (6.6, 6.2)
         report = RunReport(ctx.run_id, ctx.run_type, RunVerdict("complete"), last_gate, proof, kill_switch=ks)
@@ -679,42 +738,61 @@ class Orchestrator:
         report.last_gate = stop.gate if stop is not None and stop.gate else last_gate
         return report
 
+    def _run_so_far(self) -> RunVerdict | None:
+        """The most severe run outcome recorded so far (results.worse: the first wins a tie)."""
+        out: RunVerdict | None = None
+        for r in self.results:
+            out = worse(out, r.run)
+        return out
+
     def _kill_switch_sequence(self, decision: ControlResult, so_far: RunVerdict | None,
                               sends: tuple[DeclaredSend, ...]) -> KillSwitchReport:
         """The 6.6 sequence on the rig with the run's declared sends; its recovery login counts toward the 6.4 rate
-        caps, and the human requests pending on the kill channels are handled once it has run (killflag.py)."""
+        caps, a 6.4 mismatch that login saw is applied (killswitch choice 18), and the human requests pending on the
+        kill channels are handled once it has run (killflag.py)."""
         ctx = self.ctx
         ks = execute_kill_switch(self.rig, decision, clock=self.clock, allowlist=ctx.allowlist, start=self.start_book,
                                  fixture_account=ctx.fixture_account, declared_sends=sends, run_so_far=so_far,
                                  unproven_streak=ctx.history.unproven_streak)
         if any(name == "recovery_login" for name, _ in ks.steps):
             self.counters.login(self.clock.now())
+        if ks.identity is not None:
+            self.apply(ks.identity)
         killflag.acknowledge(self.kill_flag, self.kill_pipe)
         return ks
 
     def _recovery_proof(self, *, kicked: bool, sends: tuple[DeclaredSend, ...]) -> tuple[Proof, OrderBook | None]:
         """6.6 step 5 (and the kicked-session rule): in the hook's recovery-only arm, a fresh scripted login with A1
-        and A2, then the proof; returns it with the last Monitor read."""
+        and A2, then the proof; returns it with the last Monitor read. A 6.4 mismatch that login reads is applied like
+        any assertion and ends the attempts (killswitch choice 18); after `live_identity` the proof is UNPROVEN
+        `session_unavailable` and nothing more is read (SD-64)."""
         rig, ctx = self.rig, self.ctx
-        rig.set_hook_phase("recovery")
         attempts = 2 if kicked else 1
-        ok = False
+        login = RecoveryLogin(False)
         for _ in range(attempts):
             if kicked:
                 self.clock.sleep(SESSION_RELEASE_WAIT_S)
+            rig.set_hook_phase("recovery")             # a failed attempt left deny-all and no tree (killswitch 19)
             self.counters.login(self.clock.now())
-            ok = recovery_login(rig, ctx.allowlist, self.clock, ctx.fixture_account)
-            if ok:
+            login = recovery_login(rig, ctx.allowlist, self.clock, ctx.fixture_account)
+            if login.identity is not None:
+                self._contain(self.apply(login.identity))
                 break
+            if login.ok:
+                break
+        if login.live_identity:
+            return post_run_proof(ProofInputs(start=self.start_book, end=None, session="blocked",
+                                              declared_sends=sends)), None
+        ok = login.ok
         end = rig.read_orders() if ok else None
-        cancel = "not_needed"
+        cancel, found = "not_needed", None
         if end is not None:
-            cancel, end = cancel_new_working(rig, self.start_book, end, clock=self.clock)    # 6.6 step 5
+            cancel, end, found = cancel_new_working(rig, self.start_book, end, clock=self.clock)    # 6.6 step 5
         if kicked:
             return post_run_proof(ProofInputs(start=self.start_book, end=end, session="kicked", kicked_login_ok=ok,
-                                              cancel_all=cancel, declared_sends=sends)), end
+                                              cancel_all=cancel, declared_sends=sends, found=found)), end
         return post_run_proof(ProofInputs(start=self.start_book, end=end, recovery_login_ok=ok, cancel_all=cancel,
-                                          declared_sends=sends)), end
+                                          declared_sends=sends, found=found)), end
 
 
 def _screenshot(book: OrderBook | None) -> str | None:

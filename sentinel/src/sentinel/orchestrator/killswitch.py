@@ -32,8 +32,11 @@ Choices (reported):
    no new order row to explain it means the Monitor reads do not agree: UNPROVEN `monitor_unreadable`.
 3. The no-session rule is applied literally: the login never authenticated and the gateway issued no
    token in the run. A login that typed credentials issued secret tokens, so it takes the normal path.
-4. `Cancel All` re-reads Working every 5 s until a readable read shows no new row of any kind, declared sends
-   included, or 60 s pass (6.6 step 5: "until Working shows no new rows").
+4. `Cancel All` re-reads Working every 5 s until a clean read (readable and agreeing with Copy All) shows no new row
+   of any kind, declared sends included, or 60 s pass (6.6 step 5: "until Working shows no new rows"). The clean read
+   that made it click is kept (`ProofInputs.found`): its undeclared rows are ORDERS SENT whatever the re-reads show,
+   so re-reads that stay unreadable give `ORDERS SENT: ...; Cancel All failed`, never UNPROVEN (6.6 "which UNPROVEN
+   would understate"); the proof then names that read as its end read (choice 8).
 5. Undeclared rows found by a clean read are ORDERS SENT whatever `Cancel All` did, so `Cancel All` failing
    on undeclared rows reads `ORDERS SENT: ...; Cancel All failed`; UNPROVEN `cancel_all_failed` is left for
    a Cancel All that failed with no undeclared row (declared sends of the gated branch left Working, or a
@@ -47,7 +50,9 @@ Choices (reported):
 7. An undeclared row found by the teardown proof is one incident and gets one page (6.6 step 4, 9.10 safety
    routing): the page is sent after the kill switch sequence, never at the teardown read, so it carries the
    sequence's proof and what `Cancel All` finally did (`teardown_incident`). The teardown read's line ("Cancel All
-   not needed": it clicked nothing) is not paged.
+   not needed": it clicked nothing) is not paged. When the sequence's proof is not ORDERS SENT (its recovery login
+   failed, or no fresh read was clean), the run's proof stays the teardown read's ORDERS SENT with `Cancel All failed`
+   for a Working row (`teardown_proof`), and the sequence's line is kept on the page's evidence.
 8. Every proof carries the sha256 of the start and end Monitor reads it compared (`book_sha256`, 8.3
    `post_run_proofs.start_snapshot_sha256` and `end_snapshot_sha256`), None for a read it did not have; and its
    8.3 row form (`verdict_code`, `cancel_all_code`, `counts`), from which `proof_line` gives the 6.6 text back.
@@ -86,6 +91,16 @@ Choices (reported):
     `live_identity` the recovery arm is never entered, since no recovery login is made (SD-64). `reset_input_state`
     runs right after the kill, as before every relaunch (7.7, 10.2 step 4), so no token of the dead tree's input is
     pending when the recovery login types.
+18. The paper-mode assertion runs after every re-login (6.4 Schedule), the recovery login's included: a selector text
+    that is not an allowlist entry is the 6.4 mismatch (`RecoveryLogin.identity`), which the caller applies as at any
+    other read (S1 and the login blocked for `live_identity`; S2 for `paper_mode_mismatch`). The run keeps the abort
+    that came first (results.worse: the first wins a tie), so a kill switch whose recovery login sees a Live account
+    stays `aborted_safety (kill_switch)` with the S1 added. After `live_identity` nothing more is read through that
+    session: the proof is UNPROVEN `session_unavailable` and the login is blocked for `live_identity` (SD-64), with no
+    cancel-by-hand hand-over through it; a `paper_mode_mismatch` or unreadable selector is `recovery_login_failed`.
+19. A recovery login that fails, at authentication or after it (A1 or A2), ends its session before it returns: the hook
+    enters deny-all and the tree is killed (6.4 "an unidentified session must not stay logged in"; 6.6 step 5 "on
+    failure, stop"), so no caller leaves it running and a second attempt (the kicked rule) starts from a fresh tree.
 """
 from __future__ import annotations
 
@@ -102,7 +117,7 @@ from .identity import READ_GAP_S, Allowlist, judge_identity
 from .orderbook import MonitorBook
 from .ports import KillRequest
 from .results import ControlResult, FindingSpec, RunVerdict, safety_abort_outcome
-from .rig import GatewayLog, OrderBook, OrderRow, Rig
+from .rig import GatewayLog, OrderBook, OrderRow, Rig, SelectorRead
 
 DIALOG_OPEN_MAX_S = 30.0
 CANCEL_REREAD_S = 60.0
@@ -211,7 +226,8 @@ class ProofInputs:
     """What the proof reads (6.6). `session` is `established`, `never` (the login never authenticated), `kicked`
     (`session_kicked`, 7.7) or `blocked` (a login just blocked for `live_identity`: no recovery login, SD-64);
     `cancel_all` is `not_needed`, `done` or `failed` (not located, or rows left after 60 s); `declared_sends` are the
-    gated branch's sends as SendGate recorded them (6.7, choice 9)."""
+    gated branch's sends as SendGate recorded them (6.7, choice 9); `found` is the clean read that made `Cancel All`
+    click (choice 4), whose undeclared rows count whatever `end` shows."""
 
     start: OrderBook | None
     end: OrderBook | None
@@ -222,6 +238,7 @@ class ProofInputs:
     cancel_all: str = "not_needed"
     declared_sends: tuple[DeclaredSend, ...] = ()
     net_liq_tolerance: float = NET_LIQ_TOLERANCE
+    found: OrderBook | None = None
 
     def __post_init__(self):
         if self.session not in SESSIONS:
@@ -355,6 +372,17 @@ def _new_rows(start: OrderBook, end: OrderBook) -> dict[str, list[OrderRow]]:
     return out
 
 
+def clean(book: OrderBook | None) -> bool:
+    """A clean Monitor read (6.6): readable and agreeing with Copy All."""
+    return book is not None and book.readable and book.copy_all_agrees
+
+
+def _undeclared(start: OrderBook, end: OrderBook, keys: set[str]) -> tuple[OrderRow, ...]:
+    """The new rows of `end` no declared send explains: any Working or Canceled row not keyed to one, every fill."""
+    new = _new_rows(start, end)
+    return tuple(r for g in GRIDS for r in new[g] if r.key not in keys or g == "filled")
+
+
 def _buying_power(book: OrderBook) -> float | None:
     return book.buying_power if isinstance(book, MonitorBook) else None
 
@@ -363,8 +391,9 @@ def post_run_proof(p: ProofInputs) -> Proof:
     """The proof verdict from the inputs (6.6 Post-run proof, Runs without a usable session), with what
     Cancel All did and the run's declared sends recorded on it."""
     verdict, reason, undeclared, declared, rows = _verdict(p)
+    end = p.found if verdict == ORDERS_SENT and not clean(p.end) else p.end      # the read the rows came from (choice 4)
     return Proof(verdict, reason, undeclared, declared, rows, cancel_all=p.cancel_all, start_sha256=book_sha256(p.start),
-                 end_sha256=book_sha256(p.end), sends=p.declared_sends)
+                 end_sha256=book_sha256(end), sends=p.declared_sends)
 
 
 _Verdict = tuple[str, str | None, tuple[OrderRow, ...], tuple[OrderRow, ...], tuple[ProofRow, ...]]
@@ -379,31 +408,35 @@ def _verdict(p: ProofInputs) -> _Verdict:
         return UNPROVEN, "recovery_login_failed", (), (), ()
     if p.start is None:
         return UNPROVEN, "snapshot_missing", (), (), ()
-    if p.end is None or not (p.end.readable and p.end.copy_all_agrees and p.start.readable
-                             and p.start.copy_all_agrees):
-        return UNPROVEN, "monitor_unreadable", (), (), ()           # either Monitor read failed its cross-check (6.6)
-    new = _new_rows(p.start, p.end)
     keys = {d.row_key for d in p.declared_sends}
+    found_rows = _undeclared(p.start, p.found, keys) if clean(p.start) and p.found is not None and clean(p.found) else ()
+    end = p.end
+    if end is None or not (clean(end) and clean(p.start)):
+        if found_rows:                                   # the clean read that made Cancel All click (choice 4)
+            return _verdict(replace(p, end=p.found, found=None))
+        return UNPROVEN, "monitor_unreadable", (), (), ()           # either Monitor read failed its cross-check (6.6)
+    new = _new_rows(p.start, end)
     declared = tuple(r for g in ("working", "canceled") for r in new[g] if r.key in keys)
-    undeclared = tuple(r for g in GRIDS for r in new[g] if r.key not in keys or g == "filled")
+    undeclared = _undeclared(p.start, end, keys)
+    undeclared += tuple(r for r in found_rows if r.key not in {u.key for u in undeclared})
     work, fill, canc = new["working"], new["filled"], new["canceled"]
     left_working = [r for r in work if r.key in keys]
     canceled = {r.key for r in canc if r.key in keys}
     missing = [d for d in p.declared_sends if d.row_key not in canceled]
     rows = [
-        ProofRow("working orders", len(p.start.working), len(p.end.working), len(work), 0,
+        ProofRow("working orders", len(p.start.working), len(end.working), len(work), 0,
                  "UNDECLARED" if any(r.key not in keys for r in work) else "not canceled" if work else "ok"),
-        ProofRow("filled orders", len(p.start.filled), len(p.end.filled), len(fill), 0, "UNDECLARED" if fill else "ok"),
-        ProofRow("canceled orders", len(p.start.canceled), len(p.end.canceled), len(canc), len(p.declared_sends),
+        ProofRow("filled orders", len(p.start.filled), len(end.filled), len(fill), 0, "UNDECLARED" if fill else "ok"),
+        ProofRow("canceled orders", len(p.start.canceled), len(end.canceled), len(canc), len(p.declared_sends),
                  "UNDECLARED" if any(r.key not in keys for r in canc) else "missing" if missing else "ok"),
     ]
-    pos_change = p.end.position_rows - p.start.position_rows
-    rows.append(ProofRow("position statement rows", p.start.position_rows, p.end.position_rows, max(pos_change, 0), 0,
+    pos_change = end.position_rows - p.start.position_rows
+    rows.append(ProofRow("position statement rows", p.start.position_rows, end.position_rows, max(pos_change, 0), 0,
                          "ok" if pos_change == 0 else "changed"))
-    drift = None if p.start.net_liq is None or p.end.net_liq is None else abs(p.end.net_liq - p.start.net_liq)
-    rows.append(ProofRow("net liq", p.start.net_liq, p.end.net_liq, 0, 0,
+    drift = None if p.start.net_liq is None or end.net_liq is None else abs(end.net_liq - p.start.net_liq)
+    rows.append(ProofRow("net liq", p.start.net_liq, end.net_liq, 0, 0,
                          "ok" if drift is not None and drift <= p.net_liq_tolerance else "drift"))
-    bp0, bp1 = _buying_power(p.start), _buying_power(p.end)
+    bp0, bp1 = _buying_power(p.start), _buying_power(end)
     bp_drift = None if bp0 is None or bp1 is None else abs(bp1 - bp0)
     if bp_drift is not None:                             # both reads carry it (choice 10)
         rows.append(ProofRow("buying power", bp0, bp1, 0, 0, "ok" if bp_drift <= p.net_liq_tolerance else "drift"))
@@ -486,12 +519,14 @@ def config_invalid_proof(run_id: str, *, produced_at: str, gateway: GatewayLog =
 # -- the sequence on a rig --------------------------------------------------------------------------------
 @dataclass
 class KillSwitchReport:
-    """What `execute_kill_switch` did: the decision, the proof and each step with its monotonic time."""
+    """What `execute_kill_switch` did: the decision, the proof and each step with its monotonic time, and the 6.4
+    mismatch its recovery login saw (`RecoveryLogin.identity`), which the caller applies before the proof effect."""
 
     result: ControlResult
     proof: Proof
     proof_effect: ControlResult
     steps: list[tuple[str, float]] = field(default_factory=list)
+    identity: ControlResult | None = None
 
 
 def masked_account(account_id: str) -> str:
@@ -513,38 +548,72 @@ def live_identity_blocked(decision: ControlResult, run_so_far: RunVerdict | None
     return "live_identity" in (decision.run_reason, run_so_far.reason if run_so_far is not None else None)
 
 
-def recovery_login(rig: Rig, allowlist: Allowlist, clock: Clock, fixture_account: str | None) -> bool:
+@dataclass(frozen=True)
+class RecoveryLogin:
+    """What `recovery_login` did (6.6 step 5): `ok` when the session is usable for the proof; `identity` the 6.4
+    mismatch result of its A1 read (`judge_identity`: `aborted_safety` with `live_identity`, S1 and the login blocked,
+    or `paper_mode_mismatch`, S2) when the selector showed a text that is not an allowlist entry, for the caller to
+    apply like any other assertion (choice 18)."""
+
+    ok: bool
+    identity: ControlResult | None = None
+
+    def __bool__(self) -> bool:
+        """True when the session is usable for the proof, as the bool `recovery_login` used to return."""
+        return self.ok
+
+    @property
+    def live_identity(self) -> bool:
+        return self.identity is not None and self.identity.run_reason == "live_identity"
+
+
+def _assert_identity(rig: Rig, allowlist: Allowlist, clock: Clock) -> tuple[ControlResult, SelectorRead]:
+    """One A1 read with the two-read unreadable path (6.4): the verdict and the read it judged."""
+    reads = [rig.read_account_selector()]
+    try:
+        return judge_identity(reads, allowlist), reads[-1]
+    except ValueError:
+        clock.sleep(READ_GAP_S)
+        reads.append(rig.read_account_selector())
+        return judge_identity(reads, allowlist), reads[-1]
+
+
+def recovery_login(rig: Rig, allowlist: Allowlist, clock: Clock, fixture_account: str | None) -> RecoveryLogin:
     """A fresh scripted login with A1 and A2 (6.6 step 5): relaunch, LOGIN, an allowlisted selector, the fixture
-    account selected. True when the session is usable for the proof. The caller puts the hook in the recovery-only arm
-    first (choice 17): the login's typing goes through the gateway like any other input."""
+    account selected (A1 holds for the selected account too, 6.4). The caller puts the hook in the recovery-only arm
+    first (choice 17): the login's typing goes through the gateway like any other input. A login that fails leaves no
+    session behind: the hook enters deny-all and the tree is killed before it returns (choice 19)."""
     rig.launch()
     o = rig.login()
     if o.auth_error or o.challenge or o.session_kicked or o.live_selected or not o.vault_lease \
             or o.main_window_s is None or not o.post_login_anchor:
-        return False
-    reads = [rig.read_account_selector()]
-    try:
-        verdict = judge_identity(reads, allowlist)
-    except ValueError:
-        clock.sleep(READ_GAP_S)
-        reads.append(rig.read_account_selector())
-        verdict = judge_identity(reads, allowlist)
-    if not verdict.passed:
-        return False
-    if fixture_account is not None and reads[-1].text != fixture_account:
+        return _close(rig, RecoveryLogin(False))
+    verdict, read = _assert_identity(rig, allowlist, clock)
+    if verdict.passed and fixture_account is not None and read.text != fixture_account:
         rig.select_account(fixture_account)
-        after = rig.read_account_selector().text
-        return after == fixture_account and after in allowlist      # A1 holds for the selected account too (6.4)
-    return True
+        verdict, read = _assert_identity(rig, allowlist, clock)
+    if verdict.passed and (fixture_account is None or read.text == fixture_account):
+        return RecoveryLogin(True)
+    return _close(rig, RecoveryLogin(False, verdict if verdict.run_status == "aborted_safety" else None))
+
+
+def _close(rig: Rig, login: RecoveryLogin) -> RecoveryLogin:
+    """A failed recovery login's session ends at once (choice 19): deny-all, the tree killed, a fresh gateway."""
+    rig.set_hook_phase("kill_switch")
+    rig.kill_process_tree()
+    rig.reset_input_state()
+    return login
 
 
 def cancel_new_working(rig: Rig, start: OrderBook | None, end: OrderBook, *, clock: Clock,
-                       steps: list[tuple[str, float]] | None = None) -> tuple[str, OrderBook]:
+                       steps: list[tuple[str, float]] | None = None) -> tuple[str, OrderBook, OrderBook | None]:
     """6.6 step 5: when a fresh read of Working shows a row not in the start snapshot, click `Cancel All` and
-    re-read every 5 s until a readable read shows no new Working row of any kind (declared sends too) or 60 s pass
-    (choice 4). Returns what Cancel All did (`not_needed`, `done`, `failed`) and the last read."""
+    re-read every 5 s until a clean read shows no new Working row of any kind (declared sends too) or 60 s pass
+    (choice 4). Returns what Cancel All did (`not_needed`, `done`, `failed`), the last read, and the read that made it
+    click when that read was clean (`ProofInputs.found`), else None."""
     if start is None or not end.readable or not _new_rows(start, end)["working"]:
-        return "not_needed", end
+        return "not_needed", end, None
+    found = end if clean(end) else None
     res = rig.cancel_all()
     if steps is not None:
         steps.append(("cancel_all", clock.monotonic()))
@@ -552,13 +621,13 @@ def cancel_new_working(rig: Rig, start: OrderBook | None, end: OrderBook, *, clo
     cancel = "done" if res.located and res.clicked else "failed"
     while cancel == "done":
         end = rig.read_orders()
-        if end.readable and not _new_rows(start, end)["working"]:
+        if clean(end) and not _new_rows(start, end)["working"]:
             break
         if clock.monotonic() >= deadline:
             cancel = "failed"
             break
         clock.sleep(CANCEL_POLL_S)
-    return cancel, end
+    return cancel, end, found
 
 
 def execute_kill_switch(rig: Rig, decision: ControlResult, *, clock: Clock, allowlist: Allowlist,
@@ -577,42 +646,65 @@ def execute_kill_switch(rig: Rig, decision: ControlResult, *, clock: Clock, allo
     steps.append(("kill_tree", clock.monotonic()))
     sends = tuple(declared_sends)
     end: OrderBook | None = None
+    so_far = run_so_far or decision.run
+    login = RecoveryLogin(False)
     if live_identity_blocked(decision, run_so_far):
         inputs = ProofInputs(start=start, end=None, session="blocked", declared_sends=sends)
     else:
         cancel = "not_needed"
         rig.set_hook_phase("recovery")
-        login_ok = recovery_login(rig, allowlist, clock, fixture_account)
+        login = recovery_login(rig, allowlist, clock, fixture_account)
         steps.append(("recovery_login", clock.monotonic()))
-        if login_ok:
-            cancel, end = cancel_new_working(rig, start, rig.read_orders(), clock=clock, steps=steps)
-        inputs = ProofInputs(start=start, end=end, recovery_login_ok=login_ok, cancel_all=cancel, declared_sends=sends)
+        found = None
+        if login.ok:
+            cancel, end, found = cancel_new_working(rig, start, rig.read_orders(), clock=clock, steps=steps)
+        inputs = ProofInputs(start=start, end=end, recovery_login_ok=login.ok, cancel_all=cancel, declared_sends=sends,
+                             found=found)
+        if login.identity is not None and login.live_identity:      # 6.4, SD-64: the login is now blocked for it
+            inputs = ProofInputs(start=start, end=None, session="blocked", declared_sends=sends)
+            so_far = login.identity.run
     proof = post_run_proof(inputs)
     steps.append(("proof", clock.monotonic()))
     rig.revert_snapshot()
     steps.append(("revert_snapshot", clock.monotonic()))
     rig.set_hook_phase("between_runs")
     shot = end.screenshot_sha256 if isinstance(end, MonitorBook) else None
-    return KillSwitchReport(decision, proof, proof_result(proof, run_so_far=run_so_far or decision.run,
-                                                          unproven_streak=unproven_streak,
+    return KillSwitchReport(decision, proof, proof_result(proof, run_so_far=so_far, unproven_streak=unproven_streak,
                                                           account=account_ref(allowlist, fixture_account),
-                                                          screenshot_sha256=shot), steps)
+                                                          screenshot_sha256=shot), steps, identity=login.identity)
 
 
-def teardown_incident(found: Proof, decision: ControlResult, ks: KillSwitchReport) -> ControlResult:
+def teardown_proof(found: Proof, ks: KillSwitchReport) -> Proof:
+    """The run's proof after the teardown read found an undeclared row and the kill switch sequence ran (6.6, choice
+    7): the sequence's own proof when it is ORDERS SENT; otherwise (its recovery login failed, or no fresh read was
+    clean) the teardown read's ORDERS SENT, since that clean read found an order and UNPROVEN would understate it, with
+    `Cancel All` failed when an undeclared row was Working, because no cancel of it was ever verified (6.6 Cancel All
+    failure: `ORDERS SENT: undeclared rows (<rows>); Cancel All failed`)."""
+    if ks.proof.verdict == ORDERS_SENT:
+        return ks.proof
+    working = any(r.grid == "working" for r in found.undeclared)
+    return replace(found, cancel_all="failed" if working else found.cancel_all)
+
+
+def teardown_incident(found: Proof, decision: ControlResult, ks: KillSwitchReport, *, account: str | None = None,
+                      screenshot_sha256: str | None = None) -> ControlResult:
     """The one control result, so the one 9.10 page, of an undeclared row found by the teardown proof (6.6, 9.10).
 
     `found` is the teardown read's ORDERS SENT proof, `decision` its `proof_result` (the `aborted_safety` that ran
     the kill switch sequence) and `ks` what the sequence did. The incident pages once, after the sequence, with what
     `Cancel All` finally did (choice 7): the sequence's own result when its proof is ORDERS SENT; otherwise (the
     recovery login failed, or the fresh Monitor read was unreadable) the decision's safety page, run outcome and
-    unreached outcome, with the sequence's actions and findings added and both reads named in the detail.
+    unreached outcome, with the evidence of the run's proof (`teardown_proof`: its verdict, rows and Cancel All, the
+    login blocked for `incident`, and the hand-over with `account` and the teardown read's `screenshot_sha256` when
+    Cancel All failed), the sequence's own line under `kill_switch_proof`, and both reads named in the detail.
     """
-    final = ks.proof_effect
     if ks.proof.verdict == ORDERS_SENT:
-        return final
+        return ks.proof_effect
+    effect = proof_result(teardown_proof(found, ks), run_so_far=decision.run, account=account,
+                          screenshot_sha256=screenshot_sha256)
     rows = ", ".join(r.key for r in found.undeclared)
-    return replace(decision, actions=tuple(dict.fromkeys(decision.actions + final.actions)),
-                   findings=decision.findings + final.findings,
+    return replace(decision, actions=tuple(dict.fromkeys(decision.actions + effect.actions)),
+                   findings=decision.findings + effect.findings,
                    detail=f"{ORDERS_SENT} ({rows}) at teardown; after the kill switch sequence: {ks.proof.line}",
-                   evidence={**final.evidence, "teardown_undeclared": [r.key for r in found.undeclared]})
+                   evidence={**effect.evidence, "teardown_undeclared": [r.key for r in found.undeclared],
+                             "kill_switch_proof": ks.proof.line})

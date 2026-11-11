@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from sentinel.orchestrator.budgets import session_kicked
 from sentinel.orchestrator.clock import ManualClock
 from sentinel.orchestrator.gateway import Action, Chord, DropLedger, GatewayDrop
 from sentinel.orchestrator.gateway_config import (DEFAULT_ORDER_HOTKEYS_PATH, DefaultOrderHotkeys,
@@ -136,6 +137,34 @@ def test_the_recovery_proof_after_a_killed_tree_logs_in_inside_the_recovery_arm(
     proof = report.gate("teardown")
     assert (report.proof.verdict, report.proof.reason) == (UNPROVEN, "recovery_login_failed")
     assert proof.evidence["account"] == "account D-xxxxxxxx (allowlist entry 2) on rig rig-01"   # the hand-over page
+
+
+@pytest.mark.parametrize("recovery_reads", [[SelectorRead("12345678SCHW")], [SelectorRead("D-99999999")],
+                                            [BLIND, BLIND]], ids=["live", "foreign_paper", "unreadable"])
+def test_a_recovery_login_that_fails_its_identity_read_kills_the_session_it_logged_in(recovery_reads):
+    """session:1: a recovery login that authenticated but failed A1 (a live or foreign id, or two unreadable reads)
+    leaves no session logged in: deny-all and the tree killed right after the failed read, before the run ends."""
+    def work(o: Orchestrator) -> None:
+        o.rig.s.selector_reads = [BLIND, BLIND] + recovery_reads     # the flow boundary's assertion, then the recovery's
+        assert o.flow_boundary() is o.stop
+    report, rig, _ = run(work=work)
+    assert report.proof.verdict == UNPROVEN and not rig.app_running
+    c = rig.calls
+    tail = c[len(c) - 1 - c[::-1].index("login"):]
+    assert [x for x in tail if x != "read_account_selector"][:4] == ["login", DENY_ALL, "kill_process_tree",
+                                                                     "reset_input_state"]
+    assert tail[-1] == BETWEEN_RUNS
+
+
+def test_the_kicked_sessions_failed_first_proof_login_is_killed_before_the_second_launch():
+    """session:1: between the kicked session's two proof logins the first attempt's tree goes."""
+    def work(o: Orchestrator) -> None:
+        o.apply(session_kicked())
+    report, rig, _ = run(SimScenario(recovery_login_fails=1), work=work)
+    assert report.proof.verdict == "PROVEN: no orders sent"
+    c = rig.calls
+    first, second = [i for i, x in enumerate(c) if x == "launch"][-2:]
+    assert "kill_process_tree" in c[first:second] and c[second - 1] == RECOVERY
 
 
 def test_declared_sends_reach_the_trip_wires_and_every_proof():

@@ -160,6 +160,58 @@ def test_unproven_blocks_need_every_proof_cleared_and_the_system_owner_after_two
     assert S.unblock_login(st, "login-01", **human(role="system_owner")).evidence_run_id == "nightly-3"
 
 
+def _two_unproven(st: Store, reason: str = "recovery_login_failed") -> None:
+    """Two UNPROVEN proofs in a row on login-01, both cleared by hand."""
+    for rid, at in (("pr-1", T0), ("pr-2", T1)):
+        run(st, rid, rig="rig-01", at=at)
+        st.write_proof(proof(rid, reason=reason, at=at))
+        S.clear_proof(st, by="jdoe", shard_id=f"{rid}/1")
+
+
+def test_two_unproven_proofs_need_the_owner_and_the_proof_canary_whatever_reason_blocked_or_disabled_first(st):
+    """killswitch:4: the second UNPROVEN came from a kill switch run, so the rig was disabled for `kill_switch` first
+    and the login is blocked for `recovery_login_failed` (a drill reason). Neither first reason may hide the 6.6 rule:
+    the system owner signs both re-enables and the proof canary must pass on the current build."""
+    _two_unproven(st)
+    S.block_login(st, "login-01", "recovery_login_failed", at=T1)
+    S.disable_rig(st, "rig-01", "kill_switch", at=T1)
+    assert not S.disable_rig(st, "rig-01", "unproven_twice")            # the first reason stands
+    evidence(st, "nightly-3", drill_rows() + [canary_row("proof", passed=False)])
+    with pytest.raises(S.SafetyRefused, match="proof canary"):
+        S.unblock_login(st, "login-01", **human(role="system_owner"))
+    with pytest.raises(S.SafetyRefused, match="system owner"):
+        S.enable_rig(st, "rig-01", **human())
+    with pytest.raises(S.SafetyRefused, match="proof canary"):
+        S.enable_rig(st, "rig-01", **human(role="system_owner"))
+    evidence(st, "nightly-4", drill_rows() + [canary_row("proof")], at="2026-11-11T04:00:00+00:00")
+    assert S.unblock_login(st, "login-01", **human(role="system_owner")).evidence_run_id == "nightly-4"
+    assert S.enable_rig(st, "rig-01", **human(role="system_owner")).evidence_run_id == "nightly-4"
+
+
+def test_two_unproven_proofs_after_a_live_identity_block_still_need_the_owner(st):
+    """killswitch:4, the skeptic's variant: a live_identity block (not an UNPROVEN reason) over two UNPROVEN proofs."""
+    _two_unproven(st, reason="session_unavailable")
+    S.block_login(st, "login-01", "live_identity", at=T1)
+    evidence(st, "nightly-3", [canary_row("identity"), canary_row("proof")])
+    with pytest.raises(S.SafetyRefused, match="system owner"):
+        S.unblock_login(st, "login-01", **human())
+    assert S.unblock_login(st, "login-01", **human(role="system_owner")).evidence_run_id == "nightly-3"
+
+
+@pytest.mark.parametrize("blocked", ["live_identity", "drill_order_placed", "incident"])
+def test_an_uncleared_unproven_proof_refuses_the_login_reenable_whatever_blocked_it_first(st, blocked):
+    """killswitch:5: a login blocked first for another reason (a live identity, a drill order, an incident) still
+    needs every UNPROVEN proof on it cleared by hand before it is re-enabled (6.6, 6.4 Mismatch)."""
+    run(st, "pr-1", rig="rig-01")
+    st.write_proof(proof("pr-1", reason="session_unavailable"))
+    S.block_login(st, "login-01", blocked, at=T1)
+    evidence(st, "nightly-2", drill_rows() + [canary_row("identity")])
+    with pytest.raises(S.SafetyRefused, match="clear_proof first"):
+        S.unblock_login(st, "login-01", **human())
+    S.clear_proof(st, by="asmith", shard_id="pr-1/1")
+    assert S.unblock_login(st, "login-01", **human()).evidence_run_id == "nightly-2"
+
+
 # -- the proof clearance (6.6, 8.7) --------------------------------------------------------------------------------
 def test_clear_proof_is_a_person_once_on_an_unproven_proof(st):
     run(st, "pr-1", rig="rig-01")

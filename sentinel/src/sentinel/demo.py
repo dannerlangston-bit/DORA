@@ -22,8 +22,10 @@ and its calibration):
   the run is `aborted_safety (reason: attempted_send)` and the proof shows no order went out.
 - `app-crash`: the app freezes during a sweep step; `assertion_failed (assertion: app_alive)`, the rest
   of the ladder `not_run (reason: app_crash)`, a relaunch, and the run goes on.
-- `config-invalid`: the run date is past the first mask's expiry; preflight G1 (config lint) fails and
-  the run is `aborted_harness (reason: config_invalid)`.
+- `config-invalid`: a regions file names a mask record that does not exist (L-RGN-03); preflight G1 (the
+  run-start lint) fails and the run is `aborted_harness (reason: config_invalid)`.
+- `expired-mask`: the run date is past the first mask's expiry; the mask stops applying at run start, run health
+  lists it, a `mask_expired` finding is stored and the run completes (4.1, 4.8).
 
 `sentinel demo all` runs every scenario, prints one line each and writes `DIR/index.html`, a page that
 links each scenario's report, PR comment, summary and alerts with what to check.
@@ -52,19 +54,20 @@ import yaml
 from . import synth
 from .pipeline.orchestration import RigScript
 from .pipeline.reviewer import SIMULATED_MODEL_ID
-from .pipeline.run import (DEFAULT_TODAY, NOT_SIMULATED, NightlyScenario, RunResult, Scenario, record_decisions,
-                           run_nightly, run_pipeline)
+from .pipeline.run import (DEFAULT_TODAY, NOT_SIMULATED, NightlyScenario, PairRefused, RunResult, Scenario,
+                           record_decisions, run_nightly, run_pipeline)
 from .pipeline.sim import SimBuild
 from .store import Store
 
 EXAMPLE = Path(__file__).resolve().parents[2] / "config" / "example"
 SCENARIOS = ("flexgrid-ladder", "clean-pr", "backend-only", "ui-no-manifest", "nightly-canary", "decision-inheritance",
-             "wrong-number", "paper-mode-mismatch", "attempted-send", "app-crash", "config-invalid")
+             "wrong-number", "paper-mode-mismatch", "attempted-send", "app-crash", "config-invalid", "expired-mask")
 AT = "charts.flexible-grid.active-trader-cell"
 LADDER = "trade.active-trader.ladder"
 STOCK_FLOW = "flow.trade.order-ticket.stock.limit"
 LIVE_ACCOUNT = "12345678SCHW"                    # the live account id format of 6.13 item 5: eight digits, then SCHW
 FREEZE_AT = f"sweep/{AT}/flexgrid/640x480"
+PS_CENSUS = "census/monitor.activity.position-statement/ws.tier-a.active-trader"
 BASE_ID = "main-1998.3.0-2c91ae4"
 GRID_SRC = "desktop/ui/grid/src/main/java/com/tos/desktop/ui/grid"
 GRID_INDEX = {
@@ -299,8 +302,28 @@ entries:
                     depends_on={}, rig=RigScript(freeze_at=FREEZE_AT))
 
 
+PS_REGIONS = "regions/census/monitor.activity.position-statement/ws.tier-a.active-trader.yaml"
+
+
+def broken_ref_overlay(config_dir: Path) -> dict[str, str]:
+    """A config edit the lint refuses at run start: the Position Statement's regions file renames its mask reference
+    to `msk.ps.last-update-02`, a mask record that does not exist (L-RGN-03, a broken reference)."""
+    text = (Path(config_dir) / PS_REGIONS).read_text(encoding="utf-8")
+    old = "mask_ref: msk.ps.last-update-01}"
+    if old not in text:
+        raise ValueError(f"{PS_REGIONS} does not carry the example's mask reference")
+    return {PS_REGIONS: text.replace(old, "mask_ref: msk.ps.last-update-02}")}
+
+
+def config_invalid_scenario(today: date, config_dir: Path = EXAMPLE) -> Scenario:
+    """PR 4823 (the chart header change) on a config whose regions file names a mask record that does not exist."""
+    sc = clean_scenario(today)
+    return replace(sc, name="config-invalid", overlay=dict(sc.overlay, **broken_ref_overlay(config_dir)))
+
+
 def mask_expiry(config_dir: Path) -> date:
-    """The earliest `expires_at` of the config's masks: the first day after it, the config no longer lints."""
+    """The earliest `expires_at` of the config's masks: from the first day after it the mask stops applying at run
+    start (4.8 L-MSK-02: an error in CI, ignored at run start), and the run goes on without it."""
     dates = []
     for p in sorted((config_dir / "masks").rglob("*.yaml")):
         doc = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
@@ -438,8 +461,9 @@ def _write_summary(out: Path, title: str, story: list[str], results: list[RunRes
     if not abort_expected and any(r.reason == "config_invalid" for r in results):
         lines += ["NOTE: a run below stopped at T+0:00 because config lint failed (1.7): it ended",
                   "aborted_harness (reason: config_invalid) and its PR comment carries the abort block. With the",
-                  "default --today 2026-11-10 the example config lints clean; a later date expires its mask and the",
-                  "front-month future. The story below is what the scenario shows when the config is valid.", ""]
+                  "default --today 2026-11-10 the example config lints clean; a later date rolls its front-month",
+                  "future (an expired mask only stops applying). The story below is what the scenario shows when the",
+                  "config is valid.", ""]
     lines += story + ["", "What happened", "-" * 13]
     for r in results:
         lines += _run_block(r) + [""]
@@ -762,21 +786,44 @@ def demo_app_crash(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPL
 
 def demo_config_invalid(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
                         ) -> list[RunResult]:
-    day = mask_expiry(Path(config)) + timedelta(days=1)
-    r = run_pipeline(config, clean_scenario(day), out, day, **_rev(reviewer))
+    r = run_pipeline(config, config_invalid_scenario(today, Path(config)), out, today, **_rev(reviewer))
     story = [
-        f"PR 4823's run on {day.isoformat()}, the day after the example config's first mask expires (--today past",
-        "the mask expiry). Config lint is preflight item G1 (12.7): with an expired mask it fails (L-MSK-02), the",
-        "Orchestrator stops at the provisioned gate and the run ends aborted_harness (reason: config_invalid)",
-        "before any product action: no launch, no login, nothing captured, no scope.",
+        "PR 4823's run on a config where someone renamed the Position Statement's mask reference to",
+        "msk.ps.last-update-02 in its regions file, but no such mask record exists under masks/: a broken reference.",
+        "The run-start lint is preflight item G1 (12.7): it fails (L-RGN-03), the Orchestrator stops at the",
+        "provisioned gate and the run ends aborted_harness (reason: config_invalid) before any product action: no",
+        "launch, no login, nothing captured, no scope.",
         "",
         "- The PR comment carries the abort block with the failing lint rules; the check is error.",
         "- aborted_harness pages the harness on-call at P1 (9.10); see alerts.json.",
-        "- The post-run proof is PROVEN: no session established: the app was never started, so nothing could",
-        "  have been sent, and no login is blocked.",
+        "- No shard started, so the run's one post-run proof is the run-level row (SD-61): PROVEN: no session",
+        "  established: the app was never started, so nothing could have been sent, and no login is blocked.",
+        "- An expired mask no longer does this: it only stops applying (see the expired-mask scenario).",
     ]
-    _write_summary(out, "Scenario config-invalid: an expired mask stops the run at preflight", story, [r],
+    _write_summary(out, "Scenario config-invalid: a broken reference stops the run at preflight", story, [r],
                    _safety_lines(r), abort_expected=True)
+    return [r]
+
+
+def demo_expired_mask(out: Path, today: date = DEFAULT_TODAY, config: Path = EXAMPLE, reviewer: Any = None
+                      ) -> list[RunResult]:
+    day = mask_expiry(Path(config)) + timedelta(days=1)
+    r = run_pipeline(config, replace(clean_scenario(day), name="expired-mask"), out, day, **_rev(reviewer))
+    ps = [o for o in r.outcomes if o.checkpoint_id == PS_CENSUS]
+    story = [
+        f"PR 4823's run on {day.isoformat()}, the day after the example config's first mask (msk.ps.last-update-01,",
+        "the Position Statement's last-update clock) expires. In CI that is a lint error (L-MSK-02); at run start it",
+        "is not (4.1, 4.8): the run-start lint lists the mask as an expired record, the mask stops applying and the",
+        "run goes on.",
+        "",
+        "- The run is not config_invalid: it plans, captures and reports as on any other day.",
+        "- Run health lists the record (\"Expired records: mask expired: msk.ps.last-update-01\") and the run stores a",
+        "  mask_expired finding for its owner.",
+        "- Without the mask the clock's pixels diff as the enclosing region: the Position Statement census checkpoint "
+        + (f"ends {ps[0].outcome}" + (f" ({ps[0].reason})" if ps[0].reason else "") + "." if ps else "is not planned."),
+    ]
+    _write_summary(out, "Scenario expired-mask: an expired mask stops applying and the run goes on", story, [r],
+                   _safety_lines(r))
     return [r]
 
 
@@ -785,7 +832,7 @@ DEMOS: dict[str, Callable[..., list[RunResult]]] = {
     "ui-no-manifest": demo_ui_no_manifest, "nightly-canary": demo_nightly_canary,
     "decision-inheritance": demo_decision_inheritance, "wrong-number": demo_wrong_number,
     "paper-mode-mismatch": demo_paper_mode_mismatch, "attempted-send": demo_attempted_send,
-    "app-crash": demo_app_crash, "config-invalid": demo_config_invalid,
+    "app-crash": demo_app_crash, "config-invalid": demo_config_invalid, "expired-mask": demo_expired_mask,
 }
 
 # One sentence per scenario for out/index.html: what it demonstrates, and what a tester should check.
@@ -822,9 +869,13 @@ INDEX = {
                   "that step is assertion_failed (assertion: app_alive) with an app_crash finding, the rest of the "
                   "ladder is not_run (app_crash), counted under the Coverage table as \"Checkpoints not run: 7 "
                   "app_crash\", and the census checkpoints after it were still compared."),
-    "config-invalid": ("An expired mask fails config lint at preflight G1 and the run ends before any product action.",
-                       "the run is aborted_harness (config_invalid), the comment's abort block names L-MSK-02 and "
+    "config-invalid": ("A broken reference in the config (a mask record that does not exist) fails the run-start "
+                       "lint at preflight G1 and the run ends before any product action.",
+                       "the run is aborted_harness (config_invalid), the comment's abort block names L-RGN-03 and "
                        "alerts.json has the P1 aborted_harness page."),
+    "expired-mask": ("An expired mask stops applying at run start and the run goes on (4.1, 4.8).",
+                     "the run is complete, Run health lists \"mask expired: msk.ps.last-update-01\" and the store "
+                     "holds a mask_expired finding."),
 }
 
 
@@ -917,7 +968,11 @@ def main(argv: list[str] | None = None) -> int:
     names = SCENARIOS if a.scenario == "all" else (a.scenario,)
     done: dict[str, list[RunResult]] = {}
     for name in names:
-        done[name] = run_demo(name, a.out, a.today, Path(a.config), factory)
+        try:
+            done[name] = run_demo(name, a.out, a.today, Path(a.config), factory)
+        except PairRefused as exc:                      # 4.2: the run is never created; the rule ids go back
+            print(f"sentinel demo: {name}: {exc} (rules {', '.join(exc.rule_ids)})", file=sys.stderr)
+            return 2
         print(_line(name, done[name][-1], Path(a.out) / name))
     if a.scenario == "all":
         print(f"index: {write_index(a.out, done)}")

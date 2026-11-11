@@ -240,7 +240,9 @@ def test_attempted_send_is_dropped_by_the_gateway_and_proven_harmless(runs):
     assert [a for a in run["persisted_actions"] if a["action"] == "quarantine_flow"][0]["flow_id"] == STOCK_FLOW
     text = (out / "pr-comment.md").read_text()
     assert "Trigger: attempted_send" in text and "Post-run proof: PROVEN: no orders sent" in text
-    assert "gateway 1 drop, Cancel All not needed, proof PROVEN: no orders sent |" in text
+    # the run's stored proofs give the Safety row each shard's buying power line (6.6 step 5, 9.4)
+    assert ("gateway 1 drop, Cancel All not needed, proof PROVEN: no orders sent; shard run-2026-11-10-pr-4853-01/1: "
+            "buying power 2,500.00 to 2,500.00, drift 0.00, ok;") in text
     summary = (out / "summary.txt").read_text()
     assert "WORKAROUND" not in text + summary and "proof PROVEN: no orders sent" in summary
     assert "reason code\n  (guarded_key_refused)" in summary and "run health counts it as 1 gateway drop" in summary
@@ -274,7 +276,8 @@ def test_an_order_that_got_out_is_orders_sent_and_the_run_stays_aborted_safety(t
     text = (tmp_path / "pr-comment.md").read_text()
     assert "Trigger: undeclared_order_row" in text and f"Post-run proof: {line}" in text
     assert "An order reached the account: login " in text and "Incident: S1" in text
-    assert f"Cancel All verified, proof {line}; an order reached the account" in text
+    safety_row = next(row for row in text.splitlines() if row.startswith("| Safety |"))
+    assert f"Cancel All verified, proof {line}; shard " in safety_row and "; an order reached the account" in safety_row
     assert "UNPROVEN" not in text and r.commit_status["state"] == "error"
     *_, page = [a for a in alerts(tmp_path) if a["run_reason"] == "undeclared_order_row"]   # the kill switch's proof
     assert page["incident"] == "S1" and "login_owner" in page["paged"] and page["detail"] == line
@@ -309,14 +312,16 @@ def test_app_crash_fails_app_alive_skips_the_ladder_and_resumes_after_a_relaunch
 def test_config_invalid_aborts_harness_at_preflight_g1(runs):
     out, (r,) = runs("config-invalid")
     assert (r.status, r.reason) == ("aborted_harness", "config_invalid")
-    assert any("L-MSK-02" in e for e in r.lint_errors) and r.proof == "PROVEN: no session established"
+    assert any("L-RGN-03" in e for e in r.lint_errors) and r.proof == "PROVEN: no session established"
     with Store(out / "sentinel.db") as store:
         run = store.run_outcome(r.run_id)
         assert (run.last_gate, store.outcomes(r.run_id)) == ("provisioned", [])
+        (proof,) = store.post_run_proofs(r.run_id)               # the run-level row of a run with no shard (SD-61)
+        assert (proof.shard_id, proof.login_alias, proof.verdict) == (None, None, "proven_no_session")
     (page,) = alerts(out)
     assert (page["rule"], page["priority"], page["paged"]) == ("aborted_harness", "P1", ["harness_on_call"])
     text = (out / "pr-comment.md").read_text()
-    assert "**Abort**" in text and "`config_invalid` (rules L-MSK-02)" in text and r.commit_status["state"] == "error"
+    assert "**Abort**" in text and "`config_invalid` (rules L-RGN-03)" in text and r.commit_status["state"] == "error"
     assert "- Not re-queued: the same config would fail again; fix it first" in text and "Re-queued once" not in text
     assert "Scope not computed: the run stopped at provisioned before it planned any checkpoint." in text
     assert "| Tier |" not in text and "| Fingerprint | not read |" in text
@@ -324,10 +329,17 @@ def test_config_invalid_aborts_harness_at_preflight_g1(runs):
     assert "PR comment posted (simulated: written to pr-comment.md)" in text and "unknown" not in text
 
 
-def test_config_invalid_runs_the_day_after_the_first_mask_expiry(runs):
-    out, (r,) = runs("config-invalid")
+def test_expired_mask_runs_the_day_after_the_first_mask_expiry_and_completes(runs):
+    """4.1, 4.8: the expired mask is an expired record at run start, not `config_invalid`; the run completes with the
+    record in run health and a `mask_expired` finding."""
+    out, (r,) = runs("expired-mask")
     day = date.fromordinal(mask_expiry(EXAMPLE).toordinal() + 1)
     assert r.run_id == f"run-{day.isoformat()}-pr-4823-01"
+    assert r.status == "complete" and not r.lint_errors
+    assert [f.kind for f in r.findings if f.kind.endswith("_expired")] == ["mask_expired"]
+    text = (out / "pr-comment.md").read_text()
+    assert "Expired records" in text and "mask expired: msk.ps.last-update-01" in text
+    assert "mask expired: msk.ps.last-update-01" in (out / "summary.txt").read_text()
 
 
 # -- sentinel demo all: one line per scenario and out/index.html ---------------------------------------------

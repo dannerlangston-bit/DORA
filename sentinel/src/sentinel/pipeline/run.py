@@ -3,12 +3,19 @@
 `run_pipeline(config_dir, scenario, out_dir, today=...)` follows the PR run of 1.7 and the
 checkpoint sequence of 5.17 with the rig replaced by `sim`:
 
-1. T+0:00. The config the run pins (the given directory plus the PR's manifest and build records,
-   4.3) is linted; any error is preflight item G1 (12.7): the shard's Orchestrator stops at
-   `provisioned` and the run ends `aborted_harness (reason: config_invalid)` with the abort block in
-   the PR comment. The build pair is read from the candidate's build record.
-2. T+0:01 to 0:02. The manifest for the candidate is loaded (or not: the two no-manifest cases),
-   the changed paths go through the static impact step and `scope.compute_scope` plans the run.
+1. T+0:00. Run creation checks the candidate's build pair (4.2, `lint.rules.check_pair`): a refused pair
+   raises `PairRefused` and no run row is written. The config the run pins (the given directory plus the
+   PR's manifest and build records, 4.3) goes through the run-start lint (`lint.runstart.lint_at_run_start`,
+   4.1): an error is preflight item G1 (12.7): the shard's Orchestrator stops at `provisioned`, the run ends
+   `aborted_harness (reason: config_invalid)` with the abort block in the PR comment and the run-level proof
+   of SD-61. An expired mask, floor exception or invariant exception is not an error there: it stops applying,
+   run health lists it (`health.expired`) and the run writes its `mask_expired`, `floor_exception_expired` or
+   `invariant_exception_expired` finding; masks expiring within seven days go to the summary (`expiring`, 3.8).
+2. T+0:01 to 0:02. The manifest for the candidate is linted on its own (`lint_manifest`): one with an error
+   is treated as missing and its lint lines go to the summary (`manifest_lint`, 4.3). The manifest is loaded
+   (or not: the two no-manifest cases), the changed paths go through the static impact step and
+   `scope.compute_scope` plans the run; a `ScopeConfigError` aborts `config_invalid` with the rule ids its
+   message names (SD-01).
 3. Before any threshold is used (3.9, 1.6 Calibration run) an A/A calibration of the base build is
    run with `diff.calibration` over every planned checkpoint: five captures in one session and one
    in a fresh session; the same A/A pairs drive the invariant enablement test of 2.7.
@@ -24,9 +31,11 @@ checkpoint sequence of 5.17 with the rig replaced by `sim`:
    assertions, never for a member that inherited a decision), up to the PR cap of 60 calls.
 7. Everything goes through `store.Store` (single writer) and `store.ArtifactStore` (content
    addressed, redaction header set: synthetic screens carry no account data), each shard's post-run
-   proof included (one 8.3 `post_run_proofs` row per shard, keyed by the rig's login alias). The coverage
-   matrix (`coverage.build_matrix`) and the Reporter's PR comment, commit status and static HTML report
-   are rendered from what the store returns: the proof line, what Cancel All did and the blocked login's
+   proof included (one 8.3 `post_run_proofs` row per shard, keyed by the rig's login alias). The teardown
+   summary (8.3 `runs.summary_json`: the coverage matrix of `coverage.build_matrix`, run health, the abort
+   block, the manifest's lint, the expiring masks and the alerts) is written with `Store.end_run(summary=)`,
+   and the Reporter's PR comment, commit status and static HTML report are rendered from the finished run read
+   back (`report.ReportInputs.from_store`): the proof line, what Cancel All did and the blocked login's
    readable label (`orchestration.login_label`, never the vault alias) come from the stored proofs.
 
 `run_nightly` is the canary pass of a Nightly run (10.3): `canary.generate` mutates approved
@@ -89,9 +98,11 @@ from ..diff.engine import (DiffContext, DiffResult, compare_fingerprints, diff_p
 from ..diff.phash import phash
 from ..diff.regions import RegionsFile, effective_registry, park_rect
 from ..diff.settle import Recapture, RerunBudget, SettleResult, diff_stability, settle
-from ..lint import lint
+from ..lint.repo import Repo
+from ..lint.rules import EXPIRY_KINDS, ExpiredRecord, Violation, check_pair
+from ..lint.runstart import expiring_soon, lint_at_run_start, lint_manifest
 from ..records import PERSONAS, CheckpointOutcome, Decision, Finding, RunOutcome, Signature, StepOutcome
-from ..report import ReportContext, build_report, render_pr_comment, render_run_report
+from ..report import ReportContext, ReportInputs, render_report_markdown, write_run_report
 from ..report.cluster import Member, cluster_members
 from ..report.model import proof_severity, worst_proof
 from ..scope import (DependencyIndex, Manifest, PlannedCheckpoint, Rig, ScopeConfigError, ScopePlan, classes_in,
@@ -107,7 +118,7 @@ from ..orchestrator.clock import ManualClock
 from ..orchestrator.gates import check_authenticated, check_build_unchanged, check_launched
 from ..orchestrator.gateway import VK_ESCAPE, VK_RETURN, VK_SPACE, VK_TAB, Action, DropLedger, drain, refusal
 from ..orchestrator.identity import judge_identity
-from ..orchestrator.killswitch import proof_line
+from ..orchestrator.killswitch import config_invalid_proof, proof_line
 from ..orchestrator.machine import Orchestrator, RunContext, RunReport
 from ..orchestrator.results import ControlResult, Outcome, RunVerdict, worse
 from ..orchestrator.rig import CrashSignal
@@ -311,6 +322,7 @@ class _Run:
         self.disabled: dict[str, list[str]] = {}
         self.registries: dict[str, RegionsFile] = {}
         self.expiry_notices: list = []
+        self.expired_exceptions: list[tuple[str, inv.InvariantException]] = []
         self.budget: RerunBudget | None = None
         self.entries = frozenset(e.entry_id for e in manifest.entries) if manifest else frozenset()
         self.tickets = frozenset(t for e in manifest.entries for t in e.tickets) if manifest else frozenset()
@@ -328,8 +340,17 @@ class _Run:
     def surface_rules(self, cp: PlannedCheckpoint) -> inv.SurfaceRules:
         key = f"{cp.surface_id}|{cp.data_mode}"
         if key not in self.rules:
-            self.rules[key] = self.cfg.rules(cp.surface_id, cp.data_mode)
+            self.rules[key] = self.live_rules(cp.surface_id, cp.data_mode)
         return self.rules[key]
+
+    def live_rules(self, surface_id: str, data_mode: str) -> inv.SurfaceRules:
+        """The surface's invariant inputs as they apply at run start: an invariant exception expired by then is
+        dropped (L-SRF-11, `invariants.active_exceptions`); the run-start lint lists it as an expired record."""
+        rules, expired = inv.active_exceptions(self.cfg.rules(surface_id, data_mode),
+                                               self.now.astimezone(timezone.utc).isoformat())
+        self.expired_exceptions += [(surface_id, e) for e in expired
+                                    if (surface_id, e) not in self.expired_exceptions]
+        return rules
 
     def capture(self, cp: PlannedCheckpoint, side: str, tick: int = 0) -> Capture:
         app = self.base_app if side == "base" else self.cand_app
@@ -355,7 +376,7 @@ class _Run:
                 inv.AAPair(cp.data_mode, caps[0].models, caps[5].models))
         for key, ps in sorted(pairs.items()):
             surface, mode = key.split("|")
-            rules = self.cfg.rules(surface, mode)
+            rules = self.live_rules(surface, mode)
             statuses = inv.enablement(ps, rules)
             self.rules[key] = inv.with_enablement(rules, statuses)
             off = [i for i, s in statuses.items() if s != inv.ENABLED]
@@ -1366,22 +1387,91 @@ def _append_json(path: Path, entries: Sequence[Any]) -> None:
 # run_pipeline
 
 
+class PairRefused(ValueError):
+    """Run creation refused the build pair (4.2 L-BLD-04, L-BLD-05; `lint.rules.check_pair`): the run is never
+    queued, no run row is written, and the requester gets the rule ids (`rule_ids`) and the violations."""
+
+    def __init__(self, violations: Sequence[Violation]):
+        self.violations = list(violations)
+        self.rule_ids = sorted({v.rule for v in self.violations})
+        super().__init__("build pair refused at run creation: " + "; ".join(v.line() for v in self.violations))
+
+
+def pair_violations(repo: Repo, candidate: str, run_type: str = "pr") -> list[Violation]:
+    """4.2 at run creation: `lint.rules.check_pair` on the candidate's build pair (its `builds/<id>.yaml` record),
+    against the build records of the checkout. A candidate whose record carries no pair, or a pair of another run
+    type, is not checked here."""
+    docs = {str(d.data["build"]["build_id"]): d.data for d in repo.of("build")
+            if isinstance(d.data, dict) and isinstance(d.data.get("build"), dict) and d.data["build"].get("build_id")}
+    pair = (docs.get(candidate) or {}).get("build_pair")
+    if not isinstance(pair, dict) or pair.get("run_type", run_type) != run_type:
+        return []
+    return check_pair(pair, {b: d["build"] for b, d in docs.items()}, file=f"builds/{candidate}.yaml")
+
+
+def _expired_findings(run_id: str, expired: Sequence[ExpiredRecord], notices: Sequence[Any],
+                      exceptions: Sequence[tuple[str, inv.InvariantException]], at: str) -> list[Finding]:
+    """One finding per record that stopped applying at run start (4.1, 4.8 L-MSK-02, L-RGN-05, L-SRF-11): the
+    run-start lint's expired records, plus any the run itself dropped (`effective_registry`, `active_exceptions`)
+    that the lint's day did not reach, each once by (kind, record id)."""
+    rows: dict[tuple[str, str], tuple[str, str]] = {}
+    for e in expired:
+        rows.setdefault((e.kind, e.record_id), (e.scope, f"{e.file}, {e.rule}, expired {e.expires_at}, owner "
+                                                         f"{e.owner or 'unknown'}"))
+    for n in notices:
+        rows.setdefault((n.kind, n.record_id), (n.region_id, f"region {n.region_id}"))
+    for surface, x in exceptions:
+        rows.setdefault(("invariant_exception_expired", x.invariant_id),
+                        (surface, f"surface {surface}, expired {x.expires_at}, owner {x.owner or 'unknown'}"))
+    return [Finding(f"fnd-{run_id}-expired-{i:03d}", run_id, kind,
+                    f"{EXPIRY_KINDS[kind]}: {rid} ({where}); it stopped applying at run start", run_id, created_at=at,
+                    evidence={"raw_values": {"record_id": rid, "scope": scope,
+                                             "run_health": f"{EXPIRY_KINDS[kind]}: {rid}"}})
+            for i, ((kind, rid), (scope, where)) in enumerate(sorted(rows.items()), 1)]
+
+
+def _render(store: Store, run_id: str, mdict: dict | None, ctx: ReportContext, out: Path) -> tuple[str, dict]:
+    """The finished run read back from the store (`report.ReportInputs`: its records, its summary JSON and the Safety
+    rows; 9.2 renders from the summary written at teardown, 8.7) into `pr-comment.md`, `commit-status.json` and
+    `report.html`; returns the comment and the commit status."""
+    rep = ReportInputs.from_store(store, run_id).build(mdict, ctx)
+    comment = render_report_markdown(rep)
+    status = _status_json(rep.status)
+    (out / "pr-comment.md").write_text(comment, encoding="utf-8")
+    (out / "commit-status.json").write_text(json.dumps(status, indent=2) + "\n")
+    write_run_report(rep, out / "report.html", objects_dir=out / "artifacts" / "objects", embed=True)
+    return comment, status
+
+
 def _abort_config(store: Store, scenario: Scenario, cfg_root: Path, errors: list[str], rule_ids: list[str],
-                  out_dir: Path, today: date, started: str) -> RunResult:
+                  out_dir: Path, today: date, started: str, *, expiring: Sequence[str] = ()) -> RunResult:
     """1.7 T+0:00 and preflight G1 (12.7): config lint failed, so the shard's Orchestrator fails G1 at
-    `provisioned` and the run ends `aborted_harness (reason: config_invalid)` before any product action."""
+    `provisioned` and the run ends `aborted_harness (reason: config_invalid)` before any product action. No shard
+    started, so the run's one post-run proof is the run-level row of SD-61 (`killswitch.config_invalid_proof`)."""
     store.begin_run(_run_plan(scenario.run_id, scenario.run_type, cfg_root, (), (), started, None, scenario.pr,
                               scenario.author))
     sink = ShardSink(())                                 # 1.10: none was scoped yet
     clock = ManualClock(start=parse_time(started).astimezone(timezone.utc))
     ctx = default_context(scenario.run_id, scenario.run_type, expected_build=scenario.candidate.build_id)
-    report = Orchestrator(SimulatedRig(SimScenario(preflight_failures={"G1": None}), clock=clock), ctx, sink,
-                          clock=clock).run()
+    rig = SimulatedRig(SimScenario(preflight_failures={"G1": None}), clock=clock)
+    report = Orchestrator(rig, ctx, sink, clock=clock).run()
+    store.write_proof(config_invalid_proof(scenario.run_id, produced_at=clock.now().isoformat(),
+                                           gateway=rig.gateway_log()))
     store.fill_unreached(scenario.run_id, "harness_error", "config_invalid")
+    alerts = [a for r in report.results if (a := alert_entry(scenario.run_id, ctx.shard_id, r)) is not None]
+    abort = {"rule_ids": rule_ids, "not_requeued": "the same config would fail again; fix it first"}
+    health = {"wall_clock": _mmss(60), "budget": "45:00", "shards": 1,
+              "safety": {"attestation": "not reached", "paper_mode_asserted": 0, "gateway_drops": 0,
+                         "cancel_all": "not needed", "proof": report.proof.line},
+              "integrations": {"pr_comment": {"state": "posted", "time": "(simulated: written to pr-comment.md)"},
+                               "jira_queued": 0, "slack": {"queued": 0}}}
+    summary: dict[str, Any] = {"coverage": {}, "health": health, "abort": abort, "alerts": alerts,
+                               "lint_errors": list(errors)}
+    if expiring:
+        summary["expiring"] = list(expiring)
     run = store.end_run(RunOutcome(scenario.run_id, scenario.run_type, report.verdict.status, report.last_gate,
                                    reason=report.verdict.reason, started_at=started,
-                                   ended_at=_ts(today, scenario.clock, 60)))
-    alerts = [a for r in report.results if (a := alert_entry(scenario.run_id, ctx.shard_id, r)) is not None]
+                                   ended_at=_ts(today, scenario.clock, 60)), summary=summary)
     _append_json(out_dir / "alerts.json", alerts)
     shard = {"shard_id": ctx.shard_id, "rig": "none (stopped at provisioned)", "verdict": report.verdict.status,
              "reason": report.verdict.reason, "last_gate": report.last_gate, "proof": report.proof.line,
@@ -1390,22 +1480,35 @@ def _abort_config(store: Store, scenario: Scenario, cfg_root: Path, errors: list
     _append_json(out_dir / "orchestrator.json", [{"run_id": scenario.run_id, "shards": [shard], "persisted_actions": [],
                                                   "gateway_events": [], "lint_errors": errors}])
     ctx_r = ReportContext(pr=scenario.pr or 0, candidate_build=scenario.candidate.build_id,
-                          base_build=scenario.base.build_id,
-                          abort={"rule_ids": rule_ids,
-                                 "not_requeued": "the same config would fail again; fix it first"})
-    health = {"wall_clock": _mmss(60), "budget": "45:00", "shards": 1,
-              "safety": {"attestation": "not reached", "paper_mode_asserted": 0, "gateway_drops": 0,
-                         "cancel_all": "not needed", "proof": report.proof.line},
-              "integrations": {"pr_comment": {"state": "posted", "time": "(simulated: written to pr-comment.md)"},
-                               "jira_queued": 0, "slack": {"queued": 0}}}
-    comment = render_pr_comment(run, [], [], [], {}, health, None, ctx_r)
-    rep = build_report(run, [], [], [], {}, health, None, ctx_r)
-    (out_dir / "pr-comment.md").write_text(comment, encoding="utf-8")
-    (out_dir / "commit-status.json").write_text(json.dumps(_status_json(rep.status), indent=2) + "\n")
-    render_run_report(run, [], [], [], {}, health, None, ctx_r, out_dir / "report.html")
+                          base_build=scenario.base.build_id)
+    comment, status = _render(store, scenario.run_id, None, ctx_r, out_dir)
     return RunResult(scenario.run_id, scenario.run_type, run.status, run.reason, out_dir, comment=comment,
-                     commit_status=_status_json(rep.status), lint_errors=errors, alerts=alerts, shards=[shard],
+                     commit_status=status, lint_errors=errors, alerts=alerts, shards=[shard],
                      proof=report.proof.line)
+
+
+@dataclass(frozen=True)
+class RunStart:
+    """What the run-start lint of 4.1 left for the run (`lint.runstart`): the errors that abort it, the records that
+    stopped applying, the masks expiring within seven days, and the manifest's own lint (4.3)."""
+
+    errors: list[Violation]
+    expired: list[ExpiredRecord]
+    expiring: list[str]
+    manifest_lint: list[str]
+    manifest_ok: bool
+
+
+def run_start(repo: Repo, candidate: str, today: date) -> RunStart:
+    """4.1 and 4.3 at run start: `lint_at_run_start` (an error is `config_invalid`; an expired mask, floor exception
+    or invariant exception only stops applying), `expiring_soon` for the owner warning (3.8), and `lint_manifest` on
+    the candidate's manifest (any error: the manifest is treated as missing, its lines go to the PR comment)."""
+    report, expired = lint_at_run_start(repo, phase=1, today=today)
+    rel = f"manifests/{candidate}.yaml"
+    found = lint_manifest(repo, rel, candidate=candidate, phase=1, today=today) if rel in repo.docs else []
+    bad = any(v.severity == "error" for v in found)
+    return RunStart(report.errors, expired, [w.line() for w in expiring_soon(repo, today)],
+                    [v.line() for v in found] if bad else [], not bad)
 
 
 def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path, today: date = DEFAULT_TODAY,
@@ -1415,18 +1518,23 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
     the offline `SimulatedReviewer`. Writes into `out_dir`:
     `config/<run_id>/`, `sentinel.db` (shared by every run of the directory), `artifacts/`,
     `calibration/`, `heartbeat/`, `pr-comment.md`, `commit-status.json`, `report.html`,
-    `reviewer-calls.json`, and appends to `alerts.json` and `orchestrator.json`."""
+    `reviewer-calls.json`, and appends to `alerts.json` and `orchestrator.json`. Raises `PairRefused`, before
+    anything is written to the store, when run creation refuses the candidate's build pair (4.2)."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     started = _ts(today, scenario.clock)
     now = parse_time(started)
     cfg_root = materialize(config_dir, scenario.overlay, out / "config" / scenario.run_id)
-    report_lint = lint(cfg_root, phase=1, today=today)
+    repo = Repo.load(cfg_root)
+    refused = pair_violations(repo, scenario.candidate.build_id)
+    if refused:                                      # 4.2: the run is never created
+        raise PairRefused(refused)
+    start = run_start(repo, scenario.candidate.build_id, today)
     with Store(out / "sentinel.db") as store:
-        if report_lint.errors:
-            errs = [v.line() for v in report_lint.errors]
-            rules = sorted({v.rule for v in report_lint.errors})
-            return _abort_config(store, scenario, cfg_root, errs, rules, out, today, started)
+        if start.errors:
+            errs = [v.line() for v in start.errors]
+            rules = sorted({v.rule for v in start.errors})
+            return _abort_config(store, scenario, cfg_root, errs, rules, out, today, started, expiring=start.expiring)
         cfg = SentinelConfig.load(cfg_root)
         try:
             oracle = FlowOracle.load(cfg, now)
@@ -1435,7 +1543,7 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         cand_doc = cfg.builds.get(scenario.candidate.build_id, {})
         pair = cand_doc.get("build_pair") or {}
         base_id = pair.get("base", scenario.base.build_id)
-        mdoc = cfg.manifests.get(scenario.candidate.build_id)
+        mdoc = cfg.manifests.get(scenario.candidate.build_id) if start.manifest_ok else None
         manifest = Manifest.from_dict(mdoc) if mdoc else None
         dep_index = DependencyIndex.from_depends_on(scenario.depends_on) if scenario.depends_on is not None else None
         try:
@@ -1443,8 +1551,9 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
                                  run_id=scenario.run_id, workspaces=cfg.workspaces, flows=cfg.flows,
                                  entitlements=cfg.entitlements, quarantine=cfg.quarantine,
                                  rigs=[Rig(r, "fp") for r in RIGS], candidate_build_id=scenario.candidate.build_id)
-        except ScopeConfigError as exc:
-            return _abort_config(store, scenario, cfg_root, [str(exc)], ["L-SRF-10"], out, today, started)
+        except ScopeConfigError as exc:              # an input the lint should have refused: its own rule (SD-01)
+            return _abort_config(store, scenario, cfg_root, [str(exc)], list(exc.rule_ids), out, today, started,
+                                 expiring=start.expiring)
         planned = list(plan.planned)
         rig_of = {cp.checkpoint_id: it.rigs[0] for it in plan.items for cp in it.checkpoints}
         run = _Run(cfg, scenario.run_id, "pr", scenario.base, scenario.candidate, now, manifest, plan, plan.x_input)
@@ -1496,10 +1605,9 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         calls = _review_pass(run, evals, rev, scenario.reviewer_cap)
         for f in plan.findings:
             store.write_finding(dataclasses.replace(f, created_at=started))
-        for n in run.expiry_notices:
-            store.write_finding(Finding(f"fnd-{scenario.run_id}-expiry-{n.record_id}", scenario.run_id, n.kind,
-                                        f"{n.kind}: {n.record_id} on {n.region_id} stopped applying at run start",
-                                        scenario.run_id, created_at=started))
+        for f in _expired_findings(scenario.run_id, start.expired, run.expiry_notices, run.expired_exceptions,
+                                   started):
+            store.write_finding(f)
         for ev in evals:
             o, fs, stored = writer.records(ev)
             steps = []
@@ -1539,16 +1647,17 @@ def run_pipeline(config_dir: str | Path, scenario: Scenario, out_dir: str | Path
         if status == "complete" and store.complete_blockers(scenario.run_id):
             status, reason = "complete_with_env_errors", None
         last_gate = stop[1].gate if stop is not None and stop[1].gate else "reported"
-        runrec = store.end_run(RunOutcome(scenario.run_id, "pr", status, last_gate, reason=reason, started_at=started,
-                                          ended_at=_ts(today, scenario.clock, int(wall))))
         abort = {}
-        if stop is not None and runrec.status == "aborted_safety":
+        if stop is not None and status == "aborted_safety":
             st, r = stop
             stopped = [s.rig_id for s, rep in work.reports if rep.verdict.status == "aborted_safety"]
             abort = {"trigger": r.run_reason, "gate": r.gate, "proof": work.proof(), "incident": r.incident or "unknown",
                      "rig": stopped or [st.rig_id]}                    # every rig the abort disabled (6.6 step 6)
-        result = _report(store, cfg, plan, run, scenario, runrec, manifest, mdoc, out, today, wall, len(work.reports),
-                         safety=work.safety(), abort=abort)
+        summary = _summary(store, cfg, plan, run, scenario, wall, len(work.reports), safety=work.safety(), abort=abort,
+                           start=start, alerts=work.alerts)
+        runrec = store.end_run(RunOutcome(scenario.run_id, "pr", status, last_gate, reason=reason, started_at=started,
+                                          ended_at=_ts(today, scenario.clock, int(wall))), summary=summary)
+        result = _report(store, plan, scenario, runrec, mdoc, out, cfg.root)
         result.reviewer_calls = calls
         n_pairs = sum(1 for ev in evals if ev.diff is not None and ev.diff.signal is not None)
         result.notes.append(
@@ -1653,18 +1762,14 @@ def _area(ev: Evaluated) -> tuple:
     return (int(step.get("w", 0)) * int(step.get("h", 0)), int(step.get("w", 0)))
 
 
-def _report(store: Store, cfg: SentinelConfig, plan: ScopePlan, run: _Run, scenario: Scenario, runrec: RunOutcome,
-            manifest: Manifest | None, mdoc: dict | None, out: Path, today: date, wall: float, shards: int, *,
-            safety: dict, abort: dict) -> RunResult:
-    """Read the run back from the store and render the PR comment, commit status and report (9.2, 9.5).
+def _summary(store: Store, cfg: SentinelConfig, plan: ScopePlan, run: _Run, scenario: Scenario, wall: float,
+             shards: int, *, safety: dict, abort: dict, start: RunStart, alerts: Sequence[dict]) -> dict:
+    """The teardown summary of 8.3 `runs.summary_json` the Reporter reads (`report.model` docstring): the coverage
+    matrix, run health (with the records that expired at run start), the abort block facts, the manifest's lint
+    lines when it was treated as missing (4.3), the seven-day mask warnings (3.8) and the run's 9.10 alerts.
     `safety` is run health's safety row from the shards' control results; `abort` the abort block's facts."""
     outcomes = store.outcomes(scenario.run_id)
-    findings = store.findings(scenario.run_id)
-    steps = store.step_outcomes(scenario.run_id)
-    ids = sorted({o.decision_ref for o in outcomes if o.decision_ref} | {f.decision_ref for f in findings if f.decision_ref})
-    decisions = [d for d in (store.get_decision(i) for i in ids) if d is not None]
-    coverage = coverage_summary(cfg, plan, outcomes, scenario.run_id)
-    health = {
+    health: dict[str, Any] = {
         "wall_clock": _mmss(wall), "budget": "45:00", "shards": shards,
         "fingerprint": {"candidate": run.fp_id[7:13], "base": run.fp_id[7:13]},
         "reviewer": {"cost_usd": 0.0},
@@ -1672,22 +1777,37 @@ def _report(store: Store, cfg: SentinelConfig, plan: ScopePlan, run: _Run, scena
         "integrations": {"pr_comment": {"state": "posted", "time": "(simulated: written to pr-comment.md)"},
                          "jira_queued": 0, "slack": {"queued": 0}},
     }
+    expired = [f.evidence["raw_values"]["run_health"] for f in store.findings(scenario.run_id)
+               if f.kind in EXPIRY_KINDS]
+    if expired:
+        health["expired"] = expired
     if scenario.canary:
         health["canary"] = dict(scenario.canary)
+    out: dict[str, Any] = {"coverage": coverage_summary(cfg, plan, outcomes, scenario.run_id), "health": health,
+                           "alerts": list(alerts)}
+    if abort:
+        out["abort"] = abort
+    if start.manifest_lint:
+        out["manifest_lint"] = list(start.manifest_lint)
+    if start.expiring:
+        out["expiring"] = list(start.expiring)
+    return out
+
+
+def _report(store: Store, plan: ScopePlan, scenario: Scenario, runrec: RunOutcome, mdoc: dict | None,
+            out: Path, cfg_root: Path) -> RunResult:
+    """Read the finished run back from the store and render the PR comment, commit status and report (9.2, 9.5)."""
     ctx = ReportContext(pr=scenario.pr or 0, candidate_build=scenario.candidate.build_id,
                         base_build=scenario.base.build_id, detector_banner=scenario.detector_banner,
-                        history=scenario.history, abort=abort,
+                        history=scenario.history,
                         provenance={"harness_commit": "sentinel-core-0.1.0 (simulated run)",
-                                    "config_commit": tree_sha256(cfg.root)[:12],
+                                    "config_commit": tree_sha256(cfg_root)[:12],
                                     "vm_image_id": "none: synthetic screens from sentinel.synth"})
     mdict = as_dict(mdoc) if mdoc else None
-    comment = render_pr_comment(runrec, outcomes, findings, decisions, coverage, health, mdict, ctx, steps=steps)
-    (out / "pr-comment.md").write_text(comment, encoding="utf-8")
-    rep = build_report(runrec, outcomes, findings, decisions, coverage, health, mdict, ctx, steps)
-    status = _status_json(rep.status)
-    (out / "commit-status.json").write_text(json.dumps(status, indent=2) + "\n")
-    render_run_report(runrec, outcomes, findings, decisions, coverage, health, mdict, ctx, out / "report.html",
-                      steps=steps, objects_dir=out / "artifacts" / "objects", embed=True)
+    comment, status = _render(store, scenario.run_id, mdict, ctx, out)
+    outcomes, findings = store.outcomes(scenario.run_id), store.findings(scenario.run_id)
+    ids = sorted({o.decision_ref for o in outcomes if o.decision_ref} | {f.decision_ref for f in findings if f.decision_ref})
+    decisions = [d for d in (store.get_decision(i) for i in ids) if d is not None]
     return RunResult(scenario.run_id, "pr", runrec.status, runrec.reason, out, outcomes, findings, decisions, comment,
                      status, plan, mdict)
 
@@ -1768,7 +1888,7 @@ def planned_for(cfg: SentinelConfig, cid: str) -> PlannedCheckpoint:
         return PlannedCheckpoint(cid, surface, "flow", int(step.get("tier", tier)), flow["workspace"], flow["persona"],
                                  str(step.get("data_mode", flow.get("data_mode", mode))), flow_id=q[0], step_id=q[1])
     if kind == "sweep":
-        w, h = q[1].split("x")
+        w, h = q[1].removesuffix("-asc").split("x")          # SD-04: a Ladder F ascending step ends in -asc
         return PlannedCheckpoint(cid, surface, "sweep", tier, "ws.tier-c.sweep-harness", s["personas"][0], mode,
                                  size_step=(("host", q[0]), ("w", int(w)), ("h", int(h))))
     ws = next(w for w in cfg.workspaces if w.id == q[0])
@@ -1839,7 +1959,7 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
     started = _ts(today, scenario.clock)
     now = parse_time(started)
     cfg_root = materialize(config_dir, scenario.overlay, out / "config" / scenario.run_id)
-    lrep = lint(cfg_root, phase=1, today=today)
+    lrep, expired = lint_at_run_start(cfg_root, phase=1, today=today)
     with Store(out / "sentinel.db") as store:
         if lrep.errors:
             sc = Scenario(scenario.name, scenario.run_id, scenario.build, scenario.build, run_type="nightly",
@@ -1943,6 +2063,10 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                                                flow_class=_flow_class(cfg, cp)) for cp in cps.values()],
                                    config_commit=tree_sha256(cfg.root)[:12])
         store.begin_run(_run_plan(scenario.run_id, "nightly", cfg.root, (), shard_plan, started, None, None, None))
+        expired_findings = _expired_findings(scenario.run_id, expired, run.expiry_notices, run.expired_exceptions,
+                                             started)
+        for f in expired_findings:
+            store.write_finding(f)
         written: set[str] = set()
         for row in report.outcome_rows:
             if row.checkpoint_id in written:
@@ -1960,15 +2084,23 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                     evidence={"raw_values": {"state": r.state, "money_cell": str(r.money_cell)}},
                     created_at=_ts(today, scenario.clock, 1800)))
         _end_nightly_shard(store, work, st, shard)
-        runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", shard.verdict.status, "reported",
-                                          reason=shard.verdict.reason, started_at=started,
-                                          ended_at=_ts(today, scenario.clock, 2 * 3600)))
         money = [r for r in report.results if r.money_cell and r.state != "generation_failed"]
         other = [r for r in report.results if not r.money_cell and r.state != "generation_failed"]
         canary_health = {"money_detected": sum(r.state == "detected" for r in money), "money_total": len(money),
                          "other_detected": sum(r.state == "detected" for r in other), "other_total": len(other),
                          "detector_state": report.state, "date": today.isoformat(),
                          "since": f"{today.isoformat()} {scenario.clock[:5]} ET"}
+        health = {"wall_clock": "2:41:00", "budget": "4:00:00", "shards": 1, "canary": canary_health,
+                  "fingerprint": {"candidate": run.fp_id[7:13], "base": run.fp_id[7:13]},
+                  "integrations": {"pr_comment": {"state": "unposted", "time": "n/a (Nightly run)"}, "jira_queued":
+                                   1 if report.state != "ok" else 0, "slack": {"queued": 0}}}
+        if expired_findings:
+            health["expired"] = [f.evidence["raw_values"]["run_health"] for f in expired_findings]
+        runrec = store.end_run(RunOutcome(scenario.run_id, "nightly", shard.verdict.status, "reported",
+                                          reason=shard.verdict.reason, started_at=started,
+                                          ended_at=_ts(today, scenario.clock, 2 * 3600)),
+                               summary={"coverage": {}, "health": health, "alerts": work.alerts,
+                                        "detector_state": report.state})
         body = {"run_id": scenario.run_id, "detector_state": report.state, "banner": report.banner,
                 "catalog_version": cfg.catalog.version, "simulated": sorted(wanted),
                 "not_simulated": {k: v for k, v in NOT_SIMULATED.items() if k not in wanted},
@@ -1982,13 +2114,9 @@ def run_nightly(config_dir: str | Path, scenario: NightlyScenario, out_dir: str 
                                                   created_at=started))
         ctx = ReportContext(pr=0, candidate_build=scenario.build.build_id, base_build=scenario.build.build_id,
                             detector_banner=report.banner)
-        health = {"wall_clock": "2:41:00", "budget": "4:00:00", "shards": 1, "canary": canary_health,
-                  "fingerprint": {"candidate": run.fp_id[7:13], "base": run.fp_id[7:13]},
-                  "integrations": {"pr_comment": {"state": "unposted", "time": "n/a (Nightly run)"}, "jira_queued":
-                                   1 if report.state != "ok" else 0, "slack": {"queued": 0}}}
         outcomes = store.outcomes(scenario.run_id)
-        render_run_report(runrec, outcomes, store.findings(scenario.run_id), [], {}, health, None, ctx,
-                          out / f"nightly-report-{scenario.run_id}.html")
+        write_run_report(ReportInputs.from_store(store, scenario.run_id).build(None, ctx),
+                         out / f"nightly-report-{scenario.run_id}.html")
         res = RunResult(scenario.run_id, "nightly", runrec.status, runrec.reason, out, outcomes,
                         store.findings(scenario.run_id), alerts=work.alerts, shards=work.summaries,
                         proof=shard.proof.line)

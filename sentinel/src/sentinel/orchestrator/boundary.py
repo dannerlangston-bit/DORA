@@ -66,7 +66,7 @@ class BoundaryObservations:
     declared_sends: frozenset[str] = frozenset()  # Working row keys of declared sends (gated branch, 6.7)
     order_dialog_visible: bool | None = None      # the Order Confirmation dialog is visible now (5.4.6)
     watchdog: tuple[float, bool] | None = None    # watchdog.json age in seconds and Watchdog PID alive (10.2)
-    free_bytes: int | None = None                 # the Watchdog's free-space result (10.2)
+    free_bytes: int | None = None                 # the Watchdog's free-space result (10.2); None reads rig.free_bytes()
     disk_floor_bytes: int = DISK_FLOOR_BYTES      # the rig floor of 8.6 (R7)
     superseded: bool = False                      # a newer RC build supersedes the run (11.2 RC respin)
     model_endpoint_ok: bool | None = None         # the once-per-flow model endpoint re-check (10.7)

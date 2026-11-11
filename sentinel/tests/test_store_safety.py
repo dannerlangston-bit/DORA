@@ -413,7 +413,7 @@ def test_kill_switch_and_gateway_results_quarantine_the_running_flow_and_disable
     run(st, "pr-1", rig="rig-01")
     ks = kill_switch("file_flag", gate="running", running_flow="flow.trade.x")
     a = S.apply_safety_actions(st, ks, run_id="pr-1", rig_id="rig-01", login_alias="login-01", flow_id="flow.trade.x")
-    assert a.rig_disabled and not a.login_blocked and a.incident_id is None
+    assert a.rig_disabled and not a.login_blocked and S.incident(st, a.incident_id).severity == "S2"   # 6.12
     assert st.query("SELECT disabled_reason FROM rigs WHERE rig_id = 'rig-01'")[0][0] == "kill_switch"
     gw = DropLedger().record(GatewayDrop("deny_rect", "dropped", "safety"), unit="flow.trade.y")
     b = S.apply_safety_actions(st, gw, run_id="pr-1", rig_id="rig-01", login_alias="login-01", flow_id="flow.trade.y")
